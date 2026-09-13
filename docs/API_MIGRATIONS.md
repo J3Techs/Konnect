@@ -133,6 +133,42 @@ Both additions are additive; `status`, `changes`, `diagnostics` and every
 existing count keep their names and meanings. No argument was renamed or
 removed.
 
+## Unreleased: IPC health responses say why KiCad did not answer (minor release)
+
+`check_kicad_ui` and `open_project` gain an `ipc_failure` field (#532). It is
+`{ "kind", "message" }` when a failure kind was established, where `kind` is
+one of `not_configured`, `no_listener`, `access_denied`, `handshake_failed`,
+`transport_error`, or `request_failed`. Before this, every one of those
+surfaced only as `ipc_responsive: false` or `ipc_available: false`, so a KiCad
+that was listening but refused this account looked exactly like one that was
+closed.
+
+`ipc_failure: null` means **no failure kind was established**. That happens in
+two cases: the Ping succeeded with `AS_OK`, or `check_kicad_ui`'s own
+`timeout_seconds` deadline expired before the Ping finished. The second case
+still reports `timed_out: true`. A listener that accepts but never negotiates
+takes NNG's 10-second limit to report `handshake_failed`, longer than the
+default `timeout_seconds` of 5.
+
+No existing field was removed or renamed. Two existing values change wording:
+
+- `open_project`'s `message` for a KiCad that did not answer now depends on the
+  kind. Before, every unanswered call returned "KiCad IPC is not reachable.
+  Start KiCad and enable the IPC API, or work in file-only mode." That message
+  is kept for `not_configured`, `no_listener`, and `transport_error`. The other
+  three kinds return:
+  - `access_denied`: "KiCad IPC refused this account. Konnect must run as the
+    same operating-system user as KiCad; see ipc_failure."
+  - `handshake_failed`: "A listener at the KiCad IPC address did not complete
+    NNG's handshake, so it is probably not KiCad; see ipc_failure."
+  - `request_failed`: "KiCad IPC received the request but did not answer with
+    success; KiCad may still be starting. See ipc_failure."
+- An IPC tool whose dial fails now says in its error text why the dial failed
+  ("Nothing is listening there…", "…it refused this account…", "…did not
+  complete NNG's handshake…"), instead of one sentence listing every possible
+  cause. Callers classifying these errors by type are unaffected. Callers
+  matching the old text must update.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and

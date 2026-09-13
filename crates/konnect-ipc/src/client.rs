@@ -298,9 +298,121 @@ fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
 /// configured, or the NNG dial/send failed.
 ///
 /// Callers must classify with [`IpcFailure::from_error`], never by matching
-/// error text.
+/// error text. Why the request never arrived is read with
+/// [`unreachable_reason`]; the marker itself stays a constructible unit
+/// struct, so code that builds one keeps compiling and keeps classifying as
+/// unreachable.
 #[derive(Debug)]
 pub struct TransportUnreachable;
+
+/// The context layer that states an unreachable failure's message and records
+/// its classified reason, placed directly above [`TransportUnreachable`].
+///
+/// Its `Display` is the message alone, so an error chain renders exactly as it
+/// did when the context was a plain string.
+#[derive(Debug)]
+struct UnreachableDetail {
+    reason: UnreachableReason,
+    message: String,
+}
+
+impl std::fmt::Display for UnreachableDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// The error for a request that never reached KiCad, carrying `reason`.
+fn unreachable_error(reason: UnreachableReason, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransportUnreachable).context(UnreachableDetail {
+        reason,
+        message: message.into(),
+    })
+}
+
+/// Why a request never reached KiCad.
+///
+/// Every variant needs a different fix, which is why they are kept apart:
+/// before #532 each of them surfaced only as `ipc_responsive: false`, and a
+/// user whose KiCad was listening could not tell that from one that was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreachableReason {
+    /// No endpoint address was configured or discovered.
+    NotConfigured,
+    /// Nothing is listening at the address: KiCad is closed, its API is
+    /// disabled, or the address was left behind by a closed session.
+    NoListener,
+    /// Something is listening, but the operating system refused this account
+    /// access to it. The endpoint belongs to another user — typically KiCad
+    /// running as the desktop user while a sandboxed client runs Konnect as a
+    /// different account.
+    AccessDenied,
+    /// A listener accepted the connection but did not complete NNG's
+    /// handshake: it closed the connection, sent something that is not NNG,
+    /// or stayed silent past NNG's 10-second negotiation limit. Whatever holds
+    /// the address is probably not KiCad's API server (#531).
+    HandshakeFailed,
+    /// Any other dial or send failure.
+    TransportError,
+}
+
+impl UnreachableReason {
+    /// Classify the error NNG returned from a synchronous dial.
+    ///
+    /// Measured on Windows against named pipes: no pipe gives
+    /// `ConnectionRefused`, a pipe whose security descriptor grants this
+    /// account only read access gives `PermissionDenied`, a listener that
+    /// closes gives `Closed`, and one that never negotiates gives `TimedOut`
+    /// after 10 s. NNG's POSIX dialer maps `ENOENT` to `ECONNREFUSED` and
+    /// `EACCES` to `EPERM`, so Unix sockets land on the same variants.
+    pub fn from_dial_error(error: nng::Error) -> Self {
+        match error {
+            nng::Error::ConnectionRefused | nng::Error::EntryNotFound => Self::NoListener,
+            nng::Error::PermissionDenied => Self::AccessDenied,
+            nng::Error::TimedOut
+            | nng::Error::Closed
+            | nng::Error::ConnectionShutdown
+            | nng::Error::ConnectionReset
+            | nng::Error::ConnectionAborted
+            | nng::Error::Protocol => Self::HandshakeFailed,
+            _ => Self::TransportError,
+        }
+    }
+
+    /// The stable machine-readable name reported in tool responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::NoListener => "no_listener",
+            Self::AccessDenied => "access_denied",
+            Self::HandshakeFailed => "handshake_failed",
+            Self::TransportError => "transport_error",
+        }
+    }
+
+    /// What the failure means for the user.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "No KiCad IPC address is configured.",
+            Self::NoListener => {
+                "Nothing is listening there: KiCad may be closed, its API disabled \
+                 (Edit > Preferences > Plugins > 'Enable KiCad API'), or this address left \
+                 behind by a closed session."
+            }
+            Self::AccessDenied => {
+                "Something is listening there, but it refused this account: Konnect must run \
+                 as the same operating-system user as KiCad. A sandboxed AI client (for \
+                 example Codex on Windows) runs the server as a separate account; run Konnect \
+                 outside the sandbox instead."
+            }
+            Self::HandshakeFailed => {
+                "A listener accepted the connection but did not complete NNG's handshake, so \
+                 it is probably not KiCad's API server; another program may hold this address."
+            }
+            Self::TransportError => "The connection failed before a request reached KiCad.",
+        }
+    }
+}
 
 impl std::fmt::Display for TransportUnreachable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -319,6 +431,65 @@ pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<TransportUnreachable>())
+}
+
+/// Why `error` never reached KiCad, or `None` when it did (or may have).
+///
+/// Classifies by type, never by message text: the [`TransportUnreachable`]
+/// marker decides whether the request was unreachable, and the reason comes
+/// from the detail layer above it. anyhow's `downcast_ref` searches every
+/// context layer, so context a caller adds later does not hide it. A marker
+/// built without that layer is an unclassified [`UnreachableReason::TransportError`].
+pub fn unreachable_reason(error: &anyhow::Error) -> Option<UnreachableReason> {
+    if !is_transport_unreachable(error) {
+        return None;
+    }
+    Some(
+        error
+            .downcast_ref::<UnreachableDetail>()
+            .map_or(UnreachableReason::TransportError, |detail| detail.reason),
+    )
+}
+
+/// What one bounded `Ping` established about the configured endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingOutcome {
+    /// KiCad answered the Ping with `AS_OK`.
+    Responsive,
+    /// The request never reached KiCad; `reason` says why.
+    Unreachable {
+        reason: UnreachableReason,
+        message: String,
+    },
+    /// The request reached the endpoint, or may have, and did not succeed:
+    /// KiCad answered with an error status (for example `AS_NOT_READY` while
+    /// an editor is still starting), or no valid reply arrived in time.
+    RequestFailed { message: String },
+}
+
+impl PingOutcome {
+    pub fn is_responsive(&self) -> bool {
+        matches!(self, Self::Responsive)
+    }
+
+    /// The machine-readable failure kind, or `None` when the Ping succeeded
+    /// with `AS_OK`. An error status from KiCad is `request_failed`, not `None`.
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Responsive => None,
+            Self::Unreachable { reason, .. } => Some(reason.as_str()),
+            Self::RequestFailed { .. } => Some("request_failed"),
+        }
+    }
+
+    /// The full diagnostic for a failure, or `None` when the Ping succeeded
+    /// with `AS_OK`.
+    pub fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Responsive => None,
+            Self::Unreachable { message, .. } | Self::RequestFailed { message } => Some(message),
+        }
+    }
 }
 
 /// Typed KiCad response status for a request that completed a round trip.
@@ -575,7 +746,8 @@ impl KiCadIpcClient {
         type_name: &str,
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
-            return Err(anyhow::Error::new(TransportUnreachable).context(
+            return Err(unreachable_error(
+                UnreachableReason::NotConfigured,
                 "KiCAD IPC socket path not configured. To fix: \
                  (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
                  and copy the listed ipc:// address; \
@@ -633,19 +805,24 @@ impl KiCadIpcClient {
 
         let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
         socket.dial(&dial_url).map_err(|error| {
-            anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. KiCad may be \
-                 closed, its API disabled (Edit > Preferences > Plugins > \
-                 'Enable KiCad API'), or this address left behind by a closed \
-                 session (guide: \
-                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md)"
-            ))
+            let reason = UnreachableReason::from_dial_error(error);
+            unreachable_error(
+                reason,
+                format!(
+                    "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: \
+                     https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+                    reason.explanation()
+                ),
+            )
         })?;
 
         // Send request
         let msg = nng::Message::from(request_bytes.as_slice());
         socket.send(msg).map_err(|(_, error)| {
-            anyhow::Error::new(TransportUnreachable).context(format!("NNG send failed: {error}"))
+            unreachable_error(
+                UnreachableReason::TransportError,
+                format!("NNG send failed: {error}"),
+            )
         })?;
 
         // Receive response
@@ -684,13 +861,22 @@ impl KiCadIpcClient {
 
     /// Check if KiCAD is reachable.
     pub fn ping(&self) -> Result<bool> {
+        Ok(self.ping_outcome().is_responsive())
+    }
+
+    /// Ping KiCad and report why it did not answer, when it did not.
+    ///
+    /// A request that never arrived ([`PingOutcome::Unreachable`]) is kept
+    /// apart from one that arrived and failed ([`PingOutcome::RequestFailed`]),
+    /// and only the former carries an [`UnreachableReason`].
+    pub fn ping_outcome(&self) -> PingOutcome {
         let ping = kiapi::common::commands::Ping {};
         match self.send_command(&ping, "kiapi.common.commands.Ping") {
-            Ok(_) => Ok(true),
+            Ok(_) => PingOutcome::Responsive,
             Err(e) => {
-                // The address, because this is the one IPC failure that never
-                // reaches a caller as an error: `check_kicad_ui` reports the
-                // `false` and nothing else records which endpoint went unheard.
+                // The address, because a failed ping never reaches a caller as
+                // an error: callers that keep only `ping()`'s `false` leave the
+                // server log as the one record of which endpoint went unheard.
                 warn!(
                     "[BETA] Ping to {} failed: {}",
                     if self.socket_path.is_empty() {
@@ -700,7 +886,17 @@ impl KiCadIpcClient {
                     },
                     e
                 );
-                Ok(false)
+                // An unreachable failure's outermost context is already the
+                // whole sentence; the chain below it is only the marker.
+                match unreachable_reason(&e) {
+                    Some(reason) => PingOutcome::Unreachable {
+                        reason,
+                        message: e.to_string(),
+                    },
+                    None => PingOutcome::RequestFailed {
+                        message: format!("{e:#}"),
+                    },
+                }
             }
         }
     }
@@ -3842,6 +4038,108 @@ mod diagnostic_tests {
         assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
         assert!(!diagnostic.contains("secret"), "{diagnostic}");
         assert!(!diagnostic.contains("hidden"), "{diagnostic}");
+    }
+
+    #[test]
+    fn each_dial_error_maps_to_the_reason_whose_fix_applies() {
+        use UnreachableReason::*;
+        let cases = [
+            (nng::Error::ConnectionRefused, NoListener),
+            (nng::Error::EntryNotFound, NoListener),
+            (nng::Error::PermissionDenied, AccessDenied),
+            (nng::Error::TimedOut, HandshakeFailed),
+            (nng::Error::Closed, HandshakeFailed),
+            (nng::Error::ConnectionShutdown, HandshakeFailed),
+            (nng::Error::ConnectionReset, HandshakeFailed),
+            (nng::Error::ConnectionAborted, HandshakeFailed),
+            (nng::Error::Protocol, HandshakeFailed),
+            (nng::Error::AddressInvalid, TransportError),
+            (nng::Error::OutOfMemory, TransportError),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                UnreachableReason::from_dial_error(error),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reason_has_a_distinct_name_and_its_own_explanation() {
+        use UnreachableReason::*;
+        let all = [
+            NotConfigured,
+            NoListener,
+            AccessDenied,
+            HandshakeFailed,
+            TransportError,
+        ];
+        let names: std::collections::HashSet<_> = all.iter().map(|r| r.as_str()).collect();
+        let explanations: std::collections::HashSet<_> =
+            all.iter().map(|r| r.explanation()).collect();
+        assert_eq!(names.len(), all.len());
+        assert_eq!(explanations.len(), all.len());
+        assert!(AccessDenied
+            .explanation()
+            .contains("same operating-system user"));
+    }
+
+    #[test]
+    fn an_unconfigured_client_reports_not_configured() {
+        let mut client = KiCadIpcClient::new("");
+        client.socket_path.clear();
+        let outcome = client.ping_outcome();
+        assert!(!outcome.is_responsive());
+        assert_eq!(
+            outcome.failure_kind(),
+            Some("not_configured"),
+            "{outcome:?}"
+        );
+        assert!(!client.ping().unwrap());
+    }
+
+    #[test]
+    fn the_reason_is_read_from_the_marker_never_from_the_text() {
+        let lookalike =
+            anyhow::anyhow!("Cannot connect to KiCad IPC at ipc://x: Permission denied");
+        assert_eq!(unreachable_reason(&lookalike), None);
+
+        let marked = unreachable_error(UnreachableReason::AccessDenied, "refused")
+            .context("outer context")
+            .context("outermost context");
+        assert_eq!(
+            unreachable_reason(&marked),
+            Some(UnreachableReason::AccessDenied)
+        );
+        assert!(is_transport_unreachable(&marked));
+    }
+
+    #[test]
+    fn a_marker_built_the_old_way_still_classifies_as_unreachable() {
+        // `TransportUnreachable` stays a constructible unit struct (#535
+        // review): code that builds one without a reason must still compile
+        // and still be treated as unreachable, just unclassified.
+        let bare = anyhow::Error::new(TransportUnreachable).context("caller context");
+        assert!(is_transport_unreachable(&bare));
+        assert!(matches!(
+            IpcFailure::from_error(anyhow::Error::new(TransportUnreachable)),
+            IpcFailure::Unreachable(_)
+        ));
+        assert_eq!(
+            unreachable_reason(&bare),
+            Some(UnreachableReason::TransportError)
+        );
+    }
+
+    #[test]
+    fn a_classified_failure_renders_its_chain_as_a_string_context_did() {
+        let error = unreachable_error(UnreachableReason::NoListener, "Cannot connect to KiCad");
+        assert_eq!(error.to_string(), "Cannot connect to KiCad");
+        assert_eq!(
+            format!("{error:#}"),
+            "Cannot connect to KiCad: KiCad IPC transport unreachable"
+        );
     }
 }
 
