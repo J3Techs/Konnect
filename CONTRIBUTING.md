@@ -2,6 +2,18 @@
 
 Thanks for your interest! Bug reports, feature requests, and pull requests are welcome.
 
+## Publication boundary for this fork
+
+All pushes and pull requests belong in **`J3Techs/Konnect`**. Never push any
+branch, tag or other ref to `mixelpixx/Konnect`, and never create or reopen a
+pull request against that repository. Treat it as a read-only reference.
+
+Verify the remote's push URL before every push. Use
+`gh repo set-default J3Techs/Konnect` and pass `--repo J3Techs/Konnect`
+explicitly to PR commands. Independent branches start from this fork's current
+`origin/main`. The rules in [AGENTS.md](AGENTS.md) and this section override
+inherited upstream contribution examples about publication destinations.
+
 ## Before you start
 
 - Read [GOVERNANCE.md](GOVERNANCE.md) — who maintains what, how work is claimed,
@@ -13,7 +25,7 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 - Keep each pull request focused on one reviewable outcome. Split unrelated platform,
   protocol, feature, and documentation changes into a short PR series.
 - Follow the [branch and pull request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md).
-  Independent changes branch from current `upstream/main`; dependent work exposes one
+  Independent changes branch from current `origin/main`; dependent work exposes one
   mergeable step at a time instead of opening cumulative PRs against the same old base.
 - Keep the PR's workflow state honest. A maintainer uses one `status:*` label to name
   the next actor; `status:ready-to-merge` means the exact current head has completed
@@ -25,13 +37,13 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 
 The PR base and dependency structure are part of the change:
 
-- Branch independent changes separately from current `upstream/main`.
-- Use the latest `upstream/main`, not the latest release tag. Release tags are
+- Branch independent changes separately from current `origin/main`.
+- Use the latest `origin/main`, not the latest release tag. Release tags are
   consumption points, not contribution bases, unless a maintainer explicitly
   requests a backport.
 - If PR B genuinely depends on PR A, document the complete order, keep only A ready,
   and retain B in the contributor's fork until A merges. Then rebuild B on current
-  `upstream/main` with only B's unique commits and rerun CI.
+  `origin/main` with only B's unique commits and rerun CI.
 - Do not open several cumulative PRs against `main` from branches that all contain the
   same unmerged prerequisite commits. Green checks on those old cumulative heads do
   not establish merge readiness after `main` changes.
@@ -98,7 +110,7 @@ stale, cumulative, or poorly evidenced PR ready.
 
 If you push after that review, assume the readiness decision is invalid. GitHub may
 disable auto-merge automatically for a new commit from a fork. Resolve new feedback,
-bring the branch back to current `upstream/main` when required, rerun the evidence, and
+bring the branch back to current `origin/main` when required, rerun the evidence, and
 wait for review of the new head. After merge, GitHub deletes the topic branch
 automatically; retain any later dependent work on its own branch.
 
@@ -124,7 +136,7 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
 - `cargo test --workspace --locked --doc` passes
 - `cargo clippy --workspace --locked --all-targets -- -D warnings` is clean
 - `cargo fmt --all -- --check` is clean
-- The branch includes current `upstream/main`, GitHub reports no conflicts, and the
+- The branch includes current `origin/main`, GitHub reports no conflicts, and the
   required checks passed on the exact head being reviewed
 - Every review conversation is resolved; a post-review commit or base change requires
   review of the new exact head before auto-merge is armed again

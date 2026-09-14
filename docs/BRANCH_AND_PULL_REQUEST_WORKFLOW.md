@@ -1,5 +1,28 @@
 # Branch and Pull Request Workflow
 
+## Required publication destination
+
+This is the **J3Techs/Konnect** fork. Publish all branches, tags and pull requests
+only to `J3Techs/Konnect`. Never push any ref to `mixelpixx/Konnect`, and never
+create or reopen a pull request against it. The original repository is a
+read-only reference. This boundary overrides inherited upstream workflow and
+governance examples about publication destinations.
+
+Before every push, inspect `git remote get-url --push origin` and require the
+repository to be `J3Techs/Konnect`. If using another remote name, verify that
+remote's push URL instead. Before publishing a PR, verify its base repository.
+Set the local GitHub CLI default and still name the repository explicitly:
+
+```text
+gh repo set-default J3Techs/Konnect
+gh pr create --repo J3Techs/Konnect --base main --head fix/example
+```
+
+The `origin/main` references below mean the current main branch of
+`J3Techs/Konnect`, never the original repository's branch.
+
+## Review structure
+
 Konnect accepts independent pull requests, short dependent series, and
 maintainer-approved integration branches. Choose the smallest model that makes
 every review show one coherent change.
@@ -8,7 +31,7 @@ The base branch is part of the review contract. A green check on a branch that
 contains obsolete prerequisites does not prove that its unique change works on
 current `main`.
 
-**Contributions start from the latest `upstream/main`, not the latest release
+**Contributions start from the latest `origin/main`, not the latest release
 tag.** Release tags are stable consumption points for users and packagers; they
 do not contain work merged after the release. A PR based on a release can be
 green in isolation while omitting fixes and contracts already present on
@@ -34,16 +57,16 @@ Use an independent branch when a change can be reviewed and merged without
 another unmerged pull request.
 
 ```text
-git fetch upstream
-git switch -c fix/example upstream/main
+git fetch origin
+git switch -c fix/example origin/main
 # edit, test, and commit
 git push -u origin fix/example
 ```
 
 Open the pull request against `main`. Before final review:
 
-1. fetch `upstream`;
-2. rebase the branch onto current `upstream/main`;
+1. fetch `origin`;
+2. rebase the branch onto current `origin/main`;
 3. resolve conflicts in the branch rather than asking the merge commit to guess;
 4. push rewritten history with `--force-with-lease`, never plain `--force`;
 5. wait for the required checks to pass on the new head.
@@ -72,11 +95,11 @@ tracking issue if visibility is useful, but do not open cumulative PRs against
 `main` that repeat every prerequisite commit.
 
 After the prerequisite merges, reconstruct the next branch so it contains only
-its unique work on current `upstream/main`. For a simple one-commit step:
+its unique work on current `origin/main`. For a simple one-commit step:
 
 ```text
-git fetch upstream
-git switch -c fix/next-clean upstream/main
+git fetch origin
+git switch -c fix/next-clean origin/main
 git cherry-pick <unique-commit>
 # resolve conflicts, test, and inspect the diff
 git push --force-with-lease origin HEAD:fix/next
@@ -86,8 +109,8 @@ For several unique commits, use `git rebase --onto` or cherry-pick the precise
 range. In either case, verify both views before requesting review:
 
 ```text
-git log --oneline upstream/main..HEAD
-git diff --stat upstream/main...HEAD
+git log --oneline origin/main..HEAD
+git diff --stat origin/main...HEAD
 ```
 
 The log must contain only the commits this PR owns. The diff must not reintroduce
@@ -97,10 +120,10 @@ head or changed base.
 ### When a stacked PR base is possible
 
 A PR can target an immediate prerequisite branch only when that base branch
-exists in the upstream repository. A branch in a contributor's fork cannot be
-used as the base branch of a PR in the upstream repository.
+exists in `J3Techs/Konnect`. A branch that exists only in another repository
+cannot be used as the base branch of a PR in `J3Techs/Konnect`.
 
-Collaborators may use an upstream prerequisite branch when maintainers agree,
+Collaborators may use a J3Techs prerequisite branch when maintainers agree,
 but the deeper PR stays draft until its parent is merged. Afterward, retarget it
 to `main`, synchronize it with current `main`, and rerun CI. Do not leave a chain
 of ready PRs whose displayed diffs all contain the same unmerged changes.
@@ -168,7 +191,7 @@ For the one next-to-land PR in an overlap set:
 3. If the PR is ready but required checks are still running, the maintainer
    applies `status:ready-to-merge` and enables auto-merge with the merge-commit
    method. If all requirements are already satisfied, the maintainer may merge
-   immediately with `gh pr merge N --merge` after the same verification.
+   immediately with `gh pr merge N --repo J3Techs/Konnect --merge` after the same verification.
 4. A new commit, rewritten head, base change, failed or missing required check,
    or unresolved conversation returns the PR to review. Recheck the new exact
    head before arming auto-merge again.
