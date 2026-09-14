@@ -500,6 +500,9 @@ message BoardText
   BoardLayer layer = 3;
   bool knockout = 4;
   kiapi.common.types.LockedState locked = 5;
+
+  // Read-only parent container ID. Since: 10.0.6.
+  kiapi.common.types.KIID parent = 6;
 }
 
 // A board-specific textbox, existing on a board layer
@@ -575,6 +578,9 @@ message Pad
 
   // Since: 10.0.0
   kiapi.common.types.Time pad_to_die_delay = 11;
+
+  // Read-only parent container ID. Since: 10.0.6.
+  kiapi.common.types.KIID parent = 13;
 }
 
 enum ZoneType
@@ -1043,4 +1049,7 @@ message FootprintInstance
   // or the empty string if there is no associated symbol
   // Since: 9.0.7
   string symbol_footprint_filters = 16;
+
+  // Read-only parent container ID. Since: 10.0.6.
+  kiapi.common.types.KIID parent = 17;
 }
