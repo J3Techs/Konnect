@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
+- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -173,7 +173,7 @@ and Windows servers do not.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 12 tools
+### `sch_batch` · 15 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -186,6 +186,9 @@ and Windows servers do not.
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
+| `list_schematic_texts` | Read plain annotations from the saved schematic, returning UUIDs, positions in millimetres and a document revision. Excludes net labels, fields, text boxes and nested library text. |
+| `edit_schematic_text` | Replace an annotation's text by UUID and exact saved revision. Preserves formatting and unrelated objects, refuses editor-owned files and verifies committed readback. |
+| `delete_schematic_text` | Delete an annotation by UUID and exact saved revision, refusing group members and editor-owned files. Verifies that the selected UUID is absent afterward. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
