@@ -284,6 +284,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
+### `pcb_fields` · 2 tools
 ### `pcb_routing` · 18 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)

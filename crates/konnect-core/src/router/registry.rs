@@ -87,6 +87,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 20,
     },
     ToolsetMeta {
+        name: "pcb_fields",
+        description: "Inspect and edit live footprint text, visibility, documentation-layer placement and custom properties",
+        category: "pcb",
+        tool_count: 2,
+    },
+    ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, batch routing and deletion, copper pours and their deletion, net classes, differential pairs, and strict Specctra SES import",
         category: "pcb",
@@ -189,6 +195,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
+        "pcb_fields" => Some(Vec::from(pcb_fields::tools())),
         "pcb_routing" => Some(pcb_routing::tools()),
         "native_routing" => Some(route_native::tools()),
         "placement" => Some(placement::tools()),
