@@ -155,7 +155,7 @@ Acceptance procedure:
 1. Create or select the exact symbol and footprint only after completing the
    source columns above.
 2. Query the symbol back with `get_symbol_info` and the footprint with
-   `get_footprint_info`. Compare every returned pin/pad number, name, type,
+   `get_footprint_info(include_pads=true)`. Compare every returned pin/pad number, name, type,
    coordinate, drill, size, and layer set to the table and datasheet.
 3. Place a **disposable** symbol and footprint in a scratch project. Render the
    schematic and board, then inspect the pin-1/key marker, numbering direction,
@@ -262,6 +262,31 @@ create_footprint(
   }]
 )
 ```
+
+### Round holes and plated slots
+
+`create_footprint` pad items and `edit_footprint_pad` accept either a positive
+numeric `drill` diameter or an oval-drill object:
+
+```json
+{"drill": {"shape": "oval", "width": 1.0, "height": 1.3}}
+```
+
+Dimensions are in pad-local millimetres. Pad rotation also rotates the slot.
+The copper pad `shape` is independent of the drill shape. Both `thru_hole`
+(plated) and `np_thru_hole` pads support slots; SMD pads cannot have drills.
+
+Omitting `drill` preserves it during an edit. Supplying a number explicitly
+changes it to a circular hole. Existing nested drill offsets are preserved;
+this API does not set or clear offsets. Nonpositive dimensions, malformed
+objects, unknown fields and incompatible pad types are refused before writing,
+including an incompatible later match in a `match_all=true` edit.
+
+Verify with `get_footprint_info(include_pads=true)`. Each physical pad is a
+separate entry, even when numbers repeat. The response identifies `source=file`
+and reports pad-local position, size, rotation, layers and `drill` as null or
+an object with shape, width, height and offset. This is saved-library evidence,
+not a readback of a possibly unsaved placed footprint in the PCB editor.
 
 ### Standard Pad Sizes Reference
 

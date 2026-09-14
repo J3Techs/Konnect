@@ -344,8 +344,8 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
-| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions and independent dimensions. |
+| `create_footprint` | Create a new footprint (`.kicad_mod`) from pad layouts, including round drills or `{shape: "oval", width, height}` slots in pad-local millimetres. |
+| `edit_footprint_pad` | Atomically edit or renumber matching pads, including standard shape transitions, independent dimensions and round/oval drills. Drill edits preserve existing offsets. |
 | `set_footprint_graphics` | Atomically append, replace, or delete line, arc, rectangle, circle, and polygon primitives on one footprint layer. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
@@ -358,7 +358,7 @@ and Windows servers do not.
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
-| `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
+| `get_footprint_info` | Return footprint information. Set `include_pads` for saved pad positions, sizes, rotations, layers and round/oval drill dimensions/offsets; duplicate numbers remain separate. Set `include_graphics` (and optionally `graphics_layer`) for supported top-level primitives. |
 | `search_footprints` | Search for footprints across all registered libraries by name or keyword. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
 
