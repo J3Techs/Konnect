@@ -3179,12 +3179,7 @@ fn saved_pad_count(board_path: &std::path::Path, reference: &str) -> Option<usiz
     let tree = konnect_sexp::parser::parse_sexp(&content).ok()?;
     tree.find_all("footprint")
         .into_iter()
-        .find(|fp| {
-            fp.find_all("property").iter().any(|p| {
-                p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                    && p.get(2).and_then(|n| n.as_str()) == Some(reference)
-            })
-        })
+        .find(|fp| footprint_reference(fp).as_deref() == Some(reference))
         .map(|fp| fp.find_all("pad").len())
 }
 
@@ -3281,12 +3276,10 @@ async fn handle_get_component_pads(
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
 
     // Find the footprint with matching reference
-    let fp_node = tree.find_all("footprint").into_iter().find(|fp| {
-        fp.find_all("property").iter().any(|p| {
-            p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                && p.get(2).and_then(|n| n.as_str()) == Some(reference.as_str())
-        })
-    });
+    let fp_node = tree
+        .find_all("footprint")
+        .into_iter()
+        .find(|fp| footprint_reference(fp).as_deref() == Some(reference.as_str()));
 
     let fp_node = match fp_node {
         Some(n) => n,
@@ -5951,6 +5944,94 @@ mod tests {
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
+    }
+
+    /// KiCad-authored geometry with only R1's reference field changed to the
+    /// legacy spelling still emitted by some library footprints. R2 keeps its
+    /// modern property so the reader must handle both in the same board.
+    fn saved_board_with_legacy_reference() -> String {
+        include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb").replacen(
+            "(property \"Reference\" \"R1\"",
+            "(fp_text reference \"R1\"",
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn legacy_reference_pad_reads_preserve_saved_geometry_and_modern_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        let saved = saved_board_with_legacy_reference();
+        std::fs::write(&board, &saved).unwrap();
+        let mut config = test_ctx().config;
+        config.eager_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+
+        for (reference, x, first_net, second_net) in
+            [("R1", 100.0, "VCC", "GND"), ("R2", 110.0, "GND", "VCC")]
+        {
+            let res = handle_get_component_pads(
+                &json!({ "board": board.to_string_lossy(), "reference": reference }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!res.is_error, "{reference}: {:?}", res.content);
+            let body = parsed(&res);
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": reference, "method": "tools/call",
+                    "params": {
+                        "name": "get_component_pads",
+                        "arguments": { "board": board.to_string_lossy(), "reference": reference }
+                    }
+                }))
+                .await
+                .expect("served call returns a response");
+            let served: CallToolResult =
+                serde_json::from_value(response.result.expect("tool result")).unwrap();
+            assert!(!served.is_error, "{reference}: {:?}", served.content);
+            assert_eq!(
+                parsed(&served),
+                body,
+                "served dispatch preserves pad evidence"
+            );
+            assert_eq!(body["source"], json!("file"));
+            assert_eq!(body["reference"], json!(reference));
+            assert_eq!(body["pad_count"], json!(2));
+            for (index, number, pad_x, net) in
+                [(0, "1", x - 0.5, first_net), (1, "2", x + 0.5, second_net)]
+            {
+                let pad = &body["pads"][index];
+                assert_eq!(pad["number"], json!(number));
+                assert_eq!(pad["x"], json!(pad_x));
+                assert_eq!(pad["y"], json!(50.0));
+                assert_eq!(pad["net"], json!(net));
+                assert_eq!(pad["layers"], json!(["F.Cu", "F.Mask", "F.Paste"]));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn legacy_reference_saved_pads_still_reject_an_empty_live_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        let saved = saved_board_with_legacy_reference();
+        std::fs::write(&board, &saved).unwrap();
+        let server = spawn_kicad_holding(&board, vec![live_footprint("R1", vec![])]);
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.is_error, "saved legacy pads must not disappear");
+        assert!(result_text(&res).contains("Refusing to answer 'no pads'"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), saved);
     }
 
     #[tokio::test]
