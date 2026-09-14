@@ -2101,6 +2101,56 @@ impl KiCadIpcClient {
         Ok(Some(track))
     }
 
+    /// Delete exactly one typed via from the requested live board, then prove
+    /// absence with a fresh read. No generic item deletion or file fallback.
+    pub fn delete_via_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Via>> {
+        let document = self.find_open_board(requested)?;
+        let before = self.get_vias_in(document.clone())?;
+        let Some(via) = before
+            .into_iter()
+            .find(|via| via.id.as_ref().is_some_and(|id| id.value == uuid))
+        else {
+            return Ok(None);
+        };
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self.get_vias_in(document).with_context(|| {
+            format!("KiCad accepted deletion of via '{}' but post-delete read-back failed; the deletion may have committed", uuid)
+        })?.into_iter().any(|via| via.id.as_ref().is_some_and(|id| id.value == uuid));
+        if remains {
+            anyhow::bail!(
+                "KiCad accepted deletion of via '{}' but read-back still reports it",
+                uuid
+            );
+        }
+        Ok(Some(via))
+    }
+
+    /// Read typed vias from one bound board. Even with the via selector, verify
+    /// each returned type: protobuf compatibility is not proof of item type.
+    /// A malformed declared Via makes the read inconclusive.
+    pub fn get_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<kiapi::board::types::Via>> {
+        self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?
+            .into_iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .map(|item| {
+                let via = kiapi::board::types::Via::decode(item.value.as_slice())
+                    .context("Failed to decode a declared Via during typed via read-back")?;
+                anyhow::ensure!(
+                    via.id.as_ref().is_some_and(|id| !id.value.is_empty()),
+                    "Typed via read-back contains a Via without a usable UUID"
+                );
+                Ok(via)
+            })
+            .collect()
+    }
+
     /// Delete a board item by UUID.
     ///
     /// This low-level compatibility helper does not verify an item type or
