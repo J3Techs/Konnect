@@ -723,7 +723,9 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            // Protect copper belonging to the old assignment. Joining an existing
+            // destination net is normal when adding a previously unrouted pad.
+            if board.routed_nets.contains_key(old_net) {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -1472,29 +1474,14 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
-        if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, track.net.as_ref());
-        }
-    }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
-        if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, arc.net.as_ref());
-        }
-    }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
-        if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
-            record_routed_net(&mut routed_nets, via.net.as_ref());
-        }
-    }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
-        for net in net_codes.keys() {
-            *routed_nets.entry(net.clone()).or_insert(0) += 1;
+    for (selector, message) in [
+        (ObjectType::KotPcbTrace, "Track"),
+        (ObjectType::KotPcbArc, "Arc"),
+        (ObjectType::KotPcbVia, "Via"),
+        (ObjectType::KotPcbZone, "Zone"),
+    ] {
+        for item in client.get_items_in(document.clone(), selector)? {
+            record_routing_item(&mut routed_nets, &item, message)?;
         }
     }
     let extents = client
@@ -1658,13 +1645,47 @@ fn board_layer_name(layer: i32) -> String {
     }
 }
 
-fn record_routed_net(
+/// Decode only the requested IPC type. Missing or malformed evidence cannot
+/// turn routed copper into an apparently safe, unrouted pad-net change.
+fn record_routing_item(
     routed: &mut BTreeMap<String, usize>,
-    net: Option<&konnect_ipc::gen::kiapi::board::types::Net>,
-) {
-    if let Some(net) = net.filter(|net| !net.name.is_empty()) {
-        *routed.entry(net.name.clone()).or_insert(0) += 1;
+    item: &prost_types::Any,
+    expected: &str,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi::board::types::{zone, Arc, Track, Via, Zone, ZoneType};
+    let actual = item.type_url.rsplit('/').next().unwrap_or_default();
+    if actual != format!("kiapi.board.types.{expected}") {
+        bail!(
+            "expected {expected} routing evidence, received '{}'",
+            item.type_url
+        );
     }
+    let net = match expected {
+        "Track" => Track::decode(item.value.as_slice())?.net,
+        "Arc" => Arc::decode(item.value.as_slice())?.net,
+        "Via" => Via::decode(item.value.as_slice())?.net,
+        "Zone" => {
+            let zone = Zone::decode(item.value.as_slice())?;
+            match (zone.r#type(), zone.settings) {
+                (ZoneType::ZtCopper, Some(zone::Settings::CopperSettings(settings))) => {
+                    settings.net
+                }
+                (ZoneType::ZtRuleArea, Some(zone::Settings::RuleAreaSettings(_))) => return Ok(()),
+                (ZoneType::ZtGraphical, None) => return Ok(()),
+                _ => bail!("zone routing evidence has missing or incompatible settings"),
+            }
+        }
+        _ => bail!("unsupported routing evidence type '{expected}'"),
+    };
+    let net = net.context("routing evidence has no net assignment")?;
+    if net.name.is_empty() {
+        if net.code.as_ref().is_some_and(|code| code.value != 0) {
+            bail!("routing evidence has an unnamed nonzero net");
+        }
+    } else {
+        *routed.entry(net.name).or_insert(0) += 1;
+    }
+    Ok(())
 }
 
 fn prepare_additions(board: &Path, plan: &SyncPlan) -> Result<BTreeMap<String, PreparedFootprint>> {
@@ -3274,5 +3295,169 @@ mod tests {
             plan.counts.board_only_preserved.planned, 1,
             "the footprint the schematic never named is preserved untouched"
         );
+    }
+    fn copper_zone_evidence(name: &str) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{
+            zone, CopperZoneSettings, Net, Zone, ZoneType,
+        };
+        konnect_ipc::builders::pack_any(
+            &Zone {
+                r#type: ZoneType::ZtCopper as i32,
+                settings: Some(zone::Settings::CopperSettings(CopperZoneSettings {
+                    net: Some(Net {
+                        name: name.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            "kiapi.board.types.Zone",
+        )
+    }
+
+    #[test]
+    fn sync_copper_zones_protect_only_their_observed_nets() {
+        let mut routed = BTreeMap::new();
+        record_routing_item(&mut routed, &copper_zone_evidence("GND"), "Zone").unwrap();
+        record_routing_item(&mut routed, &copper_zone_evidence("RTN"), "Zone").unwrap();
+        assert_eq!(
+            routed,
+            BTreeMap::from([("GND".into(), 1), ("RTN".into(), 1)])
+        );
+        let mut board = board_with(vec![board_resistor("R1", Some("/sheet/existing"))]);
+        board.routed_nets = routed;
+        let mut component = resistor("R1", "/sheet/existing");
+        component.pad_nets.insert("1".into(), "EN_BUFFERED".into());
+        let mut design = ExportedDesign {
+            components: vec![component],
+            skipped: vec![],
+            unassigned: vec![],
+        };
+        assert_eq!(
+            plan_sync("netlist", &design, &board).status,
+            PlanStatus::Ready
+        );
+        design.components[0]
+            .pad_nets
+            .insert("2".into(), "OTHER".into());
+        assert_eq!(
+            plan_sync("netlist", &design, &board).status,
+            PlanStatus::Conflict
+        );
+    }
+
+    #[test]
+    fn sync_newly_assigned_pads_can_join_routed_destination_nets() {
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_nets.clear();
+        let mut board = board_with(vec![footprint]);
+        board.routed_nets = BTreeMap::from([("VCC".into(), 3), ("GND".into(), 8)]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: vec![],
+            unassigned: vec![],
+        };
+        let plan = plan_sync("netlist", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.pads_reassigned.planned, 2);
+    }
+
+    #[test]
+    fn sync_routing_evidence_records_tracks_arcs_and_vias_and_ignores_rule_areas() {
+        use konnect_ipc::builders::pack_any;
+        use konnect_ipc::gen::kiapi::board::types::{
+            zone, Arc, Net, RuleAreaSettings, Track, Via, Zone, ZoneType,
+        };
+        let net = Some(Net {
+            name: "SIGNAL".into(),
+            ..Default::default()
+        });
+        let mut routed = BTreeMap::new();
+        for (item, kind) in [
+            (
+                pack_any(
+                    &Track {
+                        net: net.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Track",
+                ),
+                "Track",
+            ),
+            (
+                pack_any(
+                    &Arc {
+                        net: net.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Arc",
+                ),
+                "Arc",
+            ),
+            (
+                pack_any(
+                    &Via {
+                        net,
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Via",
+                ),
+                "Via",
+            ),
+            (
+                pack_any(
+                    &Zone {
+                        r#type: ZoneType::ZtRuleArea as i32,
+                        settings: Some(zone::Settings::RuleAreaSettings(
+                            RuleAreaSettings::default(),
+                        )),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Zone",
+                ),
+                "Zone",
+            ),
+        ] {
+            record_routing_item(&mut routed, &item, kind).unwrap();
+        }
+        assert_eq!(routed, BTreeMap::from([("SIGNAL".into(), 3)]));
+    }
+
+    #[test]
+    fn sync_routing_evidence_rejects_wrong_types_and_malformed_data() {
+        let valid = copper_zone_evidence("GND");
+        let mut routed = BTreeMap::new();
+        assert!(record_routing_item(&mut routed, &valid, "Track").is_err());
+        let broken = prost_types::Any {
+            type_url: valid.type_url,
+            value: vec![255],
+        };
+        assert!(record_routing_item(&mut routed, &broken, "Zone").is_err());
+        assert!(routed.is_empty());
+    }
+
+    #[test]
+    fn sync_routing_evidence_rejects_missing_or_unnamed_assignments() {
+        use konnect_ipc::gen::kiapi::board::types::{Net, NetCode, Track, Zone};
+        let mut routed = BTreeMap::new();
+        let zone = konnect_ipc::builders::pack_any(&Zone::default(), "kiapi.board.types.Zone");
+        assert!(record_routing_item(&mut routed, &zone, "Zone").is_err());
+        let mut track = Track::default();
+        let item = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        assert!(record_routing_item(&mut routed, &item, "Track").is_err());
+        track.net = Some(Net {
+            code: Some(NetCode { value: 7 }),
+            name: String::new(),
+        });
+        let item = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        assert!(record_routing_item(&mut routed, &item, "Track").is_err());
+        track.net = Some(Net {
+            code: Some(NetCode { value: 0 }),
+            name: String::new(),
+        });
+        let item = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        record_routing_item(&mut routed, &item, "Track").unwrap();
+        assert!(routed.is_empty());
     }
 }
