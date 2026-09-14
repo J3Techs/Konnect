@@ -3,9 +3,14 @@
 //! Operations are file-based (S-expression manipulation + directory scanning).
 //! No IPC or kicad-cli is required for most tools.
 
+#[cfg(test)]
+#[path = "library_drill_tests.rs"]
+mod drill_tests;
+
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::footprint_drills::{self, Drill};
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
@@ -109,7 +114,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "y": { "type": "number" },
                                 "width": { "type": "number" },
                                 "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "drill": footprint_drills::schema(),
                                 "layers": {
                                     "type": "array",
                                     "items": { "type": "string" },
@@ -168,7 +173,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["circle", "rect", "oval", "roundrect"],
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
-                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" }
+                    "drill": footprint_drills::schema()
                 },
                 "required": ["footprint_path", "pad_number"]
             }),
@@ -380,6 +385,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
                     "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
+                    "include_pads": { "type": "boolean", "default": false, "description": "Read each physical pad from the saved file, including pad-local mm position/size, rotation in degrees, layers, and round/oval drill dimensions and offsets. Duplicate numbers remain separate entries." },
                     "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
                     "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
                 },
@@ -802,11 +808,10 @@ async fn handle_create_footprint(
             String::new()
         };
 
-        let drill_sexp = if let Some(drill) = pad["drill"].as_f64() {
-            format!("(drill {})", drill)
-        } else {
-            String::new()
-        };
+        let drill_sexp = Drill::requested(pad.get("drill"))
+            .expect("validated drill")
+            .map(Drill::definition)
+            .unwrap_or_default();
 
         pad_sexp.push_str(&format!(
             "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
@@ -888,6 +893,17 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                 ));
             }
         }
+        let drill = Drill::requested(pad.get("drill")).and_then(|drill| {
+            drill
+                .map(|drill| drill.validate_pad_type(pad["type"].as_str().expect("validated")))
+                .transpose()
+        });
+        if let Err(reason) = drill {
+            return Err(invalid_library_argument(
+                &format!("pads[{index}].drill"),
+                reason,
+            ));
+        }
     }
     Ok(())
 }
@@ -900,6 +916,10 @@ async fn handle_edit_footprint_pad(
     let pad_number = match require_str(args, "pad_number") {
         Ok(v) => v,
         Err(e) => return Ok(e),
+    };
+    let drill = match Drill::requested(args.get("drill")) {
+        Ok(drill) => drill,
+        Err(reason) => return Ok(invalid_library_argument("drill", reason)),
     };
     let new_number = match args.get("new_number") {
         None | Some(serde_json::Value::Null) => None,
@@ -981,10 +1001,16 @@ async fn handle_edit_footprint_pad(
         }
 
         matched_count += 1;
-        let edited = match edit_footprint_pad_block(block, args, new_number, shape) {
+        let mut edited = match edit_footprint_pad_block(block, args, new_number, shape) {
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
         };
+        if let Some(drill) = drill {
+            edited = match footprint_drills::replace_in_pad(&edited, drill) {
+                Ok(edited) => edited,
+                Err(reason) => return Ok(invalid_library_argument("drill", reason)),
+            };
+        }
         edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
             break;
@@ -1189,19 +1215,6 @@ fn edit_footprint_pad_block(
             new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
-    if let Some(drill) = args["drill"].as_f64() {
-        if let Some(drill_pos) = new_pad.find("(drill ") {
-            let drill_end = new_pad[drill_pos..]
-                .find(')')
-                .map(|i| drill_pos + i + 1)
-                .unwrap_or(new_pad.len());
-            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
-        } else {
-            let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
-        }
-    }
-
     Ok(new_pad)
 }
 
@@ -4496,6 +4509,18 @@ async fn handle_get_footprint_info(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let include_pads = match args.get("include_pads") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "include_pads",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
     // Resolve "Library:Footprint" against the project's fp-lib-table as well
     // as the global one, when the caller says which project they mean.
@@ -4548,6 +4573,15 @@ async fn handle_get_footprint_info(
         "has_3d_model": has_3d,
         "path": path.to_str().unwrap_or("")
     });
+    if include_pads {
+        match footprint_drills::inspect_pads(&footprint) {
+            Ok(pads) => {
+                response["pads"] = json!(pads);
+                response["source"] = json!("file");
+            }
+            Err(reason) => return Ok(invalid_library_argument("footprint_path", reason)),
+        }
+    }
     let graphics_layer = args["graphics_layer"].as_str();
     let include_graphics =
         args["include_graphics"].as_bool().unwrap_or(false) || graphics_layer.is_some();
