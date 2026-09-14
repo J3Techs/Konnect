@@ -658,6 +658,7 @@ pub fn board_text_with_stroke_width(
     mirror: bool,
 ) -> kiapi::board::types::BoardText {
     kiapi::board::types::BoardText {
+        parent: None,
         id: None,
         text: Some(kiapi::common::types::Text {
             position: Some(vec2(x, y)),

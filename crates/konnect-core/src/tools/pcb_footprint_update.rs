@@ -940,6 +940,7 @@ fn parse_library_property(
         id: None,
         name: name.to_string(),
         text: Some(kiapi::board::types::BoardText {
+            parent: None,
             // A library child's UUID is definition-local and cannot be reused
             // across placed instances. Let KiCad assign the board child ID.
             id: None,
@@ -2501,6 +2502,7 @@ mod tests {
             name: name.to_string(),
             visible,
             text: Some(kiapi::board::types::BoardText {
+                parent: None,
                 text: Some(kiapi::common::types::Text {
                     position: Some(builders::vec2(x, y)),
                     attributes: Some(kiapi::common::types::TextAttributes {
@@ -2545,6 +2547,7 @@ mod tests {
         let reference = field("Reference", "SW1", 101.0, 48.0, true);
         let value = field("Value", "Socket Value", 99.0, 52.0, false);
         kiapi::board::types::FootprintInstance {
+            parent: None,
             id: Some(kiapi::common::types::Kiid {
                 value: "instance-kiid".to_string(),
             }),
