@@ -168,6 +168,20 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "delete_via",
+            "Delete a via identified by its UUID via KiCAD IPC. Refuses UUIDs that are not observed vias on the requested board, then verifies the via is absent before reporting success. Returns a preimage summary (coordinates and diameters in mm) and verified postcondition. Changes the live board without saving it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via to delete" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "query_traces",
             "List trace segments on the board, optionally filtered by net and/or layer. \
              Each result includes the track's UUID, which delete_trace takes.",
@@ -1032,6 +1046,66 @@ async fn handle_delete_trace(
             "to": { "x": trace.end.x, "y": trace.end.y }
         },
         "postcondition": "absent_from_trace_readback"
+    })))
+}
+
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client| {
+        client.delete_via_verified(&board_ipc, &uuid_ipc)
+    })
+    .await?
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "Live via deletion was not verified (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+    let Some(via) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed via on the requested board".to_string(),
+            },
+            "The requested UUID is not a via on the requested board. No board item was deleted.",
+        ));
+    };
+    let position = via.position.as_ref().map(|p| {
+        json!({
+            "x": konnect_ipc::builders::nm_to_mm(p.x_nm),
+            "y": konnect_ipc::builders::nm_to_mm(p.y_nm)
+        })
+    });
+    let drill = via.pad_stack.as_ref().and_then(|p| p.drill.as_ref());
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": uuid,
+        "deleted_type": "via",
+        "preimage_summary": {
+            "uuid": uuid,
+            "net": via.net.as_ref().map(|n| n.name.as_str()),
+            "position": position,
+            "via_type": via.r#type,
+            "locked": via.locked,
+            "drill_diameter_mm": drill.and_then(|d| d.diameter.as_ref()).map(|d| json!({
+                "x": konnect_ipc::builders::nm_to_mm(d.x_nm),
+                "y": konnect_ipc::builders::nm_to_mm(d.y_nm)
+            })),
+            "start_layer": drill.map(|d| d.start_layer),
+            "end_layer": drill.map(|d| d.end_layer)
+        },
+        "postcondition": "absent_from_typed_via_readback"
     })))
 }
 

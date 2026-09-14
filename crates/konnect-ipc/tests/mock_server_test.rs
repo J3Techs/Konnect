@@ -2710,3 +2710,271 @@ fn invalid_selection_mutations_are_rejected_before_transport() {
         );
     }
 }
+
+#[test]
+fn verified_via_delete_refuses_a_non_via_before_delete_items() {
+    let delete_was_sent = Arc::new(Mutex::new(false));
+    let delete_was_sent_in_mock = delete_was_sent.clone();
+    // The payload is deliberately wire-compatible while the declared type is
+    // a Track. Protobuf decoding is permissive, so the reader must discriminate
+    // on type_url before interpreting bytes as a via.
+    let mut non_via = builders::build_via("GND", 7, 1.0, 2.0, 0.3, 0.6);
+    non_via.id = Some(kiapi::common::types::Kiid {
+        value: "trace-or-zone".to_string(),
+    });
+    let packed_non_via = builders::pack_any(&non_via, "kiapi.board.types.Track");
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let request =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                request.types,
+                vec![kiapi::common::types::KiCadObjectType::KotPcbVia as i32]
+            );
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![packed_non_via.clone()],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("DeleteItems") {
+            *delete_was_sent_in_mock.lock().unwrap() = true;
+            panic!("a UUID absent from the via set must never be sent for deletion");
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let deleted = client
+        .delete_via_verified(&mock_board("test.kicad_pcb"), "trace-or-zone")
+        .expect("a non-via is an observed outcome, not an IPC failure");
+
+    assert!(deleted.is_none());
+    assert!(!*delete_was_sent.lock().unwrap());
+}
+
+#[test]
+fn verified_via_delete_targets_one_board_and_returns_observed_preimage() {
+    let deleted = Arc::new(Mutex::new(false));
+    let deleted_in_mock = deleted.clone();
+    let addressed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let addressed_in_mock = addressed.clone();
+
+    let mut track = builders::build_via("GND", 7, 1.0, 2.0, 0.3, 0.6);
+    track.id = Some(kiapi::common::types::Kiid {
+        value: "via-1".to_string(),
+    });
+    let packed_track = builders::pack_any(&track, "kiapi.board.types.Via");
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc_for("other.kicad_pcb"), doc_for("target.kicad_pcb")],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetItems") {
+            let request =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            record_every_doc(&addressed_in_mock, &request.header);
+            let items = if *deleted_in_mock.lock().unwrap() {
+                vec![]
+            } else {
+                vec![packed_track.clone()]
+            };
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items,
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("DeleteItems") {
+            let request =
+                kiapi::common::commands::DeleteItems::decode(message.value.as_slice()).unwrap();
+            record_every_doc(&addressed_in_mock, &request.header);
+            assert_eq!(
+                request
+                    .item_ids
+                    .iter()
+                    .map(|id| id.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["via-1"]
+            );
+            *deleted_in_mock.lock().unwrap() = true;
+            let response = kiapi::common::commands::DeleteItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                deleted_items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.DeleteItemsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let observed = client
+        .delete_via_verified(&mock_board("target.kicad_pcb"), "via-1")
+        .expect("verified deletion")
+        .expect("the segment existed");
+
+    assert_eq!(observed.id.as_ref().unwrap().value, "via-1");
+    assert_eq!(observed.net.as_ref().unwrap().name, "GND");
+    assert_eq!(observed.position.as_ref().unwrap().x_nm, 1_000_000);
+    assert_eq!(observed.position.as_ref().unwrap().y_nm, 2_000_000);
+    assert_eq!(
+        observed
+            .pad_stack
+            .as_ref()
+            .unwrap()
+            .drill
+            .as_ref()
+            .unwrap()
+            .diameter
+            .as_ref()
+            .unwrap()
+            .x_nm,
+        300_000
+    );
+    assert!(*deleted.lock().unwrap());
+    assert_eq!(
+        *addressed.lock().unwrap(),
+        vec!["target.kicad_pcb", "target.kicad_pcb", "target.kicad_pcb"]
+    );
+}
+
+#[test]
+fn verified_via_delete_refuses_success_when_readback_still_contains_the_via() {
+    let mut track = builders::build_via("GND", 7, 1.0, 2.0, 0.3, 0.6);
+    track.id = Some(kiapi::common::types::Kiid {
+        value: "via-1".to_string(),
+    });
+    let packed_track = builders::pack_any(&track, "kiapi.board.types.Via");
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![packed_track.clone()],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("DeleteItems") {
+            let response = kiapi::common::commands::DeleteItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                deleted_items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.DeleteItemsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .delete_via_verified(&mock_board("test.kicad_pcb"), "via-1")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("read-back still reports it"), "{error}");
+}
+
+#[test]
+fn verified_via_delete_fails_closed_on_malformed_via_reads() {
+    // A decode failure is not evidence of absence, either before or after a
+    // delete. The latter must explicitly report a possibly committed change.
+    for (malformed_after_delete, missing_uuid) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let deleted = Arc::new(Mutex::new(false));
+        let seen = deleted.clone();
+        let mut via = builders::build_via("GND", 7, 1.0, 2.0, 0.3, 0.6);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "via-1".into(),
+        });
+        let packed = builders::pack_any(&via, "kiapi.board.types.Via");
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_board_response());
+            }
+            if message.type_url.ends_with("GetItems") {
+                let mut item = packed.clone();
+                if !malformed_after_delete || *seen.lock().unwrap() {
+                    item.value = if missing_uuid { vec![] } else { vec![0xff] };
+                }
+                let response = kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![item],
+                };
+                return Some(reply_with(builders::pack_any(
+                    &response,
+                    "kiapi.common.commands.GetItemsResponse",
+                )));
+            }
+            if message.type_url.ends_with("DeleteItems") {
+                assert!(
+                    malformed_after_delete,
+                    "An inconclusive preimage must not permit deletion"
+                );
+                *seen.lock().unwrap() = true;
+                let response = kiapi::common::commands::DeleteItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    deleted_items: vec![],
+                };
+                return Some(reply_with(builders::pack_any(
+                    &response,
+                    "kiapi.common.commands.DeleteItemsResponse",
+                )));
+            }
+            panic!("unexpected command {}", message.type_url);
+        });
+        let error = KiCadIpcClient::new(&mock.url)
+            .delete_via_verified(&mock_board("test.kicad_pcb"), "via-1")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(*deleted.lock().unwrap(), malformed_after_delete);
+        assert!(
+            error.contains(if malformed_after_delete {
+                "may have committed"
+            } else if missing_uuid {
+                "without a usable UUID"
+            } else {
+                "Failed to decode"
+            }),
+            "{error}"
+        );
+    }
+}
