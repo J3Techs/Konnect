@@ -1102,6 +1102,22 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_layer_list(args, ctx).await }
         ),
         tool!(
+            "expand_copper_layers",
+            "Increase the copper layer count on the requested open KiCad board while preserving every existing enabled layer. Live IPC only; no file fallback. Dry-run defaults to true. Apply requires the expected current count, cannot remove layers, is not undoable, and does not save the board. Verify thickness and physical stackup after applying.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string"},
+                    "copper_layer_count": {"type": "integer", "minimum": 2, "maximum": 32, "multipleOf": 2},
+                    "expected_copper_layer_count": {"type": "integer", "minimum": 2, "maximum": 32, "multipleOf": 2},
+                    "dry_run": {"type": "boolean", "default": true}
+                },
+                "required": ["board", "copper_layer_count", "expected_copper_layer_count"],
+                "additionalProperties": false
+            }),
+            |args, ctx| async move { handle_expand_copper_layers(args, ctx).await }
+        ),
+        tool!(
             "add_layer",
             "Add a new inner copper or technical layer to the board layer stack.",
             json!({
@@ -1693,6 +1709,175 @@ async fn handle_get_layer_list(
     Ok(CallToolResult::json(
         &json!({ "count": layers.len(), "layers": layers }),
     ))
+}
+
+async fn handle_expand_copper_layers(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let count = args["copper_layer_count"].as_u64();
+    let expected = args["expected_copper_layer_count"].as_u64();
+    let valid =
+        |value: Option<u64>| value.is_some_and(|v| (2..=32).contains(&v) && v.is_multiple_of(2));
+    if !valid(count) || !valid(expected) {
+        return Ok(CallToolResult::error(
+            "both copper layer counts must be even integers from 2 through 32",
+        ));
+    }
+    let dry_run = match args.get("dry_run") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return Ok(CallToolResult::error("dry_run must be a boolean")),
+        },
+    };
+    let count = count.unwrap() as u32;
+    let expected = expected.unwrap() as u32;
+    let ipc_board = board_path.clone();
+    match with_board_ipc_classified(ctx, &board_path, move |client| {
+        let document = client.find_open_board(&ipc_board)?;
+        client.expand_copper_layers_in(document, expected, count, dry_run)
+    })
+    .await?
+    {
+        Ok(observed) => Ok(CallToolResult::json(&json!({
+            "source": "ipc", "dry_run": dry_run,
+            "status": if dry_run { "planned" } else if count == expected { "unchanged" } else { "applied" },
+            "previous_copper_layer_count": expected,
+            "requested_copper_layer_count": count,
+            "observed_copper_layer_count": observed.copper_layer_count,
+            "enabled_layers": observed.layers.iter().map(|layer| &layer.name).collect::<Vec<_>>(),
+            "saved": false,
+            "note": "Copper expansion does not select a fabrication stackup. Verify thickness and dielectric/copper specifications before manufacturing."
+        }))),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "Live copper layer expansion failed; no file fallback: {error}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod copper_expansion_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    async fn exercise(
+        request: serde_json::Value,
+        wrong_target: bool,
+        ignore_write: bool,
+    ) -> (CallToolResult, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&board, "sentinel: must never be edited").unwrap();
+        let state = Arc::new(Mutex::new((4u32, vec![0i32, 2, 4, 6, 44, 46], 0usize)));
+        let server_state = state.clone();
+        let server =
+            spawn_kicad_holding_board(if wrong_target { &other } else { &board }, move |command| {
+                let mut state = server_state.lock().unwrap();
+                if command.type_url.ends_with("SetBoardEnabledLayers") {
+                    let value = kiapi::board::commands::SetBoardEnabledLayers::decode(
+                        command.value.as_slice(),
+                    )
+                    .unwrap();
+                    assert_eq!(value.layers, state.1, "all old layers must be preserved");
+                    assert_eq!(value.copper_layer_count, 6);
+                    state.2 += 1;
+                    if !ignore_write {
+                        state.0 = value.copper_layer_count;
+                        state.1.extend([8, 10]);
+                    }
+                } else if !command.type_url.ends_with("GetBoardEnabledLayers") {
+                    return None;
+                }
+                Some(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: state.0,
+                        layers: state.1.clone(),
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ))
+            });
+        let mut args =
+            json!({"board": board, "expected_copper_layer_count": 4, "copper_layer_count": 6});
+        for (key, value) in request.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        let result =
+            handle_expand_copper_layers(&args, &ctx_talking_to(server.address().to_string()))
+                .await
+                .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            "sentinel: must never be edited"
+        );
+        let writes = state.lock().unwrap().2;
+        (result, writes)
+    }
+
+    #[tokio::test]
+    async fn default_dry_run_never_mutates() {
+        let (result, writes) = exercise(json!({}), false, false).await;
+        assert!(!result.is_error);
+        assert_eq!(writes, 0);
+    }
+
+    #[tokio::test]
+    async fn expansion_preserves_layers_and_verifies_readback() {
+        let (result, writes) = exercise(json!({"dry_run": false}), false, false).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(writes, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_shrinking_odd_and_wrong_target_requests_do_not_mutate() {
+        for args in [
+            json!({"expected_copper_layer_count": 2}),
+            json!({"copper_layer_count": 2}),
+            json!({"copper_layer_count": 5}),
+            json!({"dry_run": "false"}),
+        ] {
+            let (result, writes) = exercise(args, false, false).await;
+            assert!(result.is_error);
+            assert_eq!(writes, 0);
+        }
+        let (result, writes) = exercise(json!({"dry_run": false}), true, false).await;
+        assert!(result.is_error);
+        assert_eq!(writes, 0);
+    }
+
+    #[tokio::test]
+    async fn ignored_write_is_not_reported_as_success() {
+        let (result, writes) = exercise(json!({"dry_run": false}), false, true).await;
+        assert!(result.is_error);
+        assert_eq!(writes, 1);
+    }
+
+    #[tokio::test]
+    async fn equal_count_is_an_idempotent_noop() {
+        let (result, writes) = exercise(
+            json!({"dry_run": false, "copper_layer_count": 4}),
+            false,
+            false,
+        )
+        .await;
+        assert!(!result.is_error);
+        assert_eq!(writes, 0);
+    }
+
+    #[tokio::test]
+    async fn disconnected_ipc_does_not_fall_back_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "sentinel").unwrap();
+        let result = handle_expand_copper_layers(&json!({"board": board, "copper_layer_count": 6, "expected_copper_layer_count": 4, "dry_run": false}), &ctx_talking_to(String::new())).await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "sentinel");
+    }
 }
 
 async fn handle_add_layer(

@@ -3041,6 +3041,45 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Expand copper layers on a specific live board, preserving all enabled
+    /// technical layers. Removal is deliberately unsupported: KiCad deletes
+    /// content on removed layers and this operation is not undoable.
+    pub fn expand_copper_layers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        expected_count: u32,
+        copper_layer_count: u32,
+        dry_run: bool,
+    ) -> Result<IpcEnabledLayers> {
+        anyhow::ensure!(
+            (2..=32).contains(&copper_layer_count) && copper_layer_count.is_multiple_of(2),
+            "copper_layer_count must be an even integer from 2 through 32"
+        );
+        let before = self.get_enabled_layers_in(document.clone())?;
+        anyhow::ensure!(before.copper_layer_count == expected_count,
+            "stale copper layer count: expected {expected_count}, observed {}. No mutation attempted; read the board again", before.copper_layer_count);
+        anyhow::ensure!(
+            copper_layer_count >= before.copper_layer_count,
+            "copper layer removal is unsupported; no mutation attempted"
+        );
+        if dry_run || copper_layer_count == before.copper_layer_count {
+            return Ok(before);
+        }
+        let cmd = kiapi::board::commands::SetBoardEnabledLayers {
+            board: Some(document.clone()),
+            copper_layer_count,
+            layers: before.layers.iter().map(|layer| layer.id).collect(),
+        };
+        self.send_command(&cmd, "kiapi.board.commands.SetBoardEnabledLayers")
+            .map_err(|error| anyhow::anyhow!("layer expansion was sent; result may be applied. Inspect live layers before retrying: {error:#}"))?;
+        let after = self.get_enabled_layers_in(document)
+            .map_err(|error| anyhow::anyhow!("layer expansion was sent but readback failed; inspect live layers before retrying: {error:#}"))?;
+        anyhow::ensure!(after.copper_layer_count == copper_layer_count &&
+            before.layers.iter().all(|old| after.layers.iter().any(|new| new.id == old.id)),
+            "layer expansion readback differs from the request; changes may be applied. Inspect the live board before retrying");
+        Ok(after)
+    }
+
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
     pub fn run_action(&self, action: &str) -> Result<()> {
         let cmd = kiapi::common::commands::RunAction {
