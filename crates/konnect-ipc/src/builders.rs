@@ -486,7 +486,8 @@ fn board_shape(
         }),
         layer: layer_from_name(layer) as i32,
         net: None,
-        id: None, // KiCAD assigns
+        id: None,     // KiCAD assigns
+        parent: None, // Read-only KiCad container identity
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
     }
 }
