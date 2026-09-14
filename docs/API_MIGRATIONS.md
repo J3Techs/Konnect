@@ -698,3 +698,29 @@ identical without it.
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.
+
+## Plain schematic annotation tools
+
+The additive `sch_batch` tools `list_schematic_texts`, `edit_schematic_text`, and
+`delete_schematic_text` operate on plain root-level `(text ...)` annotations.
+Net labels, symbol fields, text boxes, and nested library text are excluded.
+Existing `add_schematic_text` calls are unchanged.
+
+List a saved sheet to obtain each annotation's UUID, position in millimetres,
+and opaque document `revision`. Pass that revision as `expected_revision` with
+the UUID when editing or deleting. Every successful mutation returns a new
+revision from committed file readback, so list again or use that returned
+revision before the next change. Reads explicitly identify `source: saved_file`;
+they do not claim to include unsaved editor state.
+
+Edits replace only text contents, preserving style, position, UUID, unknown
+fields, and unrelated objects. Newlines, tabs, carriage returns, quotes,
+backslashes, and Unicode round-trip; other control characters are refused.
+A different saved revision or non-text UUID returns `stale_target`; duplicate
+UUIDs return `ambiguous_target`. Deletion also refuses annotations referenced
+by a group. Editor lock files and concurrent document changes prevent writes.
+
+Both mutations use the atomic schematic command writer. A failure after a write
+may have committed returns `mutation_outcome_uncertain`; list and inspect the
+saved annotations before deciding whether another mutation is needed. Do not
+blindly repeat a delete/add sequence after an uncertain result.

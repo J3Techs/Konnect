@@ -330,6 +330,9 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_validate_component_connections(args, ctx).await }
         ),
     ]
+    .into_iter()
+    .chain(super::sch_text::tools())
+    .collect()
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
