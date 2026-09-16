@@ -1230,6 +1230,19 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "add_rectangular_keepout",
+            "Create a named rectangular copper-layer rule area over live IPC only. Blocks tracks, vias and copper pours; pads and footprints are optional so printed antenna geometry can remain. Duplicate names are refused. Does not refill or alter existing copper.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},"name":{"type":"string"},
+                "layers":{"type":"array","items":{"type":"string"},"minItems":1},
+                "x1":{"type":"number"},"y1":{"type":"number"},
+                "x2":{"type":"number"},"y2":{"type":"number"},
+                "keepout_pads":{"type":"boolean","default":false},
+                "keepout_footprints":{"type":"boolean","default":false}
+            },"required":["board","name","layers","x1","y1","x2","y2"]}),
+            |args, ctx| async move { handle_add_rectangular_keepout(args, ctx).await }
+        ).with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
              first — with KiCAD live on this board the zone is created through the API and \
@@ -2358,6 +2371,155 @@ pub(crate) async fn add_zone_impl(
     body["fallback_reason"] = fallback_reason.evidence();
     body["warning"] = json!(fallback_reason.warning());
     Ok(CallToolResult::json(&body))
+}
+
+fn rectangular_keepout(
+    args: &serde_json::Value,
+) -> anyhow::Result<konnect_ipc::gen::kiapi::board::types::Zone> {
+    use konnect_ipc::gen::kiapi::board::types::{
+        zone, RuleAreaSettings, ZoneConnectionStyle, ZoneType,
+    };
+    let name = args["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("name must not be empty"))?;
+    let mut bounds = [0.0; 4];
+    for (i, key) in ["x1", "y1", "x2", "y2"].iter().enumerate() {
+        bounds[i] = args[key]
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("{key} must be finite"))?;
+    }
+    let [x1, y1, x2, y2] = bounds;
+    anyhow::ensure!(x2 > x1 && y2 > y1, "require x2 > x1 and y2 > y1");
+    let mut layers = Vec::new();
+    for layer in args["layers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("layers must be an array"))?
+    {
+        let name = layer
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("layer must be a string"))?;
+        let id = builders::layer_from_name(name) as i32;
+        anyhow::ensure!(
+            name.ends_with(".Cu") && (3..=34).contains(&id),
+            "unsupported copper layer {name}"
+        );
+        anyhow::ensure!(!layers.contains(&id), "duplicate layer {name}");
+        layers.push(id);
+    }
+    anyhow::ensure!(!layers.is_empty(), "layers must not be empty");
+    let points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)];
+    let mut area = builders::build_zone(
+        &builders::ZoneSpec {
+            layer: "F.Cu",
+            net_name: "",
+            points: &points,
+            clearance_mm: 0.0,
+            min_thickness_mm: 0.1,
+            name,
+            priority: 0,
+            connection: ZoneConnectionStyle::ZcsNone,
+        },
+        0,
+    );
+    area.r#type = ZoneType::ZtRuleArea as i32;
+    area.layers = layers;
+    area.settings = Some(zone::Settings::RuleAreaSettings(RuleAreaSettings {
+        keepout_copper: true,
+        keepout_vias: true,
+        keepout_tracks: true,
+        keepout_pads: args["keepout_pads"].as_bool().unwrap_or(false),
+        keepout_footprints: args["keepout_footprints"].as_bool().unwrap_or(false),
+        ..Default::default()
+    }));
+    Ok(area)
+}
+
+#[cfg(test)]
+mod rectangular_keepout_tests {
+    use super::*;
+    fn args() -> serde_json::Value {
+        json!({"name":"RF exclusion", "layers":["F.Cu","In1.Cu","In2.Cu","B.Cu"], "x1":50.0,"y1":50.0,"x2":71.0,"y2":57.75})
+    }
+    #[test]
+    fn preserves_antenna_pads_but_blocks_new_routing_and_pours() {
+        use konnect_ipc::gen::kiapi::board::types::{zone, ZoneType};
+        let area = rectangular_keepout(&args()).unwrap();
+        assert_eq!(area.r#type, ZoneType::ZtRuleArea as i32);
+        assert_eq!(area.layers.len(), 4);
+        let Some(zone::Settings::RuleAreaSettings(settings)) = area.settings else {
+            panic!("not a rule area")
+        };
+        assert!(settings.keepout_copper && settings.keepout_tracks && settings.keepout_vias);
+        assert!(!settings.keepout_pads && !settings.keepout_footprints);
+        let outline = area.outline.unwrap().polygons.remove(0).outline.unwrap();
+        assert!(outline.closed);
+        assert_eq!(outline.nodes.len(), 4);
+        assert!(!area.filled);
+        assert!(area.filled_polygons.is_empty());
+    }
+    #[test]
+    fn rejects_bad_geometry_and_layers_before_ipc() {
+        for (key, value) in [
+            ("x2", json!(49)),
+            ("y2", json!(50)),
+            ("x1", json!("NaN")),
+            ("name", json!(" ")),
+            ("layers", json!([])),
+            ("layers", json!(["F.SilkS"])),
+            ("layers", json!(["In31.Cu"])),
+            ("layers", json!(["F.Cu", "F.Cu"])),
+        ] {
+            let mut input = args();
+            input[key] = value;
+            assert!(rectangular_keepout(&input).is_err(), "{input}");
+        }
+    }
+}
+
+async fn handle_add_rectangular_keepout(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::{board::types::Zone, common::types::KiCadObjectType};
+    use prost::Message;
+    let board = get_path(args, "board")?;
+    let area = match rectangular_keepout(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(CallToolResult::error(e.to_string())),
+    };
+    let target = board.clone();
+    let result = with_board_ipc_classified(ctx, &board, move |c| {
+        let document = c.find_open_board(&target)?;
+        let enabled = c.get_enabled_layers_in(document.clone())?;
+        anyhow::ensure!(area.layers.iter().all(|layer| enabled.layers.iter().any(|entry| entry.id == *layer)), "requested layer is disabled");
+        for item in c.get_items_in(document.clone(), KiCadObjectType::KotPcbZone)? {
+            let existing = Zone::decode(item.value.as_slice())?;
+            anyhow::ensure!(existing.name != area.name, "rule area name already exists; inspect existing area before retrying");
+        }
+        let created = c.create_items_in_returning(document, vec![builders::pack_any(&area,"kiapi.board.types.Zone")])?;
+        anyhow::ensure!(created.len()==1, "unexpected create count; inspect board before retrying");
+        let actual = Zone::decode(created[0].value.as_slice())?;
+        let mut actual_layers=actual.layers.clone(); actual_layers.sort_unstable();
+        let mut requested_layers=area.layers.clone(); requested_layers.sort_unstable();
+        use konnect_ipc::gen::kiapi::board::types::zone::Settings::RuleAreaSettings;
+        let settings_match = match (&actual.settings,&area.settings) {
+            (Some(RuleAreaSettings(a)),Some(RuleAreaSettings(b))) =>
+                a.keepout_copper==b.keepout_copper && a.keepout_vias==b.keepout_vias &&
+                a.keepout_tracks==b.keepout_tracks && a.keepout_pads==b.keepout_pads &&
+                a.keepout_footprints==b.keepout_footprints && !a.placement_enabled,
+            _ => false,
+        };
+        anyhow::ensure!(actual.r#type==area.r#type && settings_match && actual_layers==requested_layers && actual.outline==area.outline, "created area differs from request; inspect board before retrying");
+        Ok(json!({"name":actual.name,"id":actual.id.map(|id|id.value),"source":"ipc","verified":true}))
+    }).await?;
+    match result {
+        Ok(value) => Ok(CallToolResult::json(&value)),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "Keepout requires live IPC; no file fallback: {error:?}"
+        ))),
+    }
 }
 
 async fn handle_add_zone(
