@@ -749,6 +749,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let models = parse_models(&root)?;
     let attributes = parse_attributes(&root)?;
     let definition = kiapi::board::types::Footprint {
+        net_ties: parse_net_ties(&root, &pads)?,
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
             entry_name: entry_name.to_string(),
@@ -772,6 +773,47 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         graphics,
         models,
     })
+}
+
+fn parse_net_ties(
+    root: &konnect_sexp::SexpNode,
+    pads: &[konnect_ipc::IpcPadDefinition],
+) -> Result<Vec<kiapi::board::types::NetTieDefinition>> {
+    let blocks: Vec<_> = root
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .filter(|node| node.head() == Some("net_tie_pad_groups"))
+        .collect();
+    if blocks.len() > 1 {
+        bail!("duplicate net_tie_pad_groups blocks");
+    }
+    let Some(block) = blocks.first() else {
+        return Ok(Vec::new());
+    };
+    let mut used = BTreeSet::new();
+    let mut groups = Vec::new();
+    for value in block.children().unwrap_or_default().iter().skip(1) {
+        let value = value
+            .as_str()
+            .context("net-tie group must be a pad-number string")?;
+        let numbers: Vec<String> = value.split(',').map(|n| n.trim().to_string()).collect();
+        if numbers.len() < 2 {
+            bail!("net-tie group needs at least two pad numbers");
+        }
+        for number in &numbers {
+            if number.is_empty() || !pads.iter().any(|pad| pad.number == *number) {
+                bail!("net-tie group references nonexistent pad '{number}'");
+            }
+            if !used.insert(number.clone()) {
+                bail!("pad '{number}' belongs to multiple net-tie entries");
+            }
+        }
+        groups.push(kiapi::board::types::NetTieDefinition {
+            pad_number: numbers,
+        });
+    }
+    Ok(groups)
 }
 
 fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
@@ -1144,7 +1186,7 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
         match tag {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
-            | "fp_poly" | "pad" | "model" => {}
+            | "fp_poly" | "pad" | "model" | "net_tie_pad_groups" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -1650,6 +1692,7 @@ fn build_updated_instance(
         .definition
         .context("typed footprint builder returned no definition")?;
     definition.attributes = library.definition.attributes.clone();
+    definition.net_ties = library.definition.net_ties.clone();
     definition.reference_field = current_definition.reference_field.clone();
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
@@ -2030,7 +2073,8 @@ fn changed_domains(
     {
         changed.insert(ChangedDomain::Models);
     }
-    if current_definition.attributes != updated_definition.attributes
+    if current_definition.net_ties != updated_definition.net_ties
+        || current_definition.attributes != updated_definition.attributes
         || field_text(&current_definition.datasheet_field)
             != field_text(&updated_definition.datasheet_field)
         || field_text(&current_definition.description_field)
@@ -3890,5 +3934,44 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+    #[test]
+    fn refresh_parses_net_ties_and_reports_changes() {
+        let source = LIBRARY_FOOTPRINT.replacen(
+            "(layer \"F.Cu\")",
+            "(layer \"F.Cu\") (net_tie_pad_groups \"1,2\")",
+            1,
+        );
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        assert_eq!(library.definition.net_ties[0].pad_number, vec!["1", "2"]);
+        for group in ["1,99", "1,1", "1", "1,,2"] {
+            let bad = source.replace("1,2", group);
+            assert!(parse_library_footprint("Test:Socket", &bad).is_err());
+        }
+        let placed = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let prepared = build_updated_instance(
+            &placed,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
+        )
+        .unwrap();
+        let refreshed =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(
+            refreshed.definition.as_ref().unwrap().net_ties,
+            library.definition.net_ties
+        );
+        assert_eq!(refreshed.layer, placed.layer);
+        assert_eq!(refreshed.id, placed.id);
+        let current = kiapi::board::types::FootprintInstance {
+            definition: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut updated = current.clone();
+        updated.definition.as_mut().unwrap().net_ties = library.definition.net_ties;
+        assert!(changed_domains(&current, &updated)
+            .unwrap()
+            .contains(&ChangedDomain::Metadata));
     }
 }
