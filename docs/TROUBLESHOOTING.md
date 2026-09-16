@@ -369,3 +369,5 @@ but are not available yet.
 Install via **Plugin and Content Manager → Install from File** with the
 `konnect-pcm-*.zip` release asset (not the bare binary archives), then restart
 KiCAD.
+
+Footprint field edits also accept `font_name` (empty selects the KiCad stroke font) and `centered: true` to center both axes on the field anchor. Omission preserves the existing font/alignment. Use these for imported TrueType reference labels that produce stroke-thickness warnings.
