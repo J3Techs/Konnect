@@ -7,7 +7,7 @@ use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -1197,5 +1197,20 @@ pub(crate) mod tests {
             "{what}: the single copper entry of a PST_NORMAL padstack must be \
              keyed to F_Cu (KiCad's ALL_LAYERS sentinel)"
         );
+    }
+}
+
+#[cfg(test)]
+mod coordinate_rounding_regression {
+    use super::{mm_to_nm, nm_to_mm};
+    #[test]
+    fn arithmetic_coordinates_round_to_the_nearest_nanometre() {
+        assert_eq!(mm_to_nm(147.6 - 0.735), 146_865_000);
+        assert_eq!(mm_to_nm(-(147.6 - 0.735)), -146_865_000);
+        for nm in [-146_865_000, -837_500, -1, 0, 1, 837_500, 146_865_000] {
+            assert_eq!(mm_to_nm(nm_to_mm(nm)), nm);
+        }
+        assert_eq!(mm_to_nm(0.0000016), 2);
+        assert_eq!(mm_to_nm(-0.0000016), -2);
     }
 }
