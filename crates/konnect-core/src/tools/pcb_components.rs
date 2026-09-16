@@ -1934,6 +1934,27 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "set_pad_thermal_angle",
+            "Plan or change only the thermal-spoke angle of one uniquely numbered placed pad through live IPC. Preserves pad geometry, nets, thermal width/gap and zone connection style. Requires an explicit existing angle; does not edit libraries. Refill zones and run DRC afterwards.",
+            json!({"type":"object","additionalProperties":false,
+                "properties":{
+                    "board":{"type":"string"},"reference":{"type":"string"},
+                    "pad_number":{"type":"string"},
+                    "angle":{"type":"number","minimum":0,"exclusiveMaximum":360},
+                    "dry_run":{"type":"boolean","default":true},
+                    "expected_angle":{"type":"number","description":"Existing angle returned by dry run; required for apply"}
+                },"required":["board","reference","pad_number","angle"]}),
+            |args, ctx| async move {
+                let reference = match require_str(args, "reference") { Ok(v)=>v.to_string(),Err(e)=>return Ok(e) };
+                let number = match require_str(args, "pad_number") { Ok(v)=>v.to_string(),Err(e)=>return Ok(e) };
+                let angle = match require_f64(args, "angle") { Ok(v)=>v,Err(e)=>return Ok(e) };
+                let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+                let expected = args["expected_angle"].as_f64();
+                let result = ipc!(ctx,args,|c|c.set_pad_thermal_angle(&reference,&number,angle,dry_run,expected));
+                Ok(CallToolResult::json(&result))
+            }
+        ).with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "edit_component",
             "Update the value or other properties of a placed footprint via KiCAD IPC.",
             json!({

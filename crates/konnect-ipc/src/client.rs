@@ -2628,6 +2628,37 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{reference}' not found")
     }
 
+    /// Change only one uniquely numbered pad's thermal-spoke angle.
+    /// Dry runs return the existing angle; apply refuses a stale expected angle.
+    pub fn set_pad_thermal_angle(
+        &self,
+        reference: &str,
+        number: &str,
+        angle: f64,
+        dry_run: bool,
+        expected: Option<f64>,
+    ) -> Result<serde_json::Value> {
+        let (mut fp, _) = self.find_footprint_instance(reference)?;
+        let before = replace_pad_thermal_angle(&mut fp, number, angle)?;
+        if !dry_run {
+            let expected = expected.context("apply requires expected_angle from a dry run")?;
+            if before != expected {
+                anyhow::bail!("pad thermal angle changed: expected {expected}, found {before}");
+            }
+            self.update_items(vec![pack_any(&fp, "kiapi.board.types.FootprintInstance")])?;
+            let (mut readback, _) = self.find_footprint_instance(reference)?;
+            let observed = replace_pad_thermal_angle(&mut readback, number, angle)?;
+            if observed != angle {
+                anyhow::bail!("thermal angle readback failed: requested {angle}, found {observed}");
+            }
+        }
+        Ok(
+            serde_json::json!({"reference":reference,"pad_number":number,
+            "before_angle":before,"angle":angle,"dry_run":dry_run,
+            "scope":"placed_pad_only"}),
+        )
+    }
+
     /// Delete a footprint by reference.
     pub fn delete_footprint(&self, reference: &str) -> Result<()> {
         let kiid = self.find_footprint_kiid(reference)?;
@@ -3633,6 +3664,146 @@ fn editor_capabilities(
         center_object: no_reveal.clone(),
         fit_view: no_reveal,
         cross_probe,
+    }
+}
+
+fn replace_pad_thermal_angle(
+    footprint: &mut kiapi::board::types::FootprintInstance,
+    number: &str,
+    angle: f64,
+) -> Result<f64> {
+    if !angle.is_finite() || !(0.0..360.0).contains(&angle) {
+        anyhow::bail!("thermal angle must be finite and in [0, 360)");
+    }
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("footprint has no definition")?;
+    let mut matches = Vec::new();
+    for (index, item) in definition.items.iter().enumerate() {
+        if !crate::builders::any_is(item, "kiapi.board.types.Pad") {
+            continue;
+        }
+        let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+        if pad.number == number {
+            matches.push((index, pad));
+        }
+    }
+    if matches.len() != 1 {
+        anyhow::bail!(
+            "expected exactly one pad numbered {number}, found {}",
+            matches.len()
+        );
+    }
+    let (index, mut pad) = matches.pop().unwrap();
+    let stack = pad.pad_stack.as_mut().context("pad has no padstack")?;
+    if stack
+        .copper_layers
+        .iter()
+        .any(|layer| layer.zone_settings.is_some())
+    {
+        anyhow::bail!("per-layer zone overrides are not supported by this tool");
+    }
+    let spokes = stack
+        .zone_settings
+        .as_mut()
+        .and_then(|settings| settings.thermal_spokes.as_mut())
+        .context("pad has no explicit thermal settings; refusing to invent inherited settings")?;
+    let stored_angle = spokes
+        .angle
+        .as_mut()
+        .context("pad has no explicit thermal angle")?;
+    let before = stored_angle.value_degrees;
+    stored_angle.value_degrees = angle;
+    definition.items[index] = pack_any(&pad, "kiapi.board.types.Pad");
+    Ok(before)
+}
+
+#[cfg(test)]
+mod pad_thermal_angle_tests {
+    use super::*;
+    fn example() -> kiapi::board::types::FootprintInstance {
+        use kiapi::board::types::*;
+        let pad = Pad {
+            number: "3".into(),
+            position: Some(kiapi::common::types::Vector2 {
+                x_nm: 123,
+                y_nm: 456,
+            }),
+            pad_stack: Some(PadStack {
+                zone_settings: Some(ZoneConnectionSettings {
+                    zone_connection: 3,
+                    thermal_spokes: Some(ThermalSpokeSettings {
+                        angle: Some(kiapi::common::types::Angle {
+                            value_degrees: 90.0,
+                        }),
+                        width: Some(kiapi::common::types::Distance { value_nm: 254000 }),
+                        gap: Some(kiapi::common::types::Distance { value_nm: 200000 }),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        FootprintInstance {
+            definition: Some(Footprint {
+                items: vec![
+                    pack_any(&pad, "kiapi.board.types.Pad"),
+                    pack_any(
+                        &BoardGraphicShape::default(),
+                        "kiapi.board.types.BoardGraphicShape",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn changes_only_angle_and_roundtrips() {
+        let mut fp = example();
+        let original = fp.clone();
+        assert_eq!(replace_pad_thermal_angle(&mut fp, "3", 45.0).unwrap(), 90.0);
+        assert_ne!(fp, original);
+        assert_eq!(replace_pad_thermal_angle(&mut fp, "3", 90.0).unwrap(), 45.0);
+        assert_eq!(fp, original);
+    }
+    #[test]
+    fn rejects_missing_duplicate_and_invalid_without_mutation() {
+        let mut fp = example();
+        let original = fp.clone();
+        assert!(replace_pad_thermal_angle(&mut fp, "2", 45.0).is_err());
+        assert!(replace_pad_thermal_angle(&mut fp, "3", f64::NAN).is_err());
+        assert!(replace_pad_thermal_angle(&mut fp, "3", 360.0).is_err());
+        assert_eq!(fp, original);
+        let items = &mut fp.definition.as_mut().unwrap().items;
+        items.push(items[0].clone());
+        let original = fp.clone();
+        assert!(replace_pad_thermal_angle(&mut fp, "3", 45.0).is_err());
+        assert_eq!(fp, original);
+    }
+    #[test]
+    fn rejects_inherited_or_per_layer_settings() {
+        for per_layer in [false, true] {
+            let mut fp = example();
+            let item = &mut fp.definition.as_mut().unwrap().items[0];
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            let stack = pad.pad_stack.as_mut().unwrap();
+            if per_layer {
+                stack
+                    .copper_layers
+                    .push(kiapi::board::types::PadStackLayer {
+                        zone_settings: Some(Default::default()),
+                        ..Default::default()
+                    });
+            } else {
+                stack.zone_settings = None;
+            }
+            *item = pack_any(&pad, "kiapi.board.types.Pad");
+            let original = fp.clone();
+            assert!(replace_pad_thermal_angle(&mut fp, "3", 45.0).is_err());
+            assert_eq!(fp, original);
+        }
     }
 }
 
