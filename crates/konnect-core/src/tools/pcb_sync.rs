@@ -15,7 +15,7 @@ use crate::tools::{
 use anyhow::{bail, Context, Result};
 use konnect_sexp::SexpNode;
 use prost::Message;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +177,17 @@ struct SyncDiagnostic {
     reference: Option<String>,
 }
 
+/// An exact, caller-reviewed topology change. Copper is deliberately not
+/// retagged: the caller must reroute and check DRC after applying this plan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewedPadNetChange {
+    reference: String,
+    pad: String,
+    old_net: String,
+    new_net: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct SyncPlan {
     status: PlanStatus,
@@ -187,6 +198,7 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    reviewed_pad_net_changes: Vec<ReviewedPadNetChange>,
 }
 
 #[derive(Debug)]
@@ -213,6 +225,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let reviewed: Vec<ReviewedPadNetChange> = match args.get("reviewed_pad_net_changes") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .context("reviewed_pad_net_changes must contain exact reference, pad, old_net and new_net strings")?,
+    };
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -289,7 +306,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan = plan_sync_with_review(&netlist_source, &design, &snapshot.state, &reviewed);
             let prepared = match prepare_additions(&library_board, &plan) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -309,6 +326,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             };
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
+            if !reviewed.is_empty() {
+                bind_review_to_live_copper(&mut plan, client, &snapshot)?;
+            }
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -411,6 +431,10 @@ fn sync_response(
         },
         "changes": plan.changes,
         "diagnostics": plan.diagnostics,
+        "reviewed_pad_net_changes": plan.reviewed_pad_net_changes,
+        "routing_followup": if plan.reviewed_pad_net_changes.is_empty() { None } else {
+            Some("Only pad assignments change. Existing tracks, vias and zones retain their nets. Reroute affected copper, refill zones, and run DRC before relying on connectivity.")
+        },
         // Schematic components with no footprint: reported per part with what
         // the board holds for them, never planned and never fatal (#507). A
         // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
@@ -444,8 +468,19 @@ fn conflict_result(message: String) -> CallToolResult {
     }
 }
 
+#[cfg(test)]
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    plan_sync_with_review(netlist_source, design, board, &[])
+}
+
+fn plan_sync_with_review(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    reviewed: &[ReviewedPadNetChange],
+) -> SyncPlan {
     let mut diagnostics = Vec::new();
+    let mut used_reviews = std::collections::BTreeSet::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
     let mut board_by_path = HashMap::new();
@@ -723,7 +758,19 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            let review = ReviewedPadNetChange {
+                reference: component.reference.clone(),
+                pad: number.clone(),
+                old_net: old_net.to_string(),
+                new_net: new_net.to_string(),
+            };
+            let explicitly_reviewed = reviewed.contains(&review);
+            if explicitly_reviewed {
+                used_reviews.insert(review);
+            }
+            if (board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net))
+                && !explicitly_reviewed
+            {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -762,6 +809,14 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
     }
 
+    let mut unique_reviews = std::collections::BTreeSet::new();
+    for review in reviewed {
+        if !unique_reviews.insert(review.clone()) || !used_reviews.contains(review) {
+            diagnostics.push(conflict("invalid_reviewed_pad_net_change",
+                format!("Review must match one actual pad-net change exactly, without duplicates: {review:?}"),
+                Some(&review.reference)));
+        }
+    }
     counts.board_only_preserved.planned = board.footprints.len() - matched.len();
     counts.conflicts.planned = diagnostics.len();
     if !diagnostics.is_empty() {
@@ -777,7 +832,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     } else {
         PlanStatus::Ready
     };
-    let plan_revision = plan_revision(netlist_source, board);
+    let mut hasher = Sha256::new();
+    hasher.update(plan_revision(netlist_source, board));
+    hasher.update(serde_json::to_vec(&unique_reviews).expect("reviews serialize"));
+    let plan_revision = format!("{:x}", hasher.finalize());
     SyncPlan {
         status,
         plan_revision,
@@ -785,6 +843,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        reviewed_pad_net_changes: unique_reviews.into_iter().collect(),
     }
 }
 
@@ -884,6 +943,41 @@ fn refresh_revision_with_staging(plan: &mut SyncPlan) {
     hasher.update(plan.plan_revision.as_bytes());
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
     plan.plan_revision = format!("{:x}", hasher.finalize());
+}
+
+/// Explicit topology changes are reviewed against the full live copper and
+/// footprint payloads, not merely per-net object counts. Moving a trace, via,
+/// pad or zone between dry-run and apply must invalidate that review.
+fn bind_review_to_live_copper(
+    plan: &mut SyncPlan,
+    client: &konnect_ipc::KiCadIpcClient,
+    snapshot: &LiveSnapshot,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
+    let mut payloads: Vec<Vec<u8>> = snapshot
+        .items
+        .values()
+        .map(Message::encode_to_vec)
+        .collect();
+    for kind in [
+        ObjectType::KotPcbTrace,
+        ObjectType::KotPcbArc,
+        ObjectType::KotPcbVia,
+        ObjectType::KotPcbZone,
+    ] {
+        for item in client.get_items_in(snapshot.document.clone(), kind)? {
+            payloads.push(item.encode_to_vec());
+        }
+    }
+    payloads.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(plan.plan_revision.as_bytes());
+    for payload in payloads {
+        hasher.update((payload.len() as u64).to_le_bytes());
+        hasher.update(payload);
+    }
+    plan.plan_revision = format!("{:x}", hasher.finalize());
+    Ok(())
 }
 
 fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
@@ -2609,6 +2703,45 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "routed_pad_net_change"));
+
+        let review = ReviewedPadNetChange {
+            reference: "R1".into(),
+            pad: "1".into(),
+            old_net: "VCC".into(),
+            new_net: "".into(),
+        };
+        let reviewed = plan_sync_with_review("netlist", &design, &board, &[review.clone()]);
+        assert_eq!(reviewed.status, PlanStatus::Ready);
+        assert_eq!(reviewed.counts.pads_reassigned.planned, 1);
+        assert_ne!(reviewed.plan_revision, plan.plan_revision);
+        assert_eq!(reviewed.reviewed_pad_net_changes, vec![review.clone()]);
+        assert_eq!(board.routed_nets["VCC"], 1);
+        for wrong in [
+            ReviewedPadNetChange {
+                old_net: "wrong".into(),
+                ..review.clone()
+            },
+            ReviewedPadNetChange {
+                new_net: "wrong".into(),
+                ..review.clone()
+            },
+            ReviewedPadNetChange {
+                pad: "2".into(),
+                ..review.clone()
+            },
+            ReviewedPadNetChange {
+                reference: "R2".into(),
+                ..review.clone()
+            },
+        ] {
+            let rejected = plan_sync_with_review("netlist", &design, &board, &[wrong]);
+            assert_eq!(rejected.status, PlanStatus::Conflict);
+            assert!(rejected.changes.is_empty());
+        }
+        let duplicated =
+            plan_sync_with_review("netlist", &design, &board, &[review.clone(), review]);
+        assert_eq!(duplicated.status, PlanStatus::Conflict);
+        assert!(duplicated.changes.is_empty());
     }
 
     #[test]
