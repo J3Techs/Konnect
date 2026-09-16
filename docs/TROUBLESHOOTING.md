@@ -548,3 +548,5 @@ remove the surrounding `(setup ...)` block. Konnect versions containing the
 fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
 the file byte-identical until stable KiCad IPC exposes a native operation with
 readback.
+
+Footprint field edits also accept `font_name` (empty selects the KiCad stroke font) and `centered: true` to center both axes on the field anchor. Omission preserves the existing font/alignment. Use these for imported TrueType reference labels that produce stroke-thickness warnings.

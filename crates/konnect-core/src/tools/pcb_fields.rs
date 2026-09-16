@@ -26,6 +26,8 @@ struct Change {
     layer: Option<String>,
     size: Option<f64>,
     stroke: Option<f64>,
+    font_name: Option<String>,
+    centered: Option<bool>,
     rotation: Option<f64>,
     #[serde(default)]
     create: bool,
@@ -116,6 +118,7 @@ fn validate(a: &Args) -> Result<()> {
     }
     let mut names = BTreeSet::new();
     for c in &a.fields {
+        if c.font_name.as_ref().is_some_and(|f| f.contains(['\0', '\n', '\r'])) { bail!("font_name must be single-line"); }
         if c.name.is_empty() || !names.insert(&c.name) {
             bail!("fields.name must be nonempty and unique");
         }
@@ -166,6 +169,8 @@ fn validate(a: &Args) -> Result<()> {
             && c.size.is_none()
             && c.stroke.is_none()
             && c.rotation.is_none()
+            && c.font_name.is_none()
+            && c.centered != Some(true)
         {
             bail!("field change is empty");
         }
@@ -227,6 +232,8 @@ fn prepare(fp: &Footprint, changes: &[Change]) -> Result<Footprint> {
             .attributes
             .as_mut()
             .context("field has no text attributes")?;
+        if c.centered == Some(true) { attr.horizontal_alignment = 2; attr.vertical_alignment = 2; }
+        if let Some(font) = &c.font_name { attr.font_name = font.clone(); }
         if let Some(s) = c.size {
             attr.size = Some(kiapi::common::types::Vector2 {
                 x_nm: builders::mm_to_nm(s),
@@ -252,7 +259,7 @@ fn view(fp: &Footprint) -> Result<Value> {
         let t = bt.text.as_ref().context("field missing Text")?;
         let p = t.position.as_ref().context("field missing position")?;
         let a = t.attributes.as_ref().context("field missing attributes")?;
-        rows.push(json!({"name":name,"value":t.text,"visible":f.visible,"x":builders::nm_to_mm(p.x_nm),"y":builders::nm_to_mm(p.y_nm),"layer":kiapi::board::types::BoardLayer::try_from(bt.layer).ok().and_then(builders::layer_name),"size":a.size.as_ref().map(|s|[builders::nm_to_mm(s.x_nm),builders::nm_to_mm(s.y_nm)]),"rotation":a.angle.as_ref().map(|a|a.value_degrees),"stroke":a.stroke_width.as_ref().map(|s|builders::nm_to_mm(s.value_nm))}));
+        rows.push(json!({"name":name,"value":t.text,"visible":f.visible,"x":builders::nm_to_mm(p.x_nm),"y":builders::nm_to_mm(p.y_nm),"layer":kiapi::board::types::BoardLayer::try_from(bt.layer).ok().and_then(builders::layer_name),"size":a.size.as_ref().map(|s|[builders::nm_to_mm(s.x_nm),builders::nm_to_mm(s.y_nm)]),"font_name":a.font_name,"rotation":a.angle.as_ref().map(|a|a.value_degrees),"stroke":a.stroke_width.as_ref().map(|s|builders::nm_to_mm(s.value_nm))}));
     }
     Ok(json!(rows))
 }
@@ -296,7 +303,7 @@ fn select(items: Vec<prost_types::Any>, name: &str) -> Result<Footprint> {
     found.with_context(|| format!("footprint '{name}' not found"))
 }
 pub(crate) fn tools() -> [ToolDef; 2] {
-    let schema = json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"},"fields":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"visible":{"type":"boolean"},"x":{"type":"number"},"y":{"type":"number"},"layer":{"type":"string"},"size":{"type":"number"},"stroke":{"type":"number"},"rotation":{"type":"number"},"create":{"type":"boolean","default":false}},"required":["name"],"additionalProperties":false}},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","reference","fields"],"additionalProperties":false});
+    let schema = json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"},"fields":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"visible":{"type":"boolean"},"x":{"type":"number"},"y":{"type":"number"},"layer":{"type":"string"},"size":{"type":"number"},"stroke":{"type":"number"},"centered":{"type":"boolean","description":"True centers both axes on the field anchor; false preserves existing alignment"},"font_name":{"type":"string","description":"Font family; empty string uses KiCad stroke font"},"rotation":{"type":"number"},"create":{"type":"boolean","default":false}},"required":["name"],"additionalProperties":false}},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","reference","fields"],"additionalProperties":false});
     [tool!("list_footprint_fields","Read mandatory and custom fields from an exact footprint on the requested live board.",json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"}},"required":["board","reference"],"additionalProperties":false}),|args,ctx|async move {handle_list_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
     tool!("edit_footprint_fields","Plan or apply footprint text visibility, style, position and custom properties through live IPC. Defaults to dry run. Apply requires exact revision and verifies the complete footprint after publishing one undo entry. Never renumbers references. No file fallback.",schema,|args,ctx|async move {handle_edit_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly)]
 }
@@ -445,6 +452,20 @@ mod tests {
         serde_json::from_value(json!({"board":"test.kicad_pcb","reference":"C1","fields":fields}))
             .unwrap()
     }
+    #[test]
+    fn font_and_center_changes_preserve_other_field_and_footprint_data() {
+        let fp = fixture();
+        let changes: Vec<Change> = serde_json::from_value(json!([{"name":"Reference","font_name":"","centered":true}])).unwrap();
+        let updated = prepare(&fp, &changes).unwrap();
+        let attrs = updated.reference_field.as_ref().unwrap().text.as_ref().unwrap().text.as_ref().unwrap().attributes.as_ref().unwrap();
+        assert_eq!(attrs.font_name, "");
+        assert_eq!(attrs.horizontal_alignment, 2);
+        assert_eq!(attrs.vertical_alignment, 2);
+        let mut restored = updated;
+        restored.reference_field = fp.reference_field.clone();
+        assert_eq!(restored, fp);
+    }
+
     #[test]
     fn changes_only_selected_field() {
         let fp = fixture();
