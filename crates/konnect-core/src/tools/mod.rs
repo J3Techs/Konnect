@@ -2524,3 +2524,5 @@ pub(crate) mod schematic_target_tests {
         );
     }
 }
+
+mod sch_import;
