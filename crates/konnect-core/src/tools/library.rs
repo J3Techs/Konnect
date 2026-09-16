@@ -433,6 +433,7 @@ pub fn tools() -> Vec<ToolDef> {
     {
         tools.insert(after_create_footprint + offset, tool);
     }
+    tools.extend(super::sch_import::tools());
     tools
 }
 
