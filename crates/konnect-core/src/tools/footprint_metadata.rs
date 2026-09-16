@@ -22,7 +22,7 @@ const SUPPORTED_ATTRIBUTES: &[&str] = &[
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_metadata",
-        "Atomically replace a footprint's description, tags, or supported attributes while \
+        "Atomically replace a footprint's description, tags, supported attributes, or net-tie pad groups while \
          preserving pads, graphics, properties, groups, and models.",
         json!({
             "type": "object",
@@ -39,6 +39,11 @@ pub(super) fn tool() -> ToolDef {
                     "type": "array",
                     "description": "Replacement search tags; an empty array removes the tags block",
                     "items": { "type": "string" }
+                },
+                "net_tie_pad_groups": {
+                    "type": "array",
+                    "description": "Replace intentional net-tie groups; each group lists at least two distinct existing pad numbers. A pad may belong to only one group. Empty array removes all groups.",
+                    "items": { "type": "array", "minItems": 2, "items": { "type": "string" } }
                 },
                 "attributes": {
                     "type": "array",
@@ -61,6 +66,7 @@ struct MetadataUpdate {
     description: Option<String>,
     tags: Option<Vec<String>>,
     attributes: Option<Vec<String>>,
+    net_tie_pad_groups: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,16 +164,60 @@ fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataErro
             ));
         }
     }
-    if description.is_none() && tags.is_none() && attributes.is_none() {
+    let net_tie_pad_groups = match args.get("net_tie_pad_groups") {
+        None => None,
+        Some(value) => {
+            let groups: Vec<Vec<String>> = serde_json::from_value(value.clone()).map_err(|_| {
+                invalid(
+                    "net_tie_pad_groups",
+                    "must be an array of arrays of pad-number strings",
+                )
+            })?;
+            let mut seen = std::collections::HashSet::new();
+            for group in &groups {
+                if group.len() < 2 {
+                    return Err(invalid(
+                        "net_tie_pad_groups",
+                        "each group must contain at least two pad numbers",
+                    ));
+                }
+                for pad in group {
+                    if pad.is_empty()
+                        || pad.contains(',')
+                        || pad.chars().any(char::is_whitespace)
+                        || pad.chars().any(char::is_control)
+                    {
+                        return Err(invalid(
+                            "net_tie_pad_groups",
+                            "pad numbers must be nonempty and contain no commas or whitespace",
+                        ));
+                    }
+                    if !seen.insert(pad.clone()) {
+                        return Err(invalid(
+                            "net_tie_pad_groups",
+                            format!("pad '{pad}' appears more than once"),
+                        ));
+                    }
+                }
+            }
+            Some(groups)
+        }
+    };
+    if description.is_none()
+        && tags.is_none()
+        && attributes.is_none()
+        && net_tie_pad_groups.is_none()
+    {
         return Err(invalid(
             "metadata",
-            "at least one of description, tags, or attributes must be supplied",
+            "at least one metadata field must be supplied",
         ));
     }
     Ok(MetadataUpdate {
         description,
         tags,
         attributes,
+        net_tie_pad_groups,
     })
 }
 
@@ -219,6 +269,8 @@ fn prepare_mutation(
     let mut description = None;
     let mut tags = None;
     let mut attributes = None;
+    let mut net_tie_pad_groups = None;
+    let mut pad_numbers = std::collections::HashSet::new();
     let mut insertion_anchor = None;
     let mut child_indent = None;
     for (start, end) in find_direct_child_blocks(source, "footprint") {
@@ -230,10 +282,22 @@ fn prepare_mutation(
         if child_indent.is_none() {
             child_indent = indent_before(source, start);
         }
+        if tag == "pad" {
+            if let Some(number) = node
+                .children()
+                .and_then(|children| children.get(1))
+                .and_then(|node| node.as_str())
+            {
+                if !number.is_empty() {
+                    pad_numbers.insert(number.to_string());
+                }
+            }
+        }
         let target = match tag {
             "descr" => Some(&mut description),
             "tags" => Some(&mut tags),
             "attr" => Some(&mut attributes),
+            "net_tie_pad_groups" => Some(&mut net_tie_pad_groups),
             _ => None,
         };
         if let Some(target) = target {
@@ -248,6 +312,16 @@ fn prepare_mutation(
         }
     }
 
+    if let Some(groups) = &update.net_tie_pad_groups {
+        for number in groups.iter().flatten() {
+            if !pad_numbers.contains(number) {
+                return Err(invalid(
+                    "net_tie_pad_groups",
+                    format!("pad '{number}' does not exist in the footprint"),
+                ));
+            }
+        }
+    }
     let indent = child_indent.unwrap_or_else(|| "  ".to_string());
     let mut edits = Vec::new();
     let mut insertions = Vec::new();
@@ -288,6 +362,29 @@ fn prepare_mutation(
                 .unwrap_or_else(|| format!("(attr {})", values.join(" ")))
         }),
         "attributes",
+        &mut edits,
+        &mut insertions,
+        &mut changed_fields,
+    )?;
+
+    apply_metadata_field(
+        source,
+        net_tie_pad_groups,
+        update.net_tie_pad_groups.as_ref().map(|groups| {
+            if groups.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "(net_tie_pad_groups {})",
+                    groups
+                        .iter()
+                        .map(|group| quote_string(&group.join(",")))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            }
+        }),
+        "net_tie_pad_groups",
         &mut edits,
         &mut insertions,
         &mut changed_fields,
@@ -681,5 +778,40 @@ mod tests {
             .expect_err("a stale expected source must conflict");
         assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+    #[test]
+    fn net_tie_groups_validate_pad_identity_and_preserve_copper() {
+        let source = BARE_FOOTPRINT.replace("(pad \"1\" thru_hole", "(pad \"2\" thru_hole");
+        let source = source.replacen(
+            "  (pad",
+            "  (pad \"1\" smd rect (at 1 0) (size 1 1) (layers \"F.Cu\"))\n  (pad",
+            1,
+        );
+        let update = parse_update(&json!({"net_tie_pad_groups": [["1", "2"]]})).unwrap();
+        let prepared = prepare_mutation(&source, &update).unwrap();
+        assert!(prepared
+            .replacement
+            .contains("(net_tie_pad_groups \"1,2\")"));
+        assert_eq!(prepared.replacement.matches("(pad ").count(), 2);
+        assert!(prepare_mutation(&prepared.replacement, &update)
+            .unwrap()
+            .changed_fields
+            .is_empty());
+        let clear = parse_update(&json!({"net_tie_pad_groups": []})).unwrap();
+        let cleared = prepare_mutation(&prepared.replacement, &clear).unwrap();
+        assert!(!cleared.replacement.contains("(net_tie_pad_groups"));
+        let missing = parse_update(&json!({"net_tie_pad_groups": [["1", "9"]]})).unwrap();
+        assert!(prepare_mutation(&source, &missing).is_err());
+        for groups in [
+            json!([["1"]]),
+            json!([["1", "1"]]),
+            json!([["1", "2"], ["2", "3"]]),
+            json!([["", "2"]]),
+            json!([["1,2", "3"]]),
+            json!([["1 2", "3"]]),
+            json!([[1, 2]]),
+        ] {
+            assert!(parse_update(&json!({"net_tie_pad_groups": groups})).is_err());
+        }
     }
 }

@@ -357,6 +357,18 @@ set_footprint_metadata(
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
 
+### Intentional net ties
+
+`set_footprint_metadata` accepts `net_tie_pad_groups=[["1", "2"]]` for intentional
+copper connections such as printed antennas. Each group must contain at least two
+distinct existing pad numbers, and groups must not overlap. An empty outer list
+removes the groups. Duplicate copper shapes with the same logical pad number are
+allowed. This declares intentional connectivity; it does not create copper.
+
+Refresh placed footprints with `update_footprints_from_library` using its dry run
+and exact plan revision, then save and check native DRC. Placement and schematic
+synchronization do not yet carry this metadata; refresh after first placement.
+
 ### Existing Footprint 3D Models
 
 Use `set_footprint_models` to append, replace, or delete top-level 3D model
