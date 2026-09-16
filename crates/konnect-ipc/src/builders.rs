@@ -480,6 +480,7 @@ fn board_shape(
     geometry: kiapi::common::types::graphic_shape::Geometry,
 ) -> kiapi::board::types::BoardGraphicShape {
     kiapi::board::types::BoardGraphicShape {
+        parent: None,
         shape: Some(kiapi::common::types::GraphicShape {
             attributes: Some(attrs),
             geometry: Some(geometry),
@@ -658,6 +659,7 @@ pub fn board_text_with_stroke_width(
     mirror: bool,
 ) -> kiapi::board::types::BoardText {
     kiapi::board::types::BoardText {
+        parent: None,
         id: None,
         text: Some(kiapi::common::types::Text {
             position: Some(vec2(x, y)),
@@ -1196,6 +1198,38 @@ pub(crate) mod tests {
             BoardLayer::BlFCu as i32,
             "{what}: the single copper entry of a PST_NORMAL padstack must be \
              keyed to F_Cu (KiCad's ALL_LAYERS sentinel)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parent_metadata_tests {
+    use super::*;
+    use prost::Message;
+    #[test]
+    fn graphic_and_text_retain_parent_on_wire_roundtrip() {
+        let parent = Some(kiapi::common::types::Kiid {
+            value: "parent-test".into(),
+        });
+        let g = kiapi::board::types::BoardGraphicShape {
+            parent: parent.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            kiapi::board::types::BoardGraphicShape::decode(g.encode_to_vec().as_slice())
+                .unwrap()
+                .parent,
+            parent
+        );
+        let t = kiapi::board::types::BoardText {
+            parent: parent.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            kiapi::board::types::BoardText::decode(t.encode_to_vec().as_slice())
+                .unwrap()
+                .parent,
+            parent
         );
     }
 }
