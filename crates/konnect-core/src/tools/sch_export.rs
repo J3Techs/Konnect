@@ -190,7 +190,17 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
-                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
+                    "reviewed_pad_net_changes": {
+                        "type": "array", "default": [],
+                        "description": "Explicit topology changes reviewed by the caller. Each must exactly match one current pad and its old/new net; no wildcards or unused entries. Copper is NOT retagged. Repeat the identical list for dry run and apply, then reroute and verify DRC.",
+                        "items": { "type": "object", "additionalProperties": false,
+                            "properties": {
+                                "reference": { "type": "string" }, "pad": { "type": "string" },
+                                "old_net": { "type": "string" }, "new_net": { "type": "string" }
+                            }, "required": ["reference", "pad", "old_net", "new_net"]
+                        }
+                    }
                 },
                 "required": ["schematic", "board"]
             }),
