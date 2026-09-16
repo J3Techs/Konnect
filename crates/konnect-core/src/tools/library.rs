@@ -425,6 +425,7 @@ pub fn tools() -> Vec<ToolDef> {
         .unwrap_or(tools.len());
     for (offset, tool) in [
         super::footprint_graphics::tool(),
+        super::footprint_paste::library_tool(),
         super::footprint_metadata::tool(),
         super::footprint_models::tool(),
     ]

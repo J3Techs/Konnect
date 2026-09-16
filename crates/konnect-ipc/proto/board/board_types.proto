@@ -575,6 +575,9 @@ message Pad
 
   // Since: 10.0.0
   kiapi.common.types.Time pad_to_die_delay = 11;
+
+  // Read-only parent container, added in KiCad 10.0.6. Field 12 is reserved by 11.0.
+  kiapi.common.types.KIID parent = 13;
 }
 
 enum ZoneType

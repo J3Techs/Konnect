@@ -7,6 +7,7 @@ pub(crate) mod cross_probe;
 pub mod design_review;
 pub mod editor_navigation;
 mod footprint_graphics;
+mod footprint_paste;
 mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
