@@ -2713,6 +2713,7 @@ impl KiCadIpcClient {
                 id: None,
                 name: name.to_string(),
                 text: Some(kiapi::board::types::BoardText {
+                    parent: None,
                     id: None,
                     text: Some(kiapi::common::types::Text {
                         position: Some(crate::builders::vec2(bx, by)),
