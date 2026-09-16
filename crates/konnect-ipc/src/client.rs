@@ -2628,6 +2628,21 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{reference}' not found")
     }
 
+    /// Show or hide the value label without changing the stored value or artwork.
+    pub fn set_footprint_value_visible(&self, reference: &str, visible: bool) -> Result<()> {
+        let (mut footprint, _) = self.find_footprint_instance(reference)?;
+        footprint.value_field.as_mut().context("footprint has no value field")?.visible = visible;
+        if let Some(field) = footprint.definition.as_mut().and_then(|definition| definition.value_field.as_mut()) {
+            field.visible = visible;
+        }
+        self.update_items(vec![crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")])?;
+        let (readback, _) = self.find_footprint_instance(reference)?;
+        if readback.value_field.as_ref().map(|field| field.visible) != Some(visible) {
+            anyhow::bail!("value visibility readback failed for {reference}");
+        }
+        Ok(())
+    }
+
     /// Delete a footprint by reference.
     pub fn delete_footprint(&self, reference: &str) -> Result<()> {
         let kiid = self.find_footprint_kiid(reference)?;

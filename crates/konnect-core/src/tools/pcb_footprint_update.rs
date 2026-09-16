@@ -54,6 +54,7 @@ struct PreparedUpdate {
 struct UpdateFilters {
     references: Option<BTreeSet<String>>,
     library_ids: Option<BTreeSet<String>>,
+    replacements: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +189,11 @@ pub(crate) fn tool() -> ToolDef {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional exact Library:Footprint allowlist"
+                },
+                "replacements": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Explicit reference-to-Library:Footprint replacements. Requires references to exactly match the keys; cannot combine with library_ids. Preserves pad nets by number, but moved pad positions require routing review."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -475,10 +481,23 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
         Ok(parsed)
     }
 
-    Ok(UpdateFilters {
-        references: parse(args, "references")?,
-        library_ids: parse(args, "library_ids")?,
-    })
+    let references = parse(args, "references")?;
+    let library_ids = parse(args, "library_ids")?;
+    let replacements: BTreeMap<String, String> = match args.get("replacements") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|_| ArgumentError {
+            field: "replacements".into(), reason: "must be an object mapping references to library IDs".into(),
+        })?,
+        None => BTreeMap::new(),
+    };
+    if !replacements.is_empty() {
+        if library_ids.is_some() || references.as_ref() != Some(&replacements.keys().cloned().collect()) {
+            return Err(ArgumentError { field: "replacements".into(), reason: "requires references exactly matching replacement keys and no library_ids filter".into() });
+        }
+        for id in replacements.values() {
+            parse(&json!({"library_ids": [id]}), "library_ids")?;
+        }
+    }
+    Ok(UpdateFilters { references, library_ids, replacements })
 }
 
 fn plan_updates(
@@ -606,7 +625,9 @@ fn plan_updates(
     hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
     let mut changes = Vec::new();
     let mut prepared_items = Vec::new();
-    for candidate in selected {
+    for mut candidate in selected {
+        let replacement = filters.replacements.get(&candidate.reference);
+        if let Some(id) = replacement { candidate.library_id = id.clone(); }
         if candidate.library_id.is_empty() {
             continue;
         }
@@ -670,7 +691,7 @@ fn plan_updates(
             }
         };
         let prepared =
-            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
+            match build_updated_instance_with_replacement(&candidate.instance, &library, net_codes, routed_nets, replacement.is_some()) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     diagnostics.push(UpdateDiagnostic {
@@ -1547,11 +1568,22 @@ fn parse_models(
         .collect()
 }
 
+#[cfg(test)]
 fn build_updated_instance(
     current: &kiapi::board::types::FootprintInstance,
     library: &LibraryFootprint,
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
+) -> Result<PreparedUpdate> {
+    build_updated_instance_with_replacement(current, library, net_codes, routed_nets, false)
+}
+
+fn build_updated_instance_with_replacement(
+    current: &kiapi::board::types::FootprintInstance,
+    library: &LibraryFootprint,
+    net_codes: &BTreeMap<String, i32>,
+    routed_nets: &BTreeSet<String>,
+    allow_replacement: bool,
 ) -> Result<PreparedUpdate> {
     let current_definition = current
         .definition
@@ -1562,7 +1594,7 @@ fn build_updated_instance(
         .as_ref()
         .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
         .unwrap_or_default();
-    if current_id != library.library_id {
+    if current_id != library.library_id && !allow_replacement {
         bail!(
             "board footprint library id '{current_id}' does not match '{}'",
             library.library_id
@@ -2030,7 +2062,8 @@ fn changed_domains(
     {
         changed.insert(ChangedDomain::Models);
     }
-    if current_definition.attributes != updated_definition.attributes
+    if current_definition.id != updated_definition.id
+        || current_definition.attributes != updated_definition.attributes
         || field_text(&current_definition.datasheet_field)
             != field_text(&updated_definition.datasheet_field)
         || field_text(&current_definition.description_field)
@@ -3312,6 +3345,35 @@ mod tests {
                 && diagnostic.message.contains("AssemblyVendor")
                 && diagnostic.message.contains("unlocked")
         }));
+    }
+
+    #[test]
+    fn replacement_requires_exact_scope_and_valid_ids() {
+        for args in [
+            json!({"replacements":{"SW1":"Test:Other"}}),
+            json!({"references":["SW2"],"replacements":{"SW1":"Test:Other"}}),
+            json!({"references":["SW1"],"library_ids":[],"replacements":{"SW1":"Test:Other"}}),
+            json!({"references":["SW1"],"replacements":{"SW1":"bad"}}),
+        ] { assert!(parse_filters(&args).is_err()); }
+    }
+
+    #[test]
+    fn replacement_preserves_nets_and_identity_and_hashes_target() {
+        let (temp, board, items) = plan_fixture();
+        std::fs::write(temp.path().join("Test.pretty/Other.kicad_mod"), KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let filters = parse_filters(&json!({"references":["SW1"],"replacements":{"SW1":"Test:Other"}})).unwrap();
+        let nets = BTreeMap::from([("ROW1".to_string(),11),("COL1".to_string(),12)]);
+        let plan = plan_updates(&board,&items,&nets,&BTreeSet::new(),&filters);
+        assert_eq!(plan.status,PlanStatus::Ready);
+        assert_eq!(plan.changes.len(),1);
+        assert_eq!(plan.changes[0].library_id,"Test:Other");
+        assert!(plan.changes[0].changed_domains.contains(&ChangedDomain::Metadata));
+        let preserved = &plan.changes[0].preserved;
+        assert!(preserved.position && preserved.rotation && preserved.layer && preserved.kiid && preserved.pad_nets && preserved.symbol_path);
+        let update = kiapi::board::types::FootprintInstance::decode(plan.prepared_items[0].value.as_slice()).unwrap();
+        assert_eq!(update.definition.unwrap().id.unwrap().entry_name,"Other");
+        let ordinary = plan_updates(&board,&items,&nets,&BTreeSet::new(),&parse_filters(&json!({"references":["SW1"]})).unwrap());
+        assert_ne!(plan.plan_revision,ordinary.plan_revision);
     }
 
     #[test]

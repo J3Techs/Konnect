@@ -1941,7 +1941,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
-                    "value":     { "type": "string", "description": "New value string (optional)" }
+                    "value":     { "type": "string", "description": "New value string (optional)" },
+                    "value_visible": { "type": "boolean", "description": "Show or hide the value label without changing its content" }
                 },
                 "required": ["board", "reference"]
             }),
@@ -2602,6 +2603,10 @@ async fn handle_edit_component(
         let value_for_ipc = value.to_string();
         ipc!(ctx, args, |c| c
             .set_footprint_value(&reference_for_ipc, &value_for_ipc));
+    }
+    if let Some(visible) = args["value_visible"].as_bool() {
+        let reference_for_ipc = reference.clone();
+        ipc!(ctx, args, |c| c.set_footprint_value_visible(&reference_for_ipc, visible));
     }
     let lookup_reference = reference.clone();
     let fp = ipc!(ctx, args, |c| {
