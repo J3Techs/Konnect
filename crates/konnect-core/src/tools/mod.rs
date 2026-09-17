@@ -21,6 +21,7 @@ pub mod pcb_routing;
 pub(crate) mod pcb_sync;
 pub mod placement;
 pub mod project;
+mod saved_footprint_metadata;
 pub mod sch_analysis;
 pub mod sch_batch;
 pub mod sch_bus;
