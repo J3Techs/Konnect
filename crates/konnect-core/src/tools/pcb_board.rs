@@ -1090,6 +1090,18 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_board_extents(args, ctx).await }
         ),
         tool!(
+            "set_four_layer_physical_stackup",
+            "Plan or apply a symmetric four-copper-layer physical stackup on a closed board. Requires exact F.Cu/In1.Cu/In2.Cu/B.Cu layers and explicit dielectric/copper values. Preserves other setup fields. Apply requires the reviewed revision and a closed board; never edits a live board.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},"dry_run":{"type":"boolean","default":true},"expected_revision":{"type":"string"},
+                "outer_copper_mm":{"type":"number"},"inner_copper_mm":{"type":"number"},
+                "prepreg_mm":{"type":"number"},"core_mm":{"type":"number"},
+                "prepreg_er":{"type":"number"},"core_er":{"type":"number"},
+                "mask_mm":{"type":"number"},"mask_er":{"type":"number"}
+            },"required":["board","outer_copper_mm","inner_copper_mm","prepreg_mm","core_mm","prepreg_er","core_er","mask_mm","mask_er"]}),
+            |args, ctx| async move { handle_four_layer_stackup(args, ctx).await }
+        ).with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        tool!(
             "get_layer_list",
             "Return all layers defined in the board with their names and types.",
             json!({
@@ -2358,6 +2370,182 @@ pub(crate) async fn add_zone_impl(
     body["fallback_reason"] = fallback_reason.evidence();
     body["warning"] = json!(fallback_reason.warning());
     Ok(CallToolResult::json(&body))
+}
+
+fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow::Result<String> {
+    let tree = parse_sexp(content)?;
+    let mut copper: Vec<_> = konnect_sexp::layers::layers(&tree)
+        .into_iter()
+        .filter(|l| l.is_copper())
+        .map(|l| l.name)
+        .collect();
+    copper.sort();
+    anyhow::ensure!(
+        copper == ["B.Cu", "F.Cu", "In1.Cu", "In2.Cu"],
+        "requires exactly F.Cu, In1.Cu, In2.Cu and B.Cu"
+    );
+    let value = |key: &str, lo: f64, hi: f64| -> anyhow::Result<f64> {
+        args[key]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= lo && *n <= hi)
+            .ok_or_else(|| anyhow::anyhow!("{key} outside [{lo},{hi}]"))
+    };
+    let outer = value("outer_copper_mm", 0.005, 0.2)?;
+    let inner = value("inner_copper_mm", 0.005, 0.2)?;
+    let pp = value("prepreg_mm", 0.025, 2.0)?;
+    let core = value("core_mm", 0.05, 4.0)?;
+    let pp_er = value("prepreg_er", 1.0, 20.0)?;
+    let core_er = value("core_er", 1.0, 20.0)?;
+    let mask = value("mask_mm", 0.0, 0.1)?;
+    let mask_er = value("mask_er", 1.0, 20.0)?;
+    let nominal = tree
+        .find("general")
+        .and_then(|g| g.find_f64("thickness"))
+        .ok_or_else(|| anyhow::anyhow!("missing nominal board thickness"))?;
+    let total = 2.0 * (outer + inner + pp + mask) + core;
+    anyhow::ensure!(
+        (nominal - total).abs() <= 0.05,
+        "stack sum {total} mm differs from nominal {nominal} mm by more than 0.05 mm"
+    );
+    let roots = find_direct_child_blocks(content, "kicad_pcb");
+    let setups: Vec<_> = roots
+        .into_iter()
+        .filter(|(s, e)| parse_sexp(&content[*s..*e]).is_ok_and(|n| n.head() == Some("setup")))
+        .collect();
+    anyhow::ensure!(setups.len() == 1, "requires one setup section");
+    let (start, end) = setups[0];
+    let setup = &content[start..end];
+    let stacks: Vec<_> = find_direct_child_blocks(setup, "setup")
+        .into_iter()
+        .filter(|(s, e)| parse_sexp(&setup[*s..*e]).is_ok_and(|n| n.head() == Some("stackup")))
+        .collect();
+    anyhow::ensure!(stacks.len() <= 1, "multiple stackups");
+    let mut properties = String::new();
+    if let Some((s, e)) = stacks.first() {
+        let old = &setup[*s..*e];
+        for (a, b) in find_direct_child_blocks(old, "stackup") {
+            let node = parse_sexp(&old[a..b])?;
+            if node.head() != Some("layer") {
+                properties.push_str(&old[a..b]);
+                properties.push('\n');
+            }
+        }
+    }
+    let mut stack = String::from("(stackup\n");
+    for (name, kind, t, er) in [
+        ("F.SilkS", "Top Silk Screen", 0.0, 0.0),
+        ("F.Paste", "Top Solder Paste", 0.0, 0.0),
+        ("F.Mask", "Top Solder Mask", mask, mask_er),
+        ("F.Cu", "copper", outer, 0.0),
+        ("dielectric 1", "prepreg", pp, pp_er),
+        ("In1.Cu", "copper", inner, 0.0),
+        ("dielectric 2", "core", core, core_er),
+        ("In2.Cu", "copper", inner, 0.0),
+        ("dielectric 3", "prepreg", pp, pp_er),
+        ("B.Cu", "copper", outer, 0.0),
+        ("B.Mask", "Bottom Solder Mask", mask, mask_er),
+        ("B.Paste", "Bottom Solder Paste", 0.0, 0.0),
+        ("B.SilkS", "Bottom Silk Screen", 0.0, 0.0),
+    ] {
+        stack.push_str(&format!("(layer \"{name}\" (type \"{kind}\")"));
+        if t > 0.0 {
+            stack.push_str(&format!(" (thickness {t})"));
+        }
+        if er > 0.0 {
+            stack.push_str(&format!(" (epsilon_r {er})"));
+        }
+        if name.starts_with("dielectric") {
+            stack.push_str(" (material \"FR4\")");
+        }
+        stack.push_str(")\n");
+    }
+    stack.push_str(&properties);
+    stack.push(')');
+    let edit = if let Some((s, e)) = stacks.first() {
+        SexpEdit::replace(start + s, start + e, stack)
+    } else {
+        SexpEdit::insert(start + 6, format!("\n{stack}\n"))
+    };
+    let updated = apply_edits(content.to_string(), vec![edit]);
+    parse_sexp(&updated)?;
+    Ok(updated)
+}
+
+#[cfg(test)]
+mod physical_stackup_tests {
+    use super::*;
+    fn board() -> &'static str {
+        "(kicad_pcb (general (thickness 1.6)) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal)) (setup (pad_to_mask_clearance 0) (stackup (layer \"F.Cu\" (thickness 0.035)) (copper_finish \"ENIG\"))) (footprint \"test\" (uuid \"keep\")))"
+    }
+    fn args() -> serde_json::Value {
+        json!({"outer_copper_mm":0.035,"inner_copper_mm":0.0152,"prepreg_mm":0.0994,"core_mm":1.265,"prepreg_er":4.1,"core_er":4.6,"mask_mm":0.015,"mask_er":3.8})
+    }
+    #[test]
+    fn replaces_only_stackup_and_is_idempotent() {
+        let result = physical_stackup_candidate(board(), &args()).unwrap();
+        let tree = parse_sexp(&result).unwrap();
+        let setup = tree.find("setup").unwrap();
+        let stack = setup.find("stackup").unwrap();
+        assert_eq!(stack.find_all("layer").len(), 13);
+        assert_eq!(stack.find_str("copper_finish"), Some("ENIG"));
+        assert_eq!(setup.find_f64("pad_to_mask_clearance"), Some(0.0));
+        assert!(result.contains("(footprint \"test\" (uuid \"keep\"))"));
+        assert_eq!(
+            physical_stackup_candidate(&result, &args()).unwrap(),
+            result
+        );
+    }
+    #[test]
+    fn rejects_incompatible_board_and_parameters() {
+        assert!(physical_stackup_candidate(&board().replace("In2.Cu", "In3.Cu"), &args()).is_err());
+        for (key, value) in [
+            ("core_mm", json!(-1)),
+            ("core_mm", json!(2)),
+            ("prepreg_er", json!(0)),
+            ("mask_mm", json!("x")),
+        ] {
+            let mut a = args();
+            a[key] = value;
+            assert!(physical_stackup_candidate(board(), &a).is_err());
+        }
+    }
+}
+
+async fn handle_four_layer_stackup(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged};
+    use sha2::{Digest, Sha256};
+    let board = get_path(args, "board")?;
+    let original = read_consistent(&board)?;
+    let candidate = match physical_stackup_candidate(&original, args) {
+        Ok(v) => v,
+        Err(e) => return Ok(CallToolResult::error(e.to_string())),
+    };
+    let revision = format!("{:x}", Sha256::digest(format!("{original}\0{candidate}")));
+    if args["dry_run"].as_bool().unwrap_or(true) {
+        return Ok(CallToolResult::json(
+            &json!({"status":"ready","revision":revision,"source":"saved_file","changed":original!=candidate}),
+        ));
+    }
+    if args["expected_revision"].as_str() != Some(&revision) {
+        return Ok(CallToolResult::error(
+            "Stale or missing revision; rerun dry-run",
+        ));
+    }
+    if let Some(refusal) = refuse_if_board_open_in_kicad(ctx, &board, "physical stackup").await? {
+        return Ok(refusal);
+    }
+    write_atomic_if_unchanged(&board, &original, &candidate)?;
+    let readback = read_consistent(&board)?;
+    anyhow::ensure!(
+        readback == candidate,
+        "stackup readback differs; inspect before retry"
+    );
+    Ok(CallToolResult::json(
+        &json!({"status":"applied","revision":revision,"source":"closed_file","readback_verified":true}),
+    ))
 }
 
 async fn handle_add_zone(
