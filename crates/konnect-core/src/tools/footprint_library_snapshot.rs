@@ -10,6 +10,7 @@ pub(super) fn tool() -> ToolDef {
     "Update an existing project footprint library entry from an authoritative saved board using native KiCad Python. Never writes the board. Requires a saved board, native Python executable, a project-local library and exact reference. Shared entry replacement refuses divergent placements; entry_name creates a separate snapshot instead. Does not relink the board. Dry run and exact plan revision required. Native export/readback verifies footprint equivalence before an atomic revision-checked library write.",
     json!({"type":"object","additionalProperties":false,"properties":{
       "board":{"type":"string"},"reference":{"type":"string"},"python_executable":{"type":"string"},
+      "destination_library":{"type":"string","description":"Optional existing project-local .pretty directory for a new entry copied from a global or project footprint; requires entry_name and refuses existing destination"},
       "entry_name":{"type":"string","description":"Optional new project-library entry; leaves original shared entry untouched"},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}
     },"required":["board","reference","python_executable"]}),
     |args,_ctx|async move {
@@ -24,10 +25,15 @@ pub(super) fn tool() -> ToolDef {
         ensure!(ids.len()==1,"reference missing or ambiguous");
         let source=super::library::resolve_footprint_path(&ids[0],board.parent()).map_err(anyhow::Error::msg)?;
         let project=board.parent().context("missing board parent")?.canonicalize()?;
-        ensure!(source.canonicalize()?.starts_with(&project),"only existing project-local library entries may be replaced");
         let entry=args["entry_name"].as_str().unwrap_or("");
         validate_entry(entry)?;
-        let dest=if entry.is_empty(){source}else{source.with_file_name(format!("{entry}.kicad_mod"))};
+        let dest=if let Some(directory)=args["destination_library"].as_str() {
+            ensure!(!entry.is_empty(),"destination_library requires entry_name");
+            new_destination(&project, std::path::Path::new(directory), entry)?
+        } else {
+            ensure!(source.canonicalize()?.starts_with(&project),"only existing project-local library entries may be replaced");
+            if entry.is_empty(){source}else{source.with_file_name(format!("{entry}.kicad_mod"))}
+        };
         let old=if dest.exists(){Some(read_consistent(&dest)?)}else{None};
         let tmp=tempfile::tempdir()?; let dir=tmp.path().join("snapshot.pretty");std::fs::create_dir(&dir)?;
         let output=std::process::Command::new(args["python_executable"].as_str().context("python executable required")?)
@@ -105,6 +111,28 @@ fn find_footprint(
     Ok(found.remove(0))
 }
 
+fn new_destination(
+    project: &std::path::Path,
+    directory: &std::path::Path,
+    entry: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    validate_entry(entry)?;
+    ensure!(!entry.is_empty(), "destination requires entry_name");
+    let library = directory.canonicalize()?;
+    ensure!(
+        library.is_dir()
+            && library.extension().is_some_and(|e| e == "pretty")
+            && library.starts_with(project.canonicalize()?),
+        "destination must be an existing project-local .pretty directory"
+    );
+    let dest = library.join(format!("{entry}.kicad_mod"));
+    ensure!(
+        !dest.exists(),
+        "cross-library export refuses existing destination"
+    );
+    Ok(dest)
+}
+
 fn validate_entry(entry: &str) -> anyhow::Result<()> {
     ensure!(
         entry.is_empty()
@@ -135,5 +163,21 @@ mod tests {
         let link = link_tool();
         assert_eq!(snapshot.name, "snapshot_saved_footprint_library");
         assert_eq!(link.name, "link_board_footprint_library");
+    }
+    #[test]
+    fn snapshot_new_destination_is_project_local_and_non_overwriting() {
+        let project = tempfile::tempdir().unwrap();
+        let library = project.path().join("parts.pretty");
+        std::fs::create_dir(&library).unwrap();
+        let target = new_destination(project.path(), &library, "USB_Variant").unwrap();
+        std::fs::write(&target, "sentinel").unwrap();
+        assert!(new_destination(project.path(), &library, "USB_Variant").is_err());
+        assert!(new_destination(project.path(), &library, "../escape").is_err());
+        assert!(new_destination(project.path(), &library, "").is_err());
+        let outside = tempfile::tempdir().unwrap();
+        let dir = outside.path().join("parts.pretty");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(new_destination(project.path(), &dir, "USB_Variant").is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
     }
 }
