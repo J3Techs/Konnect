@@ -2815,6 +2815,17 @@ impl KiCadIpcClient {
                             kiapi::board::types::DrillShape::DsCircle as i32
                         },
                         ..Default::default()
+                    })
+                    .or_else(|| {
+                        Some(kiapi::board::types::DrillProperties {
+                            // A zero diameter creates no hole, but native KiCad
+                            // still compares this otherwise unused shape setting.
+                            start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            diameter: Some(crate::builders::vec2(0.0, 0.0)),
+                            shape: kiapi::board::types::DrillShape::DsCircle as i32,
+                            ..Default::default()
+                        })
                     });
                 let stack = kiapi::board::types::PadStack {
                     r#type: kiapi::board::types::PadStackType::PstNormal as i32,
@@ -3140,13 +3151,17 @@ fn build_graphic_child(
             filled,
         } => {
             let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
+            // Native footprint comparison includes the defining circumference
+            // point, not only the resulting radius. Preserve it through rotation.
+            let (ex, ey) = xf(*end);
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
-            builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
-                SHAPE,
-            )
+            let mut circle = builders::board_circle(layer, *width, cx, cy, radius, *filled);
+            if let Some(kiapi::common::types::graphic_shape::Geometry::Circle(c)) =
+                circle.shape.as_mut().and_then(|s| s.geometry.as_mut())
+            {
+                c.radius_point = Some(builders::vec2(ex, ey));
+            }
+            builders::pack_any(&circle, SHAPE)
         }
         IpcGraphicDefinition::Arc {
             start,
@@ -4225,11 +4240,10 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // Preserve the rotated circumference point itself, not an equivalent
+        // point to the right of the center (which fails native library parity).
+        assert_eq!(c.radius_point.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 8_500_000);
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke
@@ -4279,6 +4293,13 @@ mod footprint_graphics_tests {
                 .find(|any| any.type_url.ends_with("types.Pad"))
                 .expect("pad item");
             let decoded = kiapi::board::types::Pad::decode(pad_any.value.as_slice()).unwrap();
+            let drill = decoded.pad_stack.as_ref().unwrap().drill.as_ref().unwrap();
+            assert_eq!(
+                drill.shape,
+                kiapi::board::types::DrillShape::DsCircle as i32
+            );
+            assert_eq!(drill.diameter.as_ref().unwrap().x_nm, 0);
+            assert_eq!(drill.diameter.as_ref().unwrap().y_nm, 0);
             assert_normal_padstack_is_unpackable(
                 decoded.pad_stack.as_ref().expect("pad_stack"),
                 &format!("build_footprint_item pad on {layer}"),

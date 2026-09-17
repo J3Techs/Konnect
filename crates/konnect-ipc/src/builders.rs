@@ -7,7 +7,7 @@ use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -694,6 +694,19 @@ pub fn board_text_with_stroke_width(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn millimeter_conversion_preserves_nanometer_grid() {
+        // Decimal millimeters and translated vertices can land just below an
+        // integer nanometer in binary floating point. Truncation loses a unit.
+        for nm in [2_050_000_i64, -2_050_000, 710_000, -710_000, 80_710_000, -80_710_000, 123_456_789] {
+            assert_eq!(mm_to_nm(nm_to_mm(nm)), nm);
+        }
+        assert_eq!(mm_to_nm(80.0 + 0.71), 80_710_000);
+        assert_eq!(mm_to_nm(81.1 + 0.71), 81_810_000);
+        assert_eq!(mm_to_nm(0.0000016), 2);
+        assert_eq!(mm_to_nm(-0.0000016), -2);
+    }
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was

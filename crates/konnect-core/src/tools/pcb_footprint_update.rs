@@ -23,6 +23,7 @@ struct LibraryFootprint {
     properties: Vec<kiapi::board::types::Field>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+    text_keep_upright: Vec<bool>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
 }
 
@@ -770,6 +771,16 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         properties: properties.custom,
         pads,
         graphics,
+        text_keep_upright: root
+            .find_all("fp_text")
+            .into_iter()
+            .filter(|t| t.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("user"))
+            .map(|t| {
+                !t.find("unlocked").is_some_and(|v| {
+                    v.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("yes")
+                })
+            })
+            .collect(),
         models,
     })
 }
@@ -836,6 +847,7 @@ fn parse_library_property(
     let mut rotation = 0.0;
     let mut layer = None;
     let mut hidden = None;
+    let mut unlocked = None;
     let mut knockout = None;
     let mut attributes = None;
     let mut identifier = None;
@@ -882,6 +894,12 @@ fn parse_library_property(
                         .with_context(|| format!("property '{name}' has an unsupported layer"))?
                         as i32,
                 );
+            }
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
             }
             "hide" => {
                 if hidden.is_some() {
@@ -933,6 +951,8 @@ fn parse_library_property(
         layer.with_context(|| format!("property '{name}' is missing its 'layer' clause"))?;
     let mut attributes =
         attributes.with_context(|| format!("property '{name}' is missing its 'effects' clause"))?;
+    // KiCad uses unlocked for keep-upright, independently of item locking.
+    attributes.keep_upright = !unlocked.unwrap_or(false);
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
@@ -1197,6 +1217,7 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
         .context("fp_text user is missing its text")?;
 
     let mut saw_at = false;
+    let mut saw_unlocked = false;
     let mut saw_layer = false;
     let mut saw_effects = false;
     let mut identifier = None;
@@ -1205,6 +1226,13 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
             .head()
             .context("fp_text user contains an unsupported atom")?;
         match tag {
+            "unlocked" => {
+                if saw_unlocked {
+                    bail!("fp_text user contains duplicate 'unlocked' clauses");
+                }
+                saw_unlocked = true;
+                property_yes_no(clause, "fp_text user", "unlocked")?;
+            }
             "at" => {
                 if saw_at {
                     bail!("fp_text user contains duplicate 'at' clauses");
@@ -1667,6 +1695,7 @@ fn build_updated_instance(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    let mut text_upright = library.text_keep_upright.iter();
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
@@ -1681,9 +1710,17 @@ fn build_updated_instance(
                     name: old.name.clone(),
                 });
             *item = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
-        } else if is_back && item.type_url.ends_with("kiapi.board.types.BoardText") {
+        } else if item.type_url.ends_with("kiapi.board.types.BoardText") {
             let mut text = kiapi::board::types::BoardText::decode(item.value.as_slice())?;
-            if is_side_specific_layer(text.layer) {
+            let keep_upright = *text_upright
+                .next()
+                .context("missing user text orientation")?;
+            text.text
+                .as_mut()
+                .and_then(|t| t.attributes.as_mut())
+                .context("missing user text attributes")?
+                .keep_upright = keep_upright;
+            if is_back && is_side_specific_layer(text.layer) {
                 if let Some(attributes) =
                     text.text.as_mut().and_then(|text| text.attributes.as_mut())
                 {
@@ -1693,6 +1730,10 @@ fn build_updated_instance(
             *item = konnect_ipc::builders::pack_any(&text, "kiapi.board.types.BoardText");
         }
     }
+    anyhow::ensure!(
+        text_upright.next().is_none(),
+        "unconsumed user text orientation"
+    );
     merge_custom_properties(
         &mut definition,
         current_definition,
@@ -2067,7 +2108,8 @@ fn normalized_items(
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
                     if stack.drill.as_ref().is_some_and(|drill| {
-                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                        matches!(drill.shape, x if x == kiapi::board::types::DrillShape::DsUnknown as i32 || x == kiapi::board::types::DrillShape::DsCircle as i32)
+                            && drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill.end_layer
                                 == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill
@@ -2891,13 +2933,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(future_text_option yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("future_text_option"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2922,7 +2964,9 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!(
+                    "\t(property \"{name}\" \"{value}\"\n\t\t(future_text_option yes)\n\t\t(at"
+                ),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2930,7 +2974,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("future_text_option"), "{message}");
                 }
             }
 
@@ -3048,12 +3092,124 @@ mod tests {
     }
 
     #[test]
+    fn unused_oblong_drill_is_not_normalized_away() {
+        let definition = |shape| kiapi::board::types::Footprint {
+            items: vec![builders::pack_any(
+                &kiapi::board::types::Pad {
+                    number: "1".to_string(),
+                    pad_stack: Some(kiapi::board::types::PadStack {
+                        drill: Some(kiapi::board::types::DrillProperties {
+                            start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            diameter: Some(builders::vec2(0.0, 0.0)),
+                            shape,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Pad",
+            )],
+            ..Default::default()
+        };
+        let round = definition(kiapi::board::types::DrillShape::DsCircle as i32);
+        let oblong = definition(kiapi::board::types::DrillShape::DsOblong as i32);
+        assert_ne!(
+            normalized_items(&round, "Pad").unwrap(),
+            normalized_items(&oblong, "Pad").unwrap()
+        );
+    }
+
+    #[test]
+    fn unlocked_maps_to_keep_upright_without_changing_lock_state() {
+        for (clause, expected) in [
+            ("", true),
+            ("(unlocked yes)", false),
+            ("(unlocked no)", true),
+        ] {
+            let property = konnect_sexp::parse_sexp(&format!(
+                "(property \"Vendor\" \"Example\" {clause} (at 0 0 90) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))"
+            )).unwrap();
+            let field = parse_library_property(&property, true).unwrap().unwrap();
+            let text = field.text.unwrap();
+            assert_eq!(
+                text.locked,
+                kiapi::common::types::LockedState::LsUnlocked as i32
+            );
+            assert_eq!(
+                text.text.unwrap().attributes.unwrap().keep_upright,
+                expected
+            );
+            let source = LIBRARY_FOOTPRINT.replace(
+                "(at 0 1.5 0) (layer \"F.Fab\")",
+                &format!("(at 0 1.5 0) {clause} (layer \"F.Fab\")"),
+            );
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            assert_eq!(library.text_keep_upright, vec![expected]);
+            for layer in [
+                kiapi::board::types::BoardLayer::BlFCu,
+                kiapi::board::types::BoardLayer::BlBCu,
+            ] {
+                for rotation in [0.0, 90.0, 180.0, 270.0] {
+                    let mut current = current_instance(layer);
+                    current.orientation = Some(kiapi::common::types::Angle {
+                        value_degrees: rotation,
+                    });
+                    let update = build_updated_instance(
+                        &current,
+                        &library,
+                        &BTreeMap::new(),
+                        &BTreeSet::new(),
+                    )
+                    .unwrap();
+                    let fp = kiapi::board::types::FootprintInstance::decode(
+                        update.item.value.as_slice(),
+                    )
+                    .unwrap();
+                    let texts: Vec<_> = fp
+                        .definition
+                        .unwrap()
+                        .items
+                        .into_iter()
+                        .filter(|i| i.type_url.ends_with("kiapi.board.types.BoardText"))
+                        .collect();
+                    assert_eq!(texts.len(), 1);
+                    let t =
+                        kiapi::board::types::BoardText::decode(texts[0].value.as_slice()).unwrap();
+                    assert_eq!(t.text.unwrap().attributes.unwrap().keep_upright, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_duplicate_unlocked_refuses() {
+        for clause in [
+            "(unlocked)",
+            "(unlocked maybe)",
+            "(unlocked yes no)",
+            "(unlocked yes) (unlocked no)",
+        ] {
+            let property =
+                konnect_sexp::parse_sexp(&format!("(property \"Vendor\" \"Example\" {clause})"))
+                    .unwrap();
+            assert!(parse_library_property(&property, false).is_err());
+            let source = LIBRARY_FOOTPRINT.replace(
+                "(at 0 1.5 0) (layer \"F.Fab\")",
+                &format!("(at 0 1.5 0) {clause} (layer \"F.Fab\")"),
+            );
+            assert!(parse_library_footprint("Test:Socket", &source).is_err());
+        }
+    }
+
+    #[test]
     fn parser_rejects_lossy_user_text_variants() {
         for (from, to, expected) in [
             (
                 "(at 0 1.5 0) (layer \"F.Fab\")",
-                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
-                "unlocked",
+                "(at 0 1.5 0) (future_text_option yes) (layer \"F.Fab\")",
+                "future_text_option",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
@@ -3288,7 +3444,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(future_text_option yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3310,7 +3466,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("future_text_option")
         }));
     }
 
