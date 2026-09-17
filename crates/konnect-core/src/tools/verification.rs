@@ -18,6 +18,7 @@ use super::cli;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::scoped_design_rules::tool(),
         tool!(
             "run_drc",
             "Run the Design Rule Check on the PCB and return structured violation results, \
@@ -394,7 +395,7 @@ fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
+pub(super) fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
     if let Some((start, end)) = named_rule_range(content, name) {
         return format!("{}{}{}", &content[..start], rule, &content[end..]);
     }
