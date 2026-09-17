@@ -237,7 +237,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
                     "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
                     "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "diff_pair_width": { "type": "number", "exclusiveMinimum": 0, "description": "Differential trace width in mm; omitted preserves the existing value or inheritance" },
+                    "diff_pair_gap": { "type": "number", "exclusiveMinimum": 0, "description": "Differential trace edge spacing in mm; omitted preserves the existing value or inheritance" },
+                    "diff_pair_via_gap": { "type": "number", "exclusiveMinimum": 0, "description": "Differential via edge spacing in mm; omitted preserves the existing value or inheritance" }
                 },
                 "required": ["board", "name"]
             }),
@@ -1348,6 +1351,18 @@ async fn handle_create_netclass(
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
+    let mut differential = Vec::new();
+    for key in ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"] {
+        if let Some(raw) = args.get(key) {
+            let Some(value) = raw.as_f64().filter(|v| v.is_finite() && *v > 0.0) else {
+                return Ok(CallToolResult::error(format!(
+                    "{key} must be a finite positive number in mm"
+                )));
+            };
+            differential.push((key, value));
+        }
+    }
+
     let (pro, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
@@ -1423,6 +1438,18 @@ async fn handle_create_netclass(
         classes.push(class);
         false
     };
+    // Differential settings are opt-in even for newly created named classes:
+    // omitting them must retain KiCad's inheritance from Default.
+    let class = classes
+        .iter_mut()
+        .find(|c| c["name"] == json!(name))
+        .unwrap();
+    for (key, value) in differential {
+        if class[key] != json!(value) {
+            class[key] = json!(value);
+            changed = true;
+        }
+    }
     // Report the class as it now stands rather than the arguments that came
     // in: on an update most of it was never named by the caller.
     let stored = classes
@@ -1457,6 +1484,9 @@ async fn handle_create_netclass(
         "is_default": is_default,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
+        "diff_pair_width": stored["diff_pair_width"],
+        "diff_pair_gap": stored["diff_pair_gap"],
+        "diff_pair_via_gap": stored["diff_pair_via_gap"],
         "file": pro.display().to_string(),
         "note": note
     })))
@@ -1499,18 +1529,21 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
     p == pat.len()
 }
 
-/// The four settings `create_netclass` writes, as (KiCad's key, this API's
+/// The settings `create_netclass` writes, as (KiCad's key, this API's
 /// name). Reported per class so a caller can see what a class holds before
 /// overwriting it — the gap that made #220 hard to review.
 ///
 /// A key absent from a named class means inheritance, not an unset value, so
 /// these are reported resolved with `inherits` naming what came from the
 /// Default (#326).
-const NETCLASS_FIELDS: [(&str, &str); 4] = [
+const NETCLASS_FIELDS: [(&str, &str); 7] = [
     ("clearance", "clearance"),
     ("track_width", "trace_width"),
     ("via_drill", "via_drill"),
     ("via_diameter", "via_diameter"),
+    ("diff_pair_width", "diff_pair_width"),
+    ("diff_pair_gap", "diff_pair_gap"),
+    ("diff_pair_via_gap", "diff_pair_via_gap"),
 ];
 
 async fn handle_get_netclasses(
@@ -2284,6 +2317,38 @@ mod netclass_tests {
         assert!(hv.get("diff_pair_gap").is_none(), "{hv}");
         // KiCad's constructor gives every non-default class -1.
         assert_eq!(hv["priority"], json!(-1), "{hv}");
+    }
+
+    #[tokio::test]
+    async fn differential_netclass_settings_preserve_omitted_values_and_reject_bad_inputs() {
+        let (_dir, board) = fixture(true);
+        let result = create(
+            &board,
+            json!({"name":"USB", "diff_pair_width":0.174244,
+            "diff_pair_gap":0.2032, "diff_pair_via_gap":0.25}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let result = create(&board, json!({"name":"USB", "diff_pair_gap":0.22})).await;
+        assert!(!result.is_error);
+        let settings = project_json(&board);
+        let class = &settings["net_settings"]["classes"][0];
+        assert_eq!(class["diff_pair_width"], json!(0.174244));
+        assert_eq!(class["diff_pair_gap"], json!(0.22));
+        assert_eq!(class["diff_pair_via_gap"], json!(0.25));
+        assert_eq!(class["clearance"], json!(0.2));
+        let queried = get_classes(&board).await;
+        assert_eq!(queried["netclasses"][0]["diff_pair_width"], json!(0.174244));
+        assert_eq!(queried["netclasses"][0]["diff_pair_gap"], json!(0.22));
+        assert_eq!(queried["netclasses"][0]["diff_pair_via_gap"], json!(0.25));
+        for key in ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"] {
+            for bad in [json!(0), json!(-0.1), json!("bad"), serde_json::Value::Null] {
+                let mut args = json!({"name":"USB"});
+                args[key] = bad;
+                assert!(create(&board, args).await.is_error);
+                assert_eq!(project_json(&board), settings);
+            }
+        }
     }
 
     /// A project with no Default in its file keeps the one KiCad seeds at
