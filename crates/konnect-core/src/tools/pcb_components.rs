@@ -1822,6 +1822,7 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::pcb_pad_position::tool(),
         tool!(
             "place_component",
             "Place a footprint on the PCB. Uses live KiCAD IPC when reachable; otherwise safely \

@@ -2524,3 +2524,5 @@ pub(crate) mod schematic_target_tests {
         );
     }
 }
+
+mod pcb_pad_position;

@@ -1,0 +1,9 @@
+# Verified pad position edits
+
+`translate_footprint_pads` in `pcb_components` translates exact existing pad UUIDs through the live KiCad editor. The initial supported profile is an unrotated front footprint, with displacement limited to 1 mm per axis. Other coordinate frames are refused. Pad positions returned by KiCad 10.0.6 inside footprint instances were observed in board coordinates despite the protobuf relative-position comment; the operation therefore uses explicit IPC-reported coordinates and does not claim rotated/back-side support.
+
+Dry-run first and review each pad number, UUID, and before/after coordinate. Apply requires that exact footprint/board-path revision. Nets, drills, shapes, size, paste, metadata, and every unrelated footprint item are preserved. One undo commit is followed by whole-footprint readback. For pads inside protobuf Any fields, comparison canonicalizes protobuf encoding order only: every decoded pad field still must match. A mismatch restores and verifies the original footprint. No serialized board fallback is permitted.
+
+The operation does not move attached tracks, synchronize libraries, or save. Refill, save, run native DRC, and maintain an explicit project library variant after a geometry change.
+
+Validation: five unit tests cover selective position changes, unrelated-content preservation, missing/duplicate UUIDs and excessive shifts, revision binding, protobuf wire-order equivalence, and unsupported coordinate frames. A KiCad 10.0.6 live smoke test translated four duplicated ground-pad objects by 0.030 mm; full footprint readback passed. Native DRC with a separately justified 0.20 mm same-footprint hole rule cleared four hole-clearance findings, retained all six mechanical courtyard errors and all library warnings, and reported zero unconnected items. This is tooling/geometry verification, not assembly acceptance.
