@@ -37,6 +37,18 @@ use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between}
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
+            "set_schematic_population",
+            "Plan or atomically set native DNP attributes on every placed unit of selected references. Preserves BOM/board membership, fields and wiring. Apply requires the exact dry-run revision; an open editor or stale file refuses.",
+            json!({"type":"object","properties":{
+                "schematic":{"type":"string"},
+                "references":{"type":"array","items":{"type":"string"},"minItems":1},
+                "dnp":{"type":"boolean"},
+                "dry_run":{"type":"boolean","default":true},
+                "expected_plan_revision":{"type":"string"}
+            },"required":["schematic","references","dnp"]}),
+            |args, ctx| async move { super::sch_population::handle(args, ctx).await }
+        ),
+        tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net by adding net labels at each pin \
              endpoint. Single file read → all labels inserted → single file write. \
