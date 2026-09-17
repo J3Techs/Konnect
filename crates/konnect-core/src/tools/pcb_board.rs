@@ -1102,6 +1102,19 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_four_layer_stackup(args, ctx).await }
         ).with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
+            "set_six_layer_physical_stackup",
+            "Plan or apply a symmetric six-copper-layer physical stackup on a closed board. Requires exact F.Cu/In1.Cu/In2.Cu/In3.Cu/In4.Cu/B.Cu layers and explicit dielectric/copper values. The central gap has prepreg/core/prepreg sublayers; core_mm is each outer core and center_core_mm/center_prepreg_mm specify the central gap. Preserves other setup fields. Apply requires the reviewed revision and a closed board; never edits a live board.",
+            json!({"type":"object","properties":{
+                "board":{"type":"string"},"dry_run":{"type":"boolean","default":true},"expected_revision":{"type":"string"},
+                "outer_copper_mm":{"type":"number"},"inner_copper_mm":{"type":"number"},
+                "prepreg_mm":{"type":"number"},"core_mm":{"type":"number"},
+                "center_core_mm":{"type":"number"},"center_prepreg_mm":{"type":"number"},
+                "prepreg_er":{"type":"number"},"core_er":{"type":"number"},
+                "mask_mm":{"type":"number"},"mask_er":{"type":"number"}
+            },"required":["center_core_mm","center_prepreg_mm","board","outer_copper_mm","inner_copper_mm","prepreg_mm","core_mm","prepreg_er","core_er","mask_mm","mask_er"]}),
+            |args, ctx| async move { handle_physical_stackup(args, ctx, true).await }
+        ).with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        tool!(
             "get_layer_list",
             "Return all layers defined in the board with their names and types.",
             json!({
@@ -2372,7 +2385,16 @@ pub(crate) async fn add_zone_impl(
     Ok(CallToolResult::json(&body))
 }
 
+#[cfg(test)]
 fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow::Result<String> {
+    build_physical_stackup_candidate(content, args, false)
+}
+
+fn build_physical_stackup_candidate(
+    content: &str,
+    args: &serde_json::Value,
+    six_layer: bool,
+) -> anyhow::Result<String> {
     let tree = parse_sexp(content)?;
     let mut copper: Vec<_> = konnect_sexp::layers::layers(&tree)
         .into_iter()
@@ -2380,9 +2402,14 @@ fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow
         .map(|l| l.name)
         .collect();
     copper.sort();
+    let required = if six_layer {
+        vec!["B.Cu", "F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"]
+    } else {
+        vec!["B.Cu", "F.Cu", "In1.Cu", "In2.Cu"]
+    };
     anyhow::ensure!(
-        copper == ["B.Cu", "F.Cu", "In1.Cu", "In2.Cu"],
-        "requires exactly F.Cu, In1.Cu, In2.Cu and B.Cu"
+        copper == required,
+        "requires exactly these copper layers: {required:?}"
     );
     let value = |key: &str, lo: f64, hi: f64| -> anyhow::Result<f64> {
         args[key]
@@ -2402,7 +2429,21 @@ fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow
         .find("general")
         .and_then(|g| g.find_f64("thickness"))
         .ok_or_else(|| anyhow::anyhow!("missing nominal board thickness"))?;
-    let total = 2.0 * (outer + inner + pp + mask) + core;
+    let center_core = if six_layer {
+        value("center_core_mm", 0.05, 4.0)?
+    } else {
+        0.0
+    };
+    let center_pp = if six_layer {
+        value("center_prepreg_mm", 0.025, 2.0)?
+    } else {
+        0.0
+    };
+    let total = if six_layer {
+        2.0 * (outer + 2.0 * inner + pp + core + mask + center_pp) + center_core
+    } else {
+        2.0 * (outer + inner + pp + mask) + core
+    };
     anyhow::ensure!(
         (nominal - total).abs() <= 0.05,
         "stack sum {total} mm differs from nominal {nominal} mm by more than 0.05 mm"
@@ -2432,7 +2473,7 @@ fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow
         }
     }
     let mut stack = String::from("(stackup\n");
-    for (name, kind, t, er) in [
+    let mut layers = vec![
         ("F.SilkS", "Top Silk Screen", 0.0, 0.0),
         ("F.Paste", "Top Solder Paste", 0.0, 0.0),
         ("F.Mask", "Top Solder Mask", mask, mask_er),
@@ -2446,7 +2487,20 @@ fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow
         ("B.Mask", "Bottom Solder Mask", mask, mask_er),
         ("B.Paste", "Bottom Solder Paste", 0.0, 0.0),
         ("B.SilkS", "Bottom Silk Screen", 0.0, 0.0),
-    ] {
+    ];
+    if six_layer {
+        layers.splice(
+            8..9,
+            [
+                ("dielectric 3", "prepreg", center_pp, pp_er),
+                ("In3.Cu", "copper", inner, 0.0),
+                ("dielectric 4", "core", core, core_er),
+                ("In4.Cu", "copper", inner, 0.0),
+                ("dielectric 5", "prepreg", pp, pp_er),
+            ],
+        );
+    }
+    for (name, kind, t, er) in layers {
         stack.push_str(&format!("(layer \"{name}\" (type \"{kind}\")"));
         if t > 0.0 {
             stack.push_str(&format!(" (thickness {t})"));
@@ -2456,6 +2510,12 @@ fn physical_stackup_candidate(content: &str, args: &serde_json::Value) -> anyhow
         }
         if name.starts_with("dielectric") {
             stack.push_str(" (material \"FR4\")");
+        }
+        if six_layer && name == "dielectric 3" {
+            // KiCad's native stackup syntax represents each dielectric sublayer
+            // with an addsublayer atom followed by its own physical properties.
+            stack.push_str(&format!(" addsublayer (thickness {center_core}) (material \"FR4 core\") (epsilon_r {core_er})"));
+            stack.push_str(&format!(" addsublayer (thickness {center_pp}) (material \"FR4 prepreg\") (epsilon_r {pp_er})"));
         }
         stack.push_str(")\n");
     }
@@ -2496,6 +2556,70 @@ mod physical_stackup_tests {
         );
     }
     #[test]
+    fn six_layer_composite_preserves_structure_and_layer_order() {
+        let b = board().replace(
+            "(6 \"In2.Cu\" signal)",
+            "(6 \"In2.Cu\" signal) (8 \"In3.Cu\" signal) (10 \"In4.Cu\" signal)",
+        );
+        let mut a = args();
+        a["prepreg_mm"] = json!(0.1164);
+        a["prepreg_er"] = json!(4.16);
+        a["core_mm"] = json!(0.13);
+        a["center_core_mm"] = json!(0.7);
+        a["center_prepreg_mm"] = json!(0.1164);
+        let result = build_physical_stackup_candidate(&b, &a, true).unwrap();
+        let tree = parse_sexp(&result).unwrap();
+        let stack = tree.find("setup").unwrap().find("stackup").unwrap();
+        let layers = stack.find_all("layer");
+        assert_eq!(layers.len(), 17);
+        let names: Vec<_> = layers
+            .iter()
+            .map(|l| l.get(1).unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "F.SilkS",
+                "F.Paste",
+                "F.Mask",
+                "F.Cu",
+                "dielectric 1",
+                "In1.Cu",
+                "dielectric 2",
+                "In2.Cu",
+                "dielectric 3",
+                "In3.Cu",
+                "dielectric 4",
+                "In4.Cu",
+                "dielectric 5",
+                "B.Cu",
+                "B.Mask",
+                "B.Paste",
+                "B.SilkS"
+            ]
+        );
+        assert_eq!(result.matches("addsublayer").count(), 2);
+        assert_eq!(layers[8].find_all("thickness").len(), 3);
+        assert!(result.contains("(footprint \"test\" (uuid \"keep\"))"));
+        assert_eq!(stack.find_str("copper_finish"), Some("ENIG"));
+        assert_eq!(
+            build_physical_stackup_candidate(&result, &a, true).unwrap(),
+            result
+        );
+        assert!(build_physical_stackup_candidate(board(), &a, true).is_err());
+        assert!(build_physical_stackup_candidate(&b, &a, false).is_err());
+        for bad in [
+            json!(-0.1),
+            json!(4.0),
+            json!("bad"),
+            serde_json::Value::Null,
+        ] {
+            a["center_core_mm"] = bad;
+            assert!(build_physical_stackup_candidate(&b, &a, true).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_incompatible_board_and_parameters() {
         assert!(physical_stackup_candidate(&board().replace("In2.Cu", "In3.Cu"), &args()).is_err());
         for (key, value) in [
@@ -2515,11 +2639,19 @@ async fn handle_four_layer_stackup(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    handle_physical_stackup(args, ctx, false).await
+}
+
+async fn handle_physical_stackup(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    six_layer: bool,
+) -> anyhow::Result<CallToolResult> {
     use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged};
     use sha2::{Digest, Sha256};
     let board = get_path(args, "board")?;
     let original = read_consistent(&board)?;
-    let candidate = match physical_stackup_candidate(&original, args) {
+    let candidate = match build_physical_stackup_candidate(&original, args, six_layer) {
         Ok(v) => v,
         Err(e) => return Ok(CallToolResult::error(e.to_string())),
     };
