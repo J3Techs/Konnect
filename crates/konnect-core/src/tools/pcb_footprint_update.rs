@@ -2108,7 +2108,8 @@ fn normalized_items(
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
                     if stack.drill.as_ref().is_some_and(|drill| {
-                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                        matches!(drill.shape, x if x == kiapi::board::types::DrillShape::DsUnknown as i32 || x == kiapi::board::types::DrillShape::DsCircle as i32)
+                            && drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill.end_layer
                                 == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill
@@ -3087,6 +3088,36 @@ mod tests {
         assert!(
             error.to_string().contains("solder_mask_margin"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn unused_oblong_drill_is_not_normalized_away() {
+        let definition = |shape| kiapi::board::types::Footprint {
+            items: vec![builders::pack_any(
+                &kiapi::board::types::Pad {
+                    number: "1".to_string(),
+                    pad_stack: Some(kiapi::board::types::PadStack {
+                        drill: Some(kiapi::board::types::DrillProperties {
+                            start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                            diameter: Some(builders::vec2(0.0, 0.0)),
+                            shape,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Pad",
+            )],
+            ..Default::default()
+        };
+        let round = definition(kiapi::board::types::DrillShape::DsCircle as i32);
+        let oblong = definition(kiapi::board::types::DrillShape::DsOblong as i32);
+        assert_ne!(
+            normalized_items(&round, "Pad").unwrap(),
+            normalized_items(&oblong, "Pad").unwrap()
         );
     }
 

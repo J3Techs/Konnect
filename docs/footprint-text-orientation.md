@@ -5,3 +5,7 @@ Library refresh now reads `(unlocked yes/no)` on footprint properties and user t
 Source: KiCad's [text parser](https://docs.kicad.org/doxygen/pcb__io__kicad__sexpr__parser_8cpp_source.html) and `TextAttributes.keep_upright` in the bundled IPC schema. Unknown, malformed and repeated clauses still refuse before any update. No pad fabrication metadata support or file-fallback policy changes are included.
 
 Validation: all 33 `pcb_footprint_update` unit tests passed, including new explicit/default orientation cases across front/back placement and four rotations, lock independence, and invalid/duplicate clauses. Build succeeded. Native board validation is recorded separately by the caller; passing parser tests does not establish physical footprint acceptance.
+
+Native parity inspection additionally exposed two builder defaults. Footprint circles now preserve their transformed defining circumference point instead of substituting an equivalent point on the positive X axis. SMD pads carry an explicit circular, zero-size drill; this creates no hole but prevents KiCad from defaulting the unused drill shape to oblong. Comparison normalization no longer erases an explicit oblong shape on a zero-size drill.
+
+Final validation: 68 IPC tests and 34 footprint-refresh tests passed. Native KiCad comparison and DRC confirmed that the corrected refresh clears test-point circle/drill mismatch reports; remaining unrelated custom land-pattern mismatches are not suppressed. Exported copper geometry and connectivity were checked separately.
