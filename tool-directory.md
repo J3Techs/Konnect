@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
-- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
+- **22 toolsets** organized into 10 categories
+- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -276,6 +276,15 @@ and Windows servers do not.
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
+
+### `pcb_fields` · 2 tools
+**Purpose:** Inspect and edit live footprint fields and their documentation-layer presentation.
+**Source:** [`crates/konnect-core/src/tools/pcb_fields.rs`](crates/konnect-core/src/tools/pcb_fields.rs)
+
+| Tool | Description |
+|------|-------------|
+| `list_footprint_fields` | Inspect live mandatory and custom fields with their text, visibility, layer and board position. |
+| `edit_footprint_fields` | Dry-run and revision-bound field changes with post-commit readback and explicit uncertain-state recovery; never renumbers references or writes board files. |
 
 ### `pcb_routing` · 15 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.

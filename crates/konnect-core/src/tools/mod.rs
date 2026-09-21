@@ -16,6 +16,7 @@ pub(crate) mod navigation_target;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
+pub(crate) mod pcb_fields;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;

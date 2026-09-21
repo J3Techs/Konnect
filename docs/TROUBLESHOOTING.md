@@ -313,7 +313,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 233 tools from the first call.
+startup, so `tools/list` carries all 235 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
@@ -369,3 +369,5 @@ but are not available yet.
 Install via **Plugin and Content Manager → Install from File** with the
 `konnect-pcm-*.zip` release asset (not the bare binary archives), then restart
 KiCAD.
+
+Footprint field edits also accept `font_name` (empty selects the KiCad stroke font) and `centered: true` to center both axes on the field anchor. Omission preserves the existing font/alignment. Use these for imported TrueType reference labels that produce stroke-thickness warnings.
