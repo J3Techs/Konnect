@@ -1,5 +1,56 @@
 # Troubleshooting
 
+## JLCPCB assembly cannot obtain native midpoint geometry
+
+Open the exact requested `.kicad_pcb` in PCB Editor and enable KiCad IPC.
+JLCPCB assembly export requires native per-pad bounding boxes; a saved file or
+another open board is not a substitute. Stop editing during export. A missing
+box or changing live snapshot refuses the attempt before output creation;
+retry after correcting the reported cause. The tool does not save or modify
+your board. Generic and fabrication-only exports retain file-based behavior.
+
+If positions move after upgrading, review old anchor-compensation offsets in
+your correction policy. Midpoints now precede user corrections, so old
+workarounds can double-correct them. See [JLCPCB coordinates and evidence](JLCPCB_CPL_CORRECTIONS.md).
+Always inspect the fabricator's placement preview before ordering.
+
+## IPC operation returned `ipc_outcome_unknown`
+
+Stop automatic retries. Konnect sent a request but could not establish its
+outcome, or a transaction's attempted rollback failed. The live board may
+contain some or all of the requested changes; this is not proof that nothing
+happened. The structured error reports `board_state: unknown` and
+`retry_safe: false`.
+
+Inspect the requested board in KiCad and reconcile what was actually applied
+before repeating any mutation. Do not edit the saved file as a workaround:
+it may be older than the live editor state. Keep the full diagnostic, including
+any commit identifier, when reporting the failure. Bounded recovery is only
+available for schematic-to-PCB sync when the original operation answers within
+its additional recovery window. An unknown result does not establish that an
+undo will reverse a pending, unpublished commit.
+
+## Schematic sync returned `ipc_batch_recovered`
+
+The apply was aborted after a late IPC reply, not published. Konnect confirmed
+the known commit was dropped and compared a fresh serialized live snapshot
+with the exact target's pre-apply snapshot. This reports `board_state: unchanged`,
+`drop_confirmed: true`, and `retry_safe: false`. Review the live board and run a
+fresh dry run before deciding whether to apply again; do not replay the old
+apply automatically or edit the saved file as a workaround.
+
+Sync allows up to 30 additional seconds after an ordinary 30-second receive
+window. The remaining allowance is shared by rollback and verification, not
+renewed at each step. Missing or late publish replies cannot be rolled back
+automatically; failed verification still reports `ipc_outcome_unknown`.
+
+Sync creates are sent in ordered groups of at most 32 footprints, with every
+group and the updates inside one KiCad commit. A successful apply is one Undo
+entry, not one entry per group. This bounds the item count, not the serialized
+request bytes: it does not establish KiCad's listener size limit or eliminate
+timeouts. A rejected or uncertain group stops the apply; Konnect never retries
+it or publishes a partial group sequence automatically.
+
 ## Which Konnect binary is this client using?
 
 Call the always-visible `get_installation_info` tool in the affected MCP
@@ -18,6 +69,36 @@ credentials and query or fragment data are redacted.
 Follow the returned platform-specific guidance, restart the MCP client (and
 KiCad when it owns the server process), then call `get_installation_info` again
 to verify the process that actually restarted. This diagnostic writes nothing.
+
+## Installed guidance is out of date
+
+`konnect init` writes skills, agents, and Claude hooks once. Upgrading Konnect
+does not touch them, so an older install keeps advising the old tools. Run
+`konnect status` (add `--client codex` for Codex) with the binary your MCP
+client uses. Each file and hook is compared with that binary's bundle:
+
+| Status | Meaning |
+|--------|---------|
+| `current` | Byte-identical to the bundle, or the exact hook command `init` writes |
+| `different` | Present, but not identical. It may be an older release's copy or your own edit; the install marker records only a version, so the two cannot be told apart |
+| `missing` | Not present |
+| `unreadable` | Present but could not be read, or `settings.json` is not valid JSON or not the shape Claude expects |
+
+A `different` hook carries a reason: `legacy_handler` is the pre-hook-JSON
+`… skill <name>` form, which Claude ignores, and `other_executable` is a hook
+that runs another Konnect binary, written exactly as `konnect init` writes it.
+
+The serving process makes the same comparison for both clients once per
+installed guidance version, meaning each install marker. The first start
+for that marker scans, records the resulting state in
+`~/.konnect/.guidance-checked-<client>`, and sets the MCP `initialize`
+`instructions` to a one-line notice when either client is `out_of_sync`. Later
+starts read the record instead of rescanning and give no notice. Running
+`konnect init` starts a new check. Upgrading the binary alone does not. `get_installation_info` reports the
+result under `guidance`; its `checked` field is `now` for a scan in this
+process, with per-file detail, or `earlier` for a recorded state without it.
+`konnect status` always scans. Nothing rewrites guidance. Run `konnect init` to
+update. It overwrites `different` files, so save any edits you made first.
 
 ## "KiCAD IPC socket path not configured"
 
@@ -96,6 +177,58 @@ that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
 
+## KiCad is running, but `ipc_failure` says it did not answer
+
+`check_kicad_ui` and `open_project` report `ipc_failure` as
+`{ "kind", "message" }` whenever they establish why KiCad did not answer their
+Ping. It is `null` when no kind was established: the Ping succeeded with
+`AS_OK`, or
+`check_kicad_ui`'s own timeout expired first, which it reports as
+`timed_out: true`. The kind comes from the error NNG returned, so it tells
+apart cases that used to share one `false`, and each has a different fix:
+
+| `kind` | What happened | What to do |
+|---|---|---|
+| `not_configured` | No address was configured or discovered. | See ["KiCAD IPC socket path not configured"](#kicad-ipc-socket-path-not-configured). |
+| `no_listener` | Nothing is listening at the address. | Open an editor with the API enabled, and check the address against KiCad's "Listening on" line. |
+| `access_denied` | The operating system refused this account access to the endpoint. Likely a different account or a restrictive ACL. | Run Konnect as the same operating-system user as KiCad; see below. |
+| `handshake_failed` | A listener accepted the connection and did not complete NNG's handshake. | Another program holds KiCad's address ([#531](https://github.com/mixelpixx/Konnect/issues/531)). Close it, then restart KiCad so it can bind. |
+| `transport_error` | Any other dial or send failure. | Read `message`. |
+| `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
+
+`handshake_failed` takes NNG's fixed 10-second negotiation limit to appear.
+That is longer than `check_kicad_ui`'s default 5-second budget, which then
+reports `timed_out` instead, so pass `timeout_seconds` above 10 to see it.
+
+### `access_denied` from a sandboxed AI client
+
+Some AI clients run tool commands in a sandbox under a separate
+operating-system account. On Windows, Codex does
+([#300](https://github.com/mixelpixx/Konnect/issues/300),
+[#532](https://github.com/mixelpixx/Konnect/issues/532)). The refusal itself
+proves only that the operating system denied this account. The likely cause in
+that setup: KiCad's endpoint was created by the desktop user, and a Windows
+named pipe created without an explicit security descriptor gives full control
+only to its creator and read access to everyone else, while a request needs
+both read and write. A Konnect started inside the sandbox is then refused,
+however its address is configured. A restrictive ACL on the pipe produces the
+same kind.
+
+The known workaround: run Konnect outside the sandbox, as the same user as
+KiCad, over HTTP:
+
+```toml
+# konnect.toml in the directory Konnect is started from
+transport = "http"
+http_address = "127.0.0.1:3000"
+ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
+```
+
+Start `konnect` from a normal terminal and point the client at
+`http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
+the server is up. Keep the address on `127.0.0.1`: the HTTP transport has no
+authentication. KiCad needs no change.
+
 ## Tools answer from the file while KiCad is open
 
 Tools that read the board IPC-first report `"source": "ipc"` or `"file"`, and a
@@ -110,7 +243,8 @@ It is not a global "IPC failed" log: the health tools (`check_kicad_ui`,
 `launch_kicad_ui`) and `get_project_info` dial KiCad directly and report the
 outcome in their own response — `ipc_responsive`, `connected` — rather than
 falling back to anything, so read those fields instead of looking for a
-warning. A KiCad that *answered and refused* is not warned about anywhere; that
+warning. `check_kicad_ui` and `open_project` also say why in `ipc_failure`
+(previous section). A KiCad that *answered and refused* is not warned about anywhere; that
 is a tool error, and it says so.
 
 ## "layer 'X' has no KiCAD board layer this build can represent"
@@ -145,6 +279,18 @@ state, so the saved `.kicad_pcb` is not known to be authoritative. The error
 confirms that Konnect left it unchanged
 ([#240](https://github.com/mixelpixx/Konnect/issues/240)).
 
+KiCad running with no PCB editor open is *not* this state: nothing was ever
+identified, so a `board_source` read answers from the saved file and says
+`no_pcb_editor_at_endpoint`. The refusal below is only for a board this server
+did observe live.
+
+Read-only tools that take a `board_source` selector report the same kind for the
+same reason, and nothing was going to be written: under the default
+`board_source: "auto"` they refuse rather than present a possibly stale file as
+the board's current state. The recovery below applies, and inspecting the
+snapshot deliberately — `board_source: "saved"`, which answers and states its
+freshness limitation — is also available there.
+
 Recover deliberately:
 
 1. Reopen or recover the board in KiCad.
@@ -160,6 +306,26 @@ bypass the refusal.
 This memory is intentionally process-local. It cannot detect a KiCad crash that
 happened before the current Konnect process started. File-fallback success
 therefore carries a warning describing that cold-start limitation.
+
+## `invalid_configuration` from a config tool
+
+`load_user_config`, `get_effective_config` or a save refuses with
+`error.kind: "invalid_configuration"` when a Konnect preferences file exists
+but cannot be used. `error.path` names the file and `error.reason` starts with
+`malformed_json:` (invalid JSON, or a root that is not an object — often a
+truncated write or a hand edit) or `unreadable:` (permissions, a directory at
+that path, invalid UTF-8).
+
+Konnect used to answer with its defaults here, and the next save then replaced
+the file with them. It now refuses and writes nothing, so your settings are
+still in the file. Open it, fix the JSON (or move it aside to start again from
+the defaults), and retry. The user file is `%APPDATA%\konnect\config.json` on
+Windows, `~/Library/Application Support/konnect/config.json` on macOS and
+`~/.konnect/config.json` elsewhere; a project's is
+`<project_dir>/.konnect/project.json`.
+
+A save that ends in `mutation_outcome_uncertain` could not prove what is on
+disk. Read the file before retrying; do not assume nothing was written.
 
 ## An older schematic-to-PCB sync left extra unnamed pads
 
@@ -313,7 +479,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 233 tools from the first call.
+startup, so `tools/list` carries all 235 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
@@ -369,3 +535,16 @@ but are not available yet.
 Install via **Plugin and Content Manager → Install from File** with the
 `konnect-pcm-*.zip` release asset (not the bare binary archives), then restart
 KiCAD.
+
+## A board no longer opens after `set_active_layer`
+
+Konnect v0.12.0 could write an unsupported `(active_layer "...")` entry into a
+board's `(setup ...)` block. KiCad 10.0.6 cannot parse that token because the
+active layer belongs to the editor session, not the `.kicad_pcb` document.
+
+Close the board in KiCad, make a backup copy, remove only the injected
+`(active_layer "...")` line from the board file, and reopen the board. Do not
+remove the surrounding `(setup ...)` block. Konnect versions containing the
+fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
+the file byte-identical until stable KiCad IPC exposes a native operation with
+readback.

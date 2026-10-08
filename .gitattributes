@@ -7,3 +7,4 @@
 crates/konnect-sexp/tests/fixtures/** -text
 crates/konnect-core/tests/fixtures/** -text
 crates/konnect-ipc/tests/fixtures/** -text
+crates/konnect-schematic-editor/tests/fixtures/** -text

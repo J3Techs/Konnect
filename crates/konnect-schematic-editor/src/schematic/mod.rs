@@ -233,6 +233,8 @@ impl Schematic {
             at: At::new(x, y),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
+            fields_autoplaced: None,
+            raw_sub_nodes: vec![],
         };
         self.hierarchical_labels.push(hl);
     }

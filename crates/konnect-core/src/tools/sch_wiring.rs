@@ -9,8 +9,9 @@ use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::{
-    geometry::snap_point,
+    geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
@@ -208,7 +209,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_power_symbol",
-            "Add a power symbol (VCC, GND, etc.) to the schematic. Auto-numbers the \
+            "Add a power symbol (VCC, GND, etc.) to the schematic. Snaps the position to the \
+             1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
              internal #PWR reference to the lowest number free on the sheet. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
@@ -746,19 +748,560 @@ fn wires_in_ranges(content: &str, ranges: &[(usize, usize)]) -> Vec<Wire> {
         .unwrap_or_default()
 }
 
-/// Drop the junction dots the removed wires left with nothing to justify them.
+/// A no-connect marker's owner, as far as a placement change is concerned.
 ///
-/// Deleting a wire used to leave its dots behind, so relocating a block — delete
-/// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
-/// A dot needs two wires to mean anything, with one exception: one wire plus a
-/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
-/// So a junction is pruned when no wire is left through it, or one is and no pin
-/// sits there. Junctions no removed wire touched are left alone, and moves that
-/// strand a dot without deleting a wire are #120's half of the problem.
-/// Round to the six decimals KiCAD writes, so arithmetic noise never reaches
-/// the file.
-fn round6(v: f64) -> f64 {
-    (v * 1_000_000.0).round() / 1_000_000.0
+/// The marker is a sheet item at a coordinate, but what it means is "this pin
+/// stays unconnected", so a placement change has to follow the *pin* (#626).
+/// Coordinate coincidence cannot say which pin that is: two pins may share a
+/// point and only one of them be moving.
+///
+/// The symbol instance UUID, the unit it places, and the pin number are the
+/// native identity. Library-local pin geometry joins them because a number is
+/// not unique on its own: one unit may declare the same pin number twice at
+/// different local positions, and that geometry is invariant under a placement
+/// change, so it separates them without ever separating a pin from itself. A
+/// mutation that changes the symbol definition moves it, which is how a
+/// replacement that renumbers the protected pin is refused rather than guessed
+/// at. Two pins genuinely stacked on one local point share an identity and are
+/// refused as unmappable — this key splits duplicates, it does not resolve
+/// them.
+///
+/// Quantized with [`crate::tools::sch_connectivity::pt_key`], the crate's
+/// coordinate equality key, rather than a private rounding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinIdentity {
+    symbol_uuid: String,
+    unit: u32,
+    number: String,
+    local_key: (i64, i64),
+}
+
+/// A placed pin, with the identity that survives a placement change.
+struct IdentifiedPin {
+    identity: PinIdentity,
+    reference: String,
+    at: (f64, f64),
+}
+
+/// Every placed pin with its identity.
+///
+/// Fails rather than answering short: a `lib_symbols` lookup that failed, or an
+/// instance with no UUID, is stale state and not evidence that no pin is there.
+/// [`reconcile_junctions_at`] draws the same distinction with `pins_known`,
+/// more coarsely — it cannot see one symbol of ten failing to resolve.
+fn identified_pins(
+    tree: &konnect_sexp::SexpNode,
+) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
+    let unresolved = || NoConnectCarryError::Unmappable {
+        reason: format!(
+            "{}, so the pin each no-connect protects cannot be identified",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        ),
+    };
+    let grouped = crate::tools::resolved_placed_pins_by_reference(tree).ok_or_else(unresolved)?;
+    let mut pins = Vec::new();
+    for (instance, placed) in grouped {
+        let symbol_uuid = instance.uuid.clone().ok_or_else(unresolved)?;
+        for (pin, transform) in placed {
+            pins.push(IdentifiedPin {
+                identity: PinIdentity {
+                    symbol_uuid: symbol_uuid.clone(),
+                    unit: instance.unit,
+                    number: pin.number.clone(),
+                    local_key: crate::tools::sch_connectivity::pt_key(pin.local_x, pin.local_y),
+                },
+                reference: instance.reference.clone(),
+                at: pin_endpoint(&pin, transform),
+            });
+        }
+    }
+    Ok(pins)
+}
+
+/// A no-connect marker following its pin to where the pin has landed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NoConnectCarry {
+    pub(crate) uuid: String,
+    pub(crate) from: (f64, f64),
+    pub(crate) to: (f64, f64),
+}
+
+/// Why a placement change must refuse rather than write.
+#[derive(Debug)]
+pub(crate) enum NoConnectCarryError {
+    /// The marker's pin does not map onto one arrival point.
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+    /// The sheet cannot be read well enough to follow the marker at all.
+    Unmappable { reason: String },
+}
+
+impl NoConnectCarryError {
+    pub(crate) fn into_result(self, path: &std::path::Path) -> CallToolResult {
+        match self {
+            Self::Ambiguous { target, candidates } => {
+                let reason = format!(
+                    "the pin it protects does not map onto one arrival point: {}",
+                    candidates.join(", ")
+                );
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                        target: target.clone(),
+                        candidates,
+                    },
+                    format!("refusing to move {target}: {reason}. Nothing was written."),
+                )
+            }
+            Self::Unmappable { reason } => {
+                let target = path.display().to_string();
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::StaleTarget {
+                        target: target.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "refusing to change placement in '{target}': {reason}. Nothing was written."
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// How a marker is described when it is the subject of a refusal.
+fn marker_label(uuid: &str, (x, y): (f64, f64)) -> String {
+    format!("no-connect {uuid} at ({x}, {y})")
+}
+
+/// Plan where a placement change leaves each no-connect marker, given the
+/// sheet before the change and the sheet the change produces.
+///
+/// [`reconcile_junctions_at`] refuses to add a dot where a no-connect sits,
+/// but it looks at the point the pin *arrives* at while the marker is still at
+/// the point the pin *left* — so on its own that guard misses exactly the case
+/// it exists for, and a pin the user declared unconnected is wired into the
+/// net it lands on (#626). The marker has to travel with the pin, in the same
+/// write as the symbol, for the guard to see it.
+///
+/// A marker is carried only when the pins under it map one-to-one onto a
+/// single arrival point. It refuses when:
+///
+/// * a pin under the marker is gone from the result or its identity no longer
+///   resolves — a replacement that removes or renumbers the pin;
+/// * the pins under the marker land on different points, one moving and one
+///   staying say, where carrying it would strip the protection from the pin
+///   left behind;
+/// * carrying it would stack it on a marker it did not start with, leaving two
+///   markers on one point and no way to tell which pin either belongs to.
+///
+/// A marker with no pin under it is already dangling and stays where it is;
+/// that is ERC's to report, not this pass's to move.
+///
+/// Note this derives "which pins moved where" from pin *identity*, while
+/// [`reconcile_junctions_at`]'s callers derive it from the symmetric
+/// difference of pin *coordinates*. The identity derivation is the stricter
+/// of the two — it sees a pin vacating a point another pin still occupies,
+/// which the coordinate difference cannot. Folding the junction pass onto it
+/// would change which dots that pass judges, so the two are kept apart here
+/// and the unification tracked separately.
+///
+/// The gap that leaves: two pins of one symbol *swapping* coordinates — a
+/// `Device:R` turned 180° — leave the coordinate sets equal, so the junction
+/// pass gets no candidates and any dot between them stands. A marker carried
+/// onto that dot then sits on a pin that is still on the net. Measured against
+/// KiCad 10.0.6, the pin is on that net with or without this carry, so the
+/// carry does not cause it; what changes is that ERC now reports it as
+/// `no_connect_connected` instead of leaving a stranded marker and a silent
+/// connection. Closing it needs the junction pass to take its candidates from
+/// the identity derivation above.
+///
+/// A placement tool adopts this contract in three steps, in this order: plan
+/// here, apply with [`carry_no_connects`] (typed model) or
+/// [`apply_no_connect_carries`] (S-expression edits) in the same write as the
+/// symbol, then report with [`observed_no_connect_moves`] after it. #622 and
+/// #623 use the placement identity below; #625 uses the replacement variant
+/// because changing a library symbol deliberately changes local pin geometry.
+pub(crate) fn plan_no_connect_carry(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, true)
+}
+
+/// Follow a no-connect through a symbol replacement by the identity that the
+/// replacement contract preserves: symbol UUID, unit, and pin number.
+///
+/// Local pin geometry is deliberately excluded because replacing a symbol is
+/// allowed to move that pin. The one-to-one check remains strict: a removed,
+/// renumbered, or duplicated pin produces zero or multiple arrivals and
+/// refuses before any write rather than guessing correspondence (#625).
+pub(crate) fn plan_no_connect_carry_for_replacement(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    plan_no_connect_carry_with(before, after, false)
+}
+
+fn plan_no_connect_carry_with(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+    require_same_local_geometry: bool,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
+    let coincident = |a: (f64, f64), b: (f64, f64)| {
+        konnect_sexp::geometry::points_coincident(a.0, a.1, b.0, b.1, TOL)
+    };
+
+    let mut markers: Vec<(String, (f64, f64))> = Vec::new();
+    for node in before.find_all("no_connect") {
+        let Some((x, y, _)) = parse_at(node) else {
+            continue;
+        };
+        // An empty UUID counts as absent: the typed model reads a missing one
+        // as "" and writes it back as (uuid ""), so accepting it would let the
+        // typed path carry a marker the S-expression path refuses — and two of
+        // them would share that one key.
+        let Some(uuid) = node.find_str("uuid").filter(|uuid| !uuid.is_empty()) else {
+            return Err(NoConnectCarryError::Unmappable {
+                reason: format!("the no-connect at ({x}, {y}) has no UUID to follow"),
+            });
+        };
+        markers.push((uuid.to_owned(), (x, y)));
+    }
+    if markers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
+
+    let mut carries: Vec<NoConnectCarry> = Vec::new();
+    for (uuid, from) in &markers {
+        let owners = before_pins.iter().filter(|p| coincident(p.at, *from));
+        let mut arrivals: Vec<(&IdentifiedPin, (f64, f64))> = Vec::new();
+        for owner in owners {
+            let landed: Vec<&IdentifiedPin> = after_pins
+                .iter()
+                .filter(|p| {
+                    p.identity.symbol_uuid == owner.identity.symbol_uuid
+                        && p.identity.unit == owner.identity.unit
+                        && p.identity.number == owner.identity.number
+                        && (!require_same_local_geometry
+                            || p.identity.local_key == owner.identity.local_key)
+                })
+                .collect();
+            let [arrival] = landed[..] else {
+                return Err(NoConnectCarryError::Unmappable {
+                    reason: format!(
+                        "{} is protected by {}, which the change leaves {} matching pins",
+                        marker_label(uuid, *from),
+                        pin_label(owner),
+                        landed.len()
+                    ),
+                });
+            };
+            arrivals.push((owner, arrival.at));
+        }
+        // No pin under the marker: already dangling, and not this pass's to fix.
+        let Some(&(_, to)) = arrivals.first() else {
+            continue;
+        };
+        if arrivals.iter().any(|&(_, at)| !coincident(at, to)) {
+            return Err(NoConnectCarryError::Ambiguous {
+                target: marker_label(uuid, *from),
+                candidates: sorted_labels(
+                    arrivals
+                        .iter()
+                        .map(|(owner, at)| format!("{} -> ({}, {})", pin_label(owner), at.0, at.1)),
+                ),
+            });
+        }
+        if coincident(to, *from) {
+            continue;
+        }
+        carries.push(NoConnectCarry {
+            uuid: uuid.clone(),
+            from: *from,
+            to,
+        });
+    }
+
+    // Where every marker ends up, so a carry cannot silently stack one marker
+    // on another. Markers that started on one point stay a pair; a carry that
+    // creates the pair is the outcome with no one-to-one reading.
+    struct Landing<'a> {
+        uuid: &'a str,
+        from: (f64, f64),
+        to: (f64, f64),
+    }
+    let landings: Vec<Landing<'_>> = markers
+        .iter()
+        .map(|(uuid, from)| Landing {
+            uuid,
+            from: *from,
+            to: carries
+                .iter()
+                .find(|carry| carry.uuid == *uuid)
+                .map_or(*from, |carry| carry.to),
+        })
+        .collect();
+    for (index, landing) in landings.iter().enumerate() {
+        for other in &landings[index + 1..] {
+            if !coincident(landing.to, other.to) || coincident(landing.from, other.from) {
+                continue;
+            }
+            // Whichever of the pair moved is the one being refused; if both
+            // did, either names the collision as well as the other.
+            let moved = carries
+                .iter()
+                .find(|carry| carry.uuid == landing.uuid || carry.uuid == other.uuid)
+                .expect("a newly created collision has at least one carried marker");
+            return Err(NoConnectCarryError::Ambiguous {
+                target: marker_label(&moved.uuid, moved.from),
+                candidates: sorted_labels([
+                    marker_label(landing.uuid, landing.from),
+                    marker_label(other.uuid, other.from),
+                ]),
+            });
+        }
+    }
+    Ok(carries)
+}
+
+/// The refusal a caller raises when it cannot parse a sheet well enough to
+/// follow its markers.
+///
+/// Shared so a caller's own parse failure is the same `stale_target` the
+/// planner raises rather than a different kind of answer on each path.
+pub(crate) fn no_connect_carry_unreadable(path: &std::path::Path) -> CallToolResult {
+    NoConnectCarryError::Unmappable {
+        reason: "the schematic cannot be re-parsed to follow its no-connect markers".into(),
+    }
+    .into_result(path)
+}
+
+/// The refusal a caller raises when a planned carry cannot be located in the
+/// content it is about to write.
+pub(crate) fn no_connect_carry_unwritable(path: &std::path::Path) -> CallToolResult {
+    NoConnectCarryError::Unmappable {
+        reason: "a no-connect marker that must travel with a pin cannot be located".into(),
+    }
+    .into_result(path)
+}
+
+/// Refusal candidates, ordered so a caller comparing two runs sees one list.
+fn sorted_labels(labels: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut labels: Vec<String> = labels.into_iter().collect();
+    labels.sort();
+    labels
+}
+
+/// How a pin is named in a refusal: the reference a caller sees, plus the
+/// identity behind it, because a pre-annotation sheet is all `R?`.
+fn pin_label(pin: &IdentifiedPin) -> String {
+    format!(
+        "{} [{}] unit {} pin {}",
+        pin.reference, pin.identity.symbol_uuid, pin.identity.unit, pin.identity.number
+    )
+}
+
+/// Rewrite each carried marker's `(at …)` in `content`.
+///
+/// Returns `None` when a marker cannot be located, which the caller must treat
+/// as a refusal: writing the placement change without its markers is the very
+/// outcome this pass exists to prevent.
+pub(crate) fn apply_no_connect_carries(
+    content: String,
+    carries: &[NoConnectCarry],
+) -> Option<String> {
+    if carries.is_empty() {
+        return Some(content);
+    }
+    let ranges = no_connect_at_ranges(&content);
+    let edits = carries
+        .iter()
+        .map(|carry| {
+            let &(start, end) = ranges.get(carry.uuid.as_str())?;
+            Some(SexpEdit::replace(
+                start,
+                end,
+                format!("{} {}", fmt_f64(carry.to.0), fmt_f64(carry.to.1)),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(apply_edits(content, edits))
+}
+
+/// Every marker's UUID against the byte range of the coordinates inside its
+/// `(at …)`.
+///
+/// Built in one pass: locating a marker costs a scan of the whole file, so a
+/// per-carry lookup would rescan it once per marker moved.
+fn no_connect_at_ranges(content: &str) -> std::collections::HashMap<&str, (usize, usize)> {
+    let mut ranges = std::collections::HashMap::new();
+    for start in find_block_starts(content, "no_connect") {
+        let Some((_, end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        let block = &content[start..end];
+        let Some(uuid) = parse_sexp(block)
+            .ok()
+            .as_ref()
+            .and_then(|node| node.find_str("uuid"))
+            .and_then(|uuid| block.find(uuid).map(|at| &block[at..at + uuid.len()]))
+        else {
+            continue;
+        };
+        let Some(at_rel) = block.find("(at ").map(|offset| offset + "(at ".len()) else {
+            continue;
+        };
+        let Some(close_rel) = block[at_rel..].find(')') else {
+            continue;
+        };
+        ranges.insert(uuid, (start + at_rel, start + at_rel + close_rel));
+    }
+    ranges
+}
+
+/// Move the no-connect markers a placement change relocates, in the same
+/// mutation as the symbols themselves.
+///
+/// `before_source` is the sheet as it was loaded; `sch` already carries the
+/// placement change but has not been written. The markers are applied to `sch`
+/// so one `overwrite` commits symbol and marker together — a marker written
+/// separately would leave a window where the pin is on a net it was declared
+/// off (#626).
+///
+/// This is the typed-model half of the apply step;
+/// [`apply_no_connect_carries`] is the S-expression half. Refuses before any
+/// write when a marker's pin cannot be followed one-to-one, and returns the
+/// carries for the caller to confirm against the written file with
+/// [`observed_no_connect_moves`].
+pub(crate) fn carry_no_connects(
+    path: &std::path::Path,
+    before_source: &str,
+    sch: &mut cse::Schematic,
+) -> Result<Vec<NoConnectCarry>, CallToolResult> {
+    if sch.no_connects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let after_source = sch.to_source();
+    let (Ok(before), Ok(after)) = (parse_sexp(before_source), parse_sexp(&after_source)) else {
+        return Err(no_connect_carry_unreadable(path));
+    };
+    let carries =
+        plan_no_connect_carry(&before, &after).map_err(|error| error.into_result(path))?;
+    for carry in &carries {
+        let Some(marker) = sch
+            .no_connects
+            .iter_mut()
+            .find(|marker| marker.uuid == carry.uuid)
+        else {
+            return Err(no_connect_carry_unwritable(path));
+        };
+        marker.x = carry.to.0;
+        marker.y = carry.to.1;
+    }
+    Ok(carries)
+}
+
+/// The marker moves as the written file records them.
+///
+/// Planned positions are not evidence: a move is reported only where the file
+/// now has that marker at that point, and a marker the readback cannot find
+/// there makes the whole mutation's outcome uncertain rather than a success
+/// with a footnote.
+pub(crate) fn observed_no_connect_moves(
+    path: &std::path::Path,
+    operation: &str,
+    carries: &[NoConnectCarry],
+) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
+    if carries.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let content = read_consistent(path)?;
+    let Ok(tree) = parse_sexp(&content) else {
+        return Ok(Err(crate::tools::mutation_outcome_uncertain(
+            path,
+            operation,
+            "the written schematic cannot be parsed to confirm the no-connect markers moved",
+        )));
+    };
+    let markers = tree.find_all("no_connect");
+    let mut moves = Vec::new();
+    for carry in carries {
+        let landed = markers.iter().find_map(|node| {
+            (node.find_str("uuid") == Some(carry.uuid.as_str()))
+                .then(|| konnect_sexp::schematic::parse_at(node))
+                .flatten()
+        });
+        let Some((x, y, _)) = landed.filter(|&(x, y, _)| {
+            konnect_sexp::geometry::points_coincident(x, y, carry.to.0, carry.to.1, 0.01)
+        }) else {
+            return Ok(Err(crate::tools::mutation_outcome_uncertain(
+                path,
+                operation,
+                format!(
+                    "no-connect {} is not at ({}, {}) in the written file, so the pin it protects may be on a net",
+                    carry.uuid, carry.to.0, carry.to.1
+                ),
+            )));
+        };
+        moves.push(json!({
+            "uuid": carry.uuid,
+            "from": { "x": carry.from.0, "y": carry.from.1 },
+            "to": { "x": x, "y": y }
+        }));
+    }
+    Ok(Ok(moves))
+}
+
+/// Re-judge junction dots after a placement change from two in-memory sheet states.
+///
+/// The only candidate points are pin endpoints in the symmetric difference of
+/// `before` and `after`. A pin that did not move cannot justify touching its
+/// junction, and a sheet with no wires has neither a dot to strand nor a wire
+/// for a pin to land on. Keeping this harness beside [`reconcile_junctions_at`]
+/// gives every placement-changing handler the same short-circuit, pin
+/// extraction, and canonical coincidence tolerance (#624).
+///
+/// Returns the reconciled `after` content plus (added, pruned). The caller owns
+/// the single atomic write that commits the mutation and this reconciliation
+/// together.
+pub(crate) fn reconcile_junctions_for_placement(
+    before: &str,
+    after: String,
+) -> (String, usize, usize) {
+    if !before.contains("(wire") {
+        return (after, 0, 0);
+    }
+
+    let (Ok(before_tree), Ok(after_tree)) = (parse_sexp(before), parse_sexp(&after)) else {
+        return (after, 0, 0);
+    };
+    let before_pins = crate::tools::all_pin_endpoints(&before_tree);
+    let after_pins = crate::tools::all_pin_endpoints(&after_tree);
+    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        a.iter()
+            .copied()
+            .filter(|&(x, y)| {
+                !b.iter().any(|&(other_x, other_y)| {
+                    konnect_sexp::geometry::points_coincident(
+                        x,
+                        y,
+                        other_x,
+                        other_y,
+                        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+                    )
+                })
+            })
+            .collect()
+    };
+
+    let mut points = differs(&before_pins, &after_pins);
+    points.extend(differs(&after_pins, &before_pins));
+    reconcile_junctions_at(after, &points)
 }
 
 /// Re-evaluate the junction dots at `points` after geometry moved.
@@ -798,32 +1341,18 @@ pub(crate) fn reconcile_junctions_at(
         return (content, 0, 0);
     };
     let wires = extract_wires(&tree);
+    let buses = konnect_sexp::schematic::extract_buses(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let idx = crate::tools::sch_connectivity::ConnectivityIndex::build(
         &tree,
         &wires,
+        &buses,
         &labels,
         crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
     );
-    // The shared index does not model buses yet, and KiCAD has bus junctions:
-    // a dot on a bus tee joins bus segments, which no wire count can see. Any
-    // candidate point touching a bus line is therefore outside this pass's
-    // jurisdiction — neither pruned nor added at. This is a guard, not a fifth
-    // attachment answer: the moment the index learns buses, it replaces this.
-    let buses = konnect_sexp::schematic::extract_buses(&tree);
-    let on_bus = |x: f64, y: f64| {
-        buses.iter().any(|b| {
-            konnect_sexp::geometry::point_on_segment(
-                x,
-                y,
-                b.x1,
-                b.y1,
-                b.x2,
-                b.y2,
-                crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
-            )
-        })
-    };
+    // A bus junction remains outside ordinary wire-junction mutation. The
+    // shared index owns this geometric answer so validators and mutation do
+    // not drift apart again (#328).
     let pins_known = !idx.placed_pins().is_empty() || extract_symbol_instances(&tree).is_empty();
 
     // Existing dots at the candidate points, with the byte range to delete —
@@ -854,7 +1383,7 @@ pub(crate) fn reconcile_junctions_at(
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut to_add: Vec<(f64, f64)> = Vec::new();
     for &(px, py) in points {
-        if on_bus(px, py) {
+        if idx.on_bus(px, py) {
             continue;
         }
         let here: Vec<&Dot> = existing
@@ -911,6 +1440,15 @@ pub(crate) fn reconcile_junctions_at(
     (out, added, pruned)
 }
 
+/// Drop the junction dots the removed wires left with nothing to justify them.
+///
+/// Deleting a wire used to leave its dots behind, so relocating a block — delete
+/// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
+/// A dot needs two wires to mean anything, with one exception: one wire plus a
+/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
+/// So a junction is pruned when no wire is left through it, or one is and no pin
+/// sits there. Junctions no removed wire touched are left alone, and moves that
+/// strand a dot without deleting a wire are #120's half of the problem.
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
     const TOL: f64 = 0.01;
     // Two is as high as this needs to count, so it stops there.
@@ -1589,6 +2127,12 @@ async fn handle_add_power_symbol(
         Err(e) => return Ok(e),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    // Snap like `place_one_component` does for the other two placers. Wires and
+    // labels are snapped to this grid, so a power symbol left off it cannot be
+    // reached by them: ERC reports the endpoint off grid and the pin
+    // unconnected (#662). Everything below, including the bound placement
+    // intent the readback is checked against, uses the snapped point.
+    let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
@@ -1599,7 +2143,10 @@ async fn handle_add_power_symbol(
         return Ok(error.into_tool_result());
     }
 
-    let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
+    // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
+    // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
+    // same number beside every eeschema-numbered symbol (#583).
+    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(&sch));
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
@@ -2003,47 +2550,17 @@ async fn handle_connect_to_net(
         Some(d) => crate::tools::stub_direction(direction, Some(d)),
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
-    let (label_x, label_y) = (pin_x + dir.dx * stub_length, pin_y + dir.dy * stub_length);
-    let label_rot = dir.label_rotation;
-
     let mut sch = cse::Schematic::load(&sch_path)?;
-
-    // T-junction detection for the wire stub
-    let mut existing_wires = cse_wires_to_sexp(&sch);
-    existing_wires.push(konnect_sexp::schematic::Wire {
-        x1: pin_x,
-        y1: pin_y,
-        x2: label_x,
-        y2: label_y,
-        uuid: None,
-    });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
-
-    // Add wire stub
-    sch.add_wire(pin_x, pin_y, label_x, label_y);
-    add_missing_junctions(&mut sch, &junctions);
-    // Pins the stub passes over mid-segment also need junction dots.
     let pins = crate::tools::all_pin_endpoints(&tree);
-    add_missing_junctions(
+    let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
-        &pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y),
+        &pins,
+        (pin_x, pin_y),
+        &dir,
+        stub_length,
+        label_type,
+        &net,
     );
-
-    // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
-    // unset, and KiCad then centres the text on the anchor (#43).
-    match label_type {
-        "global_label" => {
-            sch.add_global_label(&net, "input", label_x, label_y);
-            let idx = sch.global_labels.len() - 1;
-            if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.set_rotation(label_rot);
-            }
-        }
-        _ => {
-            sch.add_label(&net, label_x, label_y)
-                .set_rotation(label_rot);
-        }
-    }
 
     sch.overwrite()?;
 
@@ -2053,6 +2570,73 @@ async fn handle_connect_to_net(
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))
+}
+
+/// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
+/// with the junctions it needs, and a net or global label at its end. Returns
+/// the label's position and rotation.
+pub(crate) fn add_net_stub(
+    sch: &mut cse::Schematic,
+    pins: &[(f64, f64)],
+    pin: (f64, f64),
+    dir: &crate::tools::StubDirection,
+    stub_length: f64,
+    label_type: &str,
+    net: &str,
+) -> (f64, f64, f64) {
+    let end = dir.end(pin, stub_length);
+    add_stub_wire(sch, pins, pin, end);
+    add_stub_label(sch, label_type, net, end, dir.label_rotation);
+    (end.0, end.1, dir.label_rotation)
+}
+
+/// The wire half of [`add_net_stub`]: the wire, plus junction dots where it
+/// makes a T or passes over a pin mid-segment.
+pub(crate) fn add_stub_wire(
+    sch: &mut cse::Schematic,
+    pins: &[(f64, f64)],
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) {
+    // T-junction detection for the wire stub
+    let mut existing_wires = cse_wires_to_sexp(sch);
+    existing_wires.push(konnect_sexp::schematic::Wire {
+        x1,
+        y1,
+        x2,
+        y2,
+        uuid: None,
+    });
+    let junctions = find_t_junctions(&existing_wires, 0.01);
+
+    sch.add_wire(x1, y1, x2, y2);
+    add_missing_junctions(sch, &junctions);
+    // Pins the stub passes over mid-segment also need junction dots.
+    add_missing_junctions(sch, &pins_mid_segment(pins, x1, y1, x2, y2));
+}
+
+/// The label half of [`add_net_stub`].
+pub(crate) fn add_stub_label(
+    sch: &mut cse::Schematic,
+    label_type: &str,
+    net: &str,
+    (x, y): (f64, f64),
+    rotation: f64,
+) {
+    // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
+    // unset, and KiCad then centres the text on the anchor (#43).
+    match label_type {
+        "global_label" => {
+            sch.add_global_label(net, "input", x, y);
+            let idx = sch.global_labels.len() - 1;
+            if let Some(gl) = sch.global_labels.get_mut(idx) {
+                gl.set_rotation(rotation);
+            }
+        }
+        _ => {
+            sch.add_label(net, x, y).set_rotation(rotation);
+        }
+    }
 }
 
 async fn handle_connect_pins(
@@ -2350,6 +2934,31 @@ mod unit_aware_wiring_tests {
         );
     }
 
+    /// #744: the response echoes the snapped point, and 132 × 1.27 is
+    /// `167.64000000000001` in `f64`.
+    #[tokio::test]
+    async fn add_wire_reports_the_snapped_point_as_kicad_writes_it() {
+        let (_d, path) = bare_schematic();
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 101.6, "y1": 167.64, "x2": 111.76, "y2": 167.64
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["added_wire"],
+            json!({ "x1": 101.6, "y1": 167.64, "x2": 111.76, "y2": 167.64 })
+        );
+    }
+
     // ─── One junction per T, however many wires arrive ─────────────────────
 
     /// An empty sheet: these tests only need somewhere to put wires.
@@ -2604,6 +3213,25 @@ mod unit_aware_wiring_tests {
         let stripped = format!("{}{}", &src[..start], &src[end..]);
         assert!(!has_dot(&stripped, "120.65", "139.7"), "dot removed");
         stripped
+    }
+
+    #[test]
+    fn placement_harness_prunes_a_dot_when_its_pin_disappears() {
+        let after = fixture_without_symbol(RECONCILE_SCH, "R1");
+        let (out, added, pruned) = reconcile_junctions_for_placement(RECONCILE_SCH, after);
+
+        assert_eq!((added, pruned), (0, 1));
+        assert!(!has_dot(&out, "120.65", "139.7"));
+    }
+
+    #[test]
+    fn placement_harness_adds_a_dot_when_its_pin_appears() {
+        let before = fixture_without_symbol(RECONCILE_SCH, "R1");
+        let (out, added, pruned) =
+            reconcile_junctions_for_placement(&before, fixture_missing_r1s_dot());
+
+        assert_eq!((added, pruned), (1, 0));
+        assert!(has_dot(&out, "120.65", "139.7"));
     }
 
     /// The positive half of the reconcile: a pin sitting mid-span on exactly
@@ -3448,8 +4076,10 @@ mod power_symbol_tests {
             &json!({
                 "schematic": path.display().to_string(),
                 "power_net": "GND",
-                "x": 100.0,
-                "y": 80.0
+                // On the 1.27 mm grid (79 x 1.27, 63 x 1.27), so the anchor
+                // offsets asserted below are not mixed with the snap (#662).
+                "x": 100.33,
+                "y": 80.01
             }),
             &test_ctx(),
         )
@@ -3462,7 +4092,7 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         let ref_prop = sym
             .properties
@@ -3471,7 +4101,7 @@ mod power_symbol_tests {
             .unwrap();
         let ref_sexp = cse::sexp::writer::write(&ref_prop.to_sexp());
         assert!(
-            ref_sexp.contains("(at 100") && ref_sexp.contains("86.35"),
+            ref_sexp.contains("(at 100.33") && ref_sexp.contains("86.36"),
             "Reference must sit at the library's anchor near the symbol, not \
              sheet origin: {ref_sexp}"
         );
@@ -3486,7 +4116,7 @@ mod power_symbol_tests {
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
         assert!(
-            val_sexp.contains("(at 100") && val_sexp.contains("83.81"),
+            val_sexp.contains("(at 100.33") && val_sexp.contains("83.82"),
             "Value must sit near the symbol: {val_sexp}"
         );
         assert!(
@@ -3494,7 +4124,7 @@ mod power_symbol_tests {
             "Value must stay visible on power symbols: {val_sexp}"
         );
         assert!(
-            !after.contains("(property \"Reference\" \"#PWR001\")\n"),
+            !after.contains("(property \"Reference\" \"#PWR01\")\n"),
             "must not write a bare Reference with no (at)"
         );
     }
@@ -3526,7 +4156,7 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         assert_eq!(
             sym.footprint(),
@@ -3566,8 +4196,10 @@ mod power_symbol_tests {
             &json!({
                 "schematic": path.display().to_string(),
                 "power_net": "VCC",
-                "x": 100.0,
-                "y": 80.0
+                // On the 1.27 mm grid (79 x 1.27, 63 x 1.27), so the anchor
+                // offsets asserted below are not mixed with the snap (#662).
+                "x": 100.33,
+                "y": 80.01
             }),
             &test_ctx(),
         )
@@ -3579,18 +4211,18 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
         assert!(
-            val_sexp.contains("76.444"),
+            val_sexp.contains("76.454"),
             "VCC's Value belongs above the symbol at y-3.556, not below: {val_sexp}"
         );
     }
 
     /// Numbering by count re-issued a designator that was still on the sheet:
-    /// delete `#PWR002` of three and the next add produced a second `#PWR003`.
+    /// delete `#PWR02` of three and the next add produced a second `#PWR03`.
     #[tokio::test]
     async fn add_power_symbol_fills_a_freed_number_instead_of_duplicating() {
         let dir = tempfile::tempdir().unwrap();
@@ -3618,7 +4250,7 @@ mod power_symbol_tests {
         add(120.0).await;
 
         let mut sch = cse::Schematic::load(&path).unwrap();
-        sch.symbols.retain(|s| s.reference() != Some("#PWR002"));
+        sch.symbols.retain(|s| s.reference() != Some("#PWR02"));
         sch.overwrite().unwrap();
 
         add(130.0).await;
@@ -3628,9 +4260,355 @@ mod power_symbol_tests {
         refs.sort_unstable();
         assert_eq!(
             refs,
-            ["#PWR001", "#PWR002", "#PWR003"],
+            ["#PWR01", "#PWR02", "#PWR03"],
             "the freed number belongs to the new symbol, and nothing may repeat"
         );
+    }
+
+    /// KiCad's `ecc83-pp` demo as eeschema saved it. Its power symbols are
+    /// numbered `#PWR01`-`#PWR04`, `#PWR06`, `#PWR08` and `#PWR09`.
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    /// A copy of the ecc83 sheet that can take a `power:GND` without a KiCad
+    /// install. The sheet draws ground from its own `ecc83-pp:GND`, so that
+    /// eeschema-written definition is spliced in a second time under the name
+    /// `power:GND`. Every other byte of the copy is as eeschema wrote it.
+    fn ecc83_with_power_gnd(dir: &std::path::Path) -> std::path::PathBuf {
+        let opening = "(symbol \"ecc83-pp:GND\"";
+        let start = ECC83.find(opening).expect("the sheet's own GND definition");
+        let (_, end) = find_balanced_block(ECC83, start).expect("balanced block");
+        let renamed = ECC83[start..end].replacen("ecc83-pp:GND", "power:GND", 1);
+        let mut content = ECC83.to_string();
+        content.insert_str(start, &format!("{renamed}\n\t\t"));
+        let path = dir.join("ecc83-pp.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    async fn add_gnd(path: &std::path::Path, x: f64) -> serde_json::Value {
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": x,
+                "y": 25.4
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected a JSON text response, got {other:?}"),
+        }
+    }
+
+    /// Both places a designator lives in a schematic: the `Reference`
+    /// property and the `(reference …)` of each instance record.
+    fn designator_spellings(content: &str, designator: &str) -> (usize, usize) {
+        (
+            content
+                .matches(&format!("(property \"Reference\" \"{designator}\""))
+                .count(),
+            content
+                .matches(&format!("(reference \"{designator}\")"))
+                .count(),
+        )
+    }
+
+    /// A symbol added to a sheet eeschema numbered continues eeschema's
+    /// series in eeschema's spelling. The sheet has 1-4, 6, 8 and 9, so the
+    /// free numbers are 5, 7 and then 10: `{:03}` spelled those `#PWR005`,
+    /// `#PWR007` and `#PWR010` beside neighbours named `#PWR04` and `#PWR06`
+    /// (#583).
+    #[tokio::test]
+    async fn a_sheet_eeschema_numbered_is_continued_in_eeschemas_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ecc83_with_power_gnd(dir.path());
+
+        let mut reported = Vec::new();
+        for x in [25.4, 38.1, 50.8] {
+            let response = add_gnd(&path, x).await;
+            reported.push(response["reference"].as_str().unwrap().to_string());
+        }
+        assert_eq!(reported, ["#PWR05", "#PWR07", "#PWR010"]);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for designator in &reported {
+            assert_eq!(
+                designator_spellings(&after, designator),
+                (1, 1),
+                "{designator} is written once as the property and once in the instance record"
+            );
+        }
+        for stale in ["#PWR005", "#PWR007"] {
+            assert_eq!(designator_spellings(&after, stale), (0, 0), "{stale}");
+        }
+        for untouched in [
+            "#PWR01", "#PWR02", "#PWR03", "#PWR04", "#PWR06", "#PWR08", "#PWR09",
+        ] {
+            assert_eq!(
+                designator_spellings(&after, untouched),
+                designator_spellings(ECC83, untouched),
+                "{untouched} is eeschema's and stays as eeschema wrote it"
+            );
+        }
+    }
+
+    /// #583 through the served boundary: `tools/call` on the eeschema-numbered
+    /// sheet reports eeschema's spelling, and the committed file carries the
+    /// designator the response reported, in both places it lives.
+    #[tokio::test]
+    async fn the_served_dispatch_reports_the_spelling_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ecc83_with_power_gnd(dir.path());
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 583,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_power_symbol",
+                    "arguments": {
+                        "schematic": path.display().to_string(),
+                        "power_net": "GND", "x": 25.4, "y": 25.4
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let placed: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(placed["reference"], "#PWR05", "{placed}");
+
+        let committed = cse::Schematic::load(&path).unwrap();
+        let symbol = committed
+            .symbols
+            .iter()
+            .find(|symbol| Some(symbol.uuid.as_str()) == placed["uuid"].as_str())
+            .expect("the placed symbol is in the committed file");
+        assert_eq!(symbol.reference(), placed["reference"].as_str());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(designator_spellings(&after, "#PWR05"), (1, 1));
+    }
+
+    /// A schematic holding one power symbol per designator, as text. Each
+    /// symbol records its instance under `project`, which the placement
+    /// preflight holds to the name of the file it is written to.
+    fn sheet_with_power_symbols(project: &str, designators: &[String]) -> String {
+        let mut sheet = String::from(
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n",
+        );
+        for (index, designator) in designators.iter().enumerate() {
+            sheet.push_str(&format!(
+                "  (symbol\n    (lib_id \"power:GND\")\n    (at {x} 50.8 0)\n    (unit 1)\n    (uuid \"00000000-0000-0000-0000-{index:012}\")\n    (property \"Reference\" \"{designator}\" (at {x} 57.15 0))\n    (property \"Value\" \"GND\" (at {x} 54.61 0))\n    (instances (project \"{project}\" (path \"/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\" (reference \"{designator}\") (unit 1))))\n  )\n",
+                x = 25.4 + 2.54 * index as f64,
+            ));
+        }
+        sheet.push_str(")\n");
+        sheet
+    }
+
+    /// Past ninety-nine the `0` stays: eeschema writes `#PWR0100`, where
+    /// `{:03}` wrote `#PWR100`.
+    #[tokio::test]
+    async fn the_hundredth_power_symbol_keeps_the_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hundred.kicad_sch");
+        let used: Vec<String> = (1..=99).map(|n| format!("#PWR0{n}")).collect();
+        std::fs::write(&path, sheet_with_power_symbols("hundred", &used)).unwrap();
+
+        let response = add_gnd(&path, 25.4).await;
+        assert_eq!(response["reference"], "#PWR0100");
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(
+            sch.symbols
+                .iter()
+                .any(|s| s.reference() == Some("#PWR0100")),
+            "the committed file carries eeschema's spelling"
+        );
+        assert!(
+            !sch.symbols.iter().any(|s| s.reference() == Some("#PWR100")),
+            "and not the old one"
+        );
+    }
+
+    /// A sheet that already holds Konnect's older `#PWR001` and `#PWR002`
+    /// counts them as 1 and 2, hands out 3 in the new spelling, and leaves
+    /// the older two alone: re-spelling what is already in a file belongs
+    /// to `annotate_schematic`, not to placing a symbol.
+    #[tokio::test]
+    async fn older_spellings_on_the_sheet_are_counted_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.kicad_sch");
+        let used = vec!["#PWR001".to_string(), "#PWR002".to_string()];
+        std::fs::write(&path, sheet_with_power_symbols("mixed", &used)).unwrap();
+
+        let response = add_gnd(&path, 25.4).await;
+        assert_eq!(response["reference"], "#PWR03");
+        let sch = cse::Schematic::load(&path).unwrap();
+        let mut refs: Vec<&str> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, ["#PWR001", "#PWR002", "#PWR03"]);
+    }
+}
+
+#[cfg(test)]
+mod no_connect_carry_tests {
+    use super::*;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+
+    /// The marker on `R2` pin 1, as KiCad wrote it into the fixture.
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    fn tree(content: &str) -> konnect_sexp::SexpNode {
+        parse_sexp(content).expect("the fixture parses")
+    }
+
+    /// The fixture with `reference`'s placed symbol block cut out, standing in
+    /// for a mutation that removes the pin a marker protects.
+    fn without_symbol(reference: &str) -> String {
+        let blocks = crate::tools::find_all_symbol_instance_blocks(CARRY, reference);
+        assert_eq!(blocks.len(), 1, "the fixture places {reference} once");
+        let (start, end) = blocks[0];
+        format!("{}{}", &CARRY[..start], &CARRY[end..])
+    }
+
+    fn with_only_marker(uuid: &str) -> String {
+        let mut content = CARRY.to_owned();
+        let mut ranges = find_block_starts(CARRY, "no_connect")
+            .into_iter()
+            .filter_map(|start| find_balanced_block(CARRY, start))
+            .filter(|&(start, end)| !CARRY[start..end].contains(uuid))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+        for (start, end) in ranges {
+            content.replace_range(start..end, "");
+        }
+        content
+    }
+
+    #[test]
+    fn a_sheet_no_placement_change_touched_carries_nothing() {
+        let carries = plan_no_connect_carry(&tree(CARRY), &tree(CARRY)).expect("nothing refuses");
+        assert!(carries.is_empty(), "{carries:?}");
+    }
+
+    #[test]
+    fn replacement_matches_a_moved_pin_by_uuid_unit_and_number() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(at 0 3.81 270)", "(at -3.81 0 0)", 1);
+        assert_ne!(after, before);
+
+        let placement_error = plan_no_connect_carry(&tree(&before), &tree(&after))
+            .expect_err("ordinary placement identity includes unchanged local geometry");
+        let NoConnectCarryError::Unmappable { .. } = placement_error else {
+            panic!("expected an unmappable placement refusal: {placement_error:?}");
+        };
+
+        let carries = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect("replacement preserves the one symbol/unit/pin-number identity");
+        let carry = carries
+            .iter()
+            .find(|carry| carry.uuid == R2_MARKER)
+            .expect("R2's marker follows pin 1");
+        assert_eq!(carry.from, (158.75, 156.21));
+        assert_eq!(carry.to, (154.94, 160.02));
+    }
+
+    #[test]
+    fn replacement_refuses_a_renumbered_protected_pin() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(number \"1\"", "(number \"3\"", 1);
+        assert_ne!(after, before);
+        let error = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect_err("pin 1 has no one-to-one arrival after renumbering");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable replacement refusal: {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    #[test]
+    fn replacement_refuses_a_duplicated_protected_pin_number() {
+        let before = with_only_marker(R2_MARKER);
+        let (start, end) = find_block_starts(&before, "pin")
+            .into_iter()
+            .find_map(|start| find_balanced_block(&before, start))
+            .expect("the fixture embeds a pin block");
+        let duplicate = before[start..end].to_owned();
+        let mut after = before.clone();
+        after.insert_str(end, &duplicate);
+
+        let error = plan_no_connect_carry_for_replacement(&tree(&before), &tree(&after))
+            .expect_err("two arrivals for one protected pin are ambiguous");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable replacement refusal: {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("2 matching pins"), "{reason}");
+    }
+
+    #[test]
+    fn a_marker_whose_pin_left_the_result_refuses_rather_than_orphaning_it() {
+        let after = without_symbol("R2");
+        let error = plan_no_connect_carry(&tree(CARRY), &tree(&after))
+            .expect_err("R2 pin 1 is gone, so its marker cannot be followed");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    #[test]
+    fn unresolved_library_geometry_refuses_rather_than_reading_absence_as_no_pin() {
+        // Cutting lib_symbols leaves every placed symbol without pin geometry,
+        // which is stale state rather than evidence no pin is under a marker.
+        let (start, end) = find_block_starts(CARRY, "lib_symbols")
+            .first()
+            .and_then(|&start| find_balanced_block(CARRY, start))
+            .expect("the fixture carries lib_symbols");
+        let stripped = format!("{}{}", &CARRY[..start], &CARRY[end..]);
+        let error = plan_no_connect_carry(&tree(&stripped), &tree(&stripped))
+            .expect_err("pins that do not resolve cannot answer for a marker");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(
+            reason.contains("unresolved library pin geometry"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_no_uuid_refuses_rather_than_being_left_behind() {
+        let anchor = format!("\t\t(uuid \"{R2_MARKER}\")\n");
+        assert_eq!(CARRY.matches(anchor.as_str()).count(), 1);
+        let anonymous = CARRY.replace(anchor.as_str(), "");
+        let error = plan_no_connect_carry(&tree(&anonymous), &tree(&anonymous))
+            .expect_err("a marker with no UUID cannot be identified to move");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(reason.contains("has no UUID"), "{reason}");
     }
 }
 

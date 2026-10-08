@@ -17,9 +17,117 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+/// How long the per-layer name lookups behind `get_enabled_layers_with_names_in`
+/// may wait on KiCad in total. One socket and one round trip each, and up to
+/// 32 enabled layers: at the default receive timeout, a KiCad that wedges
+/// mid-loop would hold a read for a quarter of an hour. The names are
+/// cosmetic, so the budget stops the loop and the canonical names stand.
+///
+/// The budget is a wall-clock bound on the waiting, not just on when the last
+/// lookup may start: each lookup is sent with whatever is left of it as its own
+/// receive timeout, so the one that runs out of budget gives up at the deadline
+/// instead of falling back on [`COMMAND_RECV_TIMEOUT`].
+const LAYER_NAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a command waits for KiCad's reply when the caller has no deadline
+/// of its own. Long enough for slow board operations like a zone refill.
+const COMMAND_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a command waits to hand its request to the transport. The socket
+/// is already dialed by then, so this only bounds a send queue that will not
+/// drain.
+const COMMAND_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Converts KiCAD nanometers to millimeters.
 fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
+}
+
+fn pad_type_name(value: i32) -> Option<String> {
+    use kiapi::board::types::PadType;
+    match PadType::try_from(value).ok()? {
+        PadType::PtPth => Some("thru_hole".to_string()),
+        PadType::PtSmd => Some("smd".to_string()),
+        PadType::PtEdgeConnector => Some("edge_connector".to_string()),
+        PadType::PtNpth => Some("np_thru_hole".to_string()),
+        PadType::PtUnknown => None,
+    }
+}
+
+fn pad_shape_name(value: i32) -> Option<String> {
+    use kiapi::board::types::PadStackShape;
+    match PadStackShape::try_from(value).ok()? {
+        PadStackShape::PssCircle => Some("circle".to_string()),
+        PadStackShape::PssRectangle => Some("rect".to_string()),
+        PadStackShape::PssOval => Some("oval".to_string()),
+        PadStackShape::PssTrapezoid => Some("trapezoid".to_string()),
+        PadStackShape::PssRoundrect => Some("roundrect".to_string()),
+        PadStackShape::PssChamferedrect => Some("chamfered_rect".to_string()),
+        PadStackShape::PssCustom => Some("custom".to_string()),
+        PadStackShape::PssUnknown => None,
+    }
+}
+
+fn drill_shape_name(value: i32) -> Option<String> {
+    use kiapi::board::types::DrillShape;
+    match DrillShape::try_from(value).ok()? {
+        DrillShape::DsCircle => Some("circle".to_string()),
+        DrillShape::DsOblong => Some("oval".to_string()),
+        DrillShape::DsUndefined | DrillShape::DsUnknown => None,
+    }
+}
+
+fn optional_point_in_mm(point: Option<kiapi::common::types::Vector2>) -> Option<IpcVector2> {
+    point.map(point_in_mm)
+}
+
+struct PadGeometry {
+    rotation_deg: Option<f64>,
+    shape: Option<String>,
+    size: Option<IpcVector2>,
+    drill: Option<IpcPadDrill>,
+    copper_layers: Vec<IpcPadLayerGeometry>,
+}
+
+fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
+    let Some(stack) = pad.pad_stack.as_ref() else {
+        return PadGeometry {
+            rotation_deg: None,
+            shape: None,
+            size: None,
+            drill: None,
+            copper_layers: Vec::new(),
+        };
+    };
+    let copper_layers: Vec<_> = stack
+        .copper_layers
+        .iter()
+        .map(|layer| IpcPadLayerGeometry {
+            layer: layer_enum_to_name(layer.layer).to_string(),
+            shape: pad_shape_name(layer.shape),
+            size: optional_point_in_mm(layer.size),
+            offset: optional_point_in_mm(layer.offset),
+            corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
+                .then_some(layer.corner_rounding_ratio),
+            chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+        })
+        .collect();
+    let shape = copper_layers.first().and_then(|layer| layer.shape.clone());
+    let size = copper_layers.first().and_then(|layer| layer.size.clone());
+    let drill = stack.drill.as_ref().map(|drill| IpcPadDrill {
+        shape: drill_shape_name(drill.shape),
+        size: optional_point_in_mm(drill.diameter),
+        start_layer: (drill.start_layer != 0)
+            .then(|| layer_enum_to_name(drill.start_layer).to_string()),
+        end_layer: (drill.end_layer != 0).then(|| layer_enum_to_name(drill.end_layer).to_string()),
+    });
+    PadGeometry {
+        rotation_deg: stack.angle.as_ref().map(|angle| angle.value_degrees),
+        shape,
+        size,
+        drill,
+        copper_layers,
+    }
 }
 
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
@@ -217,6 +325,119 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// A `BoardStackup` as the crate's own types.
+///
+/// Field for field what KiCad 10.0.6's `BOARD_STACKUP::Serialize` fills: a
+/// copper layer's material is always "copper"; a dielectric's materials, εr and
+/// loss tangents are per sub-layer; a solder mask carries its own εr and loss
+/// tangent; a color is present only when the board specifies one.
+fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
+    use kiapi::board::board_stackup_layer::Details;
+    use kiapi::board::{BoardEdgeConnectorType, BoardStackupDielectricType, BoardStackupLayerType};
+
+    let nm = |d: &Option<kiapi::common::types::Distance>| d.as_ref().map_or(0, |d| d.value_nm);
+    let hex = |c: &kiapi::common::types::Color| {
+        let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!(
+            "#{:02X}{:02X}{:02X}{:02X}",
+            byte(c.r),
+            byte(c.g),
+            byte(c.b),
+            byte(c.a)
+        )
+    };
+
+    let layers = stackup
+        .layers
+        .iter()
+        .map(|layer| {
+            let kind = match BoardStackupLayerType::try_from(layer.r#type) {
+                Ok(BoardStackupLayerType::BsltCopper) => "copper",
+                Ok(BoardStackupLayerType::BsltDielectric) => "dielectric",
+                Ok(BoardStackupLayerType::BsltSoldermask) => "soldermask",
+                Ok(BoardStackupLayerType::BsltSilkscreen) => "silkscreen",
+                Ok(BoardStackupLayerType::BsltSolderpaste) => "solderpaste",
+                _ => "undefined",
+            };
+            // A dielectric has no board layer; KiCad sends BL_UNDEFINED for it.
+            let board_layer = kiapi::board::types::BoardLayer::try_from(layer.layer)
+                .ok()
+                .and_then(crate::builders::layer_name)
+                .map(str::to_string);
+            let mut out = IpcStackupLayer {
+                layer: board_layer,
+                user_name: Some(layer.user_name.clone()).filter(|n| !n.is_empty()),
+                kind: kind.to_string(),
+                enabled: layer.enabled,
+                thickness_nm: nm(&layer.thickness),
+                material: layer.material_name.clone(),
+                color: layer.color.as_ref().map(hex),
+                dielectric_type: None,
+                dielectric: Vec::new(),
+                epsilon_r: None,
+                loss_tangent: None,
+            };
+            match &layer.details {
+                Some(Details::Dielectric(dielectric)) => {
+                    out.dielectric_type = Some(
+                        match BoardStackupDielectricType::try_from(dielectric.r#type) {
+                            Ok(BoardStackupDielectricType::BsdtCore) => "core",
+                            Ok(BoardStackupDielectricType::BsdtPrepreg) => "prepreg",
+                            Ok(BoardStackupDielectricType::BsdtNone) => "none",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                    );
+                    out.dielectric = dielectric
+                        .layer
+                        .iter()
+                        .map(|sub| IpcStackupDielectric {
+                            thickness_nm: nm(&sub.thickness),
+                            material: sub.material_name.clone(),
+                            epsilon_r: sub.epsilon_r,
+                            loss_tangent: sub.loss_tangent,
+                            thickness_locked: sub.thickness_locked,
+                        })
+                        .collect();
+                }
+                Some(Details::Soldermask(mask)) => {
+                    out.material = mask.material_name.clone();
+                    out.epsilon_r = Some(mask.epsilon_r);
+                    out.loss_tangent = Some(mask.loss_tangent);
+                    out.thickness_nm = nm(&mask.thickness);
+                }
+                Some(Details::Silkscreen(silk)) => out.material = silk.material_name.clone(),
+                None => {}
+            }
+            out
+        })
+        .collect();
+
+    let edge = stackup.edge.as_ref();
+    IpcBoardStackup {
+        finish: stackup
+            .finish
+            .as_ref()
+            .map(|f| f.type_name.clone())
+            .unwrap_or_default(),
+        impedance_controlled: stackup.impedance.as_ref().is_some_and(|i| i.is_controlled),
+        edge_connector: match edge
+            .and_then(|e| e.connector.as_ref())
+            .map(|c| BoardEdgeConnectorType::try_from(c.r#type))
+        {
+            Some(Ok(BoardEdgeConnectorType::BectNone)) => "none",
+            Some(Ok(BoardEdgeConnectorType::BectPlain)) => "plain",
+            Some(Ok(BoardEdgeConnectorType::BectBeveled)) => "beveled",
+            _ => "unknown",
+        }
+        .to_string(),
+        has_edge_plating: edge
+            .and_then(|e| e.plating.as_ref())
+            .is_some_and(|p| p.has_edge_plating),
+        layers,
+    }
+}
+
 /// Decode an item only when it carries `type_name`. protobuf decoding is
 /// lenient — a `BoardText` body decodes as a `BoardGraphicShape` without
 /// error, yielding an item with no geometry and an empty UUID — so the
@@ -298,9 +519,123 @@ fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
 /// configured, or the NNG dial/send failed.
 ///
 /// Callers must classify with [`IpcFailure::from_error`], never by matching
-/// error text.
+/// error text. Why the request never arrived is read with
+/// [`unreachable_reason`]; the marker itself stays a constructible unit
+/// struct, so code that builds one keeps compiling and keeps classifying as
+/// unreachable.
 #[derive(Debug)]
 pub struct TransportUnreachable;
+
+/// The context layer that states an unreachable failure's message and records
+/// its classified reason, placed directly above [`TransportUnreachable`].
+///
+/// Its `Display` is the message alone, so an error chain renders exactly as it
+/// did when the context was a plain string.
+#[derive(Debug)]
+struct UnreachableDetail {
+    reason: UnreachableReason,
+    message: String,
+}
+
+impl std::fmt::Display for UnreachableDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// The error for a request that never reached KiCad, carrying `reason`.
+fn unreachable_error(reason: UnreachableReason, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TransportUnreachable).context(UnreachableDetail {
+        reason,
+        message: message.into(),
+    })
+}
+
+/// Why a request never reached KiCad.
+///
+/// Every variant needs a different fix, which is why they are kept apart:
+/// before #532 each of them surfaced only as `ipc_responsive: false`, and a
+/// user whose KiCad was listening could not tell that from one that was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreachableReason {
+    /// No endpoint address was configured or discovered.
+    NotConfigured,
+    /// Nothing is listening at the address: KiCad is closed, its API is
+    /// disabled, or the address was left behind by a closed session.
+    NoListener,
+    /// The operating system refused this account access to the endpoint.
+    /// That proves an authorization refusal, not who owns the endpoint. The
+    /// likely causes are an endpoint created by a different account — KiCad as
+    /// the desktop user while a sandboxed client runs Konnect as another — or
+    /// a restrictive ACL.
+    AccessDenied,
+    /// A listener accepted the connection but did not complete NNG's
+    /// handshake: it closed the connection, sent something that is not NNG,
+    /// or stayed silent past NNG's 10-second negotiation limit. Whatever holds
+    /// the address is probably not KiCad's API server (#531).
+    HandshakeFailed,
+    /// Any other dial or send failure.
+    TransportError,
+}
+
+impl UnreachableReason {
+    /// Classify the error NNG returned from a synchronous dial.
+    ///
+    /// Measured on Windows against named pipes: no pipe gives
+    /// `ConnectionRefused`, a pipe whose security descriptor grants this
+    /// account only read access gives `PermissionDenied`, a listener that
+    /// closes gives `Closed`, and one that never negotiates gives `TimedOut`
+    /// after 10 s. NNG's POSIX dialer maps `ENOENT` to `ECONNREFUSED` and
+    /// `EACCES` to `EPERM`, so Unix sockets land on the same variants.
+    pub fn from_dial_error(error: nng::Error) -> Self {
+        match error {
+            nng::Error::ConnectionRefused | nng::Error::EntryNotFound => Self::NoListener,
+            nng::Error::PermissionDenied => Self::AccessDenied,
+            nng::Error::TimedOut
+            | nng::Error::Closed
+            | nng::Error::ConnectionShutdown
+            | nng::Error::ConnectionReset
+            | nng::Error::ConnectionAborted
+            | nng::Error::Protocol => Self::HandshakeFailed,
+            _ => Self::TransportError,
+        }
+    }
+
+    /// The stable machine-readable name reported in tool responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::NoListener => "no_listener",
+            Self::AccessDenied => "access_denied",
+            Self::HandshakeFailed => "handshake_failed",
+            Self::TransportError => "transport_error",
+        }
+    }
+
+    /// What the failure means for the user.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "No KiCad IPC address is configured.",
+            Self::NoListener => {
+                "Nothing is listening there: KiCad may be closed, its API disabled \
+                 (Edit > Preferences > Plugins > 'Enable KiCad API'), or this address left \
+                 behind by a closed session."
+            }
+            Self::AccessDenied => {
+                "The operating system refused this account access to the endpoint. Likely \
+                 causes: the endpoint was created by a different account, as when a sandboxed \
+                 AI client (for example Codex on Windows) runs Konnect as a separate user, or \
+                 a restrictive ACL. Known workaround: run Konnect as the same operating-system \
+                 user as KiCad, outside the sandbox."
+            }
+            Self::HandshakeFailed => {
+                "A listener accepted the connection but did not complete NNG's handshake, so \
+                 it is probably not KiCad's API server; another program may hold this address."
+            }
+            Self::TransportError => "The connection failed before a request reached KiCad.",
+        }
+    }
+}
 
 impl std::fmt::Display for TransportUnreachable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -319,6 +654,74 @@ pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<TransportUnreachable>())
+}
+
+/// Why `error` never reached KiCad, or `None` when it did (or may have).
+///
+/// Classifies by type, never by message text: the [`TransportUnreachable`]
+/// marker decides whether the request was unreachable, and the reason comes
+/// from the detail layer above it. anyhow's `downcast_ref` searches every
+/// context layer, so context a caller adds later does not hide it. A marker
+/// built without that layer is an unclassified [`UnreachableReason::TransportError`].
+pub fn unreachable_reason(error: &anyhow::Error) -> Option<UnreachableReason> {
+    if !is_transport_unreachable(error) {
+        return None;
+    }
+    Some(
+        error
+            .downcast_ref::<UnreachableDetail>()
+            .map_or(UnreachableReason::TransportError, |detail| detail.reason),
+    )
+}
+
+/// What one bounded `Ping` established about the configured endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingOutcome {
+    /// KiCad answered the Ping with `AS_OK`.
+    Responsive,
+    /// The request never reached KiCad; `reason` says why.
+    Unreachable {
+        reason: UnreachableReason,
+        message: String,
+    },
+    /// The request did not complete and may have reached the endpoint. An
+    /// explicit KiCad error status (for example `AS_NOT_READY` while an editor
+    /// is still starting) proves receipt; a receive timeout, a malformed
+    /// reply, or a reply without a status does not. `message` carries KiCad's
+    /// status text when there was one.
+    RequestFailed { message: String },
+}
+
+impl PingOutcome {
+    pub fn is_responsive(&self) -> bool {
+        matches!(self, Self::Responsive)
+    }
+
+    /// The machine-readable failure kind, or `None` when the Ping succeeded
+    /// with `AS_OK`. An error status from KiCad is `request_failed`, not `None`.
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Responsive => None,
+            Self::Unreachable { reason, .. } => Some(reason.as_str()),
+            Self::RequestFailed { .. } => Some("request_failed"),
+        }
+    }
+
+    /// The full diagnostic for a failure, or `None` when the Ping succeeded
+    /// with `AS_OK`.
+    pub fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Responsive => None,
+            Self::Unreachable { message, .. } | Self::RequestFailed { message } => Some(message),
+        }
+    }
+}
+
+/// What `GetItems` said about one class of board items.
+enum Listed {
+    Items(Vec<prost_types::Any>),
+    /// KiCad declined to list the class at all.
+    Refused(UnavailableReason),
 }
 
 /// Typed KiCad response status for a request that completed a round trip.
@@ -407,6 +810,27 @@ pub enum BoardTargetError {
     },
 }
 
+/// A reference designator did not identify one exact placed footprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FootprintTargetError {
+    Missing { reference: String },
+    Ambiguous { reference: String, matches: usize },
+}
+
+impl std::fmt::Display for FootprintTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { reference } => write!(formatter, "Footprint '{reference}' not found"),
+            Self::Ambiguous { reference, matches } => write!(
+                formatter,
+                "Footprint reference '{reference}' is ambiguous: KiCad returned {matches} matches"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FootprintTargetError {}
+
 impl BoardTargetError {
     pub fn proves_not_open(&self) -> bool {
         matches!(
@@ -470,14 +894,20 @@ impl std::error::Error for BoardTargetError {}
 /// `Target` retains a typed board-identity decision. Only target errors whose
 /// [`BoardTargetError::proves_not_open`] is true may permit a file fallback.
 ///
-/// `Rejected` is everything else, including any error after a request was
-/// delivered (a receive timeout may mean KiCad is still processing it).
+/// `Uncertain` means no authoritative reply established the delivered
+/// request's outcome, or a transaction's rollback failed. `Rejected` covers
+/// the remaining failures, including explicit API refusals.
 /// KiCad is — or may be — alive on the other end, so a file edit could be
 /// silently overwritten on its next save. Fail closed.
 #[derive(Debug)]
 pub enum IpcFailure {
     Unreachable(String),
     Rejected(String),
+    /// A delivered request has no confirmed outcome. Never retry a mutation
+    /// or fall back to a file write on this evidence.
+    Uncertain(String),
+    /// A timed-out batch was dropped and its exact live snapshot restored.
+    Recovered(String),
     Target {
         error: BoardTargetError,
         message: String,
@@ -490,7 +920,11 @@ impl IpcFailure {
     /// message text.
     pub fn from_error(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if let Some(target) = error
+        if error.downcast_ref::<IpcOutcomeUnknown>().is_some() {
+            IpcFailure::Uncertain(message)
+        } else if error.downcast_ref::<IpcBatchRecovered>().is_some() {
+            IpcFailure::Recovered(message)
+        } else if let Some(target) = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<BoardTargetError>().cloned())
         {
@@ -509,9 +943,58 @@ impl IpcFailure {
         match self {
             IpcFailure::Unreachable(message)
             | IpcFailure::Rejected(message)
+            | IpcFailure::Uncertain(message)
+            | IpcFailure::Recovered(message)
             | IpcFailure::Target { message, .. } => message,
         }
     }
+}
+
+/// The request was sent, but no authoritative response was obtained.
+#[derive(Debug)]
+pub struct IpcOutcomeUnknown {
+    pub command: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for IpcOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KiCad IPC outcome unknown for {}: {}. Do not retry the mutation until the live board has been reconciled", self.command, self.reason)
+    }
+}
+
+impl std::error::Error for IpcOutcomeUnknown {}
+
+#[derive(Debug)]
+pub struct IpcBatchRecovered {
+    pub commit_id: String,
+}
+
+impl std::fmt::Display for IpcBatchRecovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KiCad batch {} aborted after a late reply; rollback confirmed and exact live snapshot restored", self.commit_id)
+    }
+}
+
+impl std::error::Error for IpcBatchRecovered {}
+
+#[derive(Debug)]
+struct LateReply;
+
+impl std::fmt::Display for LateReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KiCad answered after the operation timeout")
+    }
+}
+
+impl std::error::Error for LateReply {}
+
+struct RecoveryWindow {
+    document: kiapi::common::types::DocumentSpecifier,
+    contents: String,
+    receive_timeout: std::time::Duration,
+    budget: std::time::Duration,
+    deadline: Option<std::time::Instant>,
 }
 
 impl std::fmt::Display for IpcFailure {
@@ -525,6 +1008,7 @@ pub struct KiCadIpcClient {
     kicad_token: String,
     client_name: String,
     bound_board: std::sync::Mutex<Option<BoundBoardTarget>>,
+    recovery: Option<std::sync::Mutex<RecoveryWindow>>,
 }
 
 #[derive(Clone)]
@@ -554,6 +1038,7 @@ impl KiCadIpcClient {
             kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
             client_name: format!("konnect-{}", std::process::id()),
             bound_board: std::sync::Mutex::new(None),
+            recovery: None,
         }
     }
 
@@ -574,8 +1059,23 @@ impl KiCadIpcClient {
         command: &impl Message,
         type_name: &str,
     ) -> Result<Option<prost_types::Any>> {
+        self.send_command_within(command, type_name, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::send_command`], for a caller whose own deadline is shorter
+    /// than [`COMMAND_RECV_TIMEOUT`]: `recv_timeout` is how long this one call
+    /// may wait for KiCad's reply. Timing out that way is an ordinary reply
+    /// failure, not a [`TransportUnreachable`] one — the caller ran out of
+    /// patience, which is no evidence about the endpoint.
+    fn send_command_within(
+        &self,
+        command: &impl Message,
+        type_name: &str,
+        recv_timeout: std::time::Duration,
+    ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
-            return Err(anyhow::Error::new(TransportUnreachable).context(
+            return Err(unreachable_error(
+                UnreachableReason::NotConfigured,
                 "KiCAD IPC socket path not configured. To fix: \
                  (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
                  and copy the listed ipc:// address; \
@@ -611,13 +1111,35 @@ impl KiCadIpcClient {
         // Bound every step: a busy or wedged KiCAD must produce an error the
         // tools can surface, never an indefinite hang (the predecessor
         // project's sync/autoroute hangs blocked for >600 s on exactly this).
-        // 30 s receive allows slow board operations like zone refills.
+        // The receive bound is the caller's, so a caller on a deadline gets
+        // its own answer back by then rather than this command's default.
         use nng::options::Options;
+        let recovery_remaining = self.recovery_remaining()?;
+        let recv_timeout = if let Some(window) = &self.recovery {
+            let window = window
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
+            recovery_remaining
+                .unwrap_or(window.receive_timeout)
+                .min(recv_timeout)
+        } else {
+            recv_timeout
+        };
+        // Do not let the request timer retransmit a mutation while waiting
+        // for its original reply. Peer-disconnect resends are an NNG protocol
+        // limitation, so uncertainty still never authorizes automatic retry.
+        if self.recovery.is_some() {
+            socket.set_opt::<nng::options::protocol::reqrep::ResendTime>(None)?;
+        }
         socket
-            .set_opt::<nng::options::SendTimeout>(Some(std::time::Duration::from_secs(5)))
+            .set_opt::<nng::options::SendTimeout>(Some(
+                recovery_remaining
+                    .unwrap_or(COMMAND_SEND_TIMEOUT)
+                    .min(COMMAND_SEND_TIMEOUT),
+            ))
             .context("Failed to set NNG send timeout")?;
         socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(30)))
+            .set_opt::<nng::options::RecvTimeout>(Some(recv_timeout))
             .context("Failed to set NNG receive timeout")?;
 
         // Build the dial URL. inproc:// is same-process only — used by the
@@ -632,36 +1154,109 @@ impl KiCadIpcClient {
         };
 
         let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
-        socket.dial(&dial_url).map_err(|error| {
-            anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. KiCad may be \
-                 closed, its API disabled (Edit > Preferences > Plugins > \
-                 'Enable KiCad API'), or this address left behind by a closed \
-                 session (guide: \
-                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md)"
-            ))
+        let dial = if recovery_remaining.is_some() {
+            socket.dial_async(&dial_url)
+        } else {
+            socket.dial(&dial_url)
+        };
+        dial.map_err(|error| {
+            let reason = UnreachableReason::from_dial_error(error);
+            unreachable_error(
+                reason,
+                format!(
+                    "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: \
+                     https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+                    reason.explanation()
+                ),
+            )
         })?;
 
         // Send request
         let msg = nng::Message::from(request_bytes.as_slice());
         socket.send(msg).map_err(|(_, error)| {
-            anyhow::Error::new(TransportUnreachable).context(format!("NNG send failed: {error}"))
+            unreachable_error(
+                UnreachableReason::TransportError,
+                format!("NNG send failed: {error}"),
+            )
         })?;
 
-        // Receive response
-        let reply = socket
-            .recv()
-            .map_err(|e| anyhow::anyhow!("NNG recv failed: {}", e))?;
+        // NNG cancels a req0 request when recv times out; a second recv would
+        // be IncorrectState. Keep ONE receive alive through both windows and
+        // judge lateness by arrival time, without sending the request again.
+        let receive_started = std::time::Instant::now();
+        let receive_config = (|| -> Result<()> {
+            let timeout = if let Some(remaining) = self.recovery_remaining()? {
+                remaining
+            } else if let Some(window) = &self.recovery {
+                recv_timeout
+                    + window
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?
+                        .budget
+            } else {
+                recv_timeout
+            };
+            socket.set_opt::<nng::options::RecvTimeout>(Some(timeout))?;
+            Ok(())
+        })();
+        receive_config.map_err(|error| {
+            error.context(IpcOutcomeUnknown {
+                command: type_name.into(),
+                reason: "receive configuration failed after send".into(),
+            })
+        })?;
+        let reply = socket.recv().map_err(|e| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: type_name.to_string(),
+                reason: format!("NNG recv failed after send: {e}"),
+            })
+        })?;
+        let late = self.recovery.is_some()
+            && recovery_remaining.is_none()
+            && receive_started.elapsed() >= recv_timeout;
+        if late {
+            let mut window = self
+                .recovery
+                .as_ref()
+                .expect("checked recovery")
+                .lock()
+                .map_err(|_| IpcOutcomeUnknown {
+                    command: type_name.into(),
+                    reason: "recovery lock poisoned after late reply".into(),
+                })?;
+            window.deadline = Some(receive_started + recv_timeout + window.budget);
+        }
 
-        let response = kiapi::common::ApiResponse::decode(reply.as_slice())
-            .context("Failed to decode ApiResponse")?;
+        let response = kiapi::common::ApiResponse::decode(reply.as_slice()).map_err(|error| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: type_name.to_string(),
+                reason: format!("Failed to decode ApiResponse: {error}"),
+            })
+        })?;
 
         // A response without an envelope status is malformed, not success.
-        let status = response
-            .status
-            .as_ref()
-            .context("KiCad IPC response is missing its status")?;
-        let code = status.status();
+        let status = response.status.as_ref().ok_or_else(|| IpcOutcomeUnknown {
+            command: type_name.to_string(),
+            reason: "KiCad IPC response is missing its status".to_string(),
+        })?;
+        let code = kiapi::common::ApiStatusCode::try_from(status.status).map_err(|_| {
+            IpcOutcomeUnknown {
+                command: type_name.to_string(),
+                reason: "unknown response status code".into(),
+            }
+        })?;
+        if late {
+            // BeginCommit has no known id yet; EndCommit may have published.
+            // Neither may be followed by a blind drop.
+            if type_name.ends_with("BeginCommit") || type_name.ends_with("EndCommit") {
+                return Err(anyhow::Error::new(IpcOutcomeUnknown {
+                    command: type_name.to_string(),
+                    reason: "late transaction-boundary reply; no automatic rollback attempted"
+                        .into(),
+                }));
+            }
+            return Err(anyhow::Error::new(LateReply));
+        }
         if code != kiapi::common::ApiStatusCode::AsOk {
             let msg = if status.error_message.is_empty() {
                 format!("{:?}", code)
@@ -682,15 +1277,144 @@ impl KiCadIpcClient {
 
     // ─── Public API (same interface as before, tools don't change) ───────
 
+    fn recovery_remaining(&self) -> Result<Option<std::time::Duration>> {
+        let Some(window) = &self.recovery else {
+            return Ok(None);
+        };
+        let window = window
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
+        let Some(deadline) = window.deadline else {
+            return Ok(None);
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow::Error::new(IpcOutcomeUnknown {
+                command: "batch recovery".into(),
+                reason: "shared recovery deadline exhausted".into(),
+            }));
+        }
+        Ok(Some(remaining))
+    }
+
+    /// Opt one exact-board batch into bounded late-reply recovery. Ordinary
+    /// calls and other clients keep their existing timeout behavior.
+    pub fn run_commit_recovering_in<T>(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        description: &str,
+        operation: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        self.run_commit_recovering_with_limits(
+            document,
+            description,
+            operation,
+            COMMAND_RECV_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    fn run_commit_recovering_with_limits<T>(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        description: &str,
+        operation: impl FnOnce(&Self) -> Result<T>,
+        receive_timeout: std::time::Duration,
+        budget: std::time::Duration,
+    ) -> Result<T> {
+        anyhow::ensure!(
+            self.get_board_document()? == document,
+            "recovery target changed before batch"
+        );
+        let contents = self.recovery_snapshot_in(document.clone())?;
+        let scoped = Self {
+            socket_path: self.socket_path.clone(),
+            kicad_token: self.kicad_token.clone(),
+            client_name: self.client_name.clone(),
+            bound_board: std::sync::Mutex::new(
+                self.bound_board
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("bound board lock poisoned"))?
+                    .clone(),
+            ),
+            recovery: Some(std::sync::Mutex::new(RecoveryWindow {
+                document,
+                contents,
+                receive_timeout,
+                budget,
+                deadline: None,
+            })),
+        };
+        scoped.run_commit(description, operation)
+    }
+
+    fn recover_late_batch(&self, commit_id: &str) -> Result<()> {
+        let window = self.recovery.as_ref().context("no batch recovery window")?;
+        let (document, contents) = {
+            let window = window
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?;
+            (window.document.clone(), window.contents.clone())
+        };
+        self.recovery_remaining()?;
+        anyhow::ensure!(
+            self.get_board_document()? == document,
+            "recovery target changed before drop"
+        );
+        self.drop_commit(commit_id)?;
+        anyhow::ensure!(
+            self.get_board_document()? == document,
+            "recovery target changed after drop"
+        );
+        let observed = self.recovery_snapshot_in(document)?;
+        self.recovery_remaining()?;
+        anyhow::ensure!(observed == contents, "live snapshot differs after rollback");
+        Ok(())
+    }
+
+    fn recovery_snapshot_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<String> {
+        let response = unpack_required::<kiapi::common::commands::SavedDocumentResponse>(
+            self.send_command(
+                &kiapi::common::commands::SaveDocumentToString {
+                    document: Some(document.clone()),
+                },
+                "kiapi.common.commands.SaveDocumentToString",
+            )?,
+            "SaveDocumentToString",
+        )?;
+        anyhow::ensure!(
+            response.document.as_ref() == Some(&document),
+            "snapshot response names a different or missing document"
+        );
+        anyhow::ensure!(
+            !response.contents.is_empty(),
+            "KiCad returned an empty recovery snapshot"
+        );
+        Ok(response.contents)
+    }
+
     /// Check if KiCAD is reachable.
     pub fn ping(&self) -> Result<bool> {
+        Ok(self.ping_outcome().is_responsive())
+    }
+
+    /// Ping KiCad and report why it did not answer, when it did not.
+    ///
+    /// A request that never arrived ([`PingOutcome::Unreachable`]) is kept
+    /// apart from one that did not complete and may have arrived
+    /// ([`PingOutcome::RequestFailed`]),
+    /// and only the former carries an [`UnreachableReason`].
+    pub fn ping_outcome(&self) -> PingOutcome {
         let ping = kiapi::common::commands::Ping {};
         match self.send_command(&ping, "kiapi.common.commands.Ping") {
-            Ok(_) => Ok(true),
+            Ok(_) => PingOutcome::Responsive,
             Err(e) => {
-                // The address, because this is the one IPC failure that never
-                // reaches a caller as an error: `check_kicad_ui` reports the
-                // `false` and nothing else records which endpoint went unheard.
+                // The address, because a failed ping never reaches a caller as
+                // an error: callers that keep only `ping()`'s `false` leave the
+                // server log as the one record of which endpoint went unheard.
                 warn!(
                     "[BETA] Ping to {} failed: {}",
                     if self.socket_path.is_empty() {
@@ -700,7 +1424,17 @@ impl KiCadIpcClient {
                     },
                     e
                 );
-                Ok(false)
+                // An unreachable failure's outermost context is already the
+                // whole sentence; the chain below it is only the marker.
+                match unreachable_reason(&e) {
+                    Some(reason) => PingOutcome::Unreachable {
+                        reason,
+                        message: e.to_string(),
+                    },
+                    None => PingOutcome::RequestFailed {
+                        message: format!("{e:#}"),
+                    },
+                }
             }
         }
     }
@@ -1313,6 +2047,57 @@ impl KiCadIpcClient {
         self.get_items_in(self.get_board_document()?, item_type)
     }
 
+    /// Read native item boxes for an exact document. Missing, duplicated or
+    /// unexpected IDs are not geometry evidence (KiCad omits unresolved IDs).
+    pub fn get_item_boxes_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, kiapi::common::types::Box2>> {
+        let expected: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
+        anyhow::ensure!(
+            expected.len() == ids.len(),
+            "duplicate bounding-box request IDs"
+        );
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let command = kiapi::common::commands::GetBoundingBox {
+            header: Some(header_for(document)),
+            items: ids
+                .iter()
+                .map(|id| kiapi::common::types::Kiid { value: id.clone() })
+                .collect(),
+            mode: kiapi::common::commands::BoundingBoxMode::BbmItemOnly as i32,
+        };
+        let response = unpack_required::<kiapi::common::commands::GetBoundingBoxResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetBoundingBox")?,
+            "GetBoundingBox",
+        )?;
+        anyhow::ensure!(
+            response.items.len() == ids.len() && response.boxes.len() == ids.len(),
+            "incomplete native bounding-box response"
+        );
+        let mut boxes = std::collections::BTreeMap::new();
+        for (id, bounds) in response.items.into_iter().zip(response.boxes) {
+            anyhow::ensure!(
+                expected.contains(&id.value),
+                "unexpected bounding-box ID {}",
+                id.value
+            );
+            let size = bounds.size.as_ref().context("bounding box missing size")?;
+            anyhow::ensure!(
+                bounds.position.is_some() && size.x_nm >= 0 && size.y_nm >= 0,
+                "invalid native bounding box"
+            );
+            anyhow::ensure!(
+                boxes.insert(id.value, bounds).is_none(),
+                "duplicate native bounding-box ID"
+            );
+        }
+        Ok(boxes)
+    }
+
     /// As [`Self::get_items`], targeting a specific open document.
     pub fn get_items_in(
         &self,
@@ -1656,6 +2441,26 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Wait for the bound board to accept reads after an asynchronous operation.
+    /// Only KiCad's explicit AS_BUSY response is retried; mutations are never replayed.
+    pub fn wait_for_board_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.get_board_document() {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    let busy = ApiStatusError::from_error(&error).is_some_and(|status| {
+                        status.code == kiapi::common::ApiStatusCode::AsBusy as i32
+                    });
+                    if !busy || std::time::Instant::now() >= deadline {
+                        return Err(error.context("board readiness could not be established"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
     /// Save the open board document.
     pub fn save_board(&self) -> Result<()> {
         let doc = self.get_board_document()?;
@@ -1723,8 +2528,9 @@ impl KiCadIpcClient {
 
     /// Run a multi-step mutation as one KiCad undo transaction.
     ///
-    /// Any operation error, or a failure to publish the commit, triggers a
-    /// best-effort drop so callers never knowingly leave a partial batch.
+    /// Confirmed failures trigger a best-effort drop. An unknown delivered
+    /// request does not: a blind drop can race an unfinished mutation or a
+    /// commit that was already published. The caller must reconcile live state.
     pub fn run_commit<T>(
         &self,
         description: &str,
@@ -1736,17 +2542,26 @@ impl KiCadIpcClient {
         match operation_result {
             Err(panic) => {
                 if let Err(rollback_error) = self.drop_commit(&commit_id) {
-                    anyhow::bail!("KiCad batch panicked and rollback failed ({rollback_error})");
+                    return Err(anyhow::Error::new(IpcOutcomeUnknown {
+                        command: "EndCommit".to_string(),
+                        reason: format!("commit {commit_id}: batch panicked and rollback failed ({rollback_error:#})"),
+                    }));
                 }
                 std::panic::resume_unwind(panic)
             }
             Ok(Ok(value)) => {
                 if let Err(commit_error) = self.push_commit(&commit_id, description) {
+                    if commit_error.downcast_ref::<IpcOutcomeUnknown>().is_some() {
+                        return Err(commit_error).context(format!(
+                            "publish outcome unknown for commit {commit_id}; no blind rollback attempted"
+                        ));
+                    }
                     let rollback_error = self.drop_commit(&commit_id).err();
                     if let Some(rollback_error) = rollback_error {
-                        anyhow::bail!(
-                            "failed to publish KiCad commit ({commit_error}); rollback also failed ({rollback_error})"
-                        );
+                        return Err(commit_error.context(IpcOutcomeUnknown {
+                            command: "EndCommit".to_string(),
+                            reason: format!("commit {commit_id}: publish failed; rollback also failed ({rollback_error:#})"),
+                        }));
                     }
                     return Err(commit_error)
                         .context("failed to publish KiCad commit; changes dropped");
@@ -1754,10 +2569,28 @@ impl KiCadIpcClient {
                 Ok(value)
             }
             Ok(Err(operation_error)) => {
+                if operation_error.downcast_ref::<LateReply>().is_some() {
+                    return match self.recover_late_batch(&commit_id) {
+                        Ok(()) => Err(anyhow::Error::new(IpcBatchRecovered { commit_id })),
+                        Err(recovery_error) => Err(operation_error.context(IpcOutcomeUnknown {
+                            command: "batch recovery".into(),
+                            reason: format!("commit {commit_id}: recovery could not be confirmed ({recovery_error:#})"),
+                        })),
+                    };
+                }
+                if operation_error
+                    .downcast_ref::<IpcOutcomeUnknown>()
+                    .is_some()
+                {
+                    return Err(operation_error).context(format!(
+                        "batch outcome unknown for commit {commit_id}; no blind rollback attempted"
+                    ));
+                }
                 if let Err(rollback_error) = self.drop_commit(&commit_id) {
-                    anyhow::bail!(
-                        "KiCad batch failed ({operation_error}); rollback also failed ({rollback_error})"
-                    );
+                    return Err(operation_error.context(IpcOutcomeUnknown {
+                        command: "EndCommit".to_string(),
+                        reason: format!("commit {commit_id}: operation failed; rollback also failed ({rollback_error:#})"),
+                    }));
                 }
                 Err(operation_error).context("KiCad batch failed; changes dropped")
             }
@@ -1768,8 +2601,17 @@ impl KiCadIpcClient {
 
     /// Resolve a net name to its net code by querying GetNets.
     pub fn resolve_net_code(&self, net_name: &str) -> Result<i32> {
-        let nets = self.get_nets()?;
-        nets.iter()
+        self.resolve_net_code_in(self.get_board_document()?, net_name)
+    }
+
+    /// As [`Self::resolve_net_code`], targeting a specific open document.
+    pub fn resolve_net_code_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+    ) -> Result<i32> {
+        self.get_nets_in(document)?
+            .iter()
             .find(|n| n.name == net_name)
             .map(|n| n.netcode)
             .ok_or_else(|| anyhow::anyhow!("Net '{}' not found on board", net_name))
@@ -1842,12 +2684,21 @@ impl KiCadIpcClient {
                             .collect()
                     })
                     .unwrap_or_default();
+                let geometry = pad_geometry(&pad);
+                let uuid = kiid_value(pad.id.clone());
                 pads.push(IpcPad {
+                    uuid: (!uuid.is_empty()).then_some(uuid),
                     number: pad.number,
                     x: nm_to_mm(position.x_nm),
                     y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
                     layers,
+                    pad_type: pad_type_name(pad.r#type),
+                    rotation_deg: geometry.rotation_deg,
+                    shape: geometry.shape,
+                    size: geometry.size,
+                    drill: geometry.drill,
+                    copper_layers: geometry.copper_layers,
                 });
             }
             found = Some(pads);
@@ -1978,11 +2829,35 @@ impl KiCadIpcClient {
         x2: f64,
         y2: f64,
     ) -> Result<()> {
-        let net_code = self.resolve_net_code(net_name)?;
-        let track = crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2);
-        let any = crate::builders::pack_any(&track, "kiapi.board.types.Track");
-        self.create_items(vec![any])?;
-        Ok(())
+        self.add_tracks_in(
+            self.get_board_document()?,
+            net_name,
+            layer,
+            width,
+            &[(x1, y1, x2, y2)],
+        )
+    }
+
+    /// Add track segments `(x1, y1, x2, y2)` of one net to a specific open
+    /// document, in a single `CreateItems`.
+    pub fn add_tracks_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+        layer: &str,
+        width: f64,
+        segments: &[(f64, f64, f64, f64)],
+    ) -> Result<()> {
+        let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
+        let items = segments
+            .iter()
+            .map(|&(x1, y1, x2, y2)| {
+                let track =
+                    crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2);
+                crate::builders::pack_any(&track, "kiapi.board.types.Track")
+            })
+            .collect();
+        self.create_items_in(document, items)
     }
 
     /// Add a through via (F.Cu → B.Cu) to the board.
@@ -2383,6 +3258,443 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// The 3D models a placed footprint carries, read straight off its
+    /// `definition.items`. Used only for readback evidence — `flip_footprint`
+    /// never computes or writes a model transform itself; that is native
+    /// KiCad's job via `FlipItems`.
+    fn footprint_3d_models(
+        fp: &kiapi::board::types::FootprintInstance,
+    ) -> Result<Vec<crate::types::IpcFootprint3DModel>> {
+        let definition = fp
+            .definition
+            .as_ref()
+            .context("footprint readback has no definition, so its 3D models are unknown")?;
+        definition
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| crate::builders::any_is(item, "kiapi.board.types.Footprint3DModel"))
+            .map(|(index, item)| {
+                let model = kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())
+                    .with_context(|| {
+                        format!("3D model {index} is not valid Footprint3DModel evidence")
+                    })?;
+                let vector = |value: Option<kiapi::common::types::Vector3D>, field: &str| {
+                    value
+                        .map(|value| crate::types::IpcVector3 {
+                            x: value.x_nm,
+                            y: value.y_nm,
+                            z: value.z_nm,
+                        })
+                        .with_context(|| format!("3D model {index} has no {field} readback"))
+                };
+                Ok(crate::types::IpcFootprint3DModel {
+                    filename: model.filename,
+                    offset_mm: vector(model.offset, "offset_mm")?,
+                    rotation_degrees: vector(model.rotation, "rotation_degrees")?,
+                    scale: vector(model.scale, "scale")?,
+                    visible: model.visible,
+                    opacity: model.opacity,
+                })
+            })
+            .collect()
+    }
+
+    fn footprint_3d_model_message(
+        model: &crate::types::IpcFootprint3DModel,
+    ) -> kiapi::board::types::Footprint3DModel {
+        let vector = |value: crate::types::IpcVector3| kiapi::common::types::Vector3D {
+            x_nm: value.x,
+            y_nm: value.y,
+            z_nm: value.z,
+        };
+        kiapi::board::types::Footprint3DModel {
+            filename: model.filename.clone(),
+            scale: Some(vector(model.scale)),
+            rotation: Some(vector(model.rotation_degrees)),
+            offset: Some(vector(model.offset_mm)),
+            visible: model.visible,
+            opacity: model.opacity,
+        }
+    }
+
+    fn find_footprint_instance_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<kiapi::board::types::FootprintInstance> {
+        let mut matches = self
+            .get_items_in(
+                document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )?
+            .into_iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .filter(|footprint| {
+                footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    == Some(reference)
+            })
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => Err(FootprintTargetError::Missing {
+                reference: reference.to_string(),
+            }
+            .into()),
+            1 => Ok(matches.remove(0)),
+            matches => Err(FootprintTargetError::Ambiguous {
+                reference: reference.to_string(),
+                matches,
+            }
+            .into()),
+        }
+    }
+
+    /// Read one exact placed footprint's ordered 3D-model list from live KiCad.
+    pub fn footprint_3d_model_snapshot_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<crate::types::IpcFootprint3DModelSnapshot> {
+        let footprint = self.find_footprint_instance_in(document, reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        Ok(crate::types::IpcFootprint3DModelSnapshot {
+            reference: reference.to_string(),
+            kiid,
+            models: Self::footprint_3d_models(&footprint)?,
+        })
+    }
+
+    /// Edit one exact ordered 3D-model entry by updating the complete parent
+    /// footprint in one KiCad undo transaction, then prove the result through
+    /// a fresh readback. This method never saves the board.
+    pub fn edit_footprint_3d_models_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        expected_before: crate::types::IpcFootprint3DModelSnapshot,
+        edit: crate::types::IpcFootprint3DModelEdit,
+    ) -> Result<crate::types::IpcFootprint3DModelEditOutcome> {
+        use crate::types::IpcFootprint3DModelEdit::{Append, Remove, Replace};
+        use crate::types::IpcFootprint3DModelEditOutcome::{Applied, Conflict, Uncertain};
+
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let before = crate::types::IpcFootprint3DModelSnapshot {
+            reference: reference.to_string(),
+            kiid: footprint
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("footprint '{reference}' has no KIID"))?,
+            models: Self::footprint_3d_models(&footprint)?,
+        };
+        if before != expected_before {
+            return Ok(Conflict {
+                expected: expected_before,
+                observed: before,
+            });
+        }
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let model_positions = definition
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(position, item)| {
+                crate::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+
+        match &edit {
+            Append { model } => {
+                let insert_at = model_positions
+                    .last()
+                    .map(|position| position + 1)
+                    .unwrap_or(definition.items.len());
+                definition.items.insert(
+                    insert_at,
+                    crate::builders::pack_any(
+                        &Self::footprint_3d_model_message(model),
+                        "kiapi.board.types.Footprint3DModel",
+                    ),
+                );
+            }
+            Replace { index, model } => {
+                let position = *model_positions.get(*index).with_context(|| {
+                    format!(
+                        "3D-model index {index} is out of range for {} entries",
+                        model_positions.len()
+                    )
+                })?;
+                definition.items[position] = crate::builders::pack_any(
+                    &Self::footprint_3d_model_message(model),
+                    "kiapi.board.types.Footprint3DModel",
+                );
+            }
+            Remove { index } => {
+                let position = *model_positions.get(*index).with_context(|| {
+                    format!(
+                        "3D-model index {index} is out of range for {} entries",
+                        model_positions.len()
+                    )
+                })?;
+                definition.items.remove(position);
+            }
+        }
+
+        let expected_models = Self::footprint_3d_models(&footprint)?;
+        if expected_models == before.models {
+            return Ok(Applied {
+                before: before.clone(),
+                after: before,
+                changed: false,
+            });
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let mutation = self.run_commit("Edit placed footprint 3D models", |client| {
+            client.update_items_in(document.clone(), vec![packed])
+        });
+        let readback = self.footprint_3d_model_snapshot_in(document, reference);
+
+        match (mutation, readback) {
+            (Ok(()), Ok(after)) if after.kiid == before.kiid && after.models == expected_models => {
+                Ok(Applied {
+                    before,
+                    after,
+                    changed: true,
+                })
+            }
+            (Err(_), Ok(after))
+                if after.kiid == before.kiid && after.models == expected_models =>
+            {
+                Ok(Applied {
+                    before,
+                    after,
+                    changed: true,
+                })
+            }
+            (Err(error), Ok(after)) if after.kiid == before.kiid && after.models == before.models => {
+                Err(error).context("KiCad rejected the 3D-model edit; fresh readback confirmed the footprint is unchanged")
+            }
+            (mutation, readback) => Ok(Uncertain {
+                reference: reference.to_string(),
+                kiid: before.kiid,
+                expected_models,
+                observed_models: readback.ok().map(|snapshot| snapshot.models),
+                reason: match mutation {
+                    Ok(()) => "KiCad accepted the parent-footprint update, but fresh readback did not confirm the requested 3D-model list".to_string(),
+                    Err(error) => format!(
+                        "the parent-footprint update returned an error and fresh readback did not prove either the old or requested 3D-model list: {error:#}"
+                    ),
+                },
+            }),
+        }
+    }
+
+    /// Flip a placed footprint to `target_layer` ("F.Cu" or "B.Cu") using
+    /// KiCad 10.0.6's native `FlipItems` command, when the board is open live
+    /// in KiCad.
+    ///
+    /// Implements the contract accepted for issue #604:
+    ///
+    /// * The footprint is resolved by reference to its live KIID first —
+    ///   reference is discovery input, KIID is mutation identity, exactly
+    ///   like [`Self::move_footprint`].
+    /// * Already on the requested layer → a readback-derived no-op; no
+    ///   `FlipItems` call is made.
+    /// * Otherwise `FlipItems` is sent with `BFD_TOP_BOTTOM` (the same
+    ///   Y-coordinate reflection the closed-board file fallback performs)
+    ///   inside one KiCad commit/undo transaction. This method never saves.
+    /// * The protocol explicitly allows an envelope `IRS_OK` even when zero
+    ///   items were flipped, so that status is never treated as proof.
+    ///   Success requires exactly one `flipped_items` entry whose status is
+    ///   `ISC_OK` and whose returned item is a `FootprintInstance` carrying
+    ///   the requested KIID.
+    /// * After the mutation, a *fresh* read (never the mutation response)
+    ///   independently confirms the target layer, identity, and the
+    ///   footprint's 3D-model state.
+    /// * `AS_UNHANDLED`/`AS_UNIMPLEMENTED` is authoritative evidence that
+    ///   this KiCad build predates native `FlipItems`, never inferred from a
+    ///   version string.
+    pub fn flip_footprint(
+        &self,
+        reference: &str,
+        target_layer: &str,
+    ) -> Result<crate::types::IpcFlipOutcome> {
+        use crate::types::IpcFlipOutcome;
+
+        let target_board_layer = crate::builders::layer_from_name(target_layer);
+        let (fp, _) = self.find_footprint_instance(reference)?;
+        let kiid = fp
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID to flip"))?;
+        let previous_layer = layer_enum_to_name(fp.layer).to_string();
+
+        if fp.layer == target_board_layer as i32 {
+            return Ok(IpcFlipOutcome::Flipped {
+                reference: reference.to_string(),
+                kiid,
+                previous_layer: previous_layer.clone(),
+                layer: previous_layer,
+                already_on_layer: true,
+                models: Self::footprint_3d_models(&fp)?,
+            });
+        }
+
+        let flip_kiid = kiid.clone();
+        let commit_result = self.run_commit("Flip footprint", move |client| {
+            let doc = client.get_board_document()?;
+            let header = header_for(doc);
+            let cmd = kiapi::board::commands::FlipItems {
+                header: Some(header),
+                items: vec![kiapi::common::types::Kiid {
+                    value: flip_kiid.clone(),
+                }],
+                direction: kiapi::board::commands::BoardFlipDirection::BfdTopBottom as i32,
+            };
+            let response_any = client.send_command(&cmd, "kiapi.board.commands.FlipItems")?;
+            let response: kiapi::board::commands::FlipItemsResponse =
+                unpack_required(response_any, "FlipItems")?;
+
+            // The 10.0.6 protocol explicitly permits IRS_OK with zero flipped
+            // items (board_commands.proto, FlipItemsResponse.status doc
+            // comment) — envelope success is never, by itself, proof.
+            if response.flipped_items.len() != 1 {
+                anyhow::bail!(
+                    "KiCad returned {} flip results for 1 requested item",
+                    response.flipped_items.len()
+                );
+            }
+            let result = &response.flipped_items[0];
+            let status = result
+                .status
+                .as_ref()
+                .context("KiCad returned a flip result without an item status")?;
+            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
+                anyhow::bail!(
+                    "KiCad footprint flip failed: {} ({})",
+                    status.error_message,
+                    status.code().as_str_name()
+                );
+            }
+            let item_any = result
+                .item
+                .as_ref()
+                .context("KiCad returned an ISC_OK flip result without an item")?;
+            if !crate::builders::any_is(item_any, "kiapi.board.types.FootprintInstance") {
+                anyhow::bail!(
+                    "KiCad returned a flip result of unexpected type '{}'",
+                    crate::builders::any_type_name(item_any)
+                );
+            }
+            let flipped =
+                kiapi::board::types::FootprintInstance::decode(item_any.value.as_slice())
+                    .context("KiCad returned an unreadable flipped footprint")?;
+            let returned_kiid = flipped.id.as_ref().map(|k| k.value.as_str()).unwrap_or("");
+            if returned_kiid != flip_kiid {
+                anyhow::bail!(
+                    "KiCad flipped item '{returned_kiid}' does not match requested KIID '{flip_kiid}'"
+                );
+            }
+            Ok(())
+        });
+
+        if let Err(error) = commit_result {
+            if let Some(status) = ApiStatusError::from_error(&error) {
+                if status.is_unsupported() {
+                    let kicad_version = self.get_kicad_version().ok();
+                    return Ok(IpcFlipOutcome::Unsupported { kicad_version });
+                }
+            }
+            return Err(error);
+        }
+
+        // Fresh readback — never the mutation response — is the only
+        // evidence that counts for the final layer, identity and 3D-model
+        // state (accepted #604 contract).
+        let (readback_fp, _) = match self.find_footprint_instance(reference) {
+            Ok(found) => found,
+            Err(error) => {
+                return Ok(IpcFlipOutcome::Uncertain {
+                    reference: reference.to_string(),
+                    kiid,
+                    requested_layer: target_layer.to_string(),
+                    reason: format!(
+                        "post-flip readback could not resolve the footprint: {error:#}"
+                    ),
+                });
+            }
+        };
+        let readback_kiid = readback_fp
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .unwrap_or("");
+        if readback_kiid != kiid {
+            return Ok(IpcFlipOutcome::Uncertain {
+                reference: reference.to_string(),
+                kiid,
+                requested_layer: target_layer.to_string(),
+                reason: format!(
+                    "post-flip readback KIID '{readback_kiid}' does not match requested KIID"
+                ),
+            });
+        }
+        if readback_fp.layer != target_board_layer as i32 {
+            return Ok(IpcFlipOutcome::Uncertain {
+                reference: reference.to_string(),
+                kiid,
+                requested_layer: target_layer.to_string(),
+                reason: format!(
+                    "post-flip readback reports layer '{}', not the requested '{target_layer}'",
+                    layer_enum_to_name(readback_fp.layer)
+                ),
+            });
+        }
+
+        let models = match Self::footprint_3d_models(&readback_fp) {
+            Ok(models) => models,
+            Err(error) => {
+                return Ok(IpcFlipOutcome::Uncertain {
+                    reference: reference.to_string(),
+                    kiid,
+                    requested_layer: target_layer.to_string(),
+                    reason: format!(
+                        "post-flip readback could not establish 3D-model state: {error:#}"
+                    ),
+                });
+            }
+        };
+
+        Ok(IpcFlipOutcome::Flipped {
+            reference: reference.to_string(),
+            kiid,
+            previous_layer,
+            layer: layer_enum_to_name(readback_fp.layer).to_string(),
+            already_on_layer: false,
+            models,
+        })
+    }
+
     /// Rotate a footprint to a new angle.
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
@@ -2733,6 +4045,7 @@ impl KiCadIpcClient {
                     }) as i32,
                     knockout: false,
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    parent: None,
                 }),
                 visible,
             }
@@ -2926,66 +4239,216 @@ impl KiCadIpcClient {
             })
     }
 
-    /// Get board extents (bounding box of all items).
-    pub fn get_board_extents(&self) -> Result<IpcBoardExtents> {
-        self.get_board_extents_in(self.get_board_document()?)
-    }
-
-    /// As [`Self::get_board_extents`], targeting a specific open document.
-    pub fn get_board_extents_in(
+    /// Measure every item of an exact open board (#688).
+    ///
+    /// KiCad answers `GetBoundingBox` only for the KIIDs a request names: an
+    /// empty list returns no boxes on every board (measured on KiCad 10.0.5),
+    /// which is how this read used to report an empty board for all of them.
+    /// So each class of board item is listed with `GetItems`, one class per
+    /// request, and every KIID is measured in one `BBM_ITEM_ONLY` request
+    /// through [`Self::get_item_boxes_in`], which requires exactly one box
+    /// back for each.
+    ///
+    /// A class KiCad declines to list (`AS_BAD_REQUEST`) is named in
+    /// `unavailable` with KiCad's answer instead of vanishing from the read.
+    /// KiCad 10.0.5 declines tables and generators. Both are asked for on every
+    /// read: the bundled protocol has no message for either, so a KiCad that
+    /// does list them is reported too, with how many it listed. Any other
+    /// failure still fails the read.
+    ///
+    /// `BBM_ITEM_ONLY` leaves a footprint's text out of its box: board extents
+    /// mean board geometry, and footprint text can sit tens of millimetres off
+    /// a real board.
+    ///
+    /// KiCad 10.0.5 can list a KIID more than once (zones it generates on load
+    /// share them). Each KIID is measured once, and the response says how many
+    /// were shared rather than failing the read.
+    pub fn get_board_bounds_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<IpcBoardExtents> {
-        self.get_optional_board_extents_in(document)?
-            .context("No bounding box returned from KiCAD")
-    }
+    ) -> Result<IpcBoardBounds> {
+        use kiapi::board::types as board;
+        use kiapi::common::types::KiCadObjectType as Kind;
 
-    /// Return no bounds for a completely empty board instead of treating the
-    /// valid empty `GetBoundingBox` response as an IPC failure.
-    pub fn get_optional_board_extents_in(
-        &self,
-        document: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<Option<IpcBoardExtents>> {
-        // Use GetBoundingBox with no specific items = board extents
-        let header = header_for(document);
-        let cmd = kiapi::common::commands::GetBoundingBox {
-            header: Some(header),
-            items: vec![], // empty = all items
-            mode: kiapi::common::commands::BoundingBoxMode::BbmItemOnly as i32,
-        };
-        let resp_any = self.send_command(&cmd, "kiapi.common.commands.GetBoundingBox")?;
-        if let Some(any) = resp_any {
-            let resp: kiapi::common::commands::GetBoundingBoxResponse = unpack_any(&any)?;
-            if let Some(bbox) = resp.boxes.first() {
-                let pos = bbox.position.as_ref();
-                let size = bbox.size.as_ref();
-                return Ok(Some(IpcBoardExtents {
-                    min: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0),
-                    },
-                    max: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.x_nm))
-                                .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.y_nm))
-                                .unwrap_or(0.0),
-                    },
-                }));
+        fn kiid<M: Message + Default>(
+            item: &prost_types::Any,
+            id: impl Fn(&M) -> Option<&kiapi::common::types::Kiid>,
+        ) -> Result<String> {
+            let message = M::decode(item.value.as_slice())
+                .with_context(|| format!("KiCad sent an unreadable {}", item.type_url))?;
+            id(&message)
+                .map(|id| id.value.clone())
+                .filter(|id| !id.is_empty())
+                .with_context(|| format!("KiCad sent a {} without a KIID", item.type_url))
+        }
+
+        // (GetItems class, the message KiCad answers with, the response key)
+        const CLASSES: [(Kind, &str, &str); 11] = [
+            (
+                Kind::KotPcbFootprint,
+                "kiapi.board.types.FootprintInstance",
+                "footprints",
+            ),
+            (
+                Kind::KotPcbShape,
+                "kiapi.board.types.BoardGraphicShape",
+                "shapes",
+            ),
+            (Kind::KotPcbText, "kiapi.board.types.BoardText", "text"),
+            (
+                Kind::KotPcbTextbox,
+                "kiapi.board.types.BoardTextBox",
+                "text_boxes",
+            ),
+            (Kind::KotPcbTrace, "kiapi.board.types.Track", "tracks"),
+            (Kind::KotPcbArc, "kiapi.board.types.Arc", "arcs"),
+            (Kind::KotPcbVia, "kiapi.board.types.Via", "vias"),
+            (Kind::KotPcbZone, "kiapi.board.types.Zone", "zones"),
+            (
+                Kind::KotPcbDimension,
+                "kiapi.board.types.Dimension",
+                "dimensions",
+            ),
+            (Kind::KotPcbBarcode, "kiapi.board.types.Barcode", "barcodes"),
+            (
+                Kind::KotPcbReferenceImage,
+                "kiapi.board.types.ReferenceImage",
+                "reference_images",
+            ),
+        ];
+
+        // Classes the bundled protocol has no item message for. A table's or a
+        // generator's own box can reach past anything listed above: on the
+        // Jetson demo, 164 of 167 tuning patterns extend up to 3.99 mm beyond
+        // their member tracks.
+        const UNREADABLE: [(Kind, &str); 2] = [
+            (Kind::KotPcbTable, "tables"),
+            (Kind::KotPcbGenerator, "generators"),
+        ];
+
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut measured = std::collections::BTreeMap::new();
+        let mut shared_kiid_count = 0;
+        let mut unavailable = Vec::new();
+        for (kind, message, key) in CLASSES {
+            let items = match self.list_class_in(document.clone(), kind, key)? {
+                Listed::Items(items) => items,
+                Listed::Refused(reason) => {
+                    unavailable.push(IpcUnavailableItemClass {
+                        class: key.to_string(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            for item in &items {
+                anyhow::ensure!(
+                    crate::builders::any_is(item, message),
+                    "KiCad answered a request for {key} with a {}",
+                    item.type_url
+                );
+                let id = match kind {
+                    Kind::KotPcbFootprint => {
+                        kiid::<board::FootprintInstance>(item, |m| m.id.as_ref())
+                    }
+                    Kind::KotPcbShape => kiid::<board::BoardGraphicShape>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbText => kiid::<board::BoardText>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbTextbox => kiid::<board::BoardTextBox>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbTrace => kiid::<board::Track>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbArc => kiid::<board::Arc>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbVia => kiid::<board::Via>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbZone => kiid::<board::Zone>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbDimension => kiid::<board::Dimension>(item, |m| m.id.as_ref()),
+                    Kind::KotPcbBarcode => kiid::<board::Barcode>(item, |m| m.id.as_ref()),
+                    _ => kiid::<board::ReferenceImage>(item, |m| m.id.as_ref()),
+                }?;
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                } else {
+                    shared_kiid_count += 1;
+                }
+            }
+            if !items.is_empty() {
+                measured.insert(key.to_string(), items.len());
             }
         }
-        Ok(None)
+        for (kind, key) in UNREADABLE {
+            let reason = match self.list_class_in(document.clone(), kind, key)? {
+                Listed::Refused(reason) => reason,
+                Listed::Items(items) if items.is_empty() => continue,
+                Listed::Items(items) => UnavailableReason::Undecodable {
+                    listed_count: items.len(),
+                },
+            };
+            unavailable.push(IpcUnavailableItemClass {
+                class: key.to_string(),
+                reason,
+            });
+        }
+
+        let boxes = self.get_item_boxes_in(document, &ids)?;
+        let mut extents: Option<IpcBoardExtents> = None;
+        for bounds in boxes.values() {
+            let (position, size) = (bounds.position.as_ref(), bounds.size.as_ref());
+            let (Some(position), Some(size)) = (position, size) else {
+                anyhow::bail!("KiCad returned a bounding box without a position or size");
+            };
+            let (x0, y0) = (
+                crate::builders::nm_to_mm(position.x_nm),
+                crate::builders::nm_to_mm(position.y_nm),
+            );
+            let (x1, y1) = (
+                crate::builders::nm_to_mm(position.x_nm + size.x_nm),
+                crate::builders::nm_to_mm(position.y_nm + size.y_nm),
+            );
+            extents = Some(match extents {
+                None => IpcBoardExtents {
+                    min: IpcVector2 { x: x0, y: y0 },
+                    max: IpcVector2 { x: x1, y: y1 },
+                },
+                Some(e) => IpcBoardExtents {
+                    min: IpcVector2 {
+                        x: e.min.x.min(x0),
+                        y: e.min.y.min(y0),
+                    },
+                    max: IpcVector2 {
+                        x: e.max.x.max(x1),
+                        y: e.max.y.max(y1),
+                    },
+                },
+            });
+        }
+        Ok(IpcBoardBounds {
+            extents,
+            measured,
+            shared_kiid_count,
+            unavailable,
+        })
+    }
+
+    /// List one class for [`Self::get_board_bounds_in`], separating KiCad's
+    /// refusal of the class from a failure of the read.
+    fn list_class_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        kind: kiapi::common::types::KiCadObjectType,
+        key: &str,
+    ) -> Result<Listed> {
+        match self.get_items_of_types_in(document, &[kind]) {
+            Ok(items) => Ok(Listed::Items(items)),
+            Err(error) => match ApiStatusError::from_error(&error) {
+                Some(status)
+                    if status.code == kiapi::common::ApiStatusCode::AsBadRequest as i32 =>
+                {
+                    Ok(Listed::Refused(UnavailableReason::Refused {
+                        status: status.code_name.clone(),
+                        message: status.message.clone(),
+                    }))
+                }
+                _ => Err(error.context(format!("KiCad did not list the board's {key}"))),
+            },
+        }
     }
 
     /// Get enabled layers.
@@ -3011,11 +4474,12 @@ impl KiCadIpcClient {
             board: Some(document),
         };
         let resp_any = self.send_command(&cmd, "kiapi.board.commands.GetBoardEnabledLayers")?;
+        // No board has zero enabled layers — Edge.Cuts and the courtyards
+        // cannot be disabled. An `AS_OK` with no body is KiCad declining to
+        // answer, and returning it as an empty stackup would report that
+        // non-answer as the board's live layer set.
         let Some(any) = resp_any else {
-            return Ok(IpcEnabledLayers {
-                copper_layer_count: 0,
-                layers: vec![],
-            });
+            anyhow::bail!("KiCad returned no enabled-layer set for the requested board");
         };
         let resp: kiapi::board::commands::BoardEnabledLayersResponse = unpack_any(&any)?;
         let layers = resp
@@ -3032,6 +4496,7 @@ impl KiCadIpcClient {
                         .to_string(),
                     id: l,
                     kind: String::new(),
+                    display_name: None,
                 }
             })
             .collect();
@@ -3039,6 +4504,151 @@ impl KiCadIpcClient {
             copper_layer_count: resp.copper_layer_count,
             layers,
         })
+    }
+
+    /// As [`Self::get_enabled_layers_in`], also resolving the name KiCad shows
+    /// for each layer, within [`LAYER_NAME_BUDGET`].
+    ///
+    /// `GetBoardEnabledLayers` answers with layer ids only, and the name a user
+    /// sees may be a rename held in the editor. `GetBoardLayerName` is the only
+    /// command that knows it, and it takes one layer per call, so the round
+    /// trips are KiCad's shape rather than a choice.
+    pub fn get_enabled_layers_with_names_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcEnabledLayers> {
+        self.get_enabled_layers_named_within(document, LAYER_NAME_BUDGET)
+    }
+
+    /// The same, with an explicit budget for the name lookups — for a caller
+    /// on a tighter deadline than [`LAYER_NAME_BUDGET`], and for tests, which
+    /// can exhaust it without waiting on a wedged KiCad.
+    ///
+    /// `budget` bounds the waiting, not merely the starting: the lookups stop
+    /// once it is spent, and each one that does start waits at most what is
+    /// left of it.
+    pub fn get_enabled_layers_named_within(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        budget: std::time::Duration,
+    ) -> Result<IpcEnabledLayers> {
+        let mut enabled = self.get_enabled_layers_in(document.clone())?;
+        let deadline = std::time::Instant::now() + budget;
+        for (resolved, layer) in enabled.layers.iter_mut().enumerate() {
+            // Every command opens its own socket, and each one of these is a
+            // whole round trip, so at the default receive timeout a KiCad that
+            // stops answering partway through a full stackup would hold this
+            // read for a quarter of an hour. The names are a nicety — the
+            // canonical name is always there — so they get a budget.
+            //
+            // The budget has to be the receive timeout too, not just the
+            // gate on starting another lookup: a lookup begun a millisecond
+            // before the deadline would otherwise wait out the default
+            // 30 s on its own, and overrun the bound by three times over.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    named = resolved,
+                    unnamed = enabled.layers.len() - resolved,
+                    budget_secs = budget.as_secs_f64(),
+                    "KiCad is answering layer-name lookups too slowly; reporting the canonical \
+                     name for the rest"
+                );
+                break;
+            }
+            match self.get_board_layer_name_within(document.clone(), layer.id, remaining) {
+                Ok(name) => layer.display_name = Some(name),
+                // A KiCad that declines one layer's name has still answered,
+                // and the enabled set it gave is good. Leaving `display_name`
+                // unset says so, and beats failing a whole live read over one
+                // cosmetic lookup — callers fall back to the canonical name.
+                Err(error) if !crate::is_transport_unreachable(&error) => {
+                    tracing::warn!(
+                        layer = layer.id,
+                        error = %error,
+                        "KiCad did not name this board layer; reporting its canonical name"
+                    );
+                }
+                // A transport that died mid-loop is different in kind: the
+                // editor may be gone, so the partial read must not be dressed
+                // up as a complete live answer.
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(enabled)
+    }
+
+    /// The name KiCad shows for one layer of an open board — the canonical
+    /// spelling, or the user's rename of it.
+    pub fn get_board_layer_name_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: i32,
+    ) -> Result<String> {
+        self.get_board_layer_name_within(document, layer, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::get_board_layer_name_in`], waiting at most `recv_timeout`
+    /// for the reply — the remaining share of a caller's naming budget.
+    fn get_board_layer_name_within(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: i32,
+        recv_timeout: std::time::Duration,
+    ) -> Result<String> {
+        let cmd = kiapi::board::commands::GetBoardLayerName {
+            board: Some(document),
+            layer,
+        };
+        let resp: kiapi::board::commands::BoardLayerNameResponse = unpack_required(
+            self.send_command_within(&cmd, "kiapi.board.commands.GetBoardLayerName", recv_timeout)?,
+            "GetBoardLayerName",
+        )?;
+        Ok(resp.name)
+    }
+
+    /// The requested board's physical stackup, top to bottom, through
+    /// `GetBoardStackup`.
+    ///
+    /// KiCad serves the board's own stackup, or its default one when the board
+    /// defines none, and the answer does not say which. KiCad 10 declares
+    /// `UpdateBoardStackup` but does not implement it, so this is read-only.
+    pub fn get_board_stackup_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcBoardStackup> {
+        let any = self.get_board_stackup_response_in(document)?;
+        let resp: kiapi::board::commands::BoardStackupResponse = unpack_any(&any)?;
+        let stackup = resp
+            .stackup
+            .context("KiCad's BoardStackupResponse carries no stackup")?;
+        Ok(stackup_from_proto(&stackup))
+    }
+
+    /// KiCad's `GetBoardStackup` answer for the requested board as KiCad sent
+    /// it, checked to be a `BoardStackupResponse` and not decoded, as
+    /// [`Self::get_items_in`] returns items. A capture of KiCad's own message
+    /// is taken from this.
+    pub fn get_board_stackup_response_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<prost_types::Any> {
+        let cmd = kiapi::board::commands::GetBoardStackup {
+            board: Some(document),
+        };
+        let resp_any = self.send_command(&cmd, "kiapi.board.commands.GetBoardStackup")?;
+        // Every board has copper, so an `AS_OK` with no body is KiCad declining
+        // to answer, not a board without a stackup.
+        let Some(any) = resp_any else {
+            anyhow::bail!("KiCad returned no stackup for the requested board");
+        };
+        if !crate::builders::any_is(&any, "kiapi.board.commands.BoardStackupResponse") {
+            anyhow::bail!(
+                "KiCad answered GetBoardStackup with '{}', not a BoardStackupResponse",
+                any.type_url
+            );
+        }
+        Ok(any)
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
@@ -3824,8 +5434,381 @@ fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
 }
 
 #[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use nng::options::Options;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Scenario {
+        Success,
+        Late,
+        Exhausted,
+        DropFailed,
+        Changed,
+        TargetChanged,
+        Malformed,
+        PublishLate,
+        CleanupSlow,
+        WrongSnapshot,
+        ObserveFailed,
+        BeginLate,
+    }
+
+    fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Duration) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let address = format!(
+            "inproc://bounded-recovery-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&address).unwrap();
+        let control = server.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let project_directory = tempfile::tempdir().unwrap();
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: "test".into(),
+                path: project_directory.path().to_string_lossy().into_owned(),
+            }),
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "test.kicad_pcb".into(),
+                ),
+            ),
+        };
+        let target = document.clone();
+        let worker = std::thread::spawn(move || {
+            let mut mutated = false;
+            let mut dropped = false;
+            while let Ok(request) = server.recv() {
+                let request = kiapi::common::ApiRequest::decode(request.as_slice()).unwrap();
+                let message = request.message.unwrap();
+                let name = message.type_url.rsplit('.').next().unwrap().to_string();
+                observed.lock().unwrap().push(name.clone());
+                let mut response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                match name.as_str() {
+                    "GetOpenDocuments" => {
+                        let mut doc = target.clone();
+                        if mutated && matches!(scenario, Scenario::TargetChanged) {
+                            doc.identifier = Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    "other.kicad_pcb".into(),
+                                ),
+                            );
+                        }
+                        response.message = Some(pack_any(
+                            &kiapi::common::commands::GetOpenDocumentsResponse {
+                                documents: vec![doc],
+                            },
+                            "kiapi.common.commands.GetOpenDocumentsResponse",
+                        ));
+                    }
+                    "SaveDocumentToString" => {
+                        let command = kiapi::common::commands::SaveDocumentToString::decode(
+                            message.value.as_slice(),
+                        )
+                        .unwrap();
+                        assert_eq!(command.document, Some(target.clone()));
+                        let fixture = include_str!(
+                            "../../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb"
+                        );
+                        let contents =
+                            if mutated && (!dropped || matches!(scenario, Scenario::Changed)) {
+                                format!("{fixture}\n; changed")
+                            } else {
+                                fixture.into()
+                            };
+                        if mutated && matches!(scenario, Scenario::ObserveFailed) {
+                            response.status = None;
+                        }
+                        response.message = Some(pack_any(
+                            &kiapi::common::commands::SavedDocumentResponse {
+                                document: if mutated && matches!(scenario, Scenario::WrongSnapshot)
+                                {
+                                    None
+                                } else {
+                                    Some(target.clone())
+                                },
+                                contents,
+                            },
+                            "kiapi.common.commands.SavedDocumentResponse",
+                        ));
+                    }
+                    "BeginCommit" => {
+                        if matches!(scenario, Scenario::BeginLate) {
+                            std::thread::sleep(Duration::from_millis(140));
+                        }
+                        response.message = Some(pack_any(
+                            &kiapi::common::commands::BeginCommitResponse {
+                                id: Some(kiapi::common::types::Kiid {
+                                    value: "known-commit".into(),
+                                }),
+                            },
+                            "kiapi.common.commands.BeginCommitResponse",
+                        ))
+                    }
+                    "Ping" => {
+                        mutated = true;
+                        if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
+                            std::thread::sleep(if matches!(scenario, Scenario::Exhausted) {
+                                Duration::from_millis(800)
+                            } else {
+                                Duration::from_millis(140)
+                            });
+                        }
+                        if matches!(scenario, Scenario::Malformed) {
+                            response.status = None;
+                        }
+                    }
+                    "EndCommit" => {
+                        let command =
+                            kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                                .unwrap();
+                        assert_eq!(command.id.unwrap().value, "known-commit");
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(format!("action:{}", command.action));
+                        if matches!(scenario, Scenario::PublishLate) {
+                            std::thread::sleep(Duration::from_millis(140));
+                        }
+                        if matches!(scenario, Scenario::CleanupSlow) {
+                            std::thread::sleep(Duration::from_millis(480));
+                        }
+                        if matches!(scenario, Scenario::DropFailed) {
+                            response.status.as_mut().unwrap().status =
+                                kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                        } else if command.action
+                            == kiapi::common::commands::CommitAction::CmaDrop as i32
+                        {
+                            dropped = true;
+                        }
+                        response.message = Some(pack_any(
+                            &kiapi::common::commands::EndCommitResponse {},
+                            "kiapi.common.commands.EndCommitResponse",
+                        ));
+                    }
+                    other => panic!("unexpected {other}"),
+                }
+                if server.send(response.encode_to_vec().as_slice()).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let result = KiCadIpcClient::new(address).run_commit_recovering_with_limits(
+            document,
+            "test",
+            |client| {
+                client.send_command(
+                    &kiapi::common::commands::Ping {},
+                    "kiapi.common.commands.Ping",
+                )?;
+                Ok(())
+            },
+            Duration::from_millis(60),
+            Duration::from_millis(400),
+        );
+        let elapsed = started.elapsed();
+        control.close();
+        worker.join().unwrap();
+        let calls = calls.lock().unwrap().clone();
+        (result, calls, elapsed)
+    }
+
+    #[test]
+    fn bounded_recovery_success_and_late_abort() {
+        let (result, calls, _) = exercise(Scenario::Success);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls.iter().filter(|s| s.starts_with("action:")).count(), 1);
+        assert!(calls.contains(&format!(
+            "action:{}",
+            kiapi::common::commands::CommitAction::CmaCommit as i32
+        )));
+        let (result, calls, _) = exercise(Scenario::Late);
+        let failure = IpcFailure::from_error(result.unwrap_err());
+        assert!(
+            matches!(failure, IpcFailure::Recovered(_)),
+            "{failure:?}; {calls:?}"
+        );
+        assert_eq!(calls.iter().filter(|s| *s == "Ping").count(), 1);
+        assert!(calls.contains(&format!(
+            "action:{}",
+            kiapi::common::commands::CommitAction::CmaDrop as i32
+        )));
+        assert!(!calls.contains(&format!(
+            "action:{}",
+            kiapi::common::commands::CommitAction::CmaCommit as i32
+        )));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|s| *s == "SaveDocumentToString")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn bounded_recovery_never_claims_unproven_rollback() {
+        for scenario in [
+            Scenario::Exhausted,
+            Scenario::DropFailed,
+            Scenario::Changed,
+            Scenario::TargetChanged,
+            Scenario::Malformed,
+            Scenario::PublishLate,
+            Scenario::CleanupSlow,
+            Scenario::WrongSnapshot,
+            Scenario::ObserveFailed,
+            Scenario::BeginLate,
+        ] {
+            let (result, calls, elapsed) = exercise(scenario);
+            let failure = IpcFailure::from_error(result.unwrap_err());
+            assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
+            assert!(
+                elapsed < Duration::from_millis(650),
+                "shared budget exceeded: {elapsed:?}"
+            );
+            if matches!(
+                scenario,
+                Scenario::Exhausted
+                    | Scenario::TargetChanged
+                    | Scenario::Malformed
+                    | Scenario::BeginLate
+            ) {
+                assert!(!calls.iter().any(|s| s == "EndCommit"));
+            }
+            if matches!(scenario, Scenario::PublishLate) {
+                assert!(!calls.contains(&format!(
+                    "action:{}",
+                    kiapi::common::commands::CommitAction::CmaDrop as i32
+                )));
+            }
+        }
+    }
+
+    /// The proxy forwards an actual mutation to KiCad, then withholds ONLY
+    /// that reply. The rollback must restore actual serialized live state.
+    #[test]
+    #[ignore = "requires KONNECT_LIVE_RECOVERY_BOARD (disposable open PCB) and enabled KiCad API"]
+    fn bounded_recovery_live_delayed_create_restores_snapshot() {
+        let board = PathBuf::from(
+            std::env::var("KONNECT_LIVE_RECOVERY_BOARD").expect("disposable board path required"),
+        );
+        let real_address = std::env::var("KICAD_API_SOCKET")
+            .ok()
+            .or_else(crate::socket::detect_ipc_address)
+            .expect("KiCad IPC address required");
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let address = format!("inproc://live-recovery-{}", std::process::id());
+        server.listen(&address).unwrap();
+        let control = server.clone();
+        let worker = std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                let envelope = kiapi::common::ApiRequest::decode(request.as_slice()).unwrap();
+                let mutation = envelope
+                    .message
+                    .as_ref()
+                    .is_some_and(|m| m.type_url.ends_with("CreateItems"));
+                let upstream = nng::Socket::new(nng::Protocol::Req0).unwrap();
+                upstream
+                    .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(5)))
+                    .unwrap();
+                upstream
+                    .set_opt::<nng::options::SendTimeout>(Some(Duration::from_secs(5)))
+                    .unwrap();
+                upstream.dial(&real_address).unwrap();
+                upstream.send(request.as_slice()).unwrap();
+                let response = upstream.recv().unwrap();
+                if mutation {
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                if server.send(response.as_slice()).is_err() {
+                    break;
+                }
+            }
+        });
+        let client = KiCadIpcClient::new(address);
+        let outcome = (|| -> Result<()> {
+            let document = client.find_open_board(&board)?;
+            let before = client.recovery_snapshot_in(document.clone())?;
+            let track = crate::builders::build_track("", 0, "F.Cu", 0.25, 5.0, 5.0, 6.0, 5.0);
+            let result = client.run_commit_recovering_with_limits(
+                document.clone(),
+                "recovery regression",
+                |client| {
+                    client.create_items_in(
+                        document.clone(),
+                        vec![pack_any(&track, "kiapi.board.types.Track")],
+                    )?;
+                    Ok(())
+                },
+                Duration::from_millis(500),
+                Duration::from_secs(5),
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(()) => anyhow::bail!("the proxy's late response did not abort the batch"),
+            };
+            anyhow::ensure!(
+                error.downcast_ref::<IpcBatchRecovered>().is_some(),
+                "{error:#}"
+            );
+            anyhow::ensure!(
+                client.recovery_snapshot_in(document)? == before,
+                "live board was not restored"
+            );
+            Ok(())
+        })();
+        control.close();
+        worker.join().unwrap();
+        outcome.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn receive_timeout_is_typed_unknown_not_unreachable() {
+        use nng::options::Options;
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let address = format!("inproc://timeout-marker-{}", std::process::id());
+        socket.listen(&address).unwrap();
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let _request = socket.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let error = KiCadIpcClient::new(address)
+            .send_command_within(
+                &kiapi::common::commands::Ping {},
+                "kiapi.common.commands.Ping",
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<IpcOutcomeUnknown>().is_some());
+        assert!(!is_transport_unreachable(&error));
+        assert!(matches!(
+            IpcFailure::from_error(error),
+            IpcFailure::Uncertain(_)
+        ));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn dial_failure_does_not_expose_endpoint_secrets() {
@@ -3842,6 +5825,108 @@ mod diagnostic_tests {
         assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
         assert!(!diagnostic.contains("secret"), "{diagnostic}");
         assert!(!diagnostic.contains("hidden"), "{diagnostic}");
+    }
+
+    #[test]
+    fn each_dial_error_maps_to_the_reason_whose_fix_applies() {
+        use UnreachableReason::*;
+        let cases = [
+            (nng::Error::ConnectionRefused, NoListener),
+            (nng::Error::EntryNotFound, NoListener),
+            (nng::Error::PermissionDenied, AccessDenied),
+            (nng::Error::TimedOut, HandshakeFailed),
+            (nng::Error::Closed, HandshakeFailed),
+            (nng::Error::ConnectionShutdown, HandshakeFailed),
+            (nng::Error::ConnectionReset, HandshakeFailed),
+            (nng::Error::ConnectionAborted, HandshakeFailed),
+            (nng::Error::Protocol, HandshakeFailed),
+            (nng::Error::AddressInvalid, TransportError),
+            (nng::Error::OutOfMemory, TransportError),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                UnreachableReason::from_dial_error(error),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reason_has_a_distinct_name_and_its_own_explanation() {
+        use UnreachableReason::*;
+        let all = [
+            NotConfigured,
+            NoListener,
+            AccessDenied,
+            HandshakeFailed,
+            TransportError,
+        ];
+        let names: std::collections::HashSet<_> = all.iter().map(|r| r.as_str()).collect();
+        let explanations: std::collections::HashSet<_> =
+            all.iter().map(|r| r.explanation()).collect();
+        assert_eq!(names.len(), all.len());
+        assert_eq!(explanations.len(), all.len());
+        assert!(AccessDenied
+            .explanation()
+            .contains("same operating-system user"));
+    }
+
+    #[test]
+    fn an_unconfigured_client_reports_not_configured() {
+        let mut client = KiCadIpcClient::new("");
+        client.socket_path.clear();
+        let outcome = client.ping_outcome();
+        assert!(!outcome.is_responsive());
+        assert_eq!(
+            outcome.failure_kind(),
+            Some("not_configured"),
+            "{outcome:?}"
+        );
+        assert!(!client.ping().unwrap());
+    }
+
+    #[test]
+    fn the_reason_is_read_from_the_marker_never_from_the_text() {
+        let lookalike =
+            anyhow::anyhow!("Cannot connect to KiCad IPC at ipc://x: Permission denied");
+        assert_eq!(unreachable_reason(&lookalike), None);
+
+        let marked = unreachable_error(UnreachableReason::AccessDenied, "refused")
+            .context("outer context")
+            .context("outermost context");
+        assert_eq!(
+            unreachable_reason(&marked),
+            Some(UnreachableReason::AccessDenied)
+        );
+        assert!(is_transport_unreachable(&marked));
+    }
+
+    #[test]
+    fn a_marker_built_the_old_way_still_classifies_as_unreachable() {
+        // `TransportUnreachable` stays a constructible unit struct (#535
+        // review): code that builds one without a reason must still compile
+        // and still be treated as unreachable, just unclassified.
+        let bare = anyhow::Error::new(TransportUnreachable).context("caller context");
+        assert!(is_transport_unreachable(&bare));
+        assert!(matches!(
+            IpcFailure::from_error(anyhow::Error::new(TransportUnreachable)),
+            IpcFailure::Unreachable(_)
+        ));
+        assert_eq!(
+            unreachable_reason(&bare),
+            Some(UnreachableReason::TransportError)
+        );
+    }
+
+    #[test]
+    fn a_classified_failure_renders_its_chain_as_a_string_context_did() {
+        let error = unreachable_error(UnreachableReason::NoListener, "Cannot connect to KiCad");
+        assert_eq!(error.to_string(), "Cannot connect to KiCad");
+        assert_eq!(
+            format!("{error:#}"),
+            "Cannot connect to KiCad: KiCad IPC transport unreachable"
+        );
     }
 }
 
@@ -4798,5 +6883,172 @@ mod footprint_graphic_tests {
             (anchor.0, anchor.1 - builders::mm_to_nm(2.0)),
             "local +X must rotate to board -Y"
         );
+    }
+}
+
+#[cfg(test)]
+mod stackup_tests {
+    use super::*;
+    use kiapi::board::board_stackup_layer::Details;
+    use kiapi::board::types::BoardLayer;
+    use kiapi::board::{
+        BoardEdgeConnector, BoardEdgeConnectorType, BoardEdgeSettings, BoardFinish,
+        BoardImpedanceControl, BoardStackup, BoardStackupDielectricLayer,
+        BoardStackupDielectricProperties, BoardStackupDielectricType, BoardStackupLayer,
+        BoardStackupLayerType, BoardStackupSilkscreenLayer, BoardStackupSoldermaskLayer,
+        EdgePlating,
+    };
+    use kiapi::common::types::{Color, Distance};
+
+    fn nm(value_nm: i64) -> Option<Distance> {
+        Some(Distance { value_nm })
+    }
+
+    fn entry(layer: BoardLayer, kind: BoardStackupLayerType, thickness: i64) -> BoardStackupLayer {
+        BoardStackupLayer {
+            thickness: nm(thickness),
+            layer: layer as i32,
+            enabled: true,
+            r#type: kind as i32,
+            ..Default::default()
+        }
+    }
+
+    fn sample() -> BoardStackup {
+        let mut silk = entry(
+            BoardLayer::BlFSilkS,
+            BoardStackupLayerType::BsltSilkscreen,
+            0,
+        );
+        silk.user_name = "F.Silkscreen".into();
+        silk.details = Some(Details::Silkscreen(BoardStackupSilkscreenLayer {
+            material_name: "Not specified".into(),
+        }));
+
+        let mut mask = entry(
+            BoardLayer::BlFMask,
+            BoardStackupLayerType::BsltSoldermask,
+            10_000,
+        );
+        mask.color = Some(Color {
+            r: 0.0,
+            g: 0.5,
+            b: 0.0,
+            a: 1.0,
+        });
+        mask.details = Some(Details::Soldermask(BoardStackupSoldermaskLayer {
+            epsilon_r: 3.3,
+            loss_tangent: 0.0,
+            material_name: "Not specified".into(),
+            thickness: nm(10_000),
+        }));
+
+        let mut copper = entry(BoardLayer::BlFCu, BoardStackupLayerType::BsltCopper, 35_000);
+        copper.material_name = "copper".into();
+
+        // KiCad sends BL_UNDEFINED for a dielectric; this slot has two sub-layers.
+        let mut core = entry(
+            BoardLayer::BlUndefined,
+            BoardStackupLayerType::BsltDielectric,
+            200_000,
+        );
+        core.details = Some(Details::Dielectric(BoardStackupDielectricLayer {
+            layer: vec![
+                BoardStackupDielectricProperties {
+                    epsilon_r: 4.5,
+                    loss_tangent: 0.02,
+                    material_name: "FR4".into(),
+                    thickness: nm(200_000),
+                    thickness_locked: true,
+                    ..Default::default()
+                },
+                BoardStackupDielectricProperties {
+                    epsilon_r: 4.4,
+                    loss_tangent: 0.018,
+                    material_name: "FR4".into(),
+                    thickness: nm(100_000),
+                    ..Default::default()
+                },
+            ],
+            r#type: BoardStackupDielectricType::BsdtCore as i32,
+        }));
+
+        let mut inner = entry(
+            BoardLayer::BlIn1Cu,
+            BoardStackupLayerType::BsltCopper,
+            15_200,
+        );
+        inner.enabled = false;
+
+        BoardStackup {
+            finish: Some(BoardFinish {
+                type_name: "ENIG".into(),
+            }),
+            impedance: Some(BoardImpedanceControl {
+                is_controlled: true,
+            }),
+            edge: Some(BoardEdgeSettings {
+                connector: Some(BoardEdgeConnector {
+                    r#type: BoardEdgeConnectorType::BectBeveled as i32,
+                }),
+                castellation: None,
+                plating: Some(EdgePlating {
+                    has_edge_plating: true,
+                }),
+            }),
+            layers: vec![silk, mask, copper, core, inner],
+        }
+    }
+
+    #[test]
+    fn every_serialized_field_reaches_the_crate_type() {
+        let stackup = stackup_from_proto(&sample());
+
+        assert_eq!(stackup.finish, "ENIG");
+        assert!(stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "beveled");
+        assert!(stackup.has_edge_plating);
+
+        let [silk, mask, copper, core, inner] = stackup.layers.as_slice() else {
+            panic!("five entries, in order: {:?}", stackup.layers);
+        };
+        assert_eq!(silk.layer.as_deref(), Some("F.SilkS"));
+        assert_eq!(silk.kind, "silkscreen");
+        assert_eq!(silk.user_name.as_deref(), Some("F.Silkscreen"));
+        assert_eq!(silk.material, "Not specified");
+        assert_eq!(silk.color, None, "no color unless the board specifies one");
+
+        assert_eq!(mask.layer.as_deref(), Some("F.Mask"));
+        assert_eq!(mask.kind, "soldermask");
+        assert_eq!(mask.thickness_nm, 10_000);
+        assert_eq!(mask.epsilon_r, Some(3.3));
+        assert_eq!(mask.loss_tangent, Some(0.0));
+        assert_eq!(mask.color.as_deref(), Some("#008000FF"));
+
+        assert_eq!(copper.layer.as_deref(), Some("F.Cu"));
+        assert_eq!(copper.material, "copper");
+        assert_eq!(copper.thickness_nm, 35_000);
+        assert_eq!(copper.epsilon_r, None);
+
+        assert_eq!(core.layer, None, "a dielectric is not a board layer");
+        assert_eq!(core.kind, "dielectric");
+        assert_eq!(core.dielectric_type.as_deref(), Some("core"));
+        assert_eq!(core.dielectric.len(), 2);
+        assert_eq!(core.dielectric[1].thickness_nm, 100_000);
+        assert_eq!(core.dielectric[1].epsilon_r, 4.4);
+        assert!(core.dielectric[0].thickness_locked);
+
+        assert_eq!(inner.layer.as_deref(), Some("In1.Cu"));
+        assert!(!inner.enabled);
+    }
+
+    #[test]
+    fn a_stackup_with_no_finish_or_edge_settings_reads_as_unset() {
+        let stackup = stackup_from_proto(&BoardStackup::default());
+        assert_eq!(stackup.finish, "");
+        assert!(!stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "unknown");
+        assert!(!stackup.has_edge_plating);
+        assert!(stackup.layers.is_empty());
     }
 }

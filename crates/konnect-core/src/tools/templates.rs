@@ -7,7 +7,6 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
-use konnect_sexp::writer::{new_uuid, read_consistent, write_atomic_if_unchanged};
 use serde_json::json;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -253,6 +252,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "position_y": { "type": "number", "description": "Y position to place the subcircuit (mm)", "default": 100.0 },
                     "net_mappings": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Map template net names to your project's net names. E.g. {\"VUSB\": \"VCC_5V\", \"GND\": \"GND\"}"
                     },
                     "ref_start": {
@@ -414,17 +414,35 @@ async fn handle_apply_template(
         }
     };
 
-    let mut content = read_consistent(&sch_path)?;
-    let expected = content.clone();
+    // Templates are ordinary symbol placements. Load and validate the same
+    // instance context used by the single and batch placement tools rather
+    // than hand-writing a second, incomplete interpretation of KiCad's
+    // instance metadata (#609).
+    let mut sch = match konnect_schematic_editor::Schematic::load(&sch_path) {
+        Ok(schematic) => schematic,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
+    let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
     // Determine starting reference numbers by scanning existing components
     let ref_start = args["ref_start"]
         .as_u64()
         .map(|n| n as usize)
-        .unwrap_or_else(|| find_next_ref_number(&content));
+        .unwrap_or_else(|| find_next_ref_number(&sch.to_source()));
 
     let components = tmpl["components"].as_array().cloned().unwrap_or_default();
     let mut placed = Vec::new();
+    let mut placed_targets = Vec::new();
     let mut ref_counters: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
@@ -446,42 +464,25 @@ async fn handle_apply_template(
 
             let x = base_x;
             let y = base_y + (placed.len() as f64) * spacing_y;
-            let uuid = new_uuid();
-
-            // Generate symbol S-expression
-            let symbol_sexp = format!(
-                r#"
-  (symbol
-    (lib_id "{lib_id}")
-    (at {x} {y} 0)
-    (unit 1)
-    (exclude_from_sim no)
-    (in_bom yes)
-    (on_board yes)
-    (uuid "{uuid}")
-    (property "Reference" "{reference}" (at {rx} {ry} 0) (effects (font (size 1.27 1.27))))
-    (property "Value" "{value}" (at {vx} {vy} 0) (effects (font (size 1.27 1.27))))
-    (instances
-      (project ""
-        (path "/" (reference "{reference}") (unit 1))
-      )
-    )
-  )"#,
-                lib_id = lib_id,
-                x = x,
-                y = y,
-                uuid = uuid,
-                reference = reference,
-                value = value,
-                rx = x + 2.0,
-                ry = y,
-                vx = x,
-                vy = y + 2.54,
-            );
-
-            // Insert before closing paren
-            let close = content.rfind(')').unwrap_or(content.len());
-            content = format!("{}{}\n)", &content[..close], symbol_sexp);
+            let placement = match crate::tools::sch_components::place_one_component(
+                &mut sch,
+                &context.instance_paths,
+                &context.project_name,
+                lib_id,
+                x,
+                y,
+                0.0,
+                None,
+                Some(&reference),
+                Some(value),
+                None,
+                1,
+                &source,
+            ) {
+                Ok(placement) => placement,
+                Err(error) => return Ok(error),
+            };
+            placed_targets.push((placement.uuid, reference.clone()));
 
             placed.push(json!({
                 "reference": reference,
@@ -495,8 +496,48 @@ async fn handle_apply_template(
         }
     }
 
-    // Write the updated schematic
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    // The editor's overwrite is an atomic compare-and-swap against the exact
+    // revision loaded above. All placements are prepared in memory, so a
+    // preflight or library failure leaves the schematic byte-for-byte intact.
+    if let Err(error) = sch.overwrite() {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "apply_template",
+            format!("schematic persistence failed: {error}"),
+        ));
+    }
+    let committed = match konnect_schematic_editor::Schematic::load(&sch_path) {
+        Ok(schematic) => schematic,
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "apply_template",
+                format!("saved schematic could not be reloaded: {error}"),
+            ))
+        }
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &committed, &context)
+    {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "apply_template",
+            format!("saved template instance validation failed: {error}"),
+        ));
+    }
+    for (uuid, reference) in &placed_targets {
+        if !committed
+            .symbols
+            .as_slice()
+            .iter()
+            .any(|symbol| symbol.uuid == *uuid && symbol.reference() == Some(reference))
+        {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "apply_template",
+                format!("saved template readback did not contain {reference} with UUID {uuid}"),
+            ));
+        }
+    }
 
     info!(
         template_id = %template_id,
@@ -588,4 +629,207 @@ fn find_next_ref_number(content: &str) -> usize {
         pos = abs + 1;
     }
     max_ref + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
+    use std::sync::Arc;
+
+    struct TemplateEnvironment {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old_appdata: Option<std::ffi::OsString>,
+        old_home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TemplateEnvironment {
+        fn drop(&mut self) {
+            restore_env("APPDATA", self.old_appdata.take());
+            restore_env("HOME", self.old_home.take());
+        }
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    fn test_ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf, TemplateEnvironment) {
+        let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let old_appdata = std::env::var_os("APPDATA");
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("APPDATA", &config);
+        std::env::set_var("HOME", &config);
+        let template_dir = if cfg!(target_os = "windows") {
+            config.join("konnect").join("templates")
+        } else {
+            config.join(".konnect").join("templates")
+        };
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(
+            template_dir.join("one_resistor.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "test_one_resistor",
+                "name": "One resistor",
+                "description": "Hermetic placement fixture",
+                "category": "test",
+                "components": [
+                    {"ref_prefix": "R", "lib_id": "Device:R", "value": "4.7k"}
+                ],
+                "connections": [],
+                "design_notes": "test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // A real KiCad schematic fixture, including a fully embedded
+        // Device:R definition, makes this independent of a KiCad installation.
+        let schematic = dir.path().join("derived_lib_name.kicad_sch");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/derived_lib_name.kicad_sch"
+            ),
+            &schematic,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
+
+        let environment = TemplateEnvironment {
+            _guard: guard,
+            old_appdata,
+            old_home,
+        };
+        (dir, schematic, environment)
+    }
+
+    async fn call_registered(
+        definitions: Vec<ToolDef>,
+        name: &str,
+        args: serde_json::Value,
+        ctx: Arc<ToolContext>,
+    ) -> CallToolResult {
+        let tool = definitions
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .expect("registered tool");
+        (tool.handler)(&args, ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_template_uses_project_identity_and_leaves_batch_writes_usable() {
+        let (_dir, schematic, _environment) = template_fixture();
+        let ctx = test_ctx();
+
+        let applied = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor",
+                "position_x": 180.0,
+                "position_y": 100.0
+            }),
+            ctx.clone(),
+        )
+        .await;
+        assert!(!applied.is_error, "{applied:?}");
+
+        let saved = konnect_schematic_editor::Schematic::load(&schematic).unwrap();
+        let placed = saved
+            .symbols
+            .as_slice()
+            .iter()
+            .find(|symbol| symbol.position().0 > 175.0)
+            .expect("template-created symbol");
+        let instances = placed.instances();
+        assert_eq!(instances.len(), 1, "{instances:?}");
+        assert_eq!(instances[0].project.as_deref(), Some("derived_lib_name"));
+        assert_eq!(
+            instances[0].path.as_deref(),
+            Some("/11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(instances[0].reference.as_deref(), Some("R3"));
+        assert_eq!(instances[0].unit, Some(1));
+        let source = std::fs::read_to_string(&schematic).unwrap();
+        assert!(!source.contains("(project \"\""), "{source}");
+
+        // Exercise the registered batch tool after the template mutation. The
+        // original defect made this exact next call fail stale_target.
+        let batch = call_registered(
+            crate::tools::sch_batch::tools(),
+            "batch_place_components",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "components": [{
+                    "lib_id": "Device:R", "reference": "R99",
+                    "x": 190.0, "y": 100.0
+                }]
+            }),
+            ctx,
+        )
+        .await;
+        assert!(!batch.is_error, "{batch:?}");
+        assert!(konnect_schematic_editor::Schematic::load(&schematic)
+            .unwrap()
+            .symbols
+            .by_reference("R99")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_template_refuses_malformed_instance_metadata_without_writing() {
+        let (_dir, schematic, _environment) = template_fixture();
+        let malformed = std::fs::read_to_string(&schematic).unwrap().replacen(
+            "(project \"derived_lib_name\"",
+            "(project \"\"",
+            1,
+        );
+        assert_ne!(
+            malformed,
+            std::fs::read_to_string(&schematic).unwrap(),
+            "fixture must contain an instance project to corrupt"
+        );
+        std::fs::write(&schematic, &malformed).unwrap();
+        let before = std::fs::read(&schematic).unwrap();
+
+        let refused = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor"
+            }),
+            test_ctx(),
+        )
+        .await;
+        assert!(refused.is_error, "{refused:?}");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refused).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
+    }
 }

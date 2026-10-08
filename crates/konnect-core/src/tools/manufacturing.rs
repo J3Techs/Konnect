@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
-use super::{cli, pcb_export};
+use super::{cli, jlcpcb_midpoints, pcb_export};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ pub fn tools() -> Vec<ToolDef> {
             "export_manufacturing_package",
             "Generate ALL files needed for PCB fabrication and assembly in one call: \
              Gerbers, drill files, BOM (fab-house format), and pick-and-place positions. \
-             Targets a specific fab house (JLCPCB, PCBWay, etc.).",
+             Targets a specific fab house (JLCPCB, PCBWay, etc.). JLCPCB assembly requires the exact board open in KiCad with IPC enabled; native pad midpoints and board exports use one stable live snapshot.",
             json!({
                 "type": "object",
                 "properties": {
@@ -146,12 +146,6 @@ async fn handle_export_manufacturing_package(
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
-    let gerber_layers = if requested_gerber_layers.is_empty() {
-        let board_source = tokio::fs::read_to_string(&board).await?;
-        pcb_export::standard_gerber_layers(&board_source)?
-    } else {
-        requested_gerber_layers
-    };
     let position_side = args["position_side"].as_str().unwrap_or("both");
     let position_units = args["position_units"].as_str().unwrap_or("mm");
     let jlcpcb_cpl_corrections_path = if args.get("jlcpcb_cpl_corrections_path").is_some() {
@@ -182,6 +176,44 @@ async fn handle_export_manufacturing_package(
         ));
     }
 
+    // Establish native geometry before creating/publishing any output. Keep the
+    // staging owner alive for every CLI board export, not just CPL.
+    let snapshot = if is_jlcpcb && include_assembly {
+        match super::with_board_ipc_classified(ctx, &board, jlcpcb_midpoints::capture).await? {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return Ok(midpoint_failure(error)),
+        }
+    } else {
+        None
+    };
+    let gerber_layers = if requested_gerber_layers.is_empty() {
+        let board_source = match &snapshot {
+            Some(snapshot) => snapshot.contents.clone(),
+            None => tokio::fs::read_to_string(&board).await?,
+        };
+        pcb_export::standard_gerber_layers(&board_source)?
+    } else {
+        requested_gerber_layers
+    };
+    let snapshot_directory = if snapshot.is_some() {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let export_board = if let (Some(snapshot), Some(directory)) = (&snapshot, &snapshot_directory) {
+        let staged = directory
+            .path()
+            .join(board.file_name().context("board missing filename")?);
+        tokio::fs::write(&staged, &snapshot.contents).await?;
+        let project = board.with_extension("kicad_pro");
+        if project.try_exists()? {
+            tokio::fs::copy(project, staged.with_extension("kicad_pro")).await?;
+        }
+        staged
+    } else {
+        board.clone()
+    };
+
     info!(
         board = %board.display(),
         output_dir = %output_dir.display(),
@@ -204,7 +236,7 @@ async fn handle_export_manufacturing_package(
     let gerber_dir = output_dir.join("gerbers");
     tokio::fs::create_dir_all(&gerber_dir).await?;
     let gerber_layer_refs = gerber_layers.iter().map(String::as_str).collect::<Vec<_>>();
-    match cli::export_gerber(cli_path, &board, &gerber_dir, &gerber_layer_refs).await {
+    match cli::export_gerber(cli_path, &export_board, &gerber_dir, &gerber_layer_refs).await {
         Ok(gerber_files) => {
             info!(files = gerber_files.len(), "[BETA] Gerber export succeeded");
             verified_paths.extend(gerber_files.iter().cloned());
@@ -227,7 +259,7 @@ async fn handle_export_manufacturing_package(
     //    made KiCad create a directory named drill.drl, so the package
     //    advertised a "drill" file that was really an empty-looking folder and
     //    the real Excellon output never appeared in the file list at all.
-    match cli::export_drill(cli_path, &board, &gerber_dir).await {
+    match cli::export_drill(cli_path, &export_board, &gerber_dir).await {
         Ok(drill_files) => {
             info!(files = drill_files.len(), "[BETA] Drill export succeeded");
             verified_paths.extend(drill_files.iter().cloned());
@@ -261,10 +293,14 @@ async fn handle_export_manufacturing_package(
         let position_result = if is_jlcpcb {
             export_jlcpcb_cpl(
                 cli_path,
-                &board,
+                &export_board,
                 &pos_path,
                 position_side,
                 jlcpcb_cpl_corrections_path.as_deref(),
+                &snapshot
+                    .as_ref()
+                    .context("JLCPCB snapshot missing")?
+                    .midpoints,
             )
             .await
             .map(Some)
@@ -438,6 +474,8 @@ async fn handle_export_manufacturing_package(
         "position_units": if include_assembly { Some(position_units) } else { None },
         "position_side": if include_assembly { Some(position_side) } else { None },
         "placement_orientation": cpl_orientation_evidence,
+        "board_source": if snapshot.is_some() { "stable_live_ipc_snapshot" } else { "saved_file" },
+        "project_settings_source": "saved_kicad_pro_if_present",
         "warnings": warnings,
         "summary": summary,
         "next_steps": next_steps
@@ -450,12 +488,36 @@ async fn handle_export_manufacturing_package(
     })
 }
 
-async fn export_jlcpcb_cpl(
+fn midpoint_failure(error: konnect_ipc::IpcFailure) -> CallToolResult {
+    use crate::mcp::error::ToolErrorKind;
+    use konnect_ipc::IpcFailure;
+    let message = format!("JLCPCB assembly requires native midpoint geometry from the exact board open in KiCad with IPC enabled; no package was exported. {error}");
+    match error {
+        IpcFailure::Target { error, .. } => super::ipc_target_error_result(&error),
+        IpcFailure::Unreachable(reason) => CallToolResult::error_kind(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcbnew".into(),
+                reason,
+            },
+            message,
+        ),
+        // This path only reads; an unanswered read does not imply a mutation.
+        other => CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: format!("native_midpoint_unavailable: {other}"),
+            },
+            message,
+        ),
+    }
+}
+
+pub(super) async fn export_jlcpcb_cpl(
     cli_path: &str,
     board: &Path,
     output: &Path,
     side: &str,
     project_policy_path: Option<&Path>,
+    midpoints: &std::collections::BTreeMap<String, jlcpcb_midpoints::Midpoint>,
 ) -> anyhow::Result<JlcpcbCplExport> {
     let staging = tempfile::tempdir_in(
         output
@@ -466,7 +528,9 @@ async fn export_jlcpcb_cpl(
     cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
     let source = tokio::fs::read_to_string(&native).await?;
     let policies = JlcpcbCorrectionPolicies::load(project_policy_path).await?;
-    let export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
+    let (source, geometry) = jlcpcb_midpoints::convert_positions(&source, midpoints)?;
+    let mut export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
+    export.orientation_evidence.geometry = geometry;
     cli::publish_verified_bytes(output, &export.bytes, "JLCPCB CPL").await?;
     Ok(export)
 }
@@ -686,6 +750,7 @@ fn validate_finite_correction(
 struct JlcpcbOrientationEvidence {
     status: &'static str,
     physical_validation: bool,
+    geometry: Vec<jlcpcb_midpoints::Midpoint>,
     policies: Vec<JlcpcbPolicyEvidence>,
     applied_corrections: Vec<JlcpcbAppliedCorrection>,
     unmatched_footprints: Vec<JlcpcbUnmatchedFootprint>,
@@ -724,8 +789,8 @@ struct JlcpcbUnmatchedFootprint {
 }
 
 #[derive(Debug)]
-struct JlcpcbCplExport {
-    bytes: Vec<u8>,
+pub(super) struct JlcpcbCplExport {
+    pub(super) bytes: Vec<u8>,
     designators: BTreeSet<String>,
     orientation_evidence: JlcpcbOrientationEvidence,
 }
@@ -866,6 +931,7 @@ fn jlcpcb_cpl_from_kicad_csv(
         orientation_evidence: JlcpcbOrientationEvidence {
             status: "PREVIEW_REQUIRED",
             physical_validation: false,
+            geometry: Vec::new(),
             policies: policy_evidence,
             applied_corrections,
             unmatched_footprints,
@@ -1457,6 +1523,43 @@ mod jlcpcb_assembly_tests {
     }
 
     #[test]
+    fn native_midpoint_conversion_precedes_explicit_user_offsets() {
+        let project = parse_jlcpcb_correction_policy(
+            r#"{
+            "schema_version":1,"policy_id":"observed-jst-model","provenance":"test",
+            "component_overrides":[{"id":"j1","designator":"J1",
+            "rotation_degrees":0,"offset_x_mm":3,"offset_y_mm":4}]
+        }"#,
+            "test",
+        )
+        .unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in: built_in_policies().built_in,
+            project: Some(project),
+        };
+        let midpoints = std::collections::BTreeMap::from([(
+            "J1".into(),
+            jlcpcb_midpoints::Midpoint {
+                designator: "J1".into(),
+                anchor_x_mm: 15.0,
+                anchor_y_mm: 6.0,
+                midpoint_x_mm: 16.25,
+                midpoint_y_mm: 6.0,
+                algorithm: "kicad_native_board_pad_boxes_union_center",
+            },
+        )]);
+        let source = "Ref,Val,Package,PosX,PosY,Rot,Side\nJ1,X,JST,15,-6,0,top\n";
+        let (source, geometry) = jlcpcb_midpoints::convert_positions(source, &midpoints).unwrap();
+        let export = jlcpcb_cpl_from_kicad_csv(&source, &policies).unwrap();
+        assert_eq!(
+            &csv_rows(&export.bytes)[1][1..],
+            ["19.250000", "-2.000000", "top", "0.000000"]
+        );
+        assert_eq!(geometry[0].anchor_x_mm, 15.0);
+        assert_eq!(geometry[0].midpoint_x_mm, 16.25);
+    }
+
+    #[test]
     fn built_in_rules_correct_soic_usb_c_bottom_and_normalize_angles() {
         let source = concat!(
             "Ref,Val,Package,PosX,PosY,Rot,Side\n",
@@ -1643,7 +1746,7 @@ mod jlcpcb_assembly_tests {
     /// BOM and position files. Running the real exporters proves their output
     /// populations remain identical after the JLCPCB transformations.
     #[tokio::test]
-    #[ignore = "requires an installed KiCad 10 kicad-cli"]
+    #[ignore = "requires KiCad 10 kicad-cli and the exact ECC83 demo PCB open with IPC enabled"]
     async fn real_kicad_exclusions_leave_a_matched_bom_and_cpl() {
         let cli_path = std::env::var("KICAD_CLI_PATH").unwrap_or_else(|_| "kicad-cli".into());
         let fixture_root =
@@ -1654,9 +1757,17 @@ mod jlcpcb_assembly_tests {
         let bom = dir.path().join("BOM-ecc83.csv");
         let cpl = dir.path().join("CPL-ecc83.csv");
 
-        let cpl_export = export_jlcpcb_cpl(&cli_path, &board, &cpl, "both", None)
-            .await
-            .unwrap();
+        let client = konnect_ipc::KiCadIpcClient::new(
+            konnect_ipc::detect_ipc_address().expect("open the exact demo PCB with IPC enabled"),
+        );
+        let snapshot =
+            jlcpcb_midpoints::capture(&client, client.find_open_board(&board).unwrap()).unwrap();
+        let staged = dir.path().join("ecc83-pp.kicad_pcb");
+        std::fs::write(&staged, &snapshot.contents).unwrap();
+        let cpl_export =
+            export_jlcpcb_cpl(&cli_path, &staged, &cpl, "both", None, &snapshot.midpoints)
+                .await
+                .unwrap();
         let options = cli::BomOptions {
             fields: Some("Reference,Value,Footprint"),
             labels: Some("Designator,Comment,Footprint"),

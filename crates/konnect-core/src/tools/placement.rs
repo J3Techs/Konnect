@@ -13,6 +13,22 @@
 //! the response says `outline_missing` explicitly rather than skipping the
 //! check silently.
 //!
+//! # Outline shape (#594)
+//!
+//! Outside-outline and connector-edge containment is only evidence against a
+//! **provably rectangular** outline (a bbox-vs-bbox check is exact against a
+//! rectangle). Any other parsed Edge.Cuts geometry — concave, notched,
+//! rounded, rotated, or multi-boundary — cannot be proven "inside" from a
+//! bbox alone, so those checks are skipped as unproven rather than silently
+//! passed: the response carries `outline_shape` (`"rectangular"`,
+//! `"unproven"`, or `"missing"`) and `outline_unproven: bool`, and the
+//! verdict can reach `outline_unproven` the same way it reaches
+//! `outline_missing`. See [`konnect_sexp::board::OutlineShape`]. The
+//! `auto_place_from_schematic` and `refine_placement_force_directed`
+//! planners go further: they refuse to plan a mutation against an unproven
+//! outline at all, since a plan is an implicit containment claim, not just
+//! an assessment of one.
+//!
 //! # Weight table
 //!
 //! The soft-score weights (overlaps ×20 capped 40, outside ×20 capped 40,
@@ -22,15 +38,20 @@
 //! Every response field is derived from the parsed board — never echoed from
 //! the request (the recurring defect class this repo pins tests against).
 
+mod plan_status;
+
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolContext, ToolDef};
+#[cfg(test)]
+use konnect_sexp::board::board_outline_bbox;
 use konnect_sexp::board::{
-    board_outline_bbox, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
-    PcbConnectivityIndex, Side,
+    board_outline_shape, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
+    OutlineShape, PcbConnectivityIndex, Side,
 };
 use konnect_sexp::parser::SexpNode;
+use plan_status::PlanApplicability;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 
@@ -44,7 +65,11 @@ pub fn tools() -> Vec<ToolDef> {
          naming the components behind each one. Hard failures (courtyard overlaps, parts \
          outside the outline) decide the verdict regardless of the numeric score, and a \
          board without an Edge.Cuts outline can never pass — its verdict is \
-         'outline_missing'.",
+         'outline_missing'. Outside-outline and connector-edge evidence only applies against \
+         a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
+         or multi-boundary outline cannot prove containment from its bbox, so those checks \
+         are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
+         response) rather than a silent pass.",
             json!({
                 "type": "object",
                 "properties": {
@@ -56,22 +81,31 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "place_decoupling_caps",
-            "Plan (and optionally apply) a row of decoupling capacitors beside an IC. Caps \
-         are identified by NET PAIRING — a candidate shares at least one named net with \
-         the IC — never by reference guessing. Dry-run by default: the response carries \
-         the planned moves plus the board's score before and after the plan, so the \
-         change is judged before it is made. Apply refuses while KiCad holds the board \
-         open live.",
+            "Plan (and optionally apply) a row of decoupling capacitors beside an IC, from \
+         capacitor references YOU supply — this tool never infers which caps decouple which \
+         IC (a shared net, GND above all, is not evidence of that pairing). Every reference \
+         must already name a footprint on the board with usable courtyard geometry; an \
+         unknown or unplaceable reference is refused before anything is planned. The response's \
+         plan_status is 'applicable' only when every planned target lands inside the board \
+         outline AND the plan actually improves score_placement's score — otherwise it is \
+         'blocked' with blocking_reasons naming why, and apply refuses before the first \
+         mutation. Dry-run by default. Apply refuses while KiCad holds the board open live.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "ic_reference": { "type": "string", "description": "The IC (U*) the caps decouple" },
+                    "capacitor_references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Exact, caller-chosen capacitor references to place (e.g. [\"C201\", \"C202\"]) — never auto-discovered"
+                    },
                     "side": { "type": "string", "enum": ["auto", "left", "right", "top", "bottom"], "default": "auto", "description": "Which side of the IC the row goes on" },
                     "spacing_mm": { "type": "number", "default": 0.5, "description": "Gap between the IC courtyard and the row, and between caps" },
                     "dry_run": { "type": "boolean", "default": true, "description": "Plan without writing" }
                 },
-                "required": ["board", "ic_reference"]
+                "required": ["board", "ic_reference", "capacitor_references"]
             }),
             |args, ctx| async move { handle_place_decoupling(args, ctx).await }
         )
@@ -98,18 +132,24 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "auto_place_from_schematic",
-            "Deterministic first placement: cluster footprints by shared nets (union-find), \
+            "DEPRECATED diagnostic first-placement plan: cluster footprints by shared nets (union-find), \
              lay clusters out as tight grids inside the board outline, courtyards \
              non-overlapping. Footprints locked in KiCad are never moved and act as obstacles; add more with 'locked'. A starting point for refinement, not a final layout — the \
-             response says so, and carries the board's score before and after the plan. \
-             Dry-run by default.",
+             response says so, carries the board's score before and after the plan, and \
+             reports plan_status 'blocked' because autonomous whole-board mutation is retired. \
+             dry_run: false returns a structured plan_blocked error and never writes; use \
+             bounded explicit move_component calls with exact-board readback instead. \
+             Refuses (regardless of dry_run) when the board outline is not provably an \
+             axis-aligned rectangle — a concave, notched, rounded, rotated, or multi-boundary \
+             outline cannot back a containment proof; validate the saved board with KiCad DRC \
+             and make small explicit single-part moves instead.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "margin_mm": { "type": "number", "default": 2.0, "description": "Clearance from the board outline" },
                     "locked": { "type": "array", "items": { "type": "string" }, "description": "Additional references that must not move. Footprints KiCad itself marks locked are always held, without needing to be listed here." },
-                    "dry_run": { "type": "boolean", "default": true }
+                    "dry_run": { "type": "boolean", "default": true, "description": "Compatibility selector. Only true is supported; false returns plan_blocked without writing." }
                 },
                 "required": ["board"]
             }),
@@ -118,12 +158,18 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "refine_placement_force_directed",
-            "Refine placement with a deterministic spring embedder: shared nets pull \
+            "DEPRECATED: diagnose an existing deterministic spring-embedder plan; do not \
+             use this as a recommended bulk-placement workflow. Shared nets pull \
              connected parts together (power nets weighted 3x, differential pairs 5x), \
              courtyards repel, the board edge constrains. No randomness, no clocks: the \
              same input always yields the same plan, converging when the grid-snapped \
-             layout stops changing. Locked references exert force but never move. \
-             Dry-run by default; the response carries before/after scores.",
+             layout stops changing. A plan is blocked when it does not converge or improve, \
+             has a hard failure or off-board target, exceeds max_displacement_mm, or has no \
+             displacement limit. Blocked plans can be inspected in dry-run but cannot apply. \
+             Also refuses outright (regardless of dry_run) when the board outline is not \
+             provably an axis-aligned rectangle — validate the saved board with KiCad DRC and \
+             make small explicit single-part moves instead. \
+             Locked references exert force but never move. Dry-run by default.",
             json!({
                 "type": "object",
                 "properties": {
@@ -131,6 +177,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "references": { "type": "array", "items": { "type": "string" }, "description": "Components to refine (default: all)" },
                     "locked": { "type": "array", "items": { "type": "string" }, "description": "References that must not move" },
                     "iterations": { "type": "integer", "default": 300, "description": "Iteration ceiling" },
+                    "max_displacement_mm": { "type": "number", "exclusiveMinimum": 0, "description": "Required safety limit before apply; plans moving any footprint farther are blocked" },
                     "dry_run": { "type": "boolean", "default": true }
                 },
                 "required": ["board"]
@@ -160,29 +207,82 @@ const CONNECTOR_EDGE_LIMIT_MM: f64 = 10.0;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-async fn handle_score_placement(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let content = match konnect_sexp::writer::read_consistent(&board) {
-        Ok(content) => content,
+/// Read the saved board file, distinguishing "does not exist" from any other
+/// I/O failure the way [`handle_score_placement`]'s file-fallback path always
+/// has — extracted so the live-IPC attempt above it can share the same error
+/// shape.
+fn read_saved_board(board: &std::path::Path) -> anyhow::Result<Result<String, CallToolResult>> {
+    match konnect_sexp::writer::read_consistent(board) {
+        Ok(content) => Ok(Ok(content)),
         Err(error) => {
             if !board.exists() {
-                return Ok(CallToolResult::error_kind(
+                Ok(Err(CallToolResult::error_kind(
                     ToolErrorKind::FileNotFound {
                         path: board.display().to_string(),
                     },
                     format!("Board file not found: {}", board.display()),
-                ));
+                )))
+            } else {
+                Err(error.into())
             }
-            return Err(error.into());
+        }
+    }
+}
+
+async fn handle_score_placement(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+
+    // The exact board open live in KiCad, when it is this one, is the truthful
+    // source: a saved-file read here would silently score a stale snapshot
+    // against moves and edits KiCad already applied but hasn't written to
+    // disk yet — the failure mode #595 was filed against. The saved file
+    // remains the disclosed fallback for a closed or unreachable board;
+    // scoring policy itself is unchanged either way.
+    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    let (content, source) = match live {
+        Ok(content) => (content, "ipc"),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
+            Ok(content) => (content, "saved_file"),
+            Err(result) => return Ok(result),
+        },
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
+            match read_saved_board(&board)? {
+                Ok(content) => (content, "saved_file"),
+                Err(result) => return Ok(result),
+            }
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message));
+        }
+        Err(konnect_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message));
+        }
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message));
         }
     };
     let tree = konnect_sexp::parse_sexp(&content)?;
 
     let scan = footprint_courtyards(&tree);
-    let outline = board_outline_bbox(&tree);
+    let outline_shape = board_outline_shape(&tree);
+    // Containment evidence is authoritative only against a proven-rectangular
+    // outline (#594): an `Unproven` shape (concave, notched, rounded,
+    // rotated, or multi-boundary) still surfaces its bbox for advisory
+    // display, but the outside-outline and connector-edge checks below only
+    // run as pass/fail evidence for `Rectangular`.
+    let outline = match outline_shape {
+        OutlineShape::Rectangular { bbox } => Some(bbox),
+        OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
+    };
     let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
 
@@ -271,8 +371,13 @@ async fn handle_score_placement(
     }
 
     // ── Decoupling check (C* near a shared-net U*) ──────────────────────────
-    let (decoupling_violations, uncoupled_caps, interface_filter_caps) =
-        decoupling_check(&scan.items, &index, &values);
+    let DecouplingCheck {
+        violations: decoupling_violations,
+        uncoupled_caps,
+        interface_filter_caps,
+        associations: decoupling_associations,
+        unproven_caps: unproven_decoupling_caps,
+    } = decoupling_check(&scan.items, &index, &values);
 
     // ── Soft score (ported weight table — see the module docs) ──────────────
     let overlap_deduction = (overlap_pairs as i64 * OVERLAP_POINTS).min(OVERLAP_CAP);
@@ -330,20 +435,29 @@ async fn handle_score_placement(
             "detail": decoupling_violations
                 .iter()
                 .map(|v| format!(
-                    "{} ({}, limit {} mm) is {} mm from nearest shared-net IC {}",
-                    v.cap, v.value, v.limit_mm, round3(v.distance_mm), v.ic,
+                    "{} ({}, limit {} mm) is {} mm from IC {} via {} ({} references)",
+                    v.cap,
+                    v.value,
+                    v.limit_mm,
+                    round3(v.distance_mm),
+                    v.ic,
+                    v.qualifying_net,
+                    v.net_reference_count,
                 ))
                 .collect::<Vec<_>>()
                 .join("; "),
         }));
     }
 
-    // The verdict derives ONLY from hard failures and outline presence — the
-    // numeric score never decides it.
+    // The verdict derives ONLY from hard failures and outline shape — the
+    // numeric score never decides it. Precedence: hard failures →
+    // outline_missing → outline_unproven → pass.
     let verdict = if !hard_failures.is_empty() {
         "hard_fail"
-    } else if outline.is_none() {
+    } else if matches!(outline_shape, OutlineShape::Missing) {
         "outline_missing"
+    } else if matches!(outline_shape, OutlineShape::Unproven { .. }) {
+        "outline_unproven"
     } else {
         "pass"
     };
@@ -351,11 +465,38 @@ async fn handle_score_placement(
     Ok(CallToolResult::json(&json!({
         "verdict": verdict,
         "score": score,
-        "outline_missing": outline.is_none(),
+        "outline_missing": matches!(outline_shape, OutlineShape::Missing),
+        "outline_unproven": matches!(outline_shape, OutlineShape::Unproven { .. }),
+        "outline_shape": match outline_shape {
+            OutlineShape::Rectangular { .. } => "rectangular",
+            OutlineShape::Unproven { .. } => "unproven",
+            OutlineShape::Missing => "missing",
+        },
         "hard_failures": hard_failures,
         "deductions": deductions,
         "connector_edges": connector_edges,
         "uncoupled_caps": uncoupled_caps,
+        "unproven_decoupling_caps": unproven_decoupling_caps
+            .iter()
+            .map(|cap| json!({
+                "reference": cap.cap,
+                "value": cap.value,
+                "reason": cap.reason,
+            }))
+            .collect::<Vec<_>>(),
+        "decoupling_associations": decoupling_associations
+            .iter()
+            .map(|association| json!({
+                "reference": association.cap,
+                "value": association.value,
+                "ic": association.ic,
+                "qualifying_net": association.qualifying_net,
+                "net_reference_count": association.net_reference_count,
+                "distance_mm": round3(association.distance_mm),
+                "limit_mm": association.limit_mm,
+                "status": association.status,
+            }))
+            .collect::<Vec<_>>(),
         "interface_filter_caps": interface_filter_caps
             .iter()
             .map(|f| json!({
@@ -368,6 +509,7 @@ async fn handle_score_placement(
             .collect::<Vec<_>>(),
         "footprints_scored": scan.items.len(),
         "footprints_skipped": scan.skipped,
+        "source": source,
     })))
 }
 
@@ -387,18 +529,31 @@ async fn score_of_content(ctx: &ToolContext, content: &str) -> anyhow::Result<se
     Ok(serde_json::from_str(text)?)
 }
 
-/// Net set per reference, by NAME, from the index. The pairing primitive the
-/// decoupling checker and the decoupling placer share.
-fn nets_by_reference(index: &PcbConnectivityIndex) -> HashMap<String, BTreeSet<String>> {
-    let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for net in index.nets() {
-        for pad in index.pads_of_net(net) {
-            map.entry(pad.reference.clone())
-                .or_default()
-                .insert(net.to_string());
-        }
-    }
-    map
+/// Refuse to plan against an outline whose containment cannot be proven
+/// (#594): `Unproven` covers concave, notched, rounded, rotated, or
+/// multi-boundary Edge.Cuts geometry, where a bbox-only planner could place
+/// a part inside the bbox but outside the true board shape. Refuses
+/// regardless of `dry_run`/`apply` — a "preview" that claims containment it
+/// cannot prove is exactly the false-authority problem, not a safe subset of
+/// it. One shared helper so every placement planner agrees on the wording.
+fn outline_unproven_refusal(operation: &str, bbox: (f64, f64, f64, f64)) -> CallToolResult {
+    let (x0, y0, x1, y1) = bbox;
+    let reasons = vec![format!(
+        "the board outline is not provably an axis-aligned rectangle (advisory bbox \
+         ({x0}, {y0})..({x1}, {y1})) — automated layout cannot prove a planned position is \
+         inside a concave, notched, rounded, rotated, or multi-boundary board shape; use KiCad \
+         DRC to validate the saved board, and make small explicit single-part moves instead"
+    )];
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: operation.into(),
+            reasons: reasons.clone(),
+        },
+        format!(
+            "{operation} refuses to plan against an unproven outline: {}",
+            reasons.join("; ")
+        ),
+    )
 }
 
 /// Apply Set placements to board content via the SAME transform the closed-
@@ -431,6 +586,35 @@ async fn handle_place_decoupling(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    // No inference: the caller names exactly which capacitors to place. A
+    // shared net — GND above all — is not evidence of which IC a cap
+    // decouples, so this tool no longer discovers candidates itself (#596).
+    let requested_refs: Vec<String> = match args["capacitor_references"].as_array() {
+        Some(refs) if !refs.is_empty() => {
+            match refs.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>() {
+                Some(strs) => strs.into_iter().map(str::to_string).collect(),
+                None => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: "capacitor_references".into(),
+                            reason: "every entry must be a string".into(),
+                        },
+                        "Argument 'capacitor_references' must be an array of strings",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "capacitor_references".into(),
+                    reason: "required, a non-empty array of exact capacitor references".into(),
+                },
+                "Argument 'capacitor_references' is required and must name at least one \
+                 capacitor",
+            ));
+        }
+    };
     let side = args["side"].as_str().unwrap_or("auto");
     if !["auto", "left", "right", "top", "bottom"].contains(&side) {
         return Ok(CallToolResult::error_kind(
@@ -447,10 +631,6 @@ async fn handle_place_decoupling(
     let content = konnect_sexp::writer::read_consistent(&board)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
-    let index = PcbConnectivityIndex::build(&tree);
-    let values = footprint_values(&tree);
-    let nets = nets_by_reference(&index);
-
     let Some(ic) = scan
         .items
         .iter()
@@ -464,42 +644,63 @@ async fn handle_place_decoupling(
             format!("No footprint '{ic_reference}' on the board"),
         ));
     };
-    let ic_nets = nets.get(&ic_reference).cloned().unwrap_or_default();
     let ic_bbox = ic.bbox;
     let (ic_cx, ic_cy) = bbox_center(ic_bbox);
 
-    // Candidates: decoupling-family C* sharing at least one named net with
-    // the IC — the same pairing rule the score's checker applies.
-    let mut caps: Vec<&FootprintCourtyard> = scan
-        .items
-        .iter()
-        .filter(|c| {
-            let Some(reference) = c.reference.as_deref() else {
-                return false;
-            };
-            if ref_prefix(reference) != "C" {
-                return false;
-            }
-            let Some(value) = values.get(reference) else {
-                return false;
-            };
-            if decoupling_limit_mm(value).is_none() {
-                return false;
-            }
-            nets.get(reference)
-                .map(|n| !n.is_disjoint(&ic_nets))
-                .unwrap_or(false)
-        })
-        .collect();
-    if caps.is_empty() {
-        return Ok(CallToolResult::json(&json!({
-            "planned_moves": [],
-            "detail": format!(
-                "no decoupling-family capacitor shares a net with {ic_reference}; \
-                 nothing to place"
-            ),
-        })));
+    // Exact caller-supplied references are the design-intent boundary. Do not
+    // second-guess them with a C* prefix or value-family heuristic: that would
+    // reintroduce the inference this change removes. Refuse only references
+    // that are absent or cannot supply the courtyard geometry this planner
+    // mechanically requires, naming every bad reference before planning.
+    let mut duplicates: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for r in &requested_refs {
+        if !seen.insert(r.as_str()) {
+            duplicates.insert(r.clone());
+        }
     }
+    if !duplicates.is_empty() {
+        let listed = duplicates.iter().cloned().collect::<Vec<_>>().join(", ");
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "capacitor_references".into(),
+                reason: format!("listed more than once: {listed}"),
+            },
+            format!(
+                "Argument 'capacitor_references' lists the same reference more than once: {listed}"
+            ),
+        ));
+    }
+    let mut caps: Vec<&FootprintCourtyard> = Vec::with_capacity(requested_refs.len());
+    let board_references = footprint_references(&tree);
+    let mut bad_refs: Vec<String> = Vec::new();
+    for r in &requested_refs {
+        let found = scan
+            .items
+            .iter()
+            .find(|c| c.reference.as_deref() == Some(r.as_str()));
+        match found {
+            Some(c) => caps.push(c),
+            None if board_references.contains(r) => {
+                bad_refs.push(format!("{r} (no usable courtyard geometry)"));
+            }
+            None => bad_refs.push(format!("{r} (not on this board)")),
+        }
+    }
+    if !bad_refs.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "capacitor_references".into(),
+                reason: bad_refs.join("; "),
+            },
+            format!(
+                "Argument 'capacitor_references' names references that cannot be placed: {}",
+                bad_refs.join("; ")
+            ),
+        ));
+    }
+    // Row order is deterministic regardless of the order the caller listed
+    // references in.
     caps.sort_by_key(|c| c.reference.clone());
 
     // The row: below the IC unless a side is given ("auto" picks bottom —
@@ -511,6 +712,16 @@ async fn handle_place_decoupling(
         .collect();
     let row_span: f64 =
         widths.iter().map(|(w, _)| w).sum::<f64>() + spacing * (caps.len() as f64 - 1.0);
+
+    let outline_shape = board_outline_shape(&tree);
+    let outline = match outline_shape {
+        OutlineShape::Rectangular { bbox } => Some(bbox),
+        OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
+    };
+    let mut applicability = PlanApplicability::new();
+    if matches!(outline_shape, OutlineShape::Unproven { .. }) {
+        applicability.block("the board outline is unproven; bounding-box containment cannot authorize capacitor placement; use small explicit moves and KiCad validation");
+    }
 
     let mut placements = Vec::new();
     let mut planned_moves = Vec::new();
@@ -529,14 +740,31 @@ async fn handle_place_decoupling(
         let (bcx, bcy) = bbox_center(cap.bbox);
         let (ax, ay) = cap.at;
         let target = (tx + (ax - bcx), ty + (ay - bcy));
+        let reference = cap.reference.clone().expect("filtered on reference");
+
+        // A planned target the caller cannot see land outside the board is
+        // exactly the failure mode #596 reported — refuse rather than
+        // silently execute it.
+        if let Some((ox0, oy0, ox1, oy1)) = outline {
+            let (bx0, by0, bx1, by1) = (tx - w / 2.0, ty - h / 2.0, tx + w / 2.0, ty + h / 2.0);
+            if bx0 < ox0 || by0 < oy0 || bx1 > ox1 || by1 > oy1 {
+                applicability.block(format!(
+                    "{reference} plans to ({}, {}), outside the board outline \
+                     ({ox0}, {oy0})..({ox1}, {oy1})",
+                    round3(tx),
+                    round3(ty),
+                ));
+            }
+        }
+
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
-            reference: cap.reference.clone().expect("filtered on reference"),
+            reference: reference.clone(),
             x: (target.0 * 1e3).round() / 1e3,
             y: (target.1 * 1e3).round() / 1e3,
             rotation: cap.rotation_deg,
         });
         planned_moves.push(json!({
-            "reference": cap.reference,
+            "reference": reference,
             "from": { "x": round3(ax), "y": round3(ay) },
             "to": { "x": round3(target.0), "y": round3(target.1) },
         }));
@@ -546,16 +774,53 @@ async fn handle_place_decoupling(
     let planned_content = apply_placements_to_content(&content, &placements)?;
     let score_after = score_of_content(ctx, &planned_content).await?;
 
+    // A plan that does not improve the board is not useful to apply, even
+    // when nothing about it is unsafe on its own — the caller should decide
+    // deliberately, not have a no-op (or a regression) applied silently.
+    let (before_num, after_num) = (
+        score_before["score"].as_i64().unwrap_or(i64::MIN),
+        score_after["score"].as_i64().unwrap_or(i64::MIN),
+    );
+    if after_num <= before_num {
+        applicability.block(format!(
+            "the plan does not improve the score ({before_num} \u{2192} {after_num})"
+        ));
+    }
+    if score_after["verdict"] == "hard_fail" && score_before["verdict"] != "hard_fail" {
+        applicability.block(format!(
+            "the plan introduces a hard failure the board did not have \
+             (verdict {} \u{2192} hard_fail)",
+            score_before["verdict"],
+        ));
+    }
+    let (plan_status, blocking_reasons) = applicability.to_json();
+
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "ic_reference": ic_reference,
             "side": resolved_side,
+            "plan_status": plan_status,
+            "blocking_reasons": blocking_reasons,
             "planned_moves": planned_moves,
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
         })));
+    }
+
+    if applicability.is_blocked() {
+        let reasons = applicability.blocking_reasons().to_vec();
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "place_decoupling_caps".into(),
+                reasons: reasons.clone(),
+            },
+            format!(
+                "place_decoupling_caps refuses to apply a blocked plan: {}",
+                reasons.join("; ")
+            ),
+        ));
     }
 
     // Applying: never edit a board a live KiCad holds open.
@@ -575,6 +840,8 @@ async fn handle_place_decoupling(
         "dry_run": false,
         "ic_reference": ic_reference,
         "side": resolved_side,
+        "plan_status": plan_status,
+        "blocking_reasons": blocking_reasons,
         "applied": applied.iter().map(|p| json!({
             "reference": p.reference, "x": p.x, "y": p.y, "rotation": p.rotation
         })).collect::<Vec<_>>(),
@@ -738,7 +1005,7 @@ async fn handle_bga_fanout(
             )
         })
         .collect();
-    let created = match super::with_board_ipc_classified(ctx, &board, move |c| {
+    let created = match super::with_board_ipc_classified(ctx, &board, move |c, _| {
         c.apply_fanout(
             &net_stubs,
             &via_list,
@@ -786,10 +1053,16 @@ async fn handle_auto_place(
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
     let index = PcbConnectivityIndex::build(&tree);
-    let Some(outline) = board_outline_bbox(&tree) else {
-        return Ok(CallToolResult::error(
-            "auto placement needs a board outline; add Edge.Cuts first (set_board_size)",
-        ));
+    let outline = match board_outline_shape(&tree) {
+        OutlineShape::Rectangular { bbox } => bbox,
+        OutlineShape::Unproven { bbox } => {
+            return Ok(outline_unproven_refusal("auto_place_from_schematic", bbox));
+        }
+        OutlineShape::Missing => {
+            return Ok(CallToolResult::error(
+                "auto placement needs a board outline; add Edge.Cuts first (set_board_size)",
+            ));
+        }
     };
 
     // Union-find over references joined by shared nets.
@@ -979,6 +1252,11 @@ async fn handle_auto_place(
     let score_before = score_of_content(ctx, &content).await?;
     let planned_content = apply_placements_to_content(&content, &placements)?;
     let score_after = score_of_content(ctx, &planned_content).await?;
+    let mut applicability = PlanApplicability::new();
+    applicability.block(
+        "autonomous whole-board mutation is retired; inspect this diagnostic plan, then use bounded explicit move_component calls with exact-board readback",
+    );
+    let (plan_status, blocking_reasons) = applicability.to_json();
 
     let cluster_report: Vec<serde_json::Value> = clusters
         .values()
@@ -1005,7 +1283,11 @@ async fn handle_auto_place(
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
+            "applied": false,
             "note": "a starting point for refinement, not a final layout",
+            "source": "saved_file",
+            "plan_status": plan_status,
+            "blocking_reasons": blocking_reasons,
             "clusters": cluster_report,
             "planned_moves": planned_moves,
             "held": held_report.clone(),
@@ -1015,28 +1297,17 @@ async fn handle_auto_place(
         })));
     }
 
-    if let Some(refusal) =
-        super::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "auto_place_from_schematic")
-            .await?
-    {
-        return Ok(refusal);
-    }
-    let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
-        Ok(applied) => applied,
-        Err(error) => return Ok(error.into_result()),
-    };
-    let written = konnect_sexp::writer::read_consistent(&board)?;
-    let score_written = score_of_content(ctx, &written).await?;
-    Ok(CallToolResult::json(&json!({
-        "dry_run": false,
-        "note": "a starting point for refinement, not a final layout",
-        "clusters": cluster_report,
-        "applied_count": applied.len(),
-        "held": held_report,
-        "score_before": score_before["score"],
-        "score_after": score_written["score"],
-        "verdict_after": score_written["verdict"],
-    })))
+    let reasons = applicability.blocking_reasons().to_vec();
+    Ok(CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: "auto_place_from_schematic".into(),
+            reasons: reasons.clone(),
+        },
+        format!(
+            "auto_place_from_schematic refuses to apply a blocked plan: {}",
+            reasons.join("; ")
+        ),
+    ))
 }
 
 // ─── refine_placement_force_directed ─────────────────────────────────────────
@@ -1066,6 +1337,62 @@ fn net_weight(net: &str) -> f64 {
     }
 }
 
+#[derive(Debug)]
+struct ForceMoveSafety {
+    reference: String,
+    displacement_mm: f64,
+    inside_outline: bool,
+    target_anchor: (f64, f64),
+}
+
+fn force_directed_applicability(
+    max_displacement_mm: Option<f64>,
+    converged: bool,
+    iterations_run: usize,
+    score_before: i64,
+    score_after: i64,
+    verdict_after: &str,
+    moves: &[ForceMoveSafety],
+) -> PlanApplicability {
+    let mut applicability = PlanApplicability::new();
+    if max_displacement_mm.is_none() {
+        applicability
+            .block("max_displacement_mm is required before this deprecated planner can apply");
+    }
+    for planned in moves {
+        if max_displacement_mm.is_some_and(|limit| planned.displacement_mm > limit) {
+            let limit = max_displacement_mm.expect("checked as some");
+            applicability.block(format!(
+                "{} plans a {} mm displacement, exceeding max_displacement_mm {limit}",
+                planned.reference,
+                round3(planned.displacement_mm),
+            ));
+        }
+        if !planned.inside_outline {
+            applicability.block(format!(
+                "{} plans outside the board outline at ({}, {})",
+                planned.reference,
+                round3(planned.target_anchor.0),
+                round3(planned.target_anchor.1),
+            ));
+        }
+    }
+    if !converged {
+        applicability.block(format!(
+            "the plan did not converge within {iterations_run} iterations"
+        ));
+    }
+    if score_after <= score_before {
+        applicability.block(format!(
+            "the plan does not improve the score ({score_before} → {score_after})"
+        ));
+    }
+    if verdict_after == "hard_fail" {
+        applicability.block("the planned placement has a hard-fail verdict");
+    }
+    applicability
+}
+
 async fn handle_force_directed(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1073,6 +1400,10 @@ async fn handle_force_directed(
     let board = get_path(args, "board")?;
     let iterations = args["iterations"].as_u64().unwrap_or(300).min(10_000) as usize;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let max_displacement_mm = match opt_positive_f64(args, "max_displacement_mm") {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
     let locked: BTreeSet<String> = args["locked"]
         .as_array()
         .map(|a| {
@@ -1091,10 +1422,19 @@ async fn handle_force_directed(
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
     let index = PcbConnectivityIndex::build(&tree);
-    let Some((ox0, oy0, ox1, oy1)) = board_outline_bbox(&tree) else {
-        return Ok(CallToolResult::error(
-            "force-directed refinement needs a board outline (Edge.Cuts)",
-        ));
+    let (ox0, oy0, ox1, oy1) = match board_outline_shape(&tree) {
+        OutlineShape::Rectangular { bbox } => bbox,
+        OutlineShape::Unproven { bbox } => {
+            return Ok(outline_unproven_refusal(
+                "refine_placement_force_directed",
+                bbox,
+            ));
+        }
+        OutlineShape::Missing => {
+            return Ok(CallToolResult::error(
+                "force-directed refinement needs a board outline (Edge.Cuts)",
+            ));
+        }
     };
     let (board_w, board_h) = (ox1 - ox0, oy1 - oy0);
 
@@ -1288,6 +1628,7 @@ async fn handle_force_directed(
     // Final positions: snapped centers, translated back to root anchors.
     let mut placements = Vec::new();
     let mut planned_moves = Vec::new();
+    let mut move_safety = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if !movable(i) {
             continue;
@@ -1299,19 +1640,35 @@ async fn handle_force_directed(
         }
         let (ax, ay) = part.at;
         let reference = part.reference.clone().expect("filtered");
+        let target_anchor = (
+            ((target.0 + (ax - bcx)) * 1e3).round() / 1e3,
+            ((target.1 + (ay - bcy)) * 1e3).round() / 1e3,
+        );
+        let displacement_mm = (target_anchor.0 - ax).hypot(target_anchor.1 - ay);
+        let inside_outline = !(target.0 - sizes[i].0 / 2.0 < ox0
+            || target.1 - sizes[i].1 / 2.0 < oy0
+            || target.0 + sizes[i].0 / 2.0 > ox1
+            || target.1 + sizes[i].1 / 2.0 > oy1);
+        move_safety.push(ForceMoveSafety {
+            reference: reference.clone(),
+            displacement_mm,
+            inside_outline,
+            target_anchor,
+        });
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
             reference: reference.clone(),
-            x: ((target.0 + (ax - bcx)) * 1e3).round() / 1e3,
-            y: ((target.1 + (ay - bcy)) * 1e3).round() / 1e3,
+            x: target_anchor.0,
+            y: target_anchor.1,
             rotation: part.rotation_deg,
         });
         planned_moves.push(json!({
             "reference": reference,
             "from": { "x": round3(ax), "y": round3(ay) },
             "to": {
-                "x": round3(target.0 + (ax - bcx)),
-                "y": round3(target.1 + (ay - bcy)),
+                "x": round3(target_anchor.0),
+                "y": round3(target_anchor.1),
             },
+            "displacement_mm": round3(displacement_mm),
         }));
     }
 
@@ -1319,16 +1676,47 @@ async fn handle_force_directed(
     let planned_content = apply_placements_to_content(&content, &placements)?;
     let score_after = score_of_content(ctx, &planned_content).await?;
 
+    let (before_num, after_num) = (
+        score_before["score"].as_i64().unwrap_or(i64::MIN),
+        score_after["score"].as_i64().unwrap_or(i64::MIN),
+    );
+    let applicability = force_directed_applicability(
+        max_displacement_mm,
+        converged,
+        iterations_run,
+        before_num,
+        after_num,
+        score_after["verdict"].as_str().unwrap_or("unavailable"),
+        &move_safety,
+    );
+    let (plan_status, blocking_reasons) = applicability.to_json();
+
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "iterations_run": iterations_run,
             "converged": converged,
+            "plan_status": plan_status,
+            "blocking_reasons": blocking_reasons,
             "planned_moves": planned_moves,
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
         })));
+    }
+
+    if applicability.is_blocked() {
+        let reasons = applicability.blocking_reasons().to_vec();
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "refine_placement_force_directed".into(),
+                reasons: reasons.clone(),
+            },
+            format!(
+                "refine_placement_force_directed refuses to apply a blocked plan: {}",
+                reasons.join("; ")
+            ),
+        ));
     }
 
     if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
@@ -1350,6 +1738,8 @@ async fn handle_force_directed(
         "dry_run": false,
         "iterations_run": iterations_run,
         "converged": converged,
+        "plan_status": plan_status,
+        "blocking_reasons": blocking_reasons,
         "applied_count": applied.len(),
         "score_before": score_before["score"],
         "score_after": score_written["score"],
@@ -1396,8 +1786,40 @@ struct DecouplingViolation {
     cap: String,
     value: String,
     ic: String,
+    qualifying_net: String,
+    net_reference_count: usize,
     distance_mm: f64,
     limit_mm: f64,
+}
+
+/// Evidence behind one capacitor-to-IC association. The scorer may deduct
+/// only when this evidence exists; a board-wide ground rail alone is not an
+/// electrical relationship between a particular capacitor and IC.
+struct DecouplingAssociation {
+    cap: String,
+    value: String,
+    ic: String,
+    qualifying_net: String,
+    net_reference_count: usize,
+    distance_mm: f64,
+    limit_mm: f64,
+    status: &'static str,
+}
+
+/// A family-classified capacitor for which the scorer cannot prove which IC,
+/// if any, it decouples. Unproved evidence is reported and never scored.
+struct UnprovenDecouplingCap {
+    cap: String,
+    value: String,
+    reason: String,
+}
+
+struct DecouplingCheck {
+    violations: Vec<DecouplingViolation>,
+    uncoupled_caps: Vec<String>,
+    interface_filter_caps: Vec<InterfaceFilterCap>,
+    associations: Vec<DecouplingAssociation>,
+    unproven_caps: Vec<UnprovenDecouplingCap>,
 }
 
 /// One capacitor exempted from the decoupling rule because it sits on the
@@ -1436,11 +1858,7 @@ fn decoupling_check(
     items: &[FootprintCourtyard],
     index: &PcbConnectivityIndex,
     values: &HashMap<String, String>,
-) -> (
-    Vec<DecouplingViolation>,
-    Vec<String>,
-    Vec<InterfaceFilterCap>,
-) {
+) -> DecouplingCheck {
     // Net set per reference, from the connectivity index — keyed by name, so
     // both file formats resolve identically.
     let mut nets_by_ref: HashMap<&str, BTreeSet<&str>> = HashMap::new();
@@ -1448,12 +1866,17 @@ fn decoupling_check(
     // faces of the board — what decides whether a part on the far face is
     // electrically on these pins or only above them.
     let mut through_nets_by_ref: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut references_by_net: HashMap<&str, BTreeSet<&str>> = HashMap::new();
     for net in index.nets() {
         for pad in index.pads_of_net(net) {
             nets_by_ref
                 .entry(pad.reference.as_str())
                 .or_default()
                 .insert(net);
+            references_by_net
+                .entry(net)
+                .or_default()
+                .insert(pad.reference.as_str());
             if pad.reaches_both_faces {
                 through_nets_by_ref
                     .entry(pad.reference.as_str())
@@ -1474,6 +1897,8 @@ fn decoupling_check(
     let mut violations = Vec::new();
     let mut uncoupled = Vec::new();
     let mut interface_filters = Vec::new();
+    let mut associations = Vec::new();
+    let mut unproven = Vec::new();
     for c in items {
         let Some(reference) = c.reference.as_deref() else {
             continue;
@@ -1489,10 +1914,39 @@ fn decoupling_check(
         };
         let cap_nets = nets_by_ref.get(reference);
         let center = bbox_center(c.bbox);
-        match nearest_shared_net(&ics, cap_nets, &nets_by_ref, center) {
-            None => uncoupled.push(reference.to_string()),
-            Some((ic, distance_mm)) => {
+        match nearest_decoupling_association(
+            &ics,
+            cap_nets,
+            &nets_by_ref,
+            &references_by_net,
+            center,
+        ) {
+            None => {
+                uncoupled.push(reference.to_string());
+                unproven.push(UnprovenDecouplingCap {
+                    cap: reference.to_string(),
+                    value: value.clone(),
+                    reason: unproven_decoupling_reason(
+                        cap_nets,
+                        &ics,
+                        &nets_by_ref,
+                        &references_by_net,
+                    ),
+                });
+            }
+            Some(association) => {
+                let distance_mm = association.distance_mm;
                 if distance_mm <= limit_mm {
+                    associations.push(DecouplingAssociation {
+                        cap: reference.to_string(),
+                        value: value.clone(),
+                        ic: association.ic,
+                        qualifying_net: association.qualifying_net,
+                        net_reference_count: association.net_reference_count,
+                        distance_mm,
+                        limit_mm,
+                        status: "within_limit",
+                    });
                     continue;
                 }
                 // The cap is too far from the IC it shares a rail with. Before
@@ -1518,20 +1972,50 @@ fn decoupling_check(
                             connector: connector.to_string(),
                             distance_mm: connector_distance_mm,
                             limit_mm,
-                        })
+                        });
+                        associations.push(DecouplingAssociation {
+                            cap: reference.to_string(),
+                            value: value.clone(),
+                            ic: association.ic,
+                            qualifying_net: association.qualifying_net,
+                            net_reference_count: association.net_reference_count,
+                            distance_mm,
+                            limit_mm,
+                            status: "interface_filter",
+                        });
                     }
-                    None => violations.push(DecouplingViolation {
-                        cap: reference.to_string(),
-                        value: value.clone(),
-                        ic: ic.to_string(),
-                        distance_mm,
-                        limit_mm,
-                    }),
+                    None => {
+                        violations.push(DecouplingViolation {
+                            cap: reference.to_string(),
+                            value: value.clone(),
+                            ic: association.ic.clone(),
+                            qualifying_net: association.qualifying_net.clone(),
+                            net_reference_count: association.net_reference_count,
+                            distance_mm,
+                            limit_mm,
+                        });
+                        associations.push(DecouplingAssociation {
+                            cap: reference.to_string(),
+                            value: value.clone(),
+                            ic: association.ic,
+                            qualifying_net: association.qualifying_net,
+                            net_reference_count: association.net_reference_count,
+                            distance_mm,
+                            limit_mm,
+                            status: "too_far",
+                        });
+                    }
                 }
             }
         }
     }
-    (violations, uncoupled, interface_filters)
+    DecouplingCheck {
+        violations,
+        uncoupled_caps: uncoupled,
+        interface_filter_caps: interface_filters,
+        associations,
+        unproven_caps: unproven,
+    }
 }
 
 /// Footprints whose reference designator carries `prefix` exactly, paired with
@@ -1550,26 +2034,108 @@ fn footprints_with_prefix<'a>(
         .collect()
 }
 
-/// The nearest candidate that shares at least one named net with the cap, and
-/// how far its courtyard bbox is from the cap's center. `None` when no
-/// candidate shares a net.
-fn nearest_shared_net<'a, 'n>(
-    candidates: &[(&'a str, Bbox)],
+const MAX_DECOUPLING_NET_REFERENCES: usize = 8;
+
+struct DecouplingMatch {
+    ic: String,
+    qualifying_net: String,
+    net_reference_count: usize,
+    distance_mm: f64,
+}
+
+fn is_ground_like_net(net: &str) -> bool {
+    let normalized = net
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_uppercase()
+        .replace(['-', '_'], "");
+    normalized == "0"
+        || normalized == "0V"
+        || normalized.starts_with("GND")
+        || normalized.ends_with("GND")
+        || normalized.starts_with("VSS")
+}
+
+/// Find the nearest IC with evidence stronger than a board-wide rail: at
+/// least one shared, non-ground net whose distinct-reference fanout remains
+/// small enough to identify a local functional relationship.
+fn nearest_decoupling_association<'n>(
+    candidates: &[(&str, Bbox)],
     cap_nets: Option<&BTreeSet<&'n str>>,
     nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
+    references_by_net: &HashMap<&'n str, BTreeSet<&str>>,
     center: (f64, f64),
-) -> Option<(&'a str, f64)> {
+) -> Option<DecouplingMatch> {
+    let cap_nets = cap_nets?;
     candidates
         .iter()
-        .filter(|(reference, _)| {
-            // Shares at least one named net with this cap.
-            match (cap_nets, nets_by_ref.get(*reference)) {
-                (Some(a), Some(b)) => !a.is_disjoint(b),
-                _ => false,
-            }
+        .filter_map(|(reference, bbox)| {
+            let ic_nets = nets_by_ref.get(*reference)?;
+            let (qualifying_net, net_reference_count) = cap_nets
+                .intersection(ic_nets)
+                .filter(|net| !is_ground_like_net(net))
+                .filter_map(|net| {
+                    let fanout = references_by_net.get(net)?.len();
+                    (fanout <= MAX_DECOUPLING_NET_REFERENCES).then_some((*net, fanout))
+                })
+                .min_by(|(net_a, fanout_a), (net_b, fanout_b)| {
+                    fanout_a.cmp(fanout_b).then_with(|| net_a.cmp(net_b))
+                })?;
+            Some(DecouplingMatch {
+                ic: (*reference).to_string(),
+                qualifying_net: qualifying_net.to_string(),
+                net_reference_count,
+                distance_mm: distance_to_bbox(center, *bbox),
+            })
         })
-        .map(|(reference, bbox)| (*reference, distance_to_bbox(center, *bbox)))
-        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .min_by(|a, b| {
+            a.distance_mm
+                .total_cmp(&b.distance_mm)
+                .then_with(|| a.net_reference_count.cmp(&b.net_reference_count))
+                .then_with(|| a.ic.cmp(&b.ic))
+        })
+}
+
+fn unproven_decoupling_reason<'n>(
+    cap_nets: Option<&BTreeSet<&'n str>>,
+    candidates: &[(&str, Bbox)],
+    nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
+    references_by_net: &HashMap<&'n str, BTreeSet<&str>>,
+) -> String {
+    let Some(cap_nets) = cap_nets else {
+        return "the capacitor has no named pad nets".into();
+    };
+    let non_ground: Vec<&str> = cap_nets
+        .iter()
+        .copied()
+        .filter(|net| !is_ground_like_net(net))
+        .collect();
+    if non_ground.is_empty() {
+        return "the capacitor exposes only ground-like nets; ground alone does not identify an IC"
+            .into();
+    }
+    let bounded: Vec<&str> = non_ground
+        .iter()
+        .copied()
+        .filter(|net| {
+            references_by_net
+                .get(net)
+                .is_some_and(|references| references.len() <= MAX_DECOUPLING_NET_REFERENCES)
+        })
+        .collect();
+    if bounded.is_empty() {
+        return format!(
+            "every non-ground net exceeds the conservative fanout limit of {MAX_DECOUPLING_NET_REFERENCES} references"
+        );
+    }
+    if candidates.iter().all(|(reference, _)| {
+        nets_by_ref
+            .get(*reference)
+            .is_none_or(|ic_nets| bounded.iter().all(|net| !ic_nets.contains(net)))
+    }) {
+        return "no IC shares a non-ground, low-fanout rail with the capacitor".into();
+    }
+    "no conservative capacitor-to-IC association could be proved".into()
 }
 
 /// The nearest connector this capacitor is filtering for, and how far its
@@ -1666,6 +2232,30 @@ fn footprint_values(tree: &SexpNode) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Every reference authored on the board, including legacy `fp_text`
+/// reference fields. This is deliberately identity-only: exact caller input
+/// replaces any attempt to infer part role from a reference prefix or value.
+fn footprint_references(tree: &SexpNode) -> BTreeSet<String> {
+    let mut references = BTreeSet::new();
+    for fp in footprints(tree) {
+        let current = fp
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(|node| node.as_str()) == Some("Reference"))
+            .and_then(|property| property.get(2).and_then(|node| node.as_str()))
+            .or_else(|| {
+                fp.find_all("fp_text")
+                    .into_iter()
+                    .find(|text| text.get(1).and_then(|node| node.as_str()) == Some("reference"))
+                    .and_then(|text| text.get(2).and_then(|node| node.as_str()))
+            });
+        if let Some(reference) = current {
+            references.insert(reference.to_string());
+        }
+    }
+    references
 }
 
 /// The leading alphabetic run of a reference designator: `"C12"` → `"C"`,
@@ -1794,11 +2384,347 @@ mod tests {
         );
         assert!(detail.contains("U1"), "must name the IC: {detail}");
 
+        let associations = response["decoupling_associations"].as_array().unwrap();
+        assert_eq!(associations.len(), 2, "{response}");
+        for association in associations {
+            assert_eq!(association["ic"], "U1", "{association}");
+            assert_eq!(association["qualifying_net"], "VCC", "{association}");
+            assert_eq!(association["net_reference_count"], 4, "{association}");
+            assert_eq!(association["status"], "too_far", "{association}");
+        }
+        assert_eq!(
+            response["unproven_decoupling_caps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "{response}"
+        );
+
         // J1's hand-computed edge distance, reported even though it passes.
         let edges = response["connector_edges"].as_array().unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0]["reference"], "J1");
         assert_eq!(edges[0]["edge_distance_mm"], 8.81);
+
+        // No live KiCad in this test — the saved file is the disclosed source.
+        assert_eq!(response["source"], "saved_file");
+    }
+
+    /// #754: a global ground rail is connectivity, not evidence that this
+    /// particular capacitor belongs to this particular IC. C1's VCC pad is
+    /// moved to J1's /SIG_IN net, leaving GND as its only shared net with U1.
+    /// C2 keeps the fixture's proven low-fanout VCC relationship and remains
+    /// the sole deduction. The served response must disclose why C1 was not
+    /// scored rather than silently guessing or treating it as a pass.
+    #[tokio::test]
+    async fn served_score_does_not_infer_a_decoupling_relationship_from_ground_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::fs::read_to_string(FIXTURE).unwrap();
+        let board = write_variant(
+            &dir,
+            "ground_only_relationship.kicad_pcb",
+            rewrite_footprint_nets(&fixture, "C1", &[("VCC", "/SIG_IN")]),
+        );
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 754,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": board.to_string_lossy() }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["score"], 85, "only C2 may deduct: {body}");
+        assert_eq!(body["deductions"][0]["references"], json!(["C2"]));
+        assert_eq!(body["uncoupled_caps"], json!(["C1"]), "{body}");
+        assert_eq!(body["decoupling_associations"].as_array().unwrap().len(), 1);
+        assert_eq!(body["decoupling_associations"][0]["reference"], "C2");
+        let unproven = body["unproven_decoupling_caps"].as_array().unwrap();
+        assert_eq!(unproven.len(), 1, "{body}");
+        assert_eq!(unproven[0]["reference"], "C1");
+        assert!(
+            unproven[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no IC shares a non-ground, low-fanout rail"),
+            "{body}"
+        );
+    }
+
+    /// #595: when the exact board is open live in KiCad, `score_placement`
+    /// must score the live snapshot — not a stale saved file — and disclose
+    /// that it did. The file on disk here is deliberately near-empty so a
+    /// score/footprint-count match with the fixture only holds if the live
+    /// snapshot, not the file, was scored.
+    #[tokio::test]
+    async fn a_board_open_live_in_kicad_is_scored_from_the_live_snapshot() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108) (generator konnect))").unwrap();
+        let live = std::fs::read_to_string(FIXTURE).unwrap();
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live = live.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    kiapi::common::commands::SaveDocumentToString::decode(command.value.as_slice())
+                        .expect("well-formed SaveDocumentToString request");
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response["source"], "ipc");
+        assert_eq!(response["footprints_scored"], 8, "{response}");
+        assert_eq!(response["score"], 70, "{response}");
+    }
+
+    /// #690: the binding step already resolved the board, so serializing it
+    /// must address that document rather than ask KiCad which board is open
+    /// a second time.
+    #[tokio::test]
+    async fn a_live_score_asks_which_board_once_and_serializes_that_document() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108) (generator konnect))").unwrap();
+        let live = std::fs::read_to_string(FIXTURE).unwrap();
+        let resolved =
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let server = crate::test_support::MockIpcServer::spawn("counting-lookups", {
+            let (lookups, saved, resolved) = (lookups.clone(), saved.clone(), resolved.clone());
+            move |request| {
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    lookups.fetch_add(1, Ordering::Relaxed);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![resolved.clone()],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("SaveDocumentToString") {
+                    let request = kiapi::common::commands::SaveDocumentToString::decode(
+                        command.value.as_slice(),
+                    )
+                    .unwrap();
+                    saved.lock().unwrap().push(request.document);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["source"], "ipc", "{response}");
+        assert_eq!(response["score"], 70, "{response}");
+
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            1,
+            "the serialization reuses the document the binding step resolved"
+        );
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [Some(resolved)],
+            "the one SaveDocumentToString names the document GetOpenDocuments returned"
+        );
+    }
+
+    /// #595's exact reported failure mode, reproduced directly: the saved
+    /// file is the clean fixture (no collision, would score 70), but KiCad
+    /// holds this exact board live with C2 already moved onto C1 — the same
+    /// courtyard-collision-inducing move `overlapping_courtyards_are_a_hard_fail_naming_the_pair`
+    /// uses. A saved-file-only read would report a clean board; scoring the
+    /// live snapshot must report the hard failure instead.
+    #[tokio::test]
+    async fn a_live_move_that_creates_a_collision_is_reported_not_the_clean_saved_file() {
+        use konnect_ipc::gen::kiapi;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let clean = std::fs::read_to_string(FIXTURE).unwrap();
+        std::fs::write(&board, &clean).unwrap();
+
+        assert_eq!(clean.matches("(at 30 15 90)").count(), 1);
+        let live_after_move = clean.replace("(at 30 15 90)", "(at 20 15 90)");
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live_after_move = live_after_move.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live_after_move.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response["source"], "ipc", "{response}");
+        assert_eq!(
+            response["verdict"], "hard_fail",
+            "the saved file alone is clean; only the live snapshot has the collision: {response}"
+        );
+        assert_eq!(response["score"], 50, "{response}");
+        let failures = response["hard_failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{response}");
+        assert_eq!(failures[0]["kind"], "courtyard_overlap");
+        let refs = failures[0]["references"].as_array().unwrap();
+        assert!(refs.contains(&json!("C1")) && refs.contains(&json!("C2")));
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call): proves
+    /// `score_placement` is wired through the real MCP dispatch layer with
+    /// the same live-vs-saved behavior, using the identical live-move
+    /// collision scenario above.
+    #[tokio::test]
+    async fn served_score_placement_reports_the_live_collision_over_the_clean_saved_file() {
+        use konnect_ipc::gen::kiapi;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let clean = std::fs::read_to_string(FIXTURE).unwrap();
+        std::fs::write(&board, &clean).unwrap();
+        let live_after_move = clean.replace("(at 30 15 90)", "(at 20 15 90)");
+
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, {
+            let live_after_move = live_after_move.clone();
+            move |command| {
+                if command.type_url.ends_with("SaveDocumentToString") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live_after_move.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 595,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": board.to_string_lossy() }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["source"], "ipc", "{body}");
+        assert_eq!(body["verdict"], "hard_fail", "{body}");
+        assert_eq!(body["score"], 50, "{body}");
     }
 
     /// Synthetic variant derived from the KiCad-authored fixture by string
@@ -1833,6 +2759,31 @@ mod tests {
         assert!(detail.contains("0.846"), "hand-computed area: {detail}");
     }
 
+    /// Regression for the rectangular fast path (#594): the fixture's
+    /// four-`gr_line` outline classifies as `Rectangular`, so moving C1's
+    /// root anchor from (20, 15) far outside the 60×45 outline must still
+    /// reach `outside_outline` as a hard failure — containment evidence for
+    /// a proven rectangle is unaffected by the new `Unproven` classification.
+    #[tokio::test]
+    async fn rectangular_outline_still_reaches_outside_outline_hard_fail() {
+        let fixture = std::fs::read_to_string(FIXTURE).unwrap();
+        let moved = fixture.replace("(at 20 15)", "(at 200 15)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outside.kicad_pcb");
+        std::fs::write(&path, moved).unwrap();
+
+        let response = score(&path).await;
+        assert_eq!(response["outline_shape"], "rectangular", "{response}");
+        assert_eq!(response["outline_unproven"], false, "{response}");
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
+        let failures = response["hard_failures"].as_array().unwrap();
+        assert!(
+            failures.iter().any(|f| f["kind"] == "outside_outline"
+                && f["references"].as_array().unwrap().contains(&json!("C1"))),
+            "{response}"
+        );
+    }
+
     /// Synthetic variant derived from the KiCad-authored fixture: retagging
     /// the four Edge.Cuts lines removes the outline. The outside and
     /// connector-edge checks are blocked (not passed), the response says so,
@@ -1855,6 +2806,87 @@ mod tests {
         // Edge distances cannot be computed without an outline.
         assert_eq!(response["connector_edges"].as_array().unwrap().len(), 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+    }
+
+    /// KiCad-authored fixture (#593, see
+    /// `konnect-sexp/tests/fixtures/gr_poly_outline.README.md`): a single
+    /// 12-vertex, non-rectangular `gr_poly` Edge.Cuts outline, copied from a
+    /// real project board into a fresh board and saved by pcbnew — not
+    /// manufactured by string surgery. It has no footprints, so this exercises
+    /// `score_placement`'s public path purely for outline recognition: the
+    /// board must not be treated as outline-missing (gr_poly recognition
+    /// from #593 stands), but its concave shape is not a provable rectangle,
+    /// so containment is unproven (#594) — it must never reach a silent
+    /// "pass".
+    const GR_POLY_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb"
+    );
+
+    #[tokio::test]
+    async fn gr_poly_outline_is_recognized_but_unproven_through_the_public_scoring_path() {
+        let response = score(std::path::Path::new(GR_POLY_FIXTURE)).await;
+
+        assert_eq!(response["outline_missing"], false, "{response}");
+        assert_eq!(response["outline_unproven"], true, "{response}");
+        assert_eq!(response["outline_shape"], "unproven", "{response}");
+        assert_eq!(response["verdict"], "outline_unproven", "{response}");
+        assert_ne!(response["verdict"], "pass");
+        assert_eq!(response["score"], 100);
+        assert_eq!(response["footprints_scored"], 0);
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(response["connector_edges"].as_array().unwrap().len(), 0);
+
+        // Cross-check against konnect-sexp's own bbox for the same file
+        // (hand-computed in the fixture's README from its 12 `xy` vertices).
+        let content = std::fs::read_to_string(GR_POLY_FIXTURE).unwrap();
+        let tree = konnect_sexp::parse_sexp(&content).unwrap();
+        assert_eq!(
+            board_outline_bbox(&tree),
+            Some((103.42, 78.96, 154.48, 116.96))
+        );
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// `outline_unproven` verdict, over the same real-KiCad concave `gr_poly`
+    /// fixture used above.
+    #[tokio::test]
+    async fn served_score_placement_reports_outline_unproven_for_a_non_rectangular_board() {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 594,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": GR_POLY_FIXTURE }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["outline_missing"], false, "{body}");
+        assert_eq!(body["outline_unproven"], true, "{body}");
+        assert_eq!(body["outline_shape"], "unproven", "{body}");
+        assert_eq!(body["verdict"], "outline_unproven", "{body}");
+        assert_ne!(body["verdict"], "pass");
     }
 
     /// Move ONE footprint's root anchor by string surgery on the
@@ -2401,6 +3433,72 @@ mod tests {
         path
     }
 
+    #[tokio::test]
+    async fn served_decoupling_blocks_unproven_containment_without_writing() {
+        // Combine footprints and the concave outline from two KiCad-written
+        // fixtures. Retag the original rectangular edges so only the real
+        // concave polygon defines the outline.
+        let outline = std::fs::read_to_string(GR_POLY_FIXTURE).unwrap();
+        let polygon = &outline
+            [outline.find("\t(gr_poly").unwrap()..outline.find("\t(embedded_fonts").unwrap()];
+        let mut content = std::fs::read_to_string(FIXTURE)
+            .unwrap()
+            .replace("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")");
+        content.insert_str(content.rfind(')').unwrap(), polygon);
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("unproven.kicad_pcb");
+        std::fs::write(&board, content).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        for (id, dry_run) in [(5944, true), (5945, false)] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": "place_decoupling_caps", "arguments": {
+                        "board": board.to_string_lossy(), "ic_reference": "U1",
+                        "capacitor_references": ["C1", "C2"], "dry_run": dry_run
+                    }}
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            if dry_run {
+                assert_eq!(response["isError"], false, "{body}");
+                assert_eq!(body["verdict_after_plan"], "outline_unproven", "{body}");
+                assert_eq!(body["plan_status"], "blocked", "{body}");
+                assert!(
+                    body["blocking_reasons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|reason| reason.as_str().unwrap().contains("outline is unproven")),
+                    "{body}"
+                );
+            } else {
+                assert_eq!(response["isError"], true, "{body}");
+                assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+                assert_eq!(
+                    body["error"]["operation"], "place_decoupling_caps",
+                    "{body}"
+                );
+            }
+            assert_eq!(std::fs::read(&board).unwrap(), before);
+        }
+    }
+
     fn ctx_with_open_board(
         board: &std::path::Path,
     ) -> (ToolContext, crate::test_support::MockIpcServer) {
@@ -2412,21 +3510,21 @@ mod tests {
 
     /// The decoupling planner must clear the fixture's only deduction: C1/C2
     /// currently sit 7.071 mm from U1 (score 70); a row below U1's courtyard
-    /// (bbox y_max 22.7 + 0.5 spacing) puts each cap center well inside the
-    /// 2.5 mm rule measured from the courtyard-center distance the checker
-    /// uses... but note the checker measures CENTER-to-CENTER: U1's center is
-    /// (25, 20), the planned cap centers are at y ≈ 23.66, x within ±1 of 25,
-    /// so distance ≈ sqrt(1 + 3.66²) ≈ 3.8 mm — above 2.5! The row is beside
-    /// the courtyard but the SOIC-8 courtyard is tall. The correct assertion
-    /// is therefore what the geometry says: the plan improves the distance
-    /// (7.07 → ~3.8) and the response's own before/after scores tell the
-    /// truth about whether the deduction cleared. Pin the actual numbers.
+    /// clears the decoupling check entirely (confirmed by direct run: score
+    /// goes 70 → 100, verdict "pass"). #596 requires the caller to name the
+    /// exact capacitors — no net-sharing discovery — and the response must
+    /// report `plan_status: "applicable"` with no blocking reasons for this
+    /// legitimately improving plan.
     #[tokio::test]
     async fn decoupling_plan_moves_caps_beside_u1_and_reports_honest_scores() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let result = handle_place_decoupling(
-            &json!({ "board": board.to_string_lossy(), "ic_reference": "U1" }),
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+            }),
             &test_ctx(),
         )
         .await
@@ -2435,6 +3533,12 @@ mod tests {
         let response = text_of(&result).await;
         assert_eq!(response["dry_run"], true);
         assert_eq!(response["side"], "bottom");
+        assert_eq!(response["plan_status"], "applicable", "{response}");
+        assert_eq!(
+            response["blocking_reasons"].as_array().unwrap().len(),
+            0,
+            "{response}"
+        );
         let moves = response["planned_moves"].as_array().unwrap();
         assert_eq!(moves.len(), 2, "C1 and C2: {response}");
         for mv in moves {
@@ -2447,19 +3551,52 @@ mod tests {
             assert!((23.0..27.0).contains(&x), "row centered on U1 x=25: {mv}");
         }
         assert_eq!(response["score_before"], 70);
-        // The response derives its after-score from the planned content —
-        // whatever the checker says it says; both plausible outcomes are a
-        // number, never a fabricated "fixed".
-        assert!(response["score_after_plan"].is_number());
+        assert_eq!(response["score_after_plan"], 100, "{response}");
+        assert_eq!(response["verdict_after_plan"], "pass");
     }
 
     #[tokio::test]
     async fn decoupling_plan_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
-        let args = json!({ "board": board.to_string_lossy(), "ic_reference": "U1" });
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+        });
         let a = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
         let b = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(a, b);
+    }
+
+    /// Caller-supplied order must not change the plan: the row is always
+    /// laid out in reference order.
+    #[tokio::test]
+    async fn decoupling_plan_ignores_requested_reference_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let forward = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+        });
+        let reversed = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C2", "C1"],
+        });
+        let a = text_of(
+            &handle_place_decoupling(&forward, &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let b = text_of(
+            &handle_place_decoupling(&reversed, &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(a, b);
     }
 
@@ -2468,7 +3605,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let result = handle_place_decoupling(
-            &json!({ "board": board.to_string_lossy(), "ic_reference": "U99" }),
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U99",
+                "capacitor_references": ["C1"],
+            }),
             &test_ctx(),
         )
         .await
@@ -2481,13 +3622,292 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decoupling_refuses_a_missing_capacitor_references_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({ "board": board.to_string_lossy(), "ic_reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert!(result_text(&result).contains("capacitor_references"));
+    }
+
+    #[tokio::test]
+    async fn decoupling_refuses_an_empty_capacitor_references_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": [],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    /// #596: this tool never discovers candidates by net — an unrelated cap
+    /// (however tempting a shared GND makes it) is only ever placed if the
+    /// caller names it, and a nonexistent reference is a structured error
+    /// naming exactly what was wrong, not a silent skip.
+    #[tokio::test]
+    async fn decoupling_refuses_an_unknown_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C404"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let text = result_text(&result);
+        assert!(text.contains("C404"), "{text}");
+    }
+
+    /// Exact caller selection is the design-intent boundary. A present
+    /// footprint is accepted without a reference-prefix or value-family
+    /// heuristic, even when its designator is not C*.
+    #[tokio::test]
+    async fn decoupling_does_not_second_guess_an_exact_existing_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["R1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = text_of(&result).await;
+        assert_eq!(body["planned_moves"][0]["reference"], "R1", "{body}");
+    }
+
+    #[tokio::test]
+    async fn decoupling_refuses_a_duplicate_capacitor_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C1"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    /// A plan that cannot possibly help — reapplying the same row to a board
+    /// it was already applied to — must be BLOCKED, not silently accepted:
+    /// the second dry run reports `plan_status: "blocked"` naming the lack
+    /// of improvement, and apply refuses before writing anything.
+    #[tokio::test]
+    async fn decoupling_blocks_a_plan_that_does_not_improve_the_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "ic_reference": "U1",
+            "capacitor_references": ["C1", "C2"],
+            "dry_run": false,
+        });
+        let first = text_of(&handle_place_decoupling(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(first["plan_status"], "applicable", "{first}");
+        assert_eq!(first["score_after"], 100, "{first}");
+
+        let before_second = std::fs::read(&board).unwrap();
+        let second_dry = text_of(
+            &handle_place_decoupling(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "ic_reference": "U1",
+                    "capacitor_references": ["C1", "C2"],
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(second_dry["plan_status"], "blocked", "{second_dry}");
+        let reasons = second_dry["blocking_reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("does not improve")),
+            "{second_dry}"
+        );
+
+        let second_apply = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(second_apply.is_error, "{second_apply:?}");
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before_second,
+            "a blocked apply must not write"
+        );
+    }
+
+    /// #596's own repro: a row whose planned targets fall outside the board
+    /// outline must be blocked, naming the offending reference and its
+    /// planned coordinates, not silently executed.
+    #[tokio::test]
+    async fn decoupling_blocks_a_plan_landing_outside_the_board_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "u1_near_bottom_edge.kicad_pcb",
+            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        );
+        let result = handle_place_decoupling(
+            &json!({
+                "board": board.to_string_lossy(),
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = text_of(&result).await;
+        assert_eq!(response["plan_status"], "blocked", "{response}");
+        let reasons = response["blocking_reasons"].as_array().unwrap();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("outside the board outline")),
+            "{response}"
+        );
+    }
+
+    /// The public MCP route must expose the same refusal reasons during dry
+    /// run and apply, and a refused apply must leave the board byte-identical.
+    #[tokio::test]
+    async fn served_decoupling_block_is_structured_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "u1_near_bottom_edge.kicad_pcb",
+            fixture_with_moved_root("(at 25 20)", "(at 25 42)"),
+        );
+        let before = std::fs::read(&board).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "place_decoupling_caps",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "ic_reference": "U1",
+                        "capacitor_references": ["C1", "C2"],
+                        "dry_run": dry_run
+                    }
+                }
+            })
+        };
+
+        let dry_response = handler
+            .handle_message(call(596, true))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let dry_body: serde_json::Value =
+            serde_json::from_str(dry_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(dry_response["isError"], json!(false), "{dry_body}");
+        assert_eq!(dry_body["plan_status"], "blocked", "{dry_body}");
+        let dry_reasons = dry_body["blocking_reasons"].clone();
+        assert!(dry_reasons.as_array().is_some_and(|r| !r.is_empty()));
+
+        let apply_response = handler
+            .handle_message(call(597, false))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let apply_body: serde_json::Value =
+            serde_json::from_str(apply_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(apply_response["isError"], json!(true), "{apply_body}");
+        assert_eq!(apply_body["error"]["kind"], "plan_blocked", "{apply_body}");
+        assert_eq!(apply_body["error"]["operation"], "place_decoupling_caps");
+        assert_eq!(apply_body["error"]["reasons"], dry_reasons);
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "a plan_blocked refusal must not write"
+        );
+    }
+
+    #[tokio::test]
     async fn decoupling_apply_refuses_the_exact_open_board() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&board);
         let result = handle_place_decoupling(
-            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &json!({
+                "board": board,
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
             &ctx,
         )
         .await
@@ -2507,7 +3927,12 @@ mod tests {
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&other);
         let result = handle_place_decoupling(
-            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &json!({
+                "board": board,
+                "ic_reference": "U1",
+                "capacitor_references": ["C1", "C2"],
+                "dry_run": false,
+            }),
             &ctx,
         )
         .await
@@ -2565,6 +3990,13 @@ mod tests {
         let args = json!({ "board": board.to_string_lossy() });
         let a = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
         assert_eq!(a["dry_run"], true);
+        assert_eq!(a["applied"], false);
+        assert_eq!(a["source"], "saved_file");
+        assert_eq!(a["plan_status"], "blocked");
+        assert!(a["blocking_reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("autonomous whole-board mutation is retired"));
         assert_eq!(a["planned_moves"].as_array().unwrap().len(), 8, "{a}");
         assert_ne!(
             a["verdict_after_plan"], "hard_fail",
@@ -2575,34 +4007,274 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_place_apply_refuses_the_exact_open_board() {
+    async fn auto_place_apply_is_retired_and_never_writes() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
-        let (ctx, _server) = ctx_with_open_board(&board);
-        let result = handle_auto_place(&json!({"board": board, "dry_run": false}), &ctx)
+        let result = handle_auto_place(&json!({"board": board, "dry_run": false}), &test_ctx())
             .await
             .unwrap();
 
         assert!(result.is_error);
-        assert!(result_text(&result).contains("auto_place_from_schematic"));
+        let body: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(
+            body["error"]["operation"], "auto_place_from_schematic",
+            "{body}"
+        );
+        assert!(body["error"]["reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("autonomous whole-board mutation is retired"));
         assert_eq!(std::fs::read(&board).unwrap(), before);
     }
 
     #[tokio::test]
-    async fn auto_place_apply_proceeds_when_a_different_board_is_open() {
+    async fn served_auto_place_apply_is_structured_and_never_writes() {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_copy(&dir);
-        let other = dir.path().join("other.kicad_pcb");
-        std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
-        let (ctx, _server) = ctx_with_open_board(&other);
-        let result = handle_auto_place(&json!({"board": board, "dry_run": false}), &ctx)
-            .await
-            .unwrap();
 
-        assert!(!result.is_error, "{result:?}");
-        assert_ne!(std::fs::read(&board).unwrap(), before);
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 7541,
+                "method": "tools/call",
+                "params": {
+                    "name": "auto_place_from_schematic",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": false }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(true), "{body}");
+        assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+        assert_eq!(
+            body["error"]["operation"], "auto_place_from_schematic",
+            "{body}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// #594: a non-rectangular outline cannot back a containment proof, so
+    /// `auto_place_from_schematic` must refuse to plan against it — a
+    /// BLOCKED refusal, not a plan — regardless of `dry_run`/`apply`.
+    #[tokio::test]
+    async fn auto_place_refuses_an_unproven_outline_dry_run() {
+        let before = std::fs::read(GR_POLY_FIXTURE).unwrap();
+        let result = handle_auto_place(
+            &json!({ "board": GR_POLY_FIXTURE, "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("auto_place_from_schematic"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(GR_POLY_FIXTURE).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn auto_place_refuses_an_unproven_outline_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_auto_place(
+            &json!({ "board": board.to_string_lossy(), "dry_run": false }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("auto_place_from_schematic"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// #594, mirroring `auto_place_refuses_an_unproven_outline_dry_run` for
+    /// `refine_placement_force_directed`.
+    #[tokio::test]
+    async fn force_directed_refuses_an_unproven_outline_dry_run() {
+        let before = std::fs::read(GR_POLY_FIXTURE).unwrap();
+        let result = handle_force_directed(
+            &json!({ "board": GR_POLY_FIXTURE, "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("refine_placement_force_directed"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(GR_POLY_FIXTURE).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn force_directed_refuses_an_unproven_outline_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_force_directed(
+            &json!({ "board": board.to_string_lossy(), "dry_run": false }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("refine_placement_force_directed"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// planner refusal: `auto_place_from_schematic` must refuse an unproven
+    /// outline through the real MCP dispatch layer, for both `dry_run` and
+    /// `apply`, and the apply attempt must leave the board byte-identical.
+    #[tokio::test]
+    async fn served_auto_place_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "auto_place_from_schematic",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5940, true), (5941, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(body["error"]["operation"], "auto_place_from_schematic");
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
+    }
+
+    /// Served twin of `served_auto_place_refuses_an_unproven_outline_and_does_not_write`
+    /// for `refine_placement_force_directed`, the other planner that shares
+    /// the same `outline_unproven_refusal` helper.
+    #[tokio::test]
+    async fn served_force_directed_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "refine_placement_force_directed",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5942, true), (5943, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(
+                body["error"]["operation"],
+                "refine_placement_force_directed"
+            );
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2611,9 +4283,17 @@ mod tests {
         let board = fixture_copy(&dir);
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&board);
-        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_force_directed(
+            &json!({
+                "board": board,
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_error);
         assert!(result_text(&result).contains("refine_placement_force_directed"));
@@ -2628,9 +4308,17 @@ mod tests {
         std::fs::write(&other, "").unwrap();
         let before = std::fs::read(&board).unwrap();
         let (ctx, _server) = ctx_with_open_board(&other);
-        let result = handle_force_directed(&json!({"board": board, "dry_run": false}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_force_directed(
+            &json!({
+                "board": board,
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         assert!(!result.is_error, "{result:?}");
         assert_ne!(std::fs::read(&board).unwrap(), before);
@@ -2772,6 +4460,202 @@ mod tests {
             a["verdict_after_plan"], "hard_fail",
             "refinement must not create hard failures: {a}"
         );
+    }
+
+    #[test]
+    fn force_directed_applicability_names_every_blocking_condition() {
+        let applicability = force_directed_applicability(
+            Some(1.0),
+            false,
+            300,
+            70,
+            70,
+            "hard_fail",
+            &[ForceMoveSafety {
+                reference: "C1".into(),
+                displacement_mm: 12.5,
+                inside_outline: false,
+                target_anchor: (-1.0, 46.0),
+            }],
+        );
+        let reasons = applicability.blocking_reasons().join("\n");
+        for expected in [
+            "C1 plans a 12.5 mm displacement, exceeding max_displacement_mm 1",
+            "C1 plans outside the board outline at (-1, 46)",
+            "the plan did not converge within 300 iterations",
+            "the plan does not improve the score (70 → 70)",
+            "the planned placement has a hard-fail verdict",
+        ] {
+            assert!(
+                reasons.contains(expected),
+                "missing {expected:?}: {reasons}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_directed_applicability_requires_a_displacement_limit() {
+        let applicability = force_directed_applicability(None, true, 12, 70, 85, "pass", &[]);
+        assert_eq!(
+            applicability.blocking_reasons(),
+            &["max_displacement_mm is required before this deprecated planner can apply"]
+        );
+    }
+
+    /// #597: the public MCP route must disclose why a force-directed plan is
+    /// blocked and refuse the matching apply before the first footprint write.
+    #[tokio::test]
+    async fn served_force_directed_block_is_structured_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let before = std::fs::read(&board).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "refine_placement_force_directed",
+                    "arguments": {
+                        "board": board.to_string_lossy(),
+                        "iterations": 1,
+                        "dry_run": dry_run
+                    }
+                }
+            })
+        };
+
+        let dry_response = handler
+            .handle_message(call(597, true))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let dry_body: serde_json::Value =
+            serde_json::from_str(dry_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(dry_response["isError"], json!(false), "{dry_body}");
+        assert_eq!(dry_body["plan_status"], "blocked", "{dry_body}");
+        let dry_reasons = dry_body["blocking_reasons"].clone();
+        assert!(
+            dry_reasons
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("did not converge")))),
+            "{dry_body}"
+        );
+        assert!(
+            dry_reasons
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("max_displacement_mm")))),
+            "{dry_body}"
+        );
+
+        let apply_response = handler
+            .handle_message(call(598, false))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let apply_body: serde_json::Value =
+            serde_json::from_str(apply_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(apply_response["isError"], json!(true), "{apply_body}");
+        assert_eq!(apply_body["error"]["kind"], "plan_blocked", "{apply_body}");
+        assert_eq!(
+            apply_body["error"]["operation"],
+            "refine_placement_force_directed"
+        );
+        assert_eq!(apply_body["error"]["reasons"], dry_reasons);
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "a plan_blocked refusal must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_directed_blocks_a_move_over_the_declared_displacement_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let result = handle_force_directed(
+            &json!({
+                "board": board.to_string_lossy(),
+                "iterations": 1,
+                "max_displacement_mm": 0.001,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "dry-run still returns the diagnostic plan"
+        );
+        let response = text_of(&result).await;
+        assert_eq!(response["plan_status"], "blocked", "{response}");
+        assert!(
+            response["blocking_reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("exceeding max_displacement_mm")))),
+            "{response}"
+        );
+        assert!(
+            response["planned_moves"]
+                .as_array()
+                .is_some_and(|moves| moves
+                    .iter()
+                    .all(|planned| planned["displacement_mm"].is_number())),
+            "{response}"
+        );
+    }
+
+    /// A bounded plan that settles and improves the shared placement score is
+    /// still usable; #597 retires unsafe bulk cleanup, not the public API.
+    #[tokio::test]
+    async fn force_directed_applicable_plan_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let dry_args = json!({
+            "board": board.to_string_lossy(),
+            "references": ["C1"],
+            "max_displacement_mm": 20.0,
+        });
+        let dry = text_of(&handle_force_directed(&dry_args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(dry["plan_status"], "applicable", "{dry}");
+        assert!(dry["converged"].as_bool().is_some_and(|value| value));
+        assert!(dry["score_after_plan"].as_i64() > dry["score_before"].as_i64());
+
+        let result = handle_force_directed(
+            &json!({
+                "board": board.to_string_lossy(),
+                "references": ["C1"],
+                "max_displacement_mm": 20.0,
+                "dry_run": false,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let applied = text_of(&result).await;
+        assert_eq!(applied["plan_status"], "applicable", "{applied}");
+        assert_eq!(applied["applied_count"], 1, "{applied}");
     }
 
     #[tokio::test]

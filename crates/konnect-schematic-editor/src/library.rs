@@ -423,6 +423,8 @@ fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a
 /// the exact definition the schematic instance refers to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolMetadata {
+    /// The reference prefix, such as `R` or `#FLG`.
+    pub reference: String,
     pub value: String,
     pub footprint: String,
     pub datasheet: String,
@@ -447,6 +449,7 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
             .to_string()
     };
     SymbolMetadata {
+        reference: value("Reference"),
         value: value("Value"),
         footprint: value("Footprint"),
         datasheet: value("Datasheet"),
@@ -966,11 +969,12 @@ mod field_anchor_tests {
     #[test]
     fn reads_instance_metadata_from_direct_library_properties_only() {
         let (sch, _dir) = schematic_with(
-            "(symbol \"Device:R\" (property \"Value\" \"R\" (at 0 0 0)) (property \"Footprint\" \"Resistor_THT:R_Axial\" (at 0 0 0)) (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Resistor\" (at 0 0 0)) (symbol \"R_0_1\" (property \"Description\" \"nested\" (at 0 0 0))))",
+            "(symbol \"Device:R\" (property \"Reference\" \"R\" (at 0 0 0)) (property \"Value\" \"R\" (at 0 0 0)) (property \"Footprint\" \"Resistor_THT:R_Axial\" (at 0 0 0)) (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Resistor\" (at 0 0 0)) (symbol \"R_0_1\" (property \"Description\" \"nested\" (at 0 0 0))))",
         );
         assert_eq!(
             symbol_metadata(&sch, "Device:R"),
             SymbolMetadata {
+                reference: "R".to_string(),
                 value: "R".to_string(),
                 footprint: "Resistor_THT:R_Axial".to_string(),
                 datasheet: "~".to_string(),

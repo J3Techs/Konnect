@@ -82,7 +82,7 @@ table below is its human-readable explanation.
 
 | Area | Current gap | Tracking | Removal condition |
 |---|---|---|---|
-| DRC entry points | `run_drc` and `get_drc_violations` duplicate policy, and save/refill ordering can leave the evidence source ambiguous. | [#119](https://github.com/mixelpixx/Konnect/issues/119), [#408](https://github.com/mixelpixx/Konnect/issues/408) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence. |
+| DRC entry points | #408 introduces shared explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#119](https://github.com/mixelpixx/Konnect/issues/119), [#574](https://github.com/mixelpixx/Konnect/issues/574) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
 | Explicit config loading | A failed explicit plugin config can fall through to defaults and report success. | [#545](https://github.com/mixelpixx/Konnect/issues/545) | Explicit-config refusal is structured, does not start with substituted defaults, and has regression coverage. |
 | Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
 

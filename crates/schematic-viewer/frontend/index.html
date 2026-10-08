@@ -245,9 +245,26 @@
     return Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
   }
 
+  // Zoom resizes the SVG rather than scaling it with CSS: WebKitGTK scales a
+  // transformed subtree as a bitmap drawn at layout size, which for an A3
+  // sheet is ~420px wide, so no zoom level ever made text readable.
   function updateTransform() {
-    container.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+    container.style.transform = `translate(${panX}px, ${panY}px)`;
+    const svgEl = container.querySelector('svg');
+    const size = svgEl && sheetSize(svgEl);
+    if (size) {
+      svgEl.setAttribute('width', String(size.w * scale));
+      svgEl.setAttribute('height', String(size.h * scale));
+    }
     zoomDisplay.textContent = Math.round(scale * 100) + '%';
+  }
+
+  // The sheet's size in viewBox units, which are CSS px at 100% zoom.
+  function sheetSize(svgEl) {
+    const vb = svgEl.getAttribute('viewBox');
+    if (!vb) return null;
+    const [, , w, h] = vb.split(/\s+/).map(Number);
+    return w && h ? { w, h } : null;
   }
 
   function applySvgTheme() {
@@ -265,6 +282,9 @@
     const svgEl = container.querySelector('svg');
     if (svgEl) {
       svgEl.style.background = 'transparent';
+      // kicad-cli's <title> ("SVG Image created as …") became a native
+      // tooltip over the whole sheet, and on Linux it left a gray ghost.
+      svgEl.querySelector(':scope > title')?.remove();
       // Ensure a viewBox so fitToPage can compute dimensions
       if (!svgEl.getAttribute('viewBox') && svgEl.getAttribute('width')) {
         const w = parseFloat(svgEl.getAttribute('width'));
@@ -276,17 +296,11 @@
       // those — at ~3.78 CSS px/mm, an A3 sheet is natively ~1587x1122px —
       // but fitToPage()'s scale math assumes 1 viewBox unit = 1 CSS pixel.
       // Left alone, that mismatch makes "Fit" wildly over-zoom on anything
-      // bigger than a postage stamp. Force width/height to the viewBox's
-      // own numeric units so the two always agree, regardless of sheet size.
-      const vb = svgEl.getAttribute('viewBox');
-      if (vb) {
-        const parts = vb.split(/\s+/).map(Number);
-        if (parts.length === 4 && parts[2] && parts[3]) {
-          svgEl.setAttribute('width', String(parts[2]));
-          svgEl.setAttribute('height', String(parts[3]));
-        }
-      }
+      // bigger than a postage stamp. updateTransform() sets width/height to
+      // the viewBox's own numeric units times the zoom, so the two always
+      // agree, regardless of sheet size, and a re-render keeps the zoom.
     }
+    updateTransform();
     applySvgTheme();
   }
 
@@ -310,10 +324,9 @@
 
   function fitToPage() {
     const svgEl = container.querySelector('svg');
-    if (!svgEl) return;
-    const vb = svgEl.getAttribute('viewBox');
-    if (!vb) return;
-    const [, , svgW, svgH] = vb.split(/\s+/).map(Number);
+    const size = svgEl && sheetSize(svgEl);
+    if (!size) return;
+    const { w: svgW, h: svgH } = size;
     const viewW = viewer.clientWidth;
     const viewH = viewer.clientHeight;
     scale = clampScale(Math.min(viewW / svgW, viewH / svgH) * 0.95);
@@ -322,8 +335,20 @@
     updateTransform();
   }
 
-  function zoomIn() { scale = clampScale(scale * 1.25); updateTransform(); }
-  function zoomOut() { scale = clampScale(scale * 0.8); updateTransform(); }
+  // Zoom keeping the sheet point under (x, y) fixed, in viewer coordinates.
+  function zoomAt(factor, x, y) {
+    const newScale = clampScale(scale * factor);
+    if (newScale === scale) return;
+    panX = x - (x - panX) * (newScale / scale);
+    panY = y - (y - panY) * (newScale / scale);
+    scale = newScale;
+    updateTransform();
+  }
+
+  // Buttons and keys zoom about the window center; anchored at the sheet's
+  // corner, which is off-screen once zoomed in, they slid the sheet away.
+  function zoomIn() { zoomAt(1.25, viewer.clientWidth / 2, viewer.clientHeight / 2); }
+  function zoomOut() { zoomAt(0.8, viewer.clientWidth / 2, viewer.clientHeight / 2); }
 
   function toggleTheme() {
     darkTheme = !darkTheme;
@@ -345,19 +370,7 @@
   viewer.addEventListener('wheel', (e) => {
     e.preventDefault();
     const rect = viewer.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-    const newScale = clampScale(scale * zoomFactor);
-    if (newScale === scale) return;
-
-    // Adjust pan to zoom toward cursor
-    panX = mouseX - (mouseX - panX) * (newScale / scale);
-    panY = mouseY - (mouseY - panY) * (newScale / scale);
-    scale = newScale;
-
-    updateTransform();
+    zoomAt(e.deltaY < 0 ? 1.1 : 0.9, e.clientX - rect.left, e.clientY - rect.top);
   }, { passive: false });
 
   // Mouse drag pan

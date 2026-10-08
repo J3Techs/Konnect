@@ -23,12 +23,12 @@ use prost::Message;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let requested_board = get_path($args, "board")?;
-        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c, _| $body).await? {
             Ok(v) => v,
             // Only an unreachable transport justifies "KiCAD must be running".
             // This used to say it for every failure, so a tool that refused a
@@ -45,6 +45,12 @@ macro_rules! ipc {
                 return Ok(crate::tools::ipc_target_error_result(&error))
             }
             Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+            Err(konnect_ipc::IpcFailure::Recovered(msg)) => {
+                return Ok(crate::tools::ipc_recovered_result(&msg))
+            }
+            Err(konnect_ipc::IpcFailure::Uncertain(msg)) => {
+                return Ok(crate::tools::ipc_uncertain_result(&msg))
+            }
         }
     }};
 }
@@ -56,16 +62,22 @@ macro_rules! ipc {
 /// table, then the conventional KiCad library directories — the lookup that
 /// `library::resolve_footprint_path` owns.
 pub(crate) fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String> {
+    let path = resolve_footprint_file(lib_id, board)?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+}
+
+/// The resolution half of [`resolve_footprint_source`], for a caller that
+/// reports "does not resolve" and "cannot be read" as different failures.
+pub(crate) fn resolve_footprint_file(lib_id: &str, board_path: &Path) -> anyhow::Result<PathBuf> {
     let (nickname, entry) = lib_id.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("footprint must use Library:Footprint syntax, got '{lib_id}'")
     })?;
     if nickname.is_empty() || entry.is_empty() {
         anyhow::bail!("footprint must use a non-empty Library:Footprint identifier");
     }
-    let path = super::library::resolve_footprint_path(lib_id, board.parent())
-        .map_err(|message| anyhow::anyhow!(message))?;
-    std::fs::read_to_string(&path)
-        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+    super::library::resolve_footprint_path(lib_id, board_path.parent())
+        .map_err(|message| anyhow::anyhow!(message))
 }
 
 /// Structured rejection for any back-side (`B.*`) placement layer.
@@ -1582,13 +1594,15 @@ fn flip_pad_block(block: &str) -> anyhow::Result<String> {
 
 /// Refuse a `(model …)` whose placement a flip would have to move.
 ///
-/// KiCad's own flip transforms a model's Y offset and its X/Y rotation; this
-/// tool leaves `(model …)` untouched, which is silently wrong for any model
-/// where those are non-zero. Rather than guess the transform — I have not been
-/// able to measure KiCad's flip directly, because KiCad 10.0.5 exposes no
-/// `FlipItems` to drive it and its demo boards contain no back-side footprint
-/// with a non-zero offset to compare against — this refuses, consistent with
-/// how the rest of this path treats geometry it cannot mirror.
+/// This guard applies only to the closed-board file-fallback path. An open
+/// board flips through KiCad's own native `FlipItems` IPC command (10.0.6+),
+/// which transforms a model's Y offset and X/Y rotation correctly, so that
+/// path never reaches this function. The closed-board path directly edits
+/// the `.kicad_pcb` file and leaves `(model …)` untouched, which is silently
+/// wrong for any model where those are non-zero. Rather than guess the
+/// transform — reproducing KiCad's own `FOOTPRINT::Flip` 3D-model math is out
+/// of scope for the file fallback (issue #604) — this refuses, consistent
+/// with how the rest of this path treats geometry it cannot mirror.
 ///
 /// The cost of refusing is close to nothing. Across all **14,818** footprints
 /// in KiCad 10's standard libraries that carry a `(model …)`: `offset.y` is
@@ -1821,7 +1835,7 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "place_component",
             "Place a footprint on the PCB. Uses live KiCAD IPC when reachable; otherwise safely \
@@ -1904,9 +1918,14 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "flip_component",
-            "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
-             This operation requires a closed board: it safely flips supported footprints with \
-             revision checks and fails closed when KiCAD is reachable or geometry is unsupported.",
+            "Set a placed footprint to F.Cu or B.Cu. When the board is open in KiCad 10.0.6 or \
+             newer, this uses KiCad's own native FlipItems IPC command — the same transform the \
+             GUI's F key performs, including 3D-model offset/rotation — inside one KiCad undo \
+             step. Older or unsupported KiCad reachable over IPC returns an explicit \
+             unsupported_capability error rather than falling back to the file. Only when no \
+             live KiCad holds this board does it fall back to a guarded closed-board file edit, \
+             which flips supported geometry with revision checks and refuses any footprint whose \
+             3D model would need a transform the file path cannot perform.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1918,7 +1937,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_flip_component(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
@@ -2039,7 +2058,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_component_pads",
-            "Return live board-space pad positions, layers and net assignments for a footprint. \
+            "Return live board-space pad positions, effective rotations, physical geometry, drills, \
+             copper-layer shapes, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
              when no live KiCad holds this board — IPC unreachable, or that board not open — \
              'source' says which, so unsaved placements are visible without a save. \
@@ -2059,7 +2079,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_pad_position",
-            "Return the live board-space position, layers and net of a specific pad number on a footprint.",
+            "Return the live board-space position, effective rotation, physical geometry, drill, \
+             layers and net of a specific pad number on a footprint.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2154,7 +2175,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_board_2d_view(args, ctx).await }
         ),
-    ]
+    ];
+    tools.push(super::placed_footprint_models::tool());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -2514,6 +2537,12 @@ async fn handle_set_component_placements(
     }
 }
 
+/// Minimum KiCad version whose native `FlipItems` command Konnect drives over
+/// IPC (issue #604). Older reachable KiCad answers `AS_UNHANDLED`, which this
+/// handler treats as authoritative capability evidence, never inferred from a
+/// version string on its own.
+const FLIP_ITEMS_MIN_KICAD_VERSION: &str = "10.0.6";
+
 async fn handle_flip_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2537,41 +2566,89 @@ async fn handle_flip_component(
         Err(error) => return Ok(error),
     };
 
-    // KiCAD 10.0.5 and the protocol Konnect vendors carry no FlipItems command,
-    // so this tool has no IPC implementation at all — which makes
-    // `refuse_if_board_open_in_kicad` the right gate rather than
-    // `attempt_ipc_write`.
-    //
-    // The distinction is not cosmetic. Running `ensure_board_is_active` and
-    // then bailing unconditionally produced an `anyhow` classified as
-    // `Rejected` — so *every* reachable KiCAD refused the flip, including one
-    // holding an unrelated project, where this board file is demonstrably
-    // free. It also reported Konnect's own refusal as "KiCAD rejected the
-    // footprint flip over IPC", which is the class fixed in v0.5.0. That
-    // misclassification is now gone at the source: "not open" carries the
-    // `BoardNotOpen` marker and classifies as its own answer.
-    //
-    // The helper refuses only when KiCAD holds *this* board, because that is
-    // the only case where the edit would be discarded by its next save.
-    //
-    if let Some(refusal) =
-        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
-            .await?
+    // KiCad 10.0.6 added a native FlipItems IPC command, so an open board now
+    // flips through the same live-IPC-preferred-with-fallback shape as
+    // set_component_placements, rather than refusing outright whenever KiCad
+    // is reachable. The closed-board file fallback is unchanged (issue #604).
+    let reference_ipc = reference.clone();
+    let layer_ipc = layer.clone();
+    match attempt_ipc_write(ctx, &board, "footprint flip", move |client| {
+        client.flip_footprint(&reference_ipc, &layer_ipc)
+    })
+    .await?
     {
-        return Ok(refusal);
+        BoardWrite::Ipc(outcome) => Ok(flip_outcome_result(outcome)),
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(reason) => {
+            match set_closed_board_footprint_side(&board, &reference, &layer) {
+                Ok(changed) => Ok(CallToolResult::json(&json!({
+                    "flipped": reference,
+                    "layer": layer,
+                    "changed": changed,
+                    "source": "file",
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
+                }))),
+                Err(error) => Ok(error.into_result()),
+            }
+        }
     }
+}
 
-    match set_closed_board_footprint_side(&board, &reference, &layer) {
-        Ok(changed) => Ok(CallToolResult::json(&json!({
+/// Turn a [`konnect_ipc::IpcFlipOutcome`] into the tool's `CallToolResult`.
+///
+/// `Flipped` is the only case reported as a plain success. `Unsupported` and
+/// `Uncertain` are both IPC-observed states — the board is open and
+/// reachable — so neither one may fall back to the file path; each gets its
+/// own structured result naming what the caller should do next.
+fn flip_outcome_result(outcome: konnect_ipc::IpcFlipOutcome) -> CallToolResult {
+    use konnect_ipc::IpcFlipOutcome;
+    match outcome {
+        IpcFlipOutcome::Flipped {
+            reference,
+            kiid,
+            previous_layer,
+            layer,
+            already_on_layer,
+            models,
+        } => CallToolResult::json(&json!({
             "flipped": reference,
+            "kiid": kiid,
+            "previous_layer": previous_layer,
             "layer": layer,
-            "changed": changed,
-            "source": "file",
-            "warning": "KiCAD has no footprint-flip command over IPC, so the board file was \
-                        flipped directly with a revision check. Reopen the board in KiCAD to \
-                        see it."
-        }))),
-        Err(error) => Ok(error.into_result()),
+            "already_on_layer": already_on_layer,
+            "models": models,
+            "source": "ipc",
+            "undo": "One KiCad undo step reverses the flip."
+        })),
+        IpcFlipOutcome::Unsupported { kicad_version } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+                capability: "flip_component".to_string(),
+                kicad_version: kicad_version.map(|v| v.full_version),
+            },
+            format!(
+                "The running KiCad endpoint answered AS_UNHANDLED for the native footprint-flip \
+                 command. Konnect requires KiCad {FLIP_ITEMS_MIN_KICAD_VERSION} or newer to flip \
+                 a footprint on an open board over IPC. The board file was not modified."
+            ),
+        ),
+        IpcFlipOutcome::Uncertain {
+            reference,
+            kiid,
+            requested_layer,
+            reason,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+                operation: "flip_component".to_string(),
+                path: format!("{reference} ({kiid})"),
+                reason: reason.clone(),
+            },
+            format!(
+                "KiCad's footprint-flip mutation for '{reference}' toward {requested_layer} may \
+                 or may not have taken effect: {reason}. Inspect the board in KiCad and reconcile \
+                 before retrying — this may not be a no-op."
+            ),
+        ),
     }
 }
 
@@ -3188,6 +3265,129 @@ fn saved_pad_count(board_path: &std::path::Path, reference: &str) -> Option<usiz
         .map(|fp| fp.find_all("pad").len())
 }
 
+fn file_pad_drill(pad: &konnect_sexp::SexpNode) -> Option<konnect_ipc::IpcPadDrill> {
+    let drill = pad.find("drill")?;
+    let oval = drill.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("oval");
+    let first = if oval { 2 } else { 1 };
+    let x = drill.get_f64(first)?;
+    let y = drill.get_f64(first + 1).unwrap_or(x);
+    Some(konnect_ipc::IpcPadDrill {
+        shape: Some(if oval { "oval" } else { "circle" }.to_string()),
+        size: Some(konnect_ipc::IpcVector2 { x, y }),
+        // The serialized pad drill does not independently name a layer span.
+        // Do not turn the pad's wildcard/copper layer list into measured drill
+        // endpoints; live IPC provides those when KiCad exposes them.
+        start_layer: None,
+        end_layer: None,
+    })
+}
+
+/// Parse the geometry KiCad saved for one pad and express it in the same typed
+/// shape returned by the live IPC path.
+///
+/// `x`, `y`, and `rotation_deg` are already in the caller's declared coordinate
+/// space: board-space for `get_component_pads`, footprint-local for library
+/// inspection.  Keeping this serializer shared prevents the two file readers
+/// from drifting as new native pad fields are exposed.
+pub(crate) fn pad_info_from_sexp(
+    pad: &konnect_sexp::SexpNode,
+    x: f64,
+    y: f64,
+    rotation_deg: f64,
+    net: String,
+) -> anyhow::Result<konnect_ipc::IpcPad> {
+    let number = pad
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("pad has no readable number")?
+        .to_string();
+    let pad_type = pad
+        .get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|kind| {
+            match kind {
+                "thru_hole" => Some("thru_hole"),
+                "smd" => Some("smd"),
+                "connect" => Some("edge_connector"),
+                "np_thru_hole" => Some("np_thru_hole"),
+                _ => None,
+            }
+            .map(str::to_string)
+        });
+    let shape = pad
+        .get(3)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|shape| {
+            matches!(
+                shape,
+                "circle"
+                    | "rect"
+                    | "oval"
+                    | "trapezoid"
+                    | "roundrect"
+                    | "chamfered_rect"
+                    | "custom"
+            )
+            .then(|| shape.to_string())
+        });
+    let size = pad.find("size").and_then(|size| {
+        Some(konnect_ipc::IpcVector2 {
+            x: size.get_f64(1)?,
+            y: size.get_f64(2)?,
+        })
+    });
+    let layers: Vec<String> = pad
+        .find("layers")
+        .and_then(konnect_sexp::SexpNode::children)
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .filter_map(konnect_sexp::SexpNode::as_str)
+        .map(str::to_string)
+        .collect();
+    let offset = pad.find("offset").and_then(|offset| {
+        Some(konnect_ipc::IpcVector2 {
+            x: offset.get_f64(1)?,
+            y: offset.get_f64(2)?,
+        })
+    });
+    let corner_rounding_ratio = pad
+        .find("roundrect_rratio")
+        .and_then(|node| node.get_f64(1));
+    let chamfer_ratio = pad.find("chamfer_ratio").and_then(|node| node.get_f64(1));
+    let copper_layers = layers
+        .iter()
+        .filter(|layer| layer.as_str() == "*.Cu" || layer.ends_with(".Cu"))
+        .map(|layer| konnect_ipc::IpcPadLayerGeometry {
+            layer: layer.clone(),
+            shape: shape.clone(),
+            size: size.clone(),
+            offset: offset.clone(),
+            corner_rounding_ratio,
+            chamfer_ratio,
+        })
+        .collect();
+    let uuid = pad
+        .find_str("uuid")
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string);
+
+    Ok(konnect_ipc::IpcPad {
+        uuid,
+        number,
+        x,
+        y,
+        net,
+        layers,
+        pad_type,
+        rotation_deg: Some(rotation_deg),
+        shape,
+        size,
+        drill: file_pad_drill(pad),
+        copper_layers,
+    })
+}
+
 async fn handle_get_component_pads(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -3202,10 +3402,8 @@ async fn handle_get_component_pads(
     // pads in the file at all, so reading the file would either error or
     // answer about a stale board while the writers in this toolset act on the
     // live one. The file stays the fallback for an offline session.
-    let ipc_board = board_path.clone();
     let ipc_reference = reference.clone();
-    let live = with_board_ipc_classified(ctx, &board_path, move |c| {
-        let document = c.find_open_board(&ipc_board)?;
+    let live = with_board_ipc_classified(ctx, &board_path, move |c, document| {
         c.get_footprint_pads_in(document, &ipc_reference)
     })
     .await?;
@@ -3214,15 +3412,7 @@ async fn handle_get_component_pads(
         Ok(Some(pads)) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
                 .iter()
-                .map(|pad| {
-                    json!({
-                        "number": pad.number,
-                        "x": pad.x,
-                        "y": pad.y,
-                        "net": pad.net,
-                        "layers": pad.layers
-                    })
-                })
+                .map(|pad| serde_json::to_value(pad).expect("IpcPad is serializable"))
                 .collect();
             return Ok(CallToolResult::json(&json!({
                 "reference": reference,
@@ -3275,6 +3465,12 @@ async fn handle_get_component_pads(
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
         }
+        Err(konnect_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message));
+        }
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message));
+        }
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -3303,48 +3499,64 @@ async fn handle_get_component_pads(
     let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
     let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
 
-    let pads: Vec<serde_json::Value> = fp_node
-        .find_all("pad")
-        .iter()
-        .filter_map(|pad| {
-            let number = pad.get(1)?.as_str()?.to_string();
-            let pad_at = pad.find("at")?;
-            let local_x = pad_at.get_f64(1)?;
-            let local_y = pad_at.get_f64(2)?;
-            // Transform local pad coords to board space (rotation only).
-            // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
-            let (board_x, board_y) =
-                konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
-            // Three outcomes, deliberately distinguishable. No (net …) node at
-            // all is an unconnected pad, and "" says so. A node we can read
-            // gives its name. A node that is present but unreadable gives
-            // null — previously it gave "" too, so a fully connected KiCad 10
-            // pad was indistinguishable from an unconnected one. See
-            // konnect_sexp::net for the two shapes.
-            let net = match pad.find("net") {
-                None => json!(""),
-                Some(node) => match konnect_sexp::net::net_name(node) {
-                    Some(name) => json!(name),
-                    None => serde_json::Value::Null,
-                },
-            };
-            let layers: Vec<_> = pad
-                .find("layers")
-                .and_then(konnect_sexp::SexpNode::children)
-                .unwrap_or_default()
-                .iter()
-                .skip(1)
-                .filter_map(konnect_sexp::SexpNode::as_str)
-                .collect();
-            Some(json!({
-                "number": number,
-                "x": board_x,
-                "y": board_y,
-                "net": net,
-                "layers": layers
-            }))
-        })
-        .collect();
+    let mut pads = Vec::new();
+    for pad in fp_node.find_all("pad") {
+        let pad_number = pad
+            .get(1)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .unwrap_or("<unreadable>");
+        let Some(pad_at) = pad.find("at") else {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{pad_number}' on footprint '{reference}' has no readable position"
+            )));
+        };
+        let (Some(local_x), Some(local_y)) = (pad_at.get_f64(1), pad_at.get_f64(2)) else {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{pad_number}' on footprint '{reference}' has an invalid position"
+            )));
+        };
+        // Transform local pad coords to board space (rotation only).
+        // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
+        let (board_x, board_y) =
+            konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
+        // Three outcomes, deliberately distinguishable. No (net …) node at
+        // all is an unconnected pad, and "" says so. A node we can read
+        // gives its name. A node that is present but unreadable gives
+        // null — previously it gave "" too, so a fully connected KiCad 10
+        // pad was indistinguishable from an unconnected one. See
+        // konnect_sexp::net for the two shapes.
+        let net = match pad.find("net") {
+            None => json!(""),
+            Some(node) => match konnect_sexp::net::net_name(node) {
+                Some(name) => json!(name),
+                None => serde_json::Value::Null,
+            },
+        };
+        // In a saved board KiCad writes the pad's effective board-space
+        // angle here. Unlike a library footprint, adding the footprint
+        // angle again would double-rotate the reported geometry.
+        let rotation_deg = pad_at.get_f64(3).unwrap_or(0.0);
+        let pad_info = match pad_info_from_sexp(
+            pad,
+            board_x,
+            board_y,
+            rotation_deg,
+            net.as_str().unwrap_or_default().to_string(),
+        ) {
+            Ok(info) => info,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Could not read pad '{pad_number}' on footprint '{reference}': {error}"
+                )))
+            }
+        };
+        let mut value = serde_json::to_value(pad_info)?;
+        // Preserve the established three-state net contract.  The shared
+        // typed pad uses a string for known/unconnected values; malformed
+        // saved net nodes remain an explicit JSON null here.
+        value["net"] = net;
+        pads.push(value);
+    }
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
@@ -3500,7 +3712,7 @@ async fn handle_place_array(
     }
 
     let footprint_id = footprint.clone();
-    let placed = match with_board_ipc_classified(ctx, &board, move |c| {
+    let placed = match with_board_ipc_classified(ctx, &board, move |c, _| {
         let existing = c
             .list_footprints()?
             .into_iter()
@@ -3597,7 +3809,7 @@ async fn handle_align_components(
         Err(e) => return Ok(e),
     };
 
-    let aligned = match with_board_ipc_classified(ctx, &board, move |c| {
+    let aligned = match with_board_ipc_classified(ctx, &board, move |c, _| {
         c.run_commit("Align footprints", |c| {
             references
                 .iter()
@@ -5125,7 +5337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_rejection_prevents_flip_file_fallback() {
+    async fn a_reachable_kicad_that_rejects_the_flip_never_touches_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("flip.kicad_pcb");
         let before = format!(
@@ -5162,17 +5374,375 @@ mod tests {
         .await
         .unwrap();
 
-        // A KiCAD that answers but does not confirm holding *this* board does
-        // not block the flip: nothing it has open can discard a write to this
-        // file, so refusing would deny a safe edit to anyone with an unrelated
-        // project open. That is `refuse_if_board_open_in_kicad`'s contract,
-        // shared with `add_zone` and the copper-pour path.
-        assert!(!flipped.is_error, "{:?}", flipped.content);
-        let result: serde_json::Value =
-            serde_json::from_str(&result_text(&flipped)).expect("flip result must be JSON");
-        assert_eq!(result["source"], "file");
-        assert_eq!(result["changed"], true);
-        assert_ne!(std::fs::read_to_string(board).unwrap(), before);
+        // Since #604, flip_component performs the write over IPC via
+        // attempt_ipc_write, exactly like set_component_placements: a
+        // reachable KiCad that answers but rejects the request may be alive
+        // and holding this exact board, so the file must not be touched —
+        // "Rejected" fails closed rather than falling back to the file
+        // (mirrors `a_reachable_kicad_that_rejects_never_touches_the_file`).
+        assert!(
+            flipped.is_error,
+            "a rejection must not be reported as success"
+        );
+        let text = result_text(&flipped);
+        assert!(
+            text.contains("rejected the footprint flip") && text.contains("not modified"),
+            "the error must say the file was left alone: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "a reachable KiCAD that says no must never trigger the file fallback"
+        );
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open with one
+    /// footprint on it, answering `GetItems`/`BeginCommit`/`EndCommit`/
+    /// `GetVersion`, and dispatching `FlipItems` to `flip_items`. Exercises
+    /// `handle_flip_component`'s IPC path end-to-end through
+    /// `attempt_ipc_write` (issue #604) — not just `flip_footprint` in
+    /// isolation, which `flip_footprint_test.rs` already covers.
+    fn spawn_flip_capable_kicad(
+        board: &std::path::Path,
+        footprint: std::sync::Arc<
+            std::sync::Mutex<konnect_ipc::gen::kiapi::board::types::FootprintInstance>,
+        >,
+        flip_items: impl Fn(
+                &konnect_ipc::gen::kiapi::board::commands::FlipItems,
+                &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+            ) -> konnect_ipc::gen::kiapi::board::commands::FlipItemsResponse
+            + Send
+            + 'static,
+    ) -> crate::test_support::MockIpcServer {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let board = board.to_string_lossy().to_string();
+        crate::test_support::MockIpcServer::spawn("flip-capable-kicad", move |request| {
+            let command = request.message.expect("a command");
+            let body = if command.type_url.ends_with("GetOpenDocuments") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            project: None,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board.clone(),
+                                ),
+                            ),
+                        }],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if command.type_url.ends_with("GetItems") {
+                let fp = footprint.lock().unwrap().clone();
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![konnect_ipc::builders::pack_any(
+                            &fp,
+                            "kiapi.board.types.FootprintInstance",
+                        )],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if command.type_url.ends_with("BeginCommit") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "flip-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ))
+            } else if command.type_url.ends_with("EndCommit") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ))
+            } else if command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                let flip =
+                    kiapi::board::commands::FlipItems::decode(command.value.as_slice()).unwrap();
+                let mut held = footprint.lock().unwrap();
+                let response = flip_items(&flip, &mut held);
+                Some(konnect_ipc::builders::pack_any(
+                    &response,
+                    "kiapi.board.commands.FlipItemsResponse",
+                ))
+            } else if command.type_url.ends_with("GetVersion") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major: 10,
+                            minor: 0,
+                            patch: 5,
+                            full_version: "10.0.5".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                ))
+            } else {
+                None
+            };
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: body,
+            }
+        })
+    }
+
+    fn flip_test_footprint(
+        kiid: &str,
+        layer: konnect_ipc::gen::kiapi::board::types::BoardLayer,
+    ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+        kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: kiid.to_string(),
+            }),
+            position: Some(konnect_ipc::builders::vec2(10.0, 20.0)),
+            orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+            layer: layer as i32,
+            reference_field: Some(kiapi::board::types::Field {
+                name: "Reference".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "U1".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_succeeds_when_kicad_holds_this_exact_board() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        let server = spawn_flip_capable_kicad(&board, footprint, |flip, held| {
+            assert_eq!(
+                flip.direction(),
+                kiapi::board::commands::BoardFlipDirection::BfdTopBottom
+            );
+            held.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item = konnect_ipc::builders::pack_any(held, "kiapi.board.types.FootprintInstance");
+            kiapi::board::commands::FlipItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                }],
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("json result");
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["layer"], "B.Cu");
+        assert_eq!(body["flipped"], "U1");
+        // The IPC path never touches the file.
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_reports_unsupported_capability_on_as_unhandled() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        let board_for_mock = board.clone();
+        let server =
+            crate::test_support::MockIpcServer::spawn("flip-unsupported", move |request| {
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            project: None,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    board_for_mock.to_string_lossy().to_string(),
+                                ),
+                            ),
+                        }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetItems") {
+                    let fp = footprint.lock().unwrap().clone();
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: vec![konnect_ipc::builders::pack_any(
+                                &fp,
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("BeginCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "flip-commit".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("EndCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("GetVersion") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetVersionResponse {
+                            version: Some(kiapi::common::types::KiCadVersion {
+                                major: 10,
+                                minor: 0,
+                                patch: 5,
+                                full_version: "10.0.5".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.GetVersionResponse",
+                    ))
+                } else if command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                    // AS_UNHANDLED: 10.0.5 predates the native FlipItems handler.
+                    return kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                            error_message: "FlipItems is not handled".to_string(),
+                        }),
+                        header: None,
+                        message: None,
+                    };
+                } else {
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                }
+            });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_error,
+            "AS_UNHANDLED must not be reported as success"
+        );
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("json error body");
+        assert_eq!(parsed["error"]["kicad_version"], "10.0.5");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_over_ipc_reports_uncertain_outcome_when_readback_disagrees() {
+        use konnect_ipc::gen::kiapi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20260206)\n)\n").unwrap();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let footprint = std::sync::Arc::new(std::sync::Mutex::new(flip_test_footprint(
+            "U1-kiid",
+            kiapi::board::types::BoardLayer::BlFCu,
+        )));
+        // The mutation response claims success and a new layer, but the mock
+        // never actually updates `held` — so the fresh readback GetItems that
+        // follows still reports F.Cu. This is exactly the divergence the
+        // readback guard exists to catch (issue #604 acceptance criteria).
+        let server = spawn_flip_capable_kicad(&board, footprint, |_flip, held| {
+            let mut echoed = held.clone();
+            echoed.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item =
+                konnect_ipc::builders::pack_any(&echoed, "kiapi.board.types.FootprintInstance");
+            kiapi::board::commands::FlipItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                }],
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "an unconfirmed mutation is not a success");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     #[tokio::test]
@@ -5717,16 +6287,22 @@ mod tests {
     const SAVED_BOARD_WITH_R1: &str = "(kicad_pcb\n\
         \t(version 20260206)\n\
         \t(footprint \"R_0805\"\n\
-        \t\t(at 5 5 0)\n\
+        \t\t(at 5 5 90)\n\
         \t\t(property \"Reference\" \"R1\" (at 0 -1 0) (layer \"F.SilkS\"))\n\
-        \t\t(pad \"1\" smd roundrect (at -0.9 0) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (net \"SAVED\"))\n\
+        \t\t(pad \"1\" smd roundrect (at -0.9 0 105) (size 2.432 1.524)\n\
+        \t\t\t(roundrect_rratio 0.25) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")\n\
+        \t\t\t(net \"SAVED\") (uuid \"11111111-1111-1111-1111-111111111111\"))\n\
         \t)\n\
         )\n";
 
     fn live_pad(number: &str, x: f64, y: f64, net: &str) -> prost_types::Any {
         konnect_ipc::builders::pack_any(
             &konnect_ipc::gen::kiapi::board::types::Pad {
+                id: Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                    value: "22222222-2222-2222-2222-222222222222".to_string(),
+                }),
                 number: number.to_string(),
+                r#type: konnect_ipc::gen::kiapi::board::types::PadType::PtSmd as i32,
                 position: Some(konnect_ipc::builders::vec2(x, y)),
                 net: Some(konnect_ipc::gen::kiapi::board::types::Net {
                     code: None,
@@ -5738,6 +6314,78 @@ mod tests {
                         konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFPaste as i32,
                         konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFMask as i32,
                     ],
+                    copper_layers: vec![konnect_ipc::gen::kiapi::board::types::PadStackLayer {
+                        layer: konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFCu as i32,
+                        shape: konnect_ipc::gen::kiapi::board::types::PadStackShape::PssRoundrect
+                            as i32,
+                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524)),
+                        corner_rounding_ratio: 0.25,
+                        ..Default::default()
+                    }],
+                    angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                        value_degrees: 105.0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    }
+
+    fn live_custom_stack_pad(number: &str, x: f64, y: f64) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{
+            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer, PadStackShape,
+            PadType,
+        };
+
+        let layer = |layer, shape, width, height| PadStackLayer {
+            layer,
+            shape,
+            size: Some(konnect_ipc::builders::vec2(width, height)),
+            ..Default::default()
+        };
+        konnect_ipc::builders::pack_any(
+            &Pad {
+                number: number.to_string(),
+                r#type: PadType::PtPth as i32,
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                pad_stack: Some(PadStack {
+                    layers: vec![
+                        BoardLayer::BlFCu as i32,
+                        BoardLayer::BlIn1Cu as i32,
+                        BoardLayer::BlBCu as i32,
+                    ],
+                    copper_layers: vec![
+                        layer(
+                            BoardLayer::BlFCu as i32,
+                            PadStackShape::PssCustom as i32,
+                            3.0,
+                            2.0,
+                        ),
+                        layer(
+                            BoardLayer::BlIn1Cu as i32,
+                            PadStackShape::PssCircle as i32,
+                            1.5,
+                            1.5,
+                        ),
+                        layer(
+                            BoardLayer::BlBCu as i32,
+                            PadStackShape::PssRectangle as i32,
+                            2.0,
+                            1.0,
+                        ),
+                    ],
+                    drill: Some(DrillProperties {
+                        start_layer: BoardLayer::BlFCu as i32,
+                        end_layer: BoardLayer::BlBCu as i32,
+                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2)),
+                        shape: DrillShape::DsOblong as i32,
+                        ..Default::default()
+                    }),
+                    angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                        value_degrees: 37.0,
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -5866,6 +6514,15 @@ mod tests {
         assert_eq!(body["pads"][0]["net"], json!("/VBUS"));
         assert_eq!(body["pads"][0]["x"], json!(101.155));
         assert_eq!(
+            body["pads"][0]["uuid"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(body["pads"][0]["pad_type"], "smd");
+        assert_eq!(body["pads"][0]["shape"], "roundrect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 2.432, "y": 1.524}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 105.0);
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
@@ -5948,9 +6605,173 @@ mod tests {
         assert_eq!(body["source"], json!("file"));
         assert_eq!(body["pads"][0]["net"], json!("SAVED"));
         assert_eq!(
+            body["pads"][0]["uuid"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(body["pads"][0]["pad_type"], "smd");
+        assert_eq!(body["pads"][0]["shape"], "roundrect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 2.432, "y": 1.524}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 105.0);
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(
             body["pads"][0]["layers"],
             json!(["F.Cu", "F.Paste", "F.Mask"])
         );
+    }
+
+    #[tokio::test]
+    async fn live_and_file_pad_geometry_use_the_same_response_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint("R1", vec![live_pad("1", 5.0, 5.9, "SAVED")])],
+        );
+        let args = json!({ "board": board.to_string_lossy(), "reference": "R1" });
+
+        let live = handle_get_component_pads(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        let file = handle_get_component_pads(&args, &test_ctx()).await.unwrap();
+        let live = parsed(&live);
+        let file = parsed(&file);
+        let live_keys: std::collections::BTreeSet<_> = live["pads"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let file_keys: std::collections::BTreeSet<_> = file["pads"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(live_keys, file_keys);
+    }
+
+    #[tokio::test]
+    async fn live_custom_front_inner_back_stack_keeps_each_copper_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint(
+                "R1",
+                vec![live_custom_stack_pad("1", 12.0, 34.0)],
+            )],
+        );
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["rotation_deg"], 37.0);
+        assert_eq!(body["pads"][0]["drill"]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["copper_layers"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "F.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][0]["shape"], "custom");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["layer"], "In1.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][1]["shape"], "circle");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["layer"], "B.Cu");
+        assert_eq!(body["pads"][0]["copper_layers"][2]["shape"], "rect");
+    }
+
+    #[tokio::test]
+    async fn saved_back_side_footprint_keeps_board_space_rotation_and_back_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("back.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"BackSide\"\n\
+             \t\t(layer \"B.Cu\")\n\
+             \t\t(at 20 30 45)\n\
+             \t\t(property \"Reference\" \"U1\")\n\
+             \t\t(pad \"1\" smd oval (at 2 -1 225) (size 2 1)\n\
+             \t\t\t(layers \"B.Cu\" \"B.Paste\" \"B.Mask\"))\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["pads"][0]["rotation_deg"], 225.0);
+        assert_eq!(body["pads"][0]["shape"], "oval");
+        assert_eq!(
+            body["pads"][0]["layers"],
+            json!(["B.Cu", "B.Paste", "B.Mask"])
+        );
+        assert_eq!(body["pads"][0]["copper_layers"][0]["layer"], "B.Cu");
+    }
+
+    #[tokio::test]
+    async fn kicad_authored_board_reports_the_saved_effective_pad_rotation() {
+        let board =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drc_ownership_j1.kicad_pcb");
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "J1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        assert_eq!(body["source"], "file");
+        assert_eq!(body["pad_count"], 4);
+        assert_eq!(body["pads"][0]["shape"], "rect");
+        assert_eq!(body["pads"][0]["size"], json!({"x": 1.78, "y": 1.02}));
+        assert_eq!(body["pads"][0]["rotation_deg"], 90.0);
+        assert_eq!(body["pads"][0]["net"], "GND");
+    }
+
+    #[tokio::test]
+    async fn file_pad_reads_refuse_to_silently_drop_an_unreadable_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"Malformed\"\n\
+             \t\t(at 5 5 0)\n\
+             \t\t(property \"Reference\" \"R1\")\n\
+             \t\t(pad \"1\" smd rect (size 1 1) (layers \"F.Cu\"))\n\
+             \t)\n\
+             )\n",
+        )
+        .unwrap();
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("Pad '1' on footprint 'R1' has no readable position"));
     }
 
     #[tokio::test]

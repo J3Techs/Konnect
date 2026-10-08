@@ -182,6 +182,10 @@ async fn main() -> Result<()> {
         eager_toolsets: config.eager_toolsets,
     };
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    match install::InstalledGuidanceProbe::for_current_user() {
+        Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
+        Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
+    }
 
     match config.transport {
         TransportMode::Stdio => {

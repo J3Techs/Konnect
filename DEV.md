@@ -87,19 +87,21 @@ Konnect/
 │   │       │   └── meta_tools.rs    # 7 baseline meta-tools + Unix stdio reload
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
+│   │           ├── board_source.rs   # board_source selector: live-vs-saved board reads + provenance
+│   │           ├── live_board.rs     # what KiCad's answer proves about one board, shared by read and write gates
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
-│   │           ├── sch_components.rs # 20 tools (component placement with lib_symbols embedding)
+│   │           ├── sch_components.rs # 18 tools (component placement with lib_symbols embedding)
 │   │           ├── sch_wiring.rs     # 20 tools (incl. connect_pins, power symbol embedding)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 12 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
-│   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
+│   │           ├── sch_hierarchy.rs  # 14 tools (typed Sheet model, sheet-file creation and page size, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 19 tools (IPC real-time + safe headless single-placement fallback)
+│   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
 │   │           ├── pcb_routing.rs    # 15 tools (traces, vias, nets, netclasses, SES import)
 │   │           ├── pcb_export.rs     # 14 tools (Gerber, PDF, 3D, Specctra DSN, DRC, DXF/GenCAD/IPC-2581/ODB++)
@@ -174,10 +176,10 @@ Konnect/
     ├── e2e-kicad.yml                 # Real KiCAD 10.0.5: end-to-end suite, a
     │                                 # conformance pass over KiCAD's demo corpus, and
     │                                 # PCM assembly + schema validation. Weekly cron,
-    │                                 # manual dispatch, and `v*` tag push — not
-    │                                 # per-PR, and it does not gate release.yml
-    └── release.yml                   # 3 jobs: build (4 targets), pcm-package (3
-                                      # platforms, macOS universal via lipo), release
+    │                                 # manual dispatch, reusable release gate, and an
+    │                                 # opt-in label-triggered PR run.
+    └── release.yml                   # Real-KiCad gate, build (4 targets), PCM package
+                                      # (3 platforms, macOS universal via lipo), release
 ```
 
 ## KiCAD 10 Integration
@@ -207,6 +209,13 @@ Konnect/
 - Multi-file schematic changes use project-local
   `.konnect-transaction-*.json` write-ahead journals. These journals contain
   complete before/after images and must be treated as sensitive project data.
+  On Unix a journal is created `0600` whatever the umask says; elsewhere it
+  inherits whatever the platform gives a new file, so keep the project
+  directory itself private there.
+- A newly created design file or exported artifact takes the mode any other
+  new file would get — `0666 & ~umask` on Unix. A replacement keeps the mode
+  the destination already had, so a project created by an earlier Konnect
+  stays at `0600` until its owner widens it with `chmod`.
 
 `konnect_schematic_editor::Schematic` deliberately distinguishes creation from
 replacement:
@@ -223,6 +232,34 @@ For journal diagnosis and recovery, use `konnect transaction status`,
 `konnect transaction recover`, and the explicit force-gated `konnect
 transaction abandon` escape hatch documented in
 [Troubleshooting](docs/TROUBLESHOOTING.md#transaction-recovery-is-blocked-by-divergent-content).
+
+### Which board a read answers about
+
+A read-only PCB tool that can be answered by either KiCad or the saved file
+asks `tools/board_source.rs` rather than choosing for itself. It advertises a
+`board_source` argument — `auto` (default), `live`, `saved` — and reports
+observed provenance beside the answer: a `sources` object naming the origin of
+each domain (`ipc`, `saved_board`, `project_file`, `derived`, `unavailable`)
+and a `source_evidence` object carrying `board_state`,
+`excludes_unsaved_editor_state`, a machine-readable `reason` and its prose
+`detail`.
+
+Both it and the write gates in `pcb_board.rs` read KiCad's answer through
+`tools/live_board.rs`, which owns the classification itself — including the
+rule that a board this process watched KiCad hold is never treated as safely
+absent afterwards, however KiCad stops answering (#240). The policies differ on
+purpose (a stale read is disclosable, a stale write destroys work); the reading
+of the evidence does not.
+
+The rule the seam exists to hold: once KiCad has positively identified the
+requested board as live, a failed query is **returned as a failure**. It never
+becomes a successful answer read off a file that may be older than the editor's
+unsaved state. A board this process watched KiCad hold, whose IPC endpoint then
+disappears, is refused under `auto` for the same reason. An explicit `saved`
+request may still inspect that snapshot, and says so in its `reason`.
+
+`get_layer_list` and `get_netclasses` are the first consumers (#542). The
+broader per-tool inventory is tracked in #574.
 
 ### kicad-cli v10 (Subprocess)
 - Verified commands: `sch erc`, `sch export svg/pdf/bom/netlist`, `pcb drc`, `pcb export gerbers/drill/pdf/svg/step/vrml/pos/ipcd356`, `pcb render`
@@ -272,6 +309,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or prospective component state lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; the edit, annotation, and grouping preflight refuses before writing |
 | `mutation_outcome_uncertain` | A schematic edit committed, but immediate readback could not prove its requested result — carries `operation`, `path`, and `reason`; reload and inspect the named file before retrying because it may have changed |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
+| `invalid_configuration` | A Konnect preferences file (`config.json`, `.konnect/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler
@@ -328,7 +366,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 226 tools (233 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 228 tools (235 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -395,6 +433,16 @@ convention for other `kicad-cli`-calling code.
 
 ## Adding a New Tool
 
+Fixed input records are closed by `ToolDef::new` before the schema is advertised
+and compiled. Declare all accepted fields in `properties`, including fixed
+nested records. Intentional caller-keyed maps must explicitly set
+`additionalProperties: true` or a value schema; register a new exception in
+`fixed_records_are_closed_and_only_reviewed_maps_are_extensible` with a
+compatibility test. A typed map's fixed value records are still closed. Untyped
+caller data such as configuration `value` remains unrestricted. The same policy
+applies to meta-tools. Use the served dispatch for typo/no-write regressions;
+direct handler calls still require checked readers for their domain rules.
+
 1. Add the `tool!(...)` definition to the appropriate toolset's `tools()` vec
 2. Write the `async fn handle_*()` handler below the tools vec
 3. Update `tool_count` in `router/registry.rs::ALL_TOOLSETS` — this is the declared count shown in `list_toolboxes`
@@ -403,12 +451,12 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **21 toolsets, 226 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **21 toolsets, 228 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 233 tools (226 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 235 tools (228 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

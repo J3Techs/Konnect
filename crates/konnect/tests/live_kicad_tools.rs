@@ -760,3 +760,83 @@ fn real_kicad_open_documents_resolve_to_comparable_paths() {
         "a complete open-document list must prove absence, not merely fail to confirm it"
     );
 }
+
+/// `get_board_extents` against a real KiCad (#688): the live answer comes from
+/// KiCad, not silently from the file, and on an unedited board it agrees with
+/// the saved file measured the way KiCad measures it.
+///
+/// The saved read cannot measure text or dimensions, so its box lies inside the
+/// live one, and equals it when nothing went unmeasured.
+#[test]
+#[ignore = "requires a running KiCad GUI with an unedited board open and its API socket"]
+fn board_extents_live_and_saved_agree_on_an_unedited_board() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "pcb_board"}));
+    let mut extents = |source: &str| -> Value {
+        let result = mcp.tool(
+            "get_board_extents",
+            json!({"board": board, "board_source": source}),
+        );
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+            .expect("get_board_extents did not return JSON")
+    };
+    let live = extents("live");
+    let saved = extents("saved");
+    println!("live:  {live}\nsaved: {saved}");
+
+    assert_eq!(live["sources"]["bounds"], "ipc", "{live}");
+    assert_eq!(saved["sources"]["bounds"], "saved_board", "{saved}");
+    assert!(
+        live["item_count"].as_u64().unwrap() > 0,
+        "KiCad measured nothing: {live}"
+    );
+    assert_eq!(saved["skipped_item_count"], 0, "{saved}");
+    // KiCad 10 will not list tables or generators. The live answer names both
+    // with KiCad's own refusal instead of reading as complete (#688).
+    let unavailable = live["unavailable_item_classes"]
+        .as_array()
+        .expect("the live answer names what KiCad would not list");
+    for class in ["tables", "generators"] {
+        let named = unavailable
+            .iter()
+            .find(|entry| entry["class"] == class)
+            .unwrap_or_else(|| panic!("{class} is not named: {live}"));
+        assert_eq!(named["reason"], "refused", "{live}");
+        assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
+    }
+    assert_eq!(saved["unavailable_item_classes"], json!([]), "{saved}");
+
+    let coordinate = |body: &Value, key: &str| body[key].as_f64().unwrap();
+    let tolerance = 1e-4;
+    assert!(coordinate(&saved, "x_min") >= coordinate(&live, "x_min") - tolerance);
+    assert!(coordinate(&saved, "y_min") >= coordinate(&live, "y_min") - tolerance);
+    assert!(coordinate(&saved, "x_max") <= coordinate(&live, "x_max") + tolerance);
+    assert!(coordinate(&saved, "y_max") <= coordinate(&live, "y_max") + tolerance);
+    if saved["unmeasured_item_counts"] == json!({}) {
+        for key in ["x_min", "y_min", "x_max", "y_max"] {
+            let off = (coordinate(&saved, key) - coordinate(&live, key)).abs();
+            assert!(
+                off <= tolerance,
+                "{key} differs by {off} mm\n{live}\n{saved}"
+            );
+        }
+    }
+}

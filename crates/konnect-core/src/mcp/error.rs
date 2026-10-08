@@ -78,6 +78,13 @@ pub enum ToolErrorKind {
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
+    /// A valid request produced a plan, but applying that plan would be unsafe
+    /// or would not improve the requested result. The same reasons are exposed
+    /// by dry-run planning so callers can revise the request without guessing.
+    PlanBlocked {
+        operation: String,
+        reasons: Vec<String>,
+    },
     /// No live editor endpoint is configured or reachable for the requested
     /// semantic operation.
     EditorUnavailable { editor: String, reason: String },
@@ -117,9 +124,27 @@ pub enum ToolErrorKind {
     /// complete set of comparable board identities — so whether it holds this
     /// board is unknown, and neither a live edit nor a file edit is safe.
     AmbiguousOpenBoard { path: String },
+    /// A configuration file exists but cannot be used: malformed JSON, a
+    /// non-object root, or an I/O failure other than absence. Defaults are
+    /// never substituted for it, because the next save would persist them
+    /// over the user's own settings (#580). `reason` starts with
+    /// `malformed_json:` or `unreadable:`.
+    InvalidConfiguration { path: String, reason: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
+    /// A delivered IPC request has no confirmed outcome. Retrying may duplicate work.
+    IpcBatchRecovered {
+        board_state: String,
+        drop_confirmed: bool,
+        retry_safe: bool,
+        reason: String,
+    },
+    IpcOutcomeUnknown {
+        board_state: String,
+        retry_safe: bool,
+        reason: String,
+    },
 }
 
 impl ToolErrorKind {
@@ -138,6 +163,7 @@ impl ToolErrorKind {
             Self::WrongProject { .. } => "wrong_project",
             Self::WrongSheetInstance { .. } => "wrong_sheet_instance",
             Self::StaleTarget { .. } => "stale_target",
+            Self::PlanBlocked { .. } => "plan_blocked",
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::ReadbackMismatch { .. } => "readback_mismatch",
@@ -145,7 +171,10 @@ impl ToolErrorKind {
             Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
+            Self::InvalidConfiguration { .. } => "invalid_configuration",
             Self::HandlerError { .. } => "handler_error",
+            Self::IpcOutcomeUnknown { .. } => "ipc_outcome_unknown",
+            Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",
         }
     }
 }
@@ -287,6 +316,10 @@ mod tests {
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
                 reason: "r".into(),
+            },
+            ToolErrorKind::PlanBlocked {
+                operation: "place".into(),
+                reasons: vec!["outside board".into()],
             },
             ToolErrorKind::EditorUnavailable {
                 editor: "pcb".into(),

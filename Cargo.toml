@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.11.1"
+version = "0.13.0"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -29,7 +29,7 @@ rust-version = "1.96"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1"
-jsonschema = { version = "0.56", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -77,7 +77,7 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 
 # Platform directories (home dir, config dir)
-dirs = "6"
+dirs = "7"
 winreg = "0.56"
 
 # SVG parsing (import_svg_logo)
@@ -102,3 +102,11 @@ konnect-core = { path = "crates/konnect-core" }
 konnect-schematic-editor = { path = "crates/konnect-schematic-editor" }
 konnect-render = { path = "crates/konnect-render" }
 konnect-vcs = { path = "crates/konnect-vcs" }
+
+# The S-expression parser is ~25x slower unoptimized. The installed-demo
+# tests parse 185 MB of KiCad boards, and debug servers parse real boards.
+[profile.dev.package.konnect-sexp]
+opt-level = 3
+
+[profile.dev.package.nom]
+opt-level = 3

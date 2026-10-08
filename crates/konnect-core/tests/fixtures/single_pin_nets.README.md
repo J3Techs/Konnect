@@ -73,3 +73,18 @@ errors and eight warnings, none of them structural:
 - `power_pin_not_driven` on `VCC` and the child `GND`, and
   `unconnected_wire_endpoint` on the deliberately floating stubs. Those are the
   cost of a sheet built to hold defects, not defects in the fixture.
+
+## Coordinate text after a move
+
+`bulk_move_writes_kicad_coordinate_text` (#744) moves `#PWR002` and `R8` by
+`dx = -5.08, dy = 0`. The snapped y of `#PWR002`, 132 × 1.27, is
+`167.64000000000001` in `f64`. `R8`'s, 110 × 1.27, is exactly `139.7`, which
+makes it the control. The expected text is KiCad's: a Konnect-moved copy of
+this sheet, resaved by KiCad 10.0.6 with `kicad-cli sch upgrade --force`,
+carries the same symbol `(at …)` lines. (The fixture itself came from 10.0.5,
+as above.)
+
+| Symbol | Before | After, as KiCad writes it |
+|---|---|---|
+| `#PWR002` | `(at 50.8 167.64 0)` | `(at 45.72 167.64 0)` |
+| `R8` | `(at 59.69 139.7 90)` | `(at 54.61 139.7 90)` |

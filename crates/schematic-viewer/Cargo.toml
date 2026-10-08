@@ -1,6 +1,6 @@
 [package]
 name = "schematic-viewer"
-version = "0.11.1"
+version = "0.13.0"
 license = "AGPL-3.0-only"
 edition = "2021"
 publish = false

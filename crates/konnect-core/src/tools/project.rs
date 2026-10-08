@@ -11,10 +11,11 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, opt_str, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, invalid_arg, opt_str, require_str, ToolContext, ToolDef};
 use konnect_sexp::{commit_file_transaction, FileTransition, SexpError};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -210,6 +211,16 @@ async fn handle_create_project(
         Ok(n) => n.to_string(),
         Err(e) => return Ok(e),
     };
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".kicad_pro"))
+    {
+        return Ok(invalid_arg(
+            "path",
+            "pass the containing directory as 'path' and the project filename stem as 'name'",
+        ));
+    }
 
     let pro_path = path.join(format!("{}.kicad_pro", name));
     let sch_path = path.join(format!("{}.kicad_sch", name));
@@ -298,7 +309,8 @@ async fn handle_open_project(
         Err(error) => return Ok(error),
     };
     let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
-    let connected = ipc.ping().unwrap_or(false);
+    let ping = ipc.ping_outcome();
+    let connected = ping.is_responsive();
     let (open_boards, open_boards_error) = if connected {
         match ipc.get_open_board_paths() {
             Ok(paths) => (
@@ -341,7 +353,7 @@ async fn handle_open_project(
     };
 
     let message = if !connected {
-        "KiCad IPC is not reachable. Start KiCad and enable the IPC API, or work in file-only mode."
+        unanswered_message(&ping)
     } else if requested_open == Some(true) {
         "The requested board is open in KiCad."
     } else if requested_open == Some(false) {
@@ -354,6 +366,7 @@ async fn handle_open_project(
         "kicad_ui_running": connected,
         "ipc_available": connected,
         "ipc_address": ctx.config.ipc_address,
+        "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,
         "open_boards_error": open_boards_error,
@@ -363,6 +376,39 @@ async fn handle_open_project(
         "requested_check_error": requested_check_error,
         "message": message
     })))
+}
+
+/// The headline for an `open_project` call KiCad did not answer.
+///
+/// Chosen from the typed failure, so the recovery step it names is the one
+/// that applies: "start KiCad" is wrong advice when KiCad is listening and
+/// refused this account.
+fn unanswered_message(ping: &konnect_ipc::PingOutcome) -> &'static str {
+    use konnect_ipc::{PingOutcome, UnreachableReason};
+    match ping {
+        PingOutcome::Unreachable {
+            reason: UnreachableReason::AccessDenied,
+            ..
+        } => {
+            "The KiCad IPC endpoint refused this account, likely a different account or a \
+             restrictive ACL; run Konnect as the same operating-system user as KiCad. See \
+             ipc_failure."
+        }
+        PingOutcome::Unreachable {
+            reason: UnreachableReason::HandshakeFailed,
+            ..
+        } => {
+            "A listener at the KiCad IPC address did not complete NNG's handshake, so it is \
+             probably not KiCad; see ipc_failure."
+        }
+        PingOutcome::RequestFailed { .. } => {
+            "The KiCad IPC request did not complete and may have reached the endpoint; a KiCad \
+             status in ipc_failure proves receipt, and KiCad may still be starting."
+        }
+        PingOutcome::Responsive | PingOutcome::Unreachable { .. } => {
+            "KiCad IPC is not reachable. Start KiCad and enable the IPC API, or work in file-only mode."
+        }
+    }
 }
 
 async fn handle_save_project(
@@ -526,10 +572,10 @@ async fn handle_open_viewer(
             if !ctx.config.kicad_cli.is_empty() {
                 cmd.arg("--kicad-cli").arg(&ctx.config.kicad_cli);
             }
-            let child = cmd.arg(&sch_path).spawn();
+            cmd.arg(&sch_path);
 
-            match child {
-                Ok(_) => Ok(CallToolResult::text(
+            match launch_viewer(cmd, VIEWER_STARTUP_WINDOW).await {
+                Ok(()) => Ok(CallToolResult::text(
                     serde_json::to_string(&json!({
                         "launched": true,
                         "viewer": viewer_path.to_str().unwrap_or(""),
@@ -538,7 +584,7 @@ async fn handle_open_viewer(
                     }))
                     .unwrap(),
                 )),
-                Err(e) => Ok(CallToolResult::error(format!("Failed to launch viewer: {}", e))),
+                Err(message) => Ok(CallToolResult::error(message)),
             }
         }
         None => Ok(CallToolResult::error(
@@ -546,6 +592,88 @@ async fn handle_open_viewer(
              It should be in the same directory as konnect.exe.",
         )),
     }
+}
+
+/// How long the viewer must stay up before it counts as launched. A viewer
+/// that cannot open a window, such as one started without a display on Linux,
+/// exits well inside this (#702).
+const VIEWER_STARTUP_WINDOW: Duration = Duration::from_secs(1);
+
+/// Stderr lines quoted when the viewer exits during startup, and the length
+/// each is cut to, so a huge panic message cannot flood the tool result.
+const VIEWER_STDERR_TAIL_LINES: usize = 20;
+const VIEWER_STDERR_LINE_CHARS: usize = 500;
+
+/// How long to wait for the rest of a dead viewer's stderr. A `kicad-cli`
+/// render the viewer started can hold the pipe open after the viewer exits.
+const VIEWER_STDERR_DRAIN: Duration = Duration::from_millis(500);
+
+/// Spawns the viewer and watches it for `window`. A successful `spawn()` only
+/// means `exec` worked, so an exit inside the window is a failed launch,
+/// reported with the exit status and the tail of the viewer's stderr.
+async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Result<(), String> {
+    use std::collections::VecDeque;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncBufReadExt;
+
+    // stdin and stdout carry the stdio transport's JSON-RPC stream, so the
+    // viewer must not hold them. Its stderr still reaches the server log.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // Not `kill_on_drop`: the viewer outlives this call.
+    let mut child = tokio::process::Command::from(cmd)
+        .spawn()
+        .map_err(|e| format!("Failed to launch viewer: {e}"))?;
+
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    let forwarder = child.stderr.take().map(|stderr| {
+        let tail = Arc::clone(&tail);
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).split(b'\n');
+            while let Ok(Some(line)) = lines.next_segment().await {
+                let line = String::from_utf8_lossy(&line).trim_end().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                tracing::warn!(target: "schematic_viewer", "{line}");
+                // Once the caller has returned, nobody reads the tail.
+                if Arc::strong_count(&tail) == 1 {
+                    continue;
+                }
+                if let Ok(mut tail) = tail.lock() {
+                    if tail.len() == VIEWER_STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(
+                        line.chars()
+                            .take(VIEWER_STDERR_LINE_CHARS)
+                            .collect::<String>(),
+                    );
+                }
+            }
+        })
+    });
+
+    let status = match tokio::time::timeout(window, child.wait()).await {
+        Err(_still_running) => return Ok(()),
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(format!("Failed to check the viewer process: {e}")),
+    };
+
+    if let Some(forwarder) = forwarder {
+        let _ = tokio::time::timeout(VIEWER_STDERR_DRAIN, forwarder).await;
+    }
+    let tail = tail
+        .lock()
+        .map(|mut tail| tail.make_contiguous().join("\n"))
+        .unwrap_or_default();
+    Err(if tail.is_empty() {
+        format!("Schematic viewer exited during startup ({status}) with no stderr output.")
+    } else {
+        format!("Schematic viewer exited during startup ({status}). Its stderr ended with:\n{tail}")
+    })
 }
 
 fn find_viewer_binary() -> Option<std::path::PathBuf> {
@@ -599,7 +727,40 @@ fn blank_kicad_sch() -> String {
 }
 
 fn blank_kicad_pcb() -> &'static str {
-    "(kicad_pcb\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(general\n\t\t(thickness 1.6)\n\t)\n\t(paper \"A4\")\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n\t\t(34 \"B.Paste\" user)\n\t\t(35 \"F.Paste\" user)\n\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n\t\t(38 \"B.Mask\" user)\n\t\t(39 \"F.Mask\" user)\n\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n\t\t(41 \"Cmts.User\" user \"User.Comments\")\n\t\t(44 \"Edge.Cuts\" user)\n\t\t(45 \"Margin\" user)\n\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n\t\t(48 \"B.Fab\" user)\n\t\t(49 \"F.Fab\" user)\n\t)\n\t(setup\n\t\t(pad_to_mask_clearance 0.05)\n\t)\n\t(net 0 \"\")\n)\n"
+    concat!(
+        "(kicad_pcb\n",
+        "\t(version 20260206)\n",
+        "\t(generator \"konnect\")\n",
+        "\t(generator_version \"10.0\")\n",
+        "\t(general\n",
+        "\t\t(thickness 1.6)\n",
+        "\t)\n",
+        "\t(paper \"A4\")\n",
+        "\t(layers\n",
+        "\t\t(0 \"F.Cu\" signal)\n",
+        "\t\t(31 \"B.Cu\" signal)\n",
+        "\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n",
+        "\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n",
+        "\t\t(34 \"B.Paste\" user)\n",
+        "\t\t(35 \"F.Paste\" user)\n",
+        "\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n",
+        "\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n",
+        "\t\t(38 \"B.Mask\" user)\n",
+        "\t\t(39 \"F.Mask\" user)\n",
+        "\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n",
+        "\t\t(41 \"Cmts.User\" user \"User.Comments\")\n",
+        "\t\t(44 \"Edge.Cuts\" user)\n",
+        "\t\t(45 \"Margin\" user)\n",
+        "\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n",
+        "\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n",
+        "\t\t(48 \"B.Fab\" user)\n",
+        "\t\t(49 \"F.Fab\" user)\n",
+        "\t)\n",
+        "\t(setup\n",
+        "\t\t(pad_to_mask_clearance 0.05)\n",
+        "\t)\n",
+        ")\n",
+    )
 }
 
 #[cfg(test)]
@@ -666,6 +827,16 @@ mod tests {
     }
 
     #[test]
+    fn blank_kicad_pcb_uses_the_kicad_10_implicit_net_shape() {
+        let content = blank_kicad_pcb();
+        assert!(content.contains("(version 20260206)"));
+        assert!(
+            !content.contains("\n\t(net "),
+            "KiCad 10 boards must not contain a legacy top-level net table"
+        );
+    }
+
+    #[test]
     fn open_project_maps_a_project_file_to_its_board() {
         let requested = requested_board_path(&json!({ "path": "/work/voice.kicad_pro" }))
             .unwrap()
@@ -714,6 +885,41 @@ mod tests {
             .unwrap();
         let pro: serde_json::Value = serde_json::from_str(&pro_content).unwrap();
         assert_eq!(pro["meta"]["filename"], "widget.kicad_pro");
+    }
+
+    #[tokio::test]
+    async fn create_project_rejects_kicad_pro_path_without_writing() {
+        let ctx = test_ctx();
+        for extension in ["kicad_pro", "KICAD_PRO"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project_dir = dir.path().join("newproj");
+            let project_file = project_dir.join(format!("newproj.{extension}"));
+            let args = json!({
+                "path": project_file.to_str().unwrap(),
+                "name": "newproj"
+            });
+
+            let result = handle_create_project(&args, &ctx)
+                .await
+                .expect("handler should return a structured invalid argument");
+
+            assert!(result.is_error);
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            let body = response_json(&result);
+            assert_eq!(body["error"]["field"], "path");
+            assert!(
+                body["error"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("containing directory")
+                        && reason.contains("'name'")),
+                "{body}"
+            );
+            assert!(!project_dir.exists());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -921,6 +1127,117 @@ mod tests {
         .expect_err("missing PCB PDF must fail the snapshot call");
         assert!(error.to_string().contains("did not create"), "{error:#}");
         assert!(error.to_string().contains("pcb"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn open_project_reports_why_kicad_did_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address =
+            format!("ipc://{}", dir.path().join("no-kicad-here.sock").display());
+
+        let result = handle_open_project(&json!({}), &ctx).await.unwrap();
+        let response = response_json(&result);
+
+        assert_eq!(response["ipc_available"], false, "{response}");
+        assert_eq!(response["ipc_failure"]["kind"], "no_listener", "{response}");
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("KiCad IPC is not reachable")),
+            "{response}"
+        );
+    }
+
+    /// A rep0 endpoint that answers every request with `AS_NOT_READY`, the
+    /// status KiCad returns while an editor is still loading.
+    fn spawn_not_ready_kicad() -> String {
+        use nng::options::Options;
+        use prost::Message;
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        std::thread::spawn(move || {
+            while socket.recv().is_ok() {
+                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
+                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsNotReady as i32,
+                        error_message: "KiCad is not ready".to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn open_project_says_kicad_answered_when_it_answered_with_an_error() {
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = spawn_not_ready_kicad();
+
+        let result = handle_open_project(&json!({}), &ctx).await.unwrap();
+        let response = response_json(&result);
+
+        assert_eq!(response["ipc_available"], false, "{response}");
+        assert_eq!(
+            response["ipc_failure"]["kind"], "request_failed",
+            "{response}"
+        );
+        assert!(
+            response["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("KiCad is not ready")),
+            "{response}"
+        );
+        assert!(
+            response["message"].as_str().is_some_and(
+                |message| message.starts_with("The KiCad IPC request did not complete")
+            ),
+            "a KiCad that answered must not be reported as unreachable: {response}"
+        );
+    }
+
+    #[test]
+    fn the_open_project_headline_follows_the_failure_kind() {
+        use konnect_ipc::{PingOutcome, UnreachableReason};
+        let unreachable = |reason| PingOutcome::Unreachable {
+            reason,
+            message: String::new(),
+        };
+        assert!(
+            unanswered_message(&unreachable(UnreachableReason::AccessDenied))
+                .contains("same operating-system user")
+        );
+        assert!(
+            unanswered_message(&unreachable(UnreachableReason::HandshakeFailed))
+                .contains("probably not KiCad")
+        );
+        assert!(unanswered_message(&PingOutcome::RequestFailed {
+            message: String::new()
+        })
+        .contains("did not complete"));
+        for reason in [
+            UnreachableReason::NotConfigured,
+            UnreachableReason::NoListener,
+            UnreachableReason::TransportError,
+        ] {
+            assert!(
+                unanswered_message(&unreachable(reason)).starts_with("KiCad IPC is not reachable")
+            );
+        }
     }
 
     fn response_json(result: &CallToolResult) -> serde_json::Value {
@@ -1438,5 +1755,116 @@ mod rename_hierarchy_tests {
             "dry_run must not write"
         );
         assert!(pro.exists(), "dry_run must not rename");
+    }
+}
+
+/// `open_schematic_viewer` used to report `launched: true` for any successful
+/// `spawn()`, including a viewer that panicked at once for lack of a display
+/// (#702). `sh` stands in for the viewer, so these run on Unix only.
+#[cfg(all(test, unix))]
+mod viewer_launch_tests {
+    use super::launch_viewer;
+    use std::time::Duration;
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    /// The panic tao prints when GTK cannot open a display, then the exit
+    /// code a Rust panic gives, as the issue's reproduction recorded them.
+    #[tokio::test]
+    async fn a_viewer_that_crashes_on_startup_is_a_failed_launch() {
+        let err = launch_viewer(
+            sh("echo 'starting' >&2; \
+                echo 'Failed to initialize gtk backend!' >&2; exit 101"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("an exit inside the window must not count as launched");
+        assert!(err.contains("101"), "exit status missing: {err}");
+        assert!(
+            err.contains("Failed to initialize gtk backend!"),
+            "stderr missing: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_exit_during_startup_is_still_a_failed_launch() {
+        let err = launch_viewer(sh("exit 0"), Duration::from_secs(10))
+            .await
+            .expect_err("a viewer that exits shows no window");
+        assert!(err.contains("no stderr output"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn only_the_tail_of_a_long_stderr_is_quoted() {
+        let err = launch_viewer(
+            sh("i=1; while [ $i -le 30 ]; do echo line$i >&2; i=$((i+1)); done; exit 1"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("line11\n") && err.ends_with("line30"), "{err}");
+        assert!(!err.contains("line10\n"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_very_long_stderr_line_is_cut() {
+        let err = launch_viewer(
+            sh("printf '%2000s\\n' '' | tr ' ' a >&2; exit 1"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.ends_with(&"a".repeat(500)), "{err}");
+        assert!(!err.contains(&"a".repeat(501)), "{err}");
+    }
+
+    /// A `kicad-cli` render the viewer started can still be writing after
+    /// the viewer itself has exited.
+    #[tokio::test]
+    async fn stderr_from_a_child_the_viewer_started_is_still_quoted() {
+        let err = launch_viewer(
+            sh("(sleep 0.2; echo 'render failed' >&2) & exit 1"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.ends_with("render failed"), "{err}");
+    }
+
+    /// stdin and stdout are the stdio transport's JSON-RPC stream.
+    #[tokio::test]
+    async fn the_viewer_does_not_hold_the_servers_stdin_or_stdout() {
+        let err = launch_viewer(
+            sh(
+                "[ /dev/fd/0 -ef /dev/null ] && [ /dev/fd/1 -ef /dev/null ] \\
+                && echo detached >&2; exit 1",
+            ),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.ends_with("detached"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_still_running_after_the_window_is_launched() {
+        launch_viewer(sh("sleep 3"), Duration::from_millis(200))
+            .await
+            .expect("a viewer that outlives the window is up");
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_is_a_failed_launch() {
+        let err = launch_viewer(
+            std::process::Command::new("/nonexistent/schematic-viewer"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with("Failed to launch viewer:"), "{err}");
     }
 }

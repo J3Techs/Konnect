@@ -21,6 +21,9 @@
 //! - `zone_outline_elements.kicad_pcb` — KiCad 10.0.5-saved reduced board
 //!   containing two exact arc-only demo zones and one API-authored mixed path;
 //!   see `zone_outline_elements.README.md` for hashes and zone UUIDs.
+//! - `gr_poly_outline.kicad_pcb` — KiCad 10-saved minimal board holding a
+//!   single 12-vertex, non-rectangular `gr_poly` Edge.Cuts outline copied from
+//!   a real project board (#593); see `gr_poly_outline.README.md`.
 
 use konnect_sexp::board::{
     board_outline_bbox, count_pads, footprint_courtyards, footprints, lossless_zone_outlines,
@@ -158,6 +161,19 @@ fn pic_programmer_kicad10_board_geometry() {
         board_outline_bbox(&tree).expect("outline present"),
         (73.66, 40.64, 233.68, 139.7),
         "pic_programmer outline",
+    );
+}
+
+/// Exact bbox for a real, concave `gr_poly` Edge.Cuts outline (#593): the
+/// vertex hull is exact for a straight-edged polygon, so this must match the
+/// min/max hand-computed from the fixture's own 12 `xy` vertices.
+#[test]
+fn gr_poly_outline_bbox_matches_hand_computed_extrema() {
+    let tree = fixture("gr_poly_outline.kicad_pcb");
+    assert_bbox_eq(
+        board_outline_bbox(&tree).expect("gr_poly outline present"),
+        (103.42, 78.96, 154.48, 116.96),
+        "gr_poly_outline bbox",
     );
 }
 
@@ -315,7 +331,7 @@ fn fixture_corpus_scans_are_total() {
         let _ = lossless_zone_outlines(&tree);
         let _ = board_outline_bbox(&tree);
     }
-    assert_eq!(seen, 4, "expected the four committed board fixtures");
+    assert_eq!(seen, 5, "expected the five committed board fixtures");
 }
 
 // ─── Courtyards: hand-computed ground truth ──────────────────────────────────

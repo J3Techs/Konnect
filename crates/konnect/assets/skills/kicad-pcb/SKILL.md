@@ -21,18 +21,25 @@ connection communicates with the running KiCAD instance in real-time.
 
 Some board-construction and component tools have guarded closed-board paths. IPC-first
 tools fall back to the file only when the transport is unreachable and the target board
-has not been observed live during this server session. File-only operations such as
-`flip_component` proceed only when KiCad does not hold the target board open. These
-paths use revision-aware atomic writes: placement preserves pads, graphics, attributes,
-and models; moves preserve the existing angle; rotations update the footprint and its
-child angles; flips mirror supported geometry and swap front/back layers. A reachable
-KiCad rejection stays closed instead of racing the editor.
+has not been observed live during this server session. These paths use revision-aware
+atomic writes: placement preserves pads, graphics, attributes, and models; moves
+preserve the existing angle; rotations update the footprint and its child angles; the
+closed-board flip fallback mirrors supported geometry and swaps front/back layers,
+refusing any 3D model whose offset/rotation it cannot transform. On KiCad 10.0.6+,
+`flip_component` prefers KiCad's own native FlipItems IPC command instead, which
+handles that 3D-model transform correctly — the file fallback only applies when no
+live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
+the structured error **unsupported_capability**; every reachable rejection stays closed instead of racing
+the editor with a file edit.
 
 `unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
 earlier in the current server session but IPC is now unreachable, so the saved file may
 be older than lost editor state. Pause mutation work, tell the user that Konnect left
 the file unchanged, and ask them to reopen/recover, reconcile, and save the board in
-KiCad. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
+KiCad. A read-only tool taking `board_source` can return the same kind, where nothing
+was going to be written: reporting the saved file as current would be the unsafe act.
+There, `board_source: "saved"` inspects that snapshot deliberately and says what it
+excludes — offer it instead of retrying the default. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
 restart Konnect automatically, or edit `.kicad_pcb` directly. If the user confirms a
 clean close and an authoritative saved file, they may restart Konnect to deliberately
 begin a new closed-board session.
@@ -61,7 +68,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, set_design_rules, set_predefined_sizes, check_clearance
+load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -91,7 +98,11 @@ Follow this sequence for a clean PCB workflow:
    Apply only with `dry_run: false` and the exact returned
    `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
    schematic editor, and the target board must be open in KiCad. A conflict is
-   non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
+   non-mutating; resolve it and rerun the dry run. A diagnostic about a library
+   footprint names that footprint and every part that needs it: when the footprint
+   cannot be placed (custom-shape pads are not supported), assign those parts a
+   footprint without them; when the schematic connects a pad the footprint does not
+   have, fix the symbol or the footprint choice. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
@@ -134,33 +145,87 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `update_footprints_from_library` | Refresh placed definitions from linked libraries |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
-| `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |
+| `flip_component`          | Set F.Cu/B.Cu via native IPC (KiCad 10.0.6+) or safe file fallback |
+| `set_placed_footprint_models` | Inspect or edit exact indexed 3D-model entries on a live placed footprint |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 
-### Score-first automation
+### Bounded AI-directed placement loop
 
-Load `load_toolset('placement')` for the automation loop. The discipline is
-score, change, re-score — every planner reports the board's score before and
-after its own plan, so a change is judged before it is made:
+Load `load_toolset('sch_analysis')`, `load_toolset('placement')`, and
+`load_toolset('verification')`. Complete placement through this ordered loop; a
+proposed coordinate or a successful tool call is not evidence that the requested
+board now has the intended placement:
 
-1. `score_placement` — 0-100 with named deductions; hard failures (courtyard
-   overlaps, parts outside the outline) decide the verdict regardless of the
-   number, and a board with no outline can never pass. `interface_filter_caps`
-   lists caps that were within their family limit of a connector carrying every
-   one of their nets: that is cable filtering, so the decoupling rule was
-   answered rather than skipped. They are not defects to "fix" by dragging them
-   toward an IC.
-2. `auto_place_from_schematic` — deterministic first placement by net
-   clusters; explicitly a starting point, not a final layout.
-3. `refine_placement_force_directed` — deterministic spring embedder; pass
-   `locked` for parts that must not move. Same input, same plan.
-4. `place_decoupling_caps` — plans a row beside an IC, paired by shared nets.
-5. `plan_bga_fanout` — pitch detected from the pad grid; `apply` executes as
-   one KiCad undo commit over live IPC.
+1. **Recover intent and name the scope.** Read the schematic, connectivity, and
+   current board. Identify the functional reason for each move and list the exact
+   footprint references that may move. Do not infer a capacitor-to-IC relationship
+   from GND alone; use **score_placement.decoupling_associations** as supporting
+   evidence and treat **unproven_decoupling_caps** as unresolved intent.
+2. **Build the held set.** Include every caller-identified intentional
+   placement. A diagnostic `auto_place_from_schematic` dry-run reports saved-board
+   lock records in its **held** list; accept those only when that saved file is
+   known current. `get_component_list` does not expose lock state, so if neither
+   current saved evidence nor the caller establishes the KiCad-locked references,
+   report `BLOCKED` and ask the caller to confirm them. Never send a held
+   reference to `move_component` or `rotate_component`.
+3. **Plan a small explicit batch.** Prefer one functional group and the fewest
+   references needed to test the improvement. `auto_place_from_schematic` is a
+   deprecated diagnostic planner only: its plan is always blocked from apply.
+   `refine_placement_force_directed` is also deprecated; do not weaken its gates
+   or apply a score tie. Make a justified score-neutral change with explicit
+   moves instead.
+4. **Apply only the named moves.** Use `move_component` and
+   `rotate_component`; do not turn a diagnostic whole-board plan into an
+   autonomous bulk mutation.
+5. **Read back the exact requested live board.** After every batch, call
+   `get_component_list` for that board and verify each requested reference's
+   observed position, rotation, and layer. Call `get_board_info` and require
+   `source: "ipc"` before treating this as live-board proof (`score_placement`
+   names the same live authority **source: "live_ipc"**). A saved-file or CLI
+   observation may support a separate check, but report it as saved/CLI evidence
+   and do not present it as live IPC readback.
+6. **Validate the observed result.** Re-run `score_placement` and KiCad DRC.
+   Check the score's hard failures, outline status, deductions, associations,
+   and evidence source—not only its numeric score. Continue with another small
+   batch only when the observed result justifies it.
+7. **Finish with evidence or `BLOCKED`.** Report the exact moved and held
+   references, observed live positions, source for each check, score/DRC result,
+   and remaining findings. Report `BLOCKED` when live source authority,
+   functional intent, containment, or another required fact cannot be proved;
+   never fill an evidence gap with a guessed coordinate or a request value.
 
-Every planner is dry-run by default; apply refuses while KiCad holds the
-board open live (fanout apply is the inverse: it REQUIRES the live board).
+Completion requires live readback of every applied move plus placement and DRC
+results from the resulting board. A diagnostic plan, a saved-file snapshot, or
+an unproved outline is not completion evidence.
+
+### Placement diagnostics and planners
+
+- `score_placement` reports a 0-100 score with named deductions. Hard failures
+  (courtyard overlaps, parts outside a proven outline) decide the verdict
+  regardless of the number, and a board with no outline can never pass.
+  **decoupling_associations** names the non-ground, bounded-fanout evidence used
+  for cap-to-IC distance checks; **unproven_decoupling_caps** identifies caps the
+  scorer deliberately did not guess about. `interface_filter_caps` lists caps
+  within their family limit of a connector carrying every one of their nets;
+  do not drag those cable-filtering parts toward an IC.
+- Outside-outline and connector-edge evidence applies only to a provably
+  axis-aligned rectangular outline (`outline_shape: "rectangular"`). Treat
+  `outline_unproven` like `outline_missing`, not like `pass`; validate a
+  non-rectangular board's real fit with KiCad DRC and report `BLOCKED` for the
+  unavailable containment proof.
+- `auto_place_from_schematic` returns a deterministic net-clustered starting
+  plan for diagnosis. It never writes: `dry_run: false` returns structured
+  **plan_blocked**.
+- `refine_placement_force_directed` is deprecated. Its global-net spring model
+  can pull a part toward every footprint sharing a board-wide rail. Dry-run may
+  explain its plan, but blocked, non-improving, and score-tied plans do not
+  apply; use bounded explicit moves instead.
+- `place_decoupling_caps` plans a row beside an IC from exact caller-given
+  `capacitor_references` (never net-inferred). It refuses an out-of-bounds,
+  non-improving, or containment-unproven plan.
+- `plan_bga_fanout` detects pitch from the pad grid; apply executes as one
+  KiCad undo commit over live IPC.
 
 ### Placement Tips
 
@@ -172,6 +237,12 @@ board open live (fanout apply is the inverse: it REQUIRES the live board).
 ---
 
 ## Routing
+
+Before choosing trace approach points, call `get_component_pads` for the
+participating footprints. Use its returned board-space position, effective
+rotation, shape, size, drill, and per-copper-layer geometry; do not estimate
+copper extent from package family or a different pad in the footprint. A null
+geometry field is unavailable evidence, not a zero-size pad.
 
 ### Routing Tools
 

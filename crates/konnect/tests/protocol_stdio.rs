@@ -13,6 +13,8 @@ struct McpProcess {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: i64,
+    /// The handshake's `initialize` response.
+    initialized: Value,
 }
 
 impl McpProcess {
@@ -72,6 +74,7 @@ impl McpProcess {
             stdin,
             reader,
             next_id: 1,
+            initialized: Value::Null,
         };
         // MCP handshake
         let init = p.request(
@@ -83,6 +86,7 @@ impl McpProcess {
             }),
         );
         assert_eq!(init["result"]["serverInfo"]["name"], "konnect");
+        p.initialized = init;
         p.notify("notifications/initialized");
         p
     }
@@ -376,7 +380,8 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         .expect("expected a tools/call result")["result"]
         .clone();
     let body = McpProcess::tool_body(&r);
-    assert_eq!(body["tools_added"].as_u64(), Some(40));
+    // sch_components (18) + sch_wiring (20).
+    assert_eq!(body["tools_added"].as_u64(), Some(38));
     // tools items are {name, description} objects, matching the legacy
     // single-name result shape -- not bare name strings.
     let tools = body["tools"].as_array().expect("tools array");
@@ -677,4 +682,245 @@ fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
         !stderr.contains("configuration:"),
         "startup must not report any configuration selection: {stderr}"
     );
+}
+
+/// `ipc_failure` (#532) must reach a client over the real stdio protocol path,
+/// not only the in-process handler. The endpoint is a socket nothing listens
+/// on; the working directory and home are isolated so `KICAD_API_SOCKET` is
+/// the address that resolves.
+#[test]
+fn ipc_failure_kind_and_message_reach_the_client_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let address = format!("ipc://{}", tmp.path().join("no-kicad-here.sock").display());
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[("KICAD_API_SOCKET", address.as_str())],
+    );
+    McpProcess::tool_body(
+        &p.call_tool("load_toolset", json!({"name": ["project", "verification"]})),
+    );
+
+    for (tool, args) in [
+        ("check_kicad_ui", json!({"timeout_seconds": 60})),
+        ("open_project", json!({})),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["ipc_failure"]["kind"], "no_listener", "{tool}: {body}");
+        assert!(
+            body["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Nothing is listening there")),
+            "{tool}: {body}"
+        );
+    }
+}
+
+/// Where `user_config_path()` puts the preferences file when `HOME` /
+/// `APPDATA` point at `home`.
+fn user_config_under(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = if cfg!(target_os = "windows") {
+        home.join("konnect")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("konnect")
+    } else {
+        home.join(".konnect")
+    };
+    dir.join("config.json")
+}
+
+/// #580 over real stdio: a user preferences file that exists and cannot be
+/// parsed is refused by the load, and the save that used to replace it with
+/// the defaults refuses too and leaves it byte-identical.
+#[test]
+fn a_malformed_user_configuration_is_refused_and_never_overwritten_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = user_config_under(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let original =
+        r#"{"kicad_cli": "D:/tools/kicad-cli.exe", "sourcing": {"avl": ["Vishay", "Murata"]},"#;
+    std::fs::write(&config, original).unwrap();
+
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+    for (tool, args) in [
+        ("load_user_config", json!({})),
+        (
+            "save_user_config",
+            json!({"key_path": "ui.theme", "value": "dark"}),
+        ),
+        ("get_effective_config", json!({})),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_eq!(result["isError"], json!(true), "{tool}: {result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(
+            body["error"]["kind"], "invalid_configuration",
+            "{tool}: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            original,
+            "{tool} left the preferences file exactly as it was"
+        );
+    }
+}
+
+/// The other half: with no preferences file the load says it answered with
+/// the defaults, leaves them on disk, and the next load reads that file.
+#[test]
+fn an_absent_user_configuration_reports_defaults_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = user_config_under(tmp.path());
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let first = McpProcess::tool_body(&p.call_tool("load_user_config", json!({})));
+    assert_eq!(first["source"], "defaults", "{first}");
+    assert_eq!(first["persisted"], true, "{first}");
+    assert!(config.is_file(), "the defaults were written to {config:?}");
+
+    let second = McpProcess::tool_body(&p.call_tool("load_user_config", json!({})));
+    assert_eq!(second["source"], "file", "{second}");
+}
+
+/// The served binary compares installed guidance with its own bundle once per
+/// installed version and tells both the model and `get_installation_info`
+/// (#728). It writes only its record under `.konnect`, and a second start with
+/// the same install neither rescans nor repeats the notice.
+/// Unix only: `dirs::home_dir` ignores `HOME` on Windows, so the child would
+/// read the real profile there.
+#[cfg(unix)]
+#[test]
+fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".konnect")).unwrap();
+    std::fs::write(tmp.path().join(".konnect/.installed"), "0.2.2").unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.starts_with("Konnect Claude guidance (installed by v0.2.2)"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("`konnect init`"), "{instructions}");
+    assert_eq!(instructions.lines().count(), 1, "Codex was never installed");
+
+    let result = p.call_tool("get_installation_info", json!({}));
+    let body = McpProcess::tool_body(&result);
+    let guidance = &body["guidance"];
+    assert_eq!(guidance["probe_status"], "ok");
+    assert_eq!(guidance["claude"]["state"], "out_of_sync");
+    assert_eq!(guidance["claude"]["checked"], "now");
+    assert_eq!(guidance["claude"]["marker"]["version"], "0.2.2");
+    assert_eq!(guidance["codex"]["state"], "not_installed");
+    assert!(guidance["claude"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|file| file["status"] == "missing"));
+    drop(p);
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let init = &p.initialized["result"];
+    assert!(init.get("instructions").is_none(), "{init}");
+    let result = p.call_tool("get_installation_info", json!({}));
+    let guidance = &McpProcess::tool_body(&result)["guidance"];
+    assert_eq!(guidance["claude"]["state"], "out_of_sync");
+    assert_eq!(guidance["claude"]["checked"], "earlier");
+    assert!(guidance["claude"].get("files").is_none(), "{guidance}");
+    drop(p);
+
+    for dir in [".claude", ".agents"] {
+        assert!(!tmp.path().join(dir).exists(), "detection wrote {dir}");
+    }
+    let mut data = std::fs::read_dir(tmp.path().join(".konnect"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        // The call log and runtime directory every server start keeps.
+        .filter(|name| name != "logs" && name != "run")
+        .collect::<Vec<_>>();
+    data.sort();
+    assert_eq!(
+        data,
+        [
+            ".guidance-checked-claude",
+            ".guidance-checked-codex",
+            ".installed"
+        ]
+    );
+}
+
+/// #787 over real stdio: with nothing to find, `check_freerouting` reports
+/// every location it searched, in the documented order, from the server's own
+/// environment. The environment is redirected so a Freerouting installed on
+/// the machine running the test cannot be found.
+#[test]
+fn check_freerouting_reports_every_location_it_searched_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let third_party: Vec<String> = ["3rd-10", "3rd-9", "3rd-8"]
+        .iter()
+        .map(|name| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.display().to_string()
+        })
+        .collect();
+    let (bin_s, home_s) = (bin.display().to_string(), tmp.path().display().to_string());
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[
+            ("PATH", bin_s.as_str()),
+            ("USERPROFILE", home_s.as_str()),
+            ("KICAD10_3RD_PARTY", third_party[0].as_str()),
+            ("KICAD9_3RD_PARTY", third_party[1].as_str()),
+            ("KICAD8_3RD_PARTY", third_party[2].as_str()),
+        ],
+    );
+    McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "integration"})));
+
+    let result = p.call_tool("check_freerouting", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["engine_found"], false, "{body}");
+    assert_eq!(body["available"], false, "{body}");
+
+    let searched = body["searched_locations"]
+        .as_array()
+        .expect("searched_locations is reported");
+    let kinds: Vec<&str> = searched
+        .iter()
+        .map(|root| root["kind"].as_str().unwrap())
+        .collect();
+    // `HOME` and `USERPROFILE` name the same directory here, so on Windows the
+    // `Documents` plugin folders are reached twice and searched once.
+    let plugin_folders = 6;
+    let mut expected = vec!["kicad_3rd_party_variable"; 3];
+    expected.extend(vec!["kicad_plugin_folder"; plugin_folders]);
+    expected.extend(["working_directory", "system_directory", "system_directory"]);
+    expected.push("path_directory");
+    assert_eq!(kinds, expected, "{body}");
+
+    for (root, dir) in searched[..3].iter().zip(&third_party) {
+        assert_eq!(root["location_path"], json!(dir), "{root}");
+        assert_eq!(root["exists"], true, "{root}");
+    }
+    let working = std::path::PathBuf::from(
+        searched[3 + plugin_folders]["location_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(working.file_name().unwrap(), "freerouting.jar");
+    assert_eq!(
+        working.parent().unwrap().canonicalize().unwrap(),
+        tmp.path().canonicalize().unwrap()
+    );
+    assert_eq!(searched[3 + plugin_folders]["exists"], false);
+    let last = searched.last().unwrap();
+    assert_eq!(last["location_path"], json!(bin_s), "{last}");
+    assert_eq!(last["max_depth"], 1, "{last}");
 }

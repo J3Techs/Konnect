@@ -2,6 +2,7 @@
   "schema_version": 1,
   "adopted_outcome_tools": [
     "add_schematic_component",
+    "annotate_schematic",
     "batch_place_components",
     "run_design_review"
   ],
@@ -12,12 +13,13 @@
       "paths": [
         "crates/konnect-core/src/tools/verification.rs",
         "crates/konnect-core/src/tools/pcb_export.rs",
-        "crates/konnect-core/src/tools/cli.rs"
+        "crates/konnect-core/src/tools/cli.rs",
+        "crates/konnect-core/src/tools/drc.rs"
       ],
-      "rationale": "The DRC entry points still duplicate execution policy, and save/refill ordering can leave the evidence source ambiguous.",
+      "rationale": "Explicit synchronization and provenance are shared through tools::drc after #408, but general source authority and the outcome-envelope migration remain incomplete.",
       "tracking_issues": [
         "https://github.com/mixelpixx/Konnect/issues/119",
-        "https://github.com/mixelpixx/Konnect/issues/408"
+        "https://github.com/mixelpixx/Konnect/issues/574"
       ],
       "removal_criteria": "One owned DRC execution/result contract identifies source state and reports unavailable or partial evidence without ambiguity."
     },

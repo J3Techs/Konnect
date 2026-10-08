@@ -11,7 +11,13 @@ use crate::mcp::{
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
-    require_array, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
+    require_array, require_f64, require_str,
+    sch_wiring::{
+        apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
+        observed_no_connect_moves, plan_no_connect_carry_for_replacement,
+        reconcile_junctions_for_placement,
+    },
+    ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -23,8 +29,7 @@ use konnect_sexp::{
         pin_outward_direction, read_schematic,
     },
     writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
-        write_new_atomic, SexpEdit,
+        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
     },
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
@@ -33,58 +38,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
-        tool!(
-            "create_schematic",
-            "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
-             size is given. Use set_schematic_page to change it later.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" },
-                    "size": {
-                        "type": "string",
-                        "description": "Paper size, e.g. 'A4', 'A3', 'USLetter' (default 'A4')",
-                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
-                                 "A", "B", "C", "D", "E",
-                                 "USLetter", "USLegal", "USLedger"],
-                        "default": "A4"
-                    },
-                    "portrait": {
-                        "type": "boolean",
-                        "description": "Portrait instead of the default landscape",
-                        "default": false
-                    }
-                },
-                "required": ["path"]
-            }),
-            |args, ctx| async move { handle_create_schematic(args, ctx).await }
-        ),
-        tool!(
-            "set_schematic_page",
-            "Set the sheet's paper size (A0-A5, A-E, USLetter, USLegal, USLedger) and \
-             orientation. Content outside the frame still exports and still nets up, so a \
-             too-small page is a silent defect — check the layout extents against the size.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "size": {
-                        "type": "string",
-                        "description": "Paper size, e.g. 'A4', 'A3', 'A2', 'USLetter'",
-                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
-                                 "A", "B", "C", "D", "E",
-                                 "USLetter", "USLegal", "USLedger"]
-                    },
-                    "portrait": {
-                        "type": "boolean",
-                        "description": "Portrait instead of the default landscape",
-                        "default": false
-                    }
-                },
-                "required": ["schematic", "size"]
-            }),
-            |args, ctx| async move { handle_set_page(args, ctx).await }
-        ),
         tool!(
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
@@ -101,7 +54,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
-                    "reference": { "type": "string", "description": "Optional override for reference designator" },
+                    "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
@@ -137,6 +90,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
                     "fields": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Additional property fields to set as key:value pairs"
                     },
                     "field_placements": {
@@ -177,7 +131,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "list_schematic_components",
             "List all symbol instances in a schematic with their positions, values, \
-             footprints, and pin locations.",
+             footprints, and properties.",
             json!({
                 "type": "object",
                 "properties": {
@@ -193,7 +147,9 @@ pub fn tools() -> Vec<ToolDef> {
              other placed unit by the same delta. Does NOT adjust connected wires. \
              Junction dots are re-judged where the pins moved: a dot the pins leave \
              unjustified is removed and a pin landing mid-span on a wire gains one, \
-             reported as junctions_pruned_count and junctions_added_count.",
+             reported as junctions_pruned_count and junctions_added_count. A no-connect \
+             flag travels with the pin it protects, reported as no_connects_moved; the \
+             move is refused before writing when that pin cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -208,7 +164,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_component",
-            "Set the lowest-numbered unit's absolute rotation and rotate every other placed unit by the same delta.",
+            "Set the lowest-numbered unit's absolute rotation and rotate every other placed \
+             unit by the same delta. Does NOT adjust connected wires. Each unit's \
+             Reference and Value text turns with its body, keeping any offset the caller \
+             gave it; use reset_schematic_field_positions to put fields back on their \
+             library anchors instead. Junction dots are \
+             re-judged where the pins turned, reported as junctions_pruned_count and \
+             junctions_added_count. A no-connect flag travels with the pin it protects, \
+             reported as no_connects_moved; the turn is refused before writing when that \
+             pin cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -236,7 +200,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_region",
-            "Move all symbols within a bounding box by a given offset.",
+            "Move all symbol units whose origins are within a bounding box by a given offset. \
+             Does NOT adjust connected wires. Junction dots are re-judged once for the whole \
+             region where its pins moved, reported as junctions_pruned_count and \
+             junctions_added_count. No-connect flags travel with the pins they protect, \
+             reported as no_connects_moved; the move is refused before writing when a pin \
+             cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -254,11 +223,40 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "annotate_schematic",
-            "Run kicad-cli to auto-assign reference designators (R? → R1, U? → U1, etc.).",
+            "Assign reference designators in the saved schematic the way eeschema's Tools → \
+             Annotate does with its defaults: every '?' designator gets the first free number \
+             for its prefix in the project, in ascending X per sheet instance, numbers used on \
+             any sheet instance in the file are reserved, and numbered designators are kept. \
+             The units of one multi-unit part (same embedded definition and value, distinct \
+             units) share one designator; when which units belong together is not proven they \
+             are reported in 'unresolved', never guessed. Two separate parts sharing a \
+             designator are reported in 'unresolved' with a 'partial' outcome; they are \
+             renumbered only when resolve_duplicates is true (the first in ascending X keeps \
+             the number). Annotates one project's instance records — the schematic's owner by \
+             default, or 'project' — and never touches another project's. Writes both the \
+             Reference property and the instances block, then reads the file back; every count \
+             in the response comes from that readback. Numbers used on the project's other \
+             sheets are reserved through its sheet tree ('other_sheets_consulted'); duplicates \
+             already spread across sheets are not detected here. Konnect's own implementation \
+             — kicad-cli has no annotate command. dry_run returns the plan without writing.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string" }
+                    "schematic": { "type": "string", "description": "Path to the .kicad_sch file" },
+                    "resolve_duplicates": {
+                        "type": "boolean",
+                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in ascending X keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
+                        "default": false
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Report what would be assigned without writing. Default false.",
+                        "default": false
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project whose instance records to annotate, as named in the symbols' (instances (project …)) blocks. Default: the project that owns the schematic (its .kicad_pro), else the only project the file names; refused with the candidates when that is ambiguous. Other projects' records are never edited."
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -335,7 +333,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "replace_component",
-            "Replace every placed unit of a component with a new library symbol while preserving unit numbers. A unit override is accepted only for a single placement.",
+            "Replace every placed unit of a component with a new library symbol while \
+             preserving unit numbers. A unit override is accepted only for a single \
+             placement. Junction dots are re-judged once for the whole replacement, \
+             reported as junctions_pruned_count and junctions_added_count. A no-connect \
+             flag follows the same symbol UUID, unit, and pin number when that mapping is \
+             one-to-one; removed, renumbered, or duplicated protected pins refuse before \
+             writing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -415,131 +419,6 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-async fn handle_create_schematic(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let path = get_path(args, "path")?;
-    let size = opt_str(args, "size").unwrap_or("A4").to_string();
-    let portrait = args["portrait"].as_bool().unwrap_or(false);
-    let (w, h) = match paper_dimensions(&size) {
-        Ok(dims) => dims,
-        Err(e) => return Ok(e),
-    };
-    let (width_mm, height_mm) = if portrait { (h, w) } else { (w, h) };
-
-    // Build a minimal valid schematic and save via cse's atomic writer.
-    let template = crate::tools::blank_schematic_template_with_paper(&size, portrait);
-    // Write the template then immediately load/save through cse so the file
-    // is normalised to cse's writer output format.
-    write_new_atomic(&path, &template)?;
-    let sch = cse::Schematic::load(&path)?;
-    sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({
-        "created": path.display().to_string(),
-        "size": size,
-        "portrait": portrait,
-        "width_mm": width_mm,
-        "height_mm": height_mm
-    })))
-}
-
-/// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
-/// dimensions in mm — reported back so the caller can sanity-check the layout
-/// against the frame instead of discovering the overflow at print time.
-const PAPER_SIZES: &[(&str, f64, f64)] = &[
-    ("A0", 1189.0, 841.0),
-    ("A1", 841.0, 594.0),
-    ("A2", 594.0, 420.0),
-    ("A3", 420.0, 297.0),
-    ("A4", 297.0, 210.0),
-    ("A5", 210.0, 148.0),
-    ("A", 279.4, 215.9),
-    ("B", 431.8, 279.4),
-    ("C", 558.8, 431.8),
-    ("D", 863.6, 558.8),
-    ("E", 1117.6, 863.6),
-    ("USLetter", 279.4, 215.9),
-    ("USLegal", 355.6, 215.9),
-    ("USLedger", 431.8, 279.4),
-];
-
-/// Landscape width and height of a named paper size, or the `invalid_argument`
-/// refusal naming every size that would have worked.
-fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
-    match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
-        Some(&(_, w, h)) => Ok((w, h)),
-        None => {
-            let valid = PAPER_SIZES
-                .iter()
-                .map(|(n, _, _)| *n)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::InvalidArgument {
-                    field: "size".into(),
-                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
-                },
-                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
-            ))
-        }
-    }
-}
-
-async fn handle_set_page(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let size = match require_str(args, "size") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let portrait = args["portrait"].as_bool().unwrap_or(false);
-
-    let dims = match paper_dimensions(&size) {
-        Ok(dims) => dims,
-        Err(e) => return Ok(e),
-    };
-    let (w, h) = if portrait { (dims.1, dims.0) } else { dims };
-
-    let node = if portrait {
-        format!("(paper \"{size}\" portrait)")
-    } else {
-        format!("(paper \"{size}\")")
-    };
-
-    let mut content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    match content.find("(paper ") {
-        Some(start) => {
-            let end = start
-                + content[start..]
-                    .find(')')
-                    .map(|p| p + 1)
-                    .unwrap_or(content.len() - start);
-            content.replace_range(start..end, &node);
-        }
-        None => {
-            // A freshly created blank sheet has no paper node; it belongs in
-            // the header, right after the uuid.
-            let anchor = content
-                .find("(uuid ")
-                .and_then(|p| content[p..].find(')').map(|q| p + q + 1))
-                .unwrap_or_else(|| content.find('\n').map(|p| p + 1).unwrap_or(0));
-            content.insert_str(anchor, &format!("\n  {node}"));
-        }
-    }
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "size": size,
-        "portrait": portrait,
-        "width_mm": w,
-        "height_mm": h
-    })))
-}
-
 async fn handle_add_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -569,8 +448,6 @@ async fn handle_add_schematic_component(
         Ok(unit) => unit.unwrap_or(1),
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let ref_str = reference.unwrap_or("?");
-
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
 
@@ -613,7 +490,7 @@ async fn handle_add_schematic_component(
         y,
         rotation,
         mirror,
-        ref_str,
+        reference,
         value,
         footprint,
         unit,
@@ -632,7 +509,7 @@ async fn handle_add_schematic_component(
         expected_y,
         rotation,
         mirror,
-        ref_str,
+        &placed.reference,
         &placed.fields,
         unit,
     );
@@ -660,7 +537,7 @@ async fn handle_add_schematic_component(
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, ref_str) {
+    let junctions = match crate::tools::add_pin_midwire_junctions(&sch_path, &placed.reference) {
         Ok(junctions) => junctions,
         Err(error) => {
             let uncertain = crate::tools::mutation_outcome_uncertain(
@@ -812,7 +689,7 @@ pub(crate) fn place_one_component(
     y: f64,
     rotation: f64,
     mirror: Option<&str>,
-    reference: &str,
+    reference: Option<&str>,
     value: Option<&str>,
     footprint: Option<&str>,
     unit: u32,
@@ -827,6 +704,13 @@ pub(crate) fn place_one_component(
     }
     let metadata = cse::library::symbol_metadata(sch, lib_id);
     let fields = PlacementFields::resolve(lib_id, &metadata, value, footprint);
+    // Unannotated, but keeping the library prefix: annotation numbers `R?`
+    // as `R1`, while a bare `?` becomes `1` and a `#FLG` loses the `#` that
+    // keeps it off the board (#669).
+    let reference = match reference {
+        Some(reference) => reference.to_owned(),
+        None => format!("{}?", metadata.reference),
+    };
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -874,7 +758,7 @@ pub(crate) fn place_one_component(
     let centred = cse::library::FieldJustify::default();
     sym.properties.push(positioned(
         "Reference",
-        reference,
+        &reference,
         ref_x,
         ref_y,
         ref_rot,
@@ -921,13 +805,17 @@ pub(crate) fn place_one_component(
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
     for instance_path in instance_paths {
-        sym.set_instance_path(project_name, instance_path, reference, unit);
+        sym.set_instance_path(project_name, instance_path, &reference, unit);
     }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
-    Ok(PlacedComponent { uuid, fields })
+    Ok(PlacedComponent {
+        uuid,
+        reference,
+        fields,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,6 +850,7 @@ impl PlacementFields {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacedComponent {
     pub(crate) uuid: String,
+    pub(crate) reference: String,
     pub(crate) fields: PlacementFields,
 }
 
@@ -2109,14 +1998,9 @@ pub(crate) fn plan_component_and_item_deletions(
     let grouped = if selected.is_empty() {
         Vec::new()
     } else {
-        let grouped = crate::tools::placed_pins_by_reference(&tree);
-        if grouped.len() != instances.len() {
-            return Err(ComponentDeleteTargetError::stale(
-                path,
-                "one or more placed symbols have unresolved library pin geometry",
-            ));
-        }
-        grouped
+        crate::tools::resolved_placed_pins_by_reference(&tree).ok_or_else(|| {
+            ComponentDeleteTargetError::stale(path, crate::tools::UNRESOLVED_PIN_GEOMETRY)
+        })?
     };
     let selected_ids = unit_uuids.iter().cloned().collect::<BTreeSet<_>>();
     let mut affected = Vec::new();
@@ -2367,9 +2251,9 @@ fn is_reserved_property(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PropertyWriteCounts {
-    updated: usize,
-    added: usize,
+pub(crate) struct PropertyWriteCounts {
+    pub(crate) updated: usize,
+    pub(crate) added: usize,
 }
 
 fn escape_property_text(value: &str) -> String {
@@ -2436,10 +2320,21 @@ fn property_insert_edit(
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let prop = format!(
-        "\n{indent}(property \"{escaped_name}\" \"{escaped_value}\"\n{indent}\t(at {x} {y} 0)\n\
-         {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
-         (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
+        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+         {indent}\t(at {x} {y} 0){newline}\
+         {indent}\t(hide yes){newline}\
+         {indent}\t(effects{newline}\
+         {indent}\t\t(font{newline}\
+         {indent}\t\t\t(size 1.27 1.27){newline}\
+         {indent}\t\t){newline}\
+         {indent}\t){newline}\
+         {indent})"
     );
 
     // Insert before the block's closing paren so the property stays inside it.
@@ -2456,7 +2351,7 @@ fn property_insert_edit(
 /// Custom fields may be present on only some units in a legacy/broken sheet;
 /// `add_missing=true` updates those copies and fills the missing ones in the
 /// same atomic document command.
-fn set_property_value(
+pub(crate) fn set_property_value(
     content: &str,
     reference: &str,
     field: &str,
@@ -3074,6 +2969,18 @@ async fn handle_edit_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// Every property of a placed symbol by name. A repeated name keeps its first
+/// value, the one `value` and `footprint` are read from.
+fn symbol_properties(symbol: &cse::Symbol) -> BTreeMap<&str, &str> {
+    let mut properties = BTreeMap::new();
+    for property in &symbol.properties {
+        properties
+            .entry(property.name.as_str())
+            .or_insert(property.value.as_str());
+    }
+    properties
+}
+
 async fn handle_get_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3128,7 +3035,8 @@ async fn handle_get_schematic_component(
         "mirror_y": mirror.contains('y'),
         "uuid": anchor.uuid,
         "unit_count": units.len(),
-        "units": units
+        "units": units,
+        "properties": symbol_properties(anchor)
     })))
 }
 
@@ -3155,7 +3063,8 @@ async fn handle_list_schematic_components(
                 "y": y,
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y')
+                "mirror_y": mirror.contains('y'),
+                "properties": symbol_properties(sym)
             })
         })
         .collect();
@@ -3185,20 +3094,9 @@ async fn handle_move_schematic_component(
     };
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
 
-    // Pin positions before the move, so the dots the pins vacate can be judged
-    // afterwards (#120). Wires do not change here — pins do. A sheet with no
-    // wires has nothing to reconcile, and skipping spares it the symbol walk.
-    let before_pins = if read_consistent(&sch_path)
-        .map(|c| c.contains("(wire"))
-        .unwrap_or(false)
-    {
-        pin_endpoints_of(&sch_path)
-    } else {
-        Vec::new()
-    };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -3223,8 +3121,20 @@ async fn handle_move_schematic_component(
     {
         symbol.translate(dx, dy);
     }
-    sch.overwrite()?;
-    let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
+    // A no-connect belongs to the pin, not to the coordinate it was dropped
+    // on, so it travels in this same write (#626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    let moved_markers =
+        match observed_no_connect_moves(&sch_path, "move_schematic_component", &carried)? {
+            Ok(moved) => moved,
+            Err(error) => return Ok(error),
+        };
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3236,56 +3146,12 @@ async fn handle_move_schematic_component(
         "moved_units": observed["unit_count"],
         "placements": observed["units"],
         "junctions_added_count": added,
-        "junctions_pruned_count": pruned
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
-}
-
-/// Pin endpoints on the sheet as it currently stands on disk, or empty if it
-/// cannot be read — the caller only ever diffs two of these.
-fn pin_endpoints_of(path: &std::path::Path) -> Vec<(f64, f64)> {
-    read_consistent(path)
-        .ok()
-        .and_then(|c| konnect_sexp::parse_sexp(&c).ok())
-        .map(|t| crate::tools::all_pin_endpoints(&t))
-        .unwrap_or_default()
-}
-
-/// Re-judge junction dots wherever a pin appeared or disappeared.
-///
-/// The points that matter are exactly the symmetric difference of the pin sets:
-/// a dot at a vacated position may now be stranded, and a pin that has landed
-/// mid-span on a wire needs one. Everything else on the sheet is untouched, so
-/// unrelated dots cannot be disturbed.
-fn reconcile_junctions_after_move(
-    path: &std::path::Path,
-    before_pins: &[(f64, f64)],
-) -> anyhow::Result<(usize, usize)> {
-    const TOL: f64 = 0.01;
-    let after_pins = pin_endpoints_of(path);
-    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
-        a.iter()
-            .copied()
-            .filter(|&(x, y)| {
-                !b.iter()
-                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
-            })
-            .collect()
-    };
-    let mut points = differs(before_pins, &after_pins);
-    points.extend(differs(&after_pins, before_pins));
-    if points.is_empty() {
-        return Ok((0, 0));
-    }
-    let content = read_consistent(path)?;
-    let expected = content.clone();
-    let (new_content, added, pruned) =
-        crate::tools::sch_wiring::reconcile_junctions_at(content, &points);
-    if added > 0 || pruned > 0 {
-        write_atomic_if_unchanged(path, &expected, &new_content)?;
-    }
-    Ok((added, pruned))
 }
 
 async fn handle_rotate_schematic_component(
@@ -3302,8 +3168,9 @@ async fn handle_rotate_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -3333,7 +3200,20 @@ async fn handle_rotate_schematic_component(
         let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
     }
-    sch.overwrite()?;
+    // A turn relocates pin endpoints exactly as a move does, so the markers on
+    // those pins travel with them here too (#626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    let moved_markers =
+        match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
+            Ok(moved) => moved,
+            Err(error) => return Ok(error),
+        };
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3342,7 +3222,11 @@ async fn handle_rotate_schematic_component(
         "rotated": observed["reference"],
         "rotation": observed["rotation"],
         "rotated_units": observed["unit_count"],
-        "placements": observed["units"]
+        "placements": observed["units"],
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
@@ -3392,7 +3276,8 @@ async fn handle_move_region(
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
 
     // Select placements by UUID, not reference. A multi-unit reference may
     // have one unit inside the rectangle and another outside; resolving the
@@ -3405,43 +3290,122 @@ async fn handle_move_region(
         .map(|symbol| symbol.uuid.clone())
         .collect();
 
-    let mut moved_references = Vec::new();
-    let mut placements = Vec::new();
+    let mut moved_uuids = Vec::new();
+    let mut expected_positions = BTreeMap::new();
     for symbol in sch.symbols.iter_mut() {
         if uuids_to_move.contains(&symbol.uuid) {
             let (old_x, old_y) = symbol.position();
             let (new_x, new_y) = snap_point(old_x + dx, old_y + dy, 1.27);
             symbol.move_to(new_x, new_y);
-            let reference = symbol.reference().unwrap_or("?").to_string();
-            if !moved_references.contains(&reference) {
-                moved_references.push(reference.clone());
-            }
-            placements.push(json!({
-                "reference": reference,
-                "unit": symbol.unit,
-                "x": new_x,
-                "y": new_y
-            }));
+            moved_uuids.push(symbol.uuid.clone());
+            expected_positions.insert(symbol.uuid.clone(), (new_x, new_y));
         }
     }
 
-    sch.overwrite()?;
+    // Region movement is one placement change, not a series of independent
+    // moves. Carry marker intent and reconcile the whole-sheet symmetric pin
+    // difference once so pins that swap coordinates do not manufacture or
+    // remove a junction between the per-symbol steps (#623, #626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
+    let candidate = sch.to_source();
+    let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+
+    let moved_markers = match observed_no_connect_moves(&sch_path, "move_region", &carried)? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
+
+    // Planned coordinates are not proof that the committed file contains the
+    // move. Bind the response back to the selected UUIDs and reject an
+    // incomplete or divergent readback as uncertain after mutation.
+    let committed = match cse::Schematic::load(&sch_path) {
+        Ok(committed) => committed,
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!("the written schematic cannot be read back: {error}"),
+            ));
+        }
+    };
+    let mut moved_references = Vec::new();
+    let mut placements = Vec::new();
+    for uuid in &moved_uuids {
+        let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == *uuid) else {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!("selected symbol UUID {uuid} is missing from the written schematic"),
+            ));
+        };
+        let (observed_x, observed_y) = symbol.position();
+        let &(expected_x, expected_y) = expected_positions
+            .get(uuid)
+            .expect("every selected UUID has a planned position");
+        if !konnect_sexp::geometry::points_coincident(
+            observed_x,
+            observed_y,
+            expected_x,
+            expected_y,
+            crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+        ) {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                format!(
+                    "selected symbol UUID {uuid} was written at ({observed_x}, {observed_y}), expected ({expected_x}, {expected_y})"
+                ),
+            ));
+        }
+        let reference = symbol.reference().unwrap_or("?").to_string();
+        if !moved_references.contains(&reference) {
+            moved_references.push(reference.clone());
+        }
+        placements.push(json!({
+            "reference": reference,
+            "unit": symbol.unit,
+            "x": observed_x,
+            "y": observed_y
+        }));
+    }
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved_references.len(),
         "moved": moved_references,
         "moved_unit_count": placements.len(),
-        "placements": placements
+        "placements": placements,
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     })))
 }
 
 async fn handle_annotate_schematic(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use super::sch_annotate::{annotate_file, opt_bool, opt_string, AnnotateOptions};
     let sch_path = get_path(args, "schematic")?;
-    crate::tools::cli::annotate_schematic(&ctx.config.kicad_cli, &sch_path).await?;
-    Ok(CallToolResult::text("Annotation complete."))
+    let options = AnnotateOptions {
+        resolve_duplicates: match opt_bool(args, "resolve_duplicates") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+        dry_run: match opt_bool(args, "dry_run") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+        project: match opt_string(args, "project") {
+            Ok(value) => value,
+            Err(refusal) => return Ok(refusal),
+        },
+    };
+    Ok(tokio::task::spawn_blocking(move || annotate_file(&sch_path, options)).await?)
 }
 
 async fn handle_get_schematic_pin_locations(
@@ -4085,7 +4049,6 @@ async fn handle_replace_component(
             blocks.len()
         )));
     }
-
     let parsed = parse_sexp(&content)?;
     let current_units: Vec<u32> = extract_symbol_instances(&parsed)
         .into_iter()
@@ -4096,6 +4059,14 @@ async fn handle_replace_component(
     let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
         Ok(source) => source,
         Err(error) => return Ok(error.into_tool_result()),
+    };
+    // Preserve the ownership preflight as the first semantic gate. Binding the
+    // selected instances is still performed before any in-memory mutation,
+    // but an ambiguously owned sheet must report that conflict rather than a
+    // secondary instance-metadata diagnosis.
+    let mut target = match component_target_from_source(&sch_path, &content, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
     };
     let embedded_unit_count = parsed
         .find("lib_symbols")
@@ -4202,15 +4173,63 @@ async fn handle_replace_component(
     if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id, &src));
     }
+
+    // A replacement changes pin geometry while preserving only symbol UUID,
+    // unit and pin number. Carry a marker through that narrower, explicitly
+    // one-to-one identity before the junction pass sees the new endpoints;
+    // removed, renumbered or duplicated protected pins refuse before writing.
+    let after_tree = parse_sexp(&content)?;
+    let carries = match plan_no_connect_carry_for_replacement(&parsed, &after_tree) {
+        Ok(carries) => carries,
+        Err(error) => return Ok(error.into_result(&sch_path)),
+    };
+    content = match apply_no_connect_carries(content, &carries) {
+        Some(content) => content,
+        None => return Ok(no_connect_carry_unwritable(&sch_path)),
+    };
+    let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
-    Ok(CallToolResult::json(&json!({
-        "reference": reference,
+    let moved_markers = match observed_no_connect_moves(&sch_path, "replace_component", &carries)? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
+    for unit in &mut target.units {
+        unit.lib_id.clone_from(&new_lib_id);
+        if let Some(new_unit) = new_unit {
+            unit.unit = new_unit;
+        }
+    }
+    let observed = match load_component_mutation_readback(&sch_path, &target) {
+        Ok(Ok(observed)) => observed,
+        Ok(Err(error)) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                tool_error_summary(&error),
+            ));
+        }
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                format!("the written schematic cannot be read back: {error}"),
+            ));
+        }
+    };
+    let mut result = json!({
+        "reference": observed["reference"],
         "old_lib_id": old_lib_id,
-        "new_lib_id": new_lib_id,
+        "new_lib_id": observed["lib_id"],
         "unit": new_unit,
-        "units_replaced": blocks.len()
-    })))
+        "units_replaced": observed["unit_count"],
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
 }
 
 // Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
@@ -4227,6 +4246,7 @@ async fn handle_replace_component(
 mod tests {
     use super::*;
     use crate::router::ToolRouter;
+    use crate::tools::sch_hierarchy::handle_create_schematic;
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
@@ -4318,77 +4338,6 @@ mod tests {
         .unwrap();
         std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
         (dir, guard)
-    }
-
-    #[tokio::test]
-    async fn create_schematic_writes_root_uuid() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fresh.kicad_sch");
-        let ctx = test_ctx();
-
-        let result = handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-
-        let sch = cse::Schematic::load(&path).unwrap();
-        assert!(
-            sch.uuid.is_some(),
-            "root (uuid ...) is required for KiCAD's netlister to resolve instance paths"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_schematic_defaults_to_a4() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fresh.kicad_sch");
-        handle_create_schematic(&json!({ "path": path.display().to_string() }), &test_ctx())
-            .await
-            .unwrap();
-        let out = std::fs::read_to_string(&path).unwrap();
-        assert!(out.contains("(paper \"A4\")"), "got {out}");
-    }
-
-    #[tokio::test]
-    async fn create_schematic_honours_size_and_orientation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.kicad_sch");
-        let result = handle_create_schematic(
-            &json!({ "path": path.display().to_string(), "size": "A3", "portrait": true }),
-            &test_ctx(),
-        )
-        .await
-        .unwrap();
-        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
-            panic!("expected text")
-        };
-        // The dimensions are reported swapped for portrait, matching
-        // set_schematic_page.
-        assert!(text.contains("\"width_mm\":297"), "got {text}");
-        assert!(text.contains("\"height_mm\":420"), "got {text}");
-
-        let out = std::fs::read_to_string(&path).unwrap();
-        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
-        // The orientation token has to survive cse's normalising rewrite:
-        // KiCad rejects a `(paper …)` it cannot parse.
-        assert_eq!(
-            cse::Schematic::load(&path).unwrap().paper.as_deref(),
-            Some("A3")
-        );
-    }
-
-    #[tokio::test]
-    async fn create_schematic_refuses_an_unknown_size_before_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nope.kicad_sch");
-        let result = handle_create_schematic(
-            &json!({ "path": path.display().to_string(), "size": "A9" }),
-            &test_ctx(),
-        )
-        .await
-        .unwrap();
-        assert!(result.is_error);
-        assert!(!path.exists(), "a rejected size must leave no file behind");
     }
 
     /// #204: on a child sheet both halves of the instance key came from the
@@ -4694,6 +4643,135 @@ mod tests {
         );
         assert_eq!(fields.value, "10k");
         assert_eq!(fields.footprint, "Resistor_THT:R_Axial");
+    }
+
+    /// A placement without `reference` keeps the stock library prefix, so
+    /// annotation yields `R1` and `#FLG01`, not `1` and `2` (#669).
+    #[tokio::test]
+    async fn add_component_without_reference_keeps_library_prefix() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (lib_id, x) in [("Device:R", 101.6), ("power:PWR_FLAG", 127.0)] {
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": lib_id,
+                    "x": x, "y": 101.6,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{lib_id}: {result:?}");
+        }
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R?".into(), vec!["R?".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG?".into(),
+                    vec!["#FLG?".into()]
+                ),
+            ]
+        );
+
+        let result =
+            handle_annotate_schematic(&json!({ "schematic": path.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R1".into(), vec!["R1".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG01".into(),
+                    vec!["#FLG01".into()]
+                ),
+            ]
+        );
+    }
+
+    /// The mid-wire junction pass must look the part up by its resolved `R?`:
+    /// keyed on the omitted reference it finds nothing, adds no dot, and still
+    /// succeeds, leaving both pins unconnected.
+    #[tokio::test]
+    async fn served_add_component_without_reference_joins_pins_landing_mid_wire() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        let schematic = path.display().to_string();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let call = |name: &str, arguments: serde_json::Value| {
+            let message = json!({"jsonrpc": "2.0", "id": 669, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}});
+            let handler = &handler;
+            async move {
+                let result = handler
+                    .handle_message(message)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_ne!(result["isError"], true, "{result}");
+                serde_json::from_str::<serde_json::Value>(
+                    result["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap()
+            }
+        };
+
+        call("create_schematic", json!({ "path": schematic })).await;
+        // Device:R at (101.6, 101.6) puts its pins at y 97.79 and 105.41.
+        for y in [97.79, 105.41] {
+            call(
+                "add_wire",
+                json!({ "schematic": schematic, "x1": 96.52, "y1": y, "x2": 106.68, "y2": y }),
+            )
+            .await;
+        }
+        let placed = call(
+            "add_schematic_component",
+            json!({ "schematic": schematic, "lib_id": "Device:R", "x": 101.6, "y": 101.6 }),
+        )
+        .await;
+
+        let pins = [(101.6, 97.79), (101.6, 105.41)];
+        let matches = |points: Vec<(f64, f64)>| {
+            points.len() == pins.len()
+                && pins.iter().all(|&(px, py)| {
+                    points.iter().any(|&(x, y)| {
+                        konnect_sexp::geometry::points_coincident(px, py, x, y, 0.01)
+                    })
+                })
+        };
+        let reported = placed["junctions_added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| (point["x"].as_f64().unwrap(), point["y"].as_f64().unwrap()))
+            .collect();
+        assert!(matches(reported), "{placed}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        assert!(
+            matches(saved.junctions.iter().map(|j| (j.x, j.y)).collect()),
+            "without these dots KiCad leaves both pins of R? unconnected"
+        );
     }
 
     #[tokio::test]
@@ -6110,92 +6188,6 @@ mod edit_component_tests {
 }
 
 #[cfg(test)]
-mod page_tests {
-    use super::{tools, PAPER_SIZES};
-    use crate::tools::ToolContext;
-    use serde_json::json;
-    use std::io::Write;
-    use std::sync::Arc;
-
-    async fn set_page(body: &str, size: &str, portrait: bool) -> String {
-        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        f.flush().unwrap();
-        let def = tools()
-            .into_iter()
-            .find(|t| t.name == "set_schematic_page")
-            .unwrap();
-        let cfg = crate::tools::ServerConfig {
-            kicad_cli: String::new(),
-            kicad_binary: String::new(),
-            ipc_address: String::new(),
-            project_dir: None,
-            jlcpcb_db_path: None,
-            auto_load_toolsets: false,
-            eager_toolsets: false,
-        };
-        let ctx = Arc::new(ToolContext::new(
-            cfg,
-            Arc::new(crate::router::ToolRouter::new()),
-        ));
-        let args = json!({
-            "schematic": f.path().to_str().unwrap(),
-            "size": size, "portrait": portrait
-        });
-        (def.handler)(&args, ctx).await.unwrap();
-        std::fs::read_to_string(f.path()).unwrap()
-    }
-
-    const WITH_PAPER: &str =
-        "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (paper \"A4\")\n  (symbol)\n)\n";
-    const NO_PAPER: &str = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (symbol)\n)\n";
-
-    #[tokio::test]
-    async fn replaces_an_existing_paper_node() {
-        let out = set_page(WITH_PAPER, "A2", false).await;
-        assert!(out.contains("(paper \"A2\")"), "got {out}");
-        assert!(!out.contains("A4"), "old size must be gone: {out}");
-        assert_eq!(out.matches("(paper").count(), 1);
-    }
-
-    /// A sheet written without a paper node — KiCad treats it as A4 — takes the
-    /// new one in the header, before any element.
-    #[tokio::test]
-    async fn inserts_when_absent_and_stays_in_the_header() {
-        let out = set_page(NO_PAPER, "A3", false).await;
-        assert!(out.contains("(paper \"A3\")"), "got {out}");
-        assert!(out.find("(paper").unwrap() < out.find("(symbol").unwrap());
-    }
-
-    #[tokio::test]
-    async fn portrait_is_marked_on_the_node() {
-        let out = set_page(WITH_PAPER, "A3", true).await;
-        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
-    }
-
-    #[tokio::test]
-    async fn unknown_size_leaves_the_file_alone() {
-        let out = set_page(WITH_PAPER, "A9", false).await;
-        assert!(
-            out.contains("(paper \"A4\")"),
-            "must not have written: {out}"
-        );
-    }
-
-    #[test]
-    fn paper_table_is_landscape_and_unique() {
-        let mut names: Vec<_> = PAPER_SIZES.iter().map(|(n, _, _)| *n).collect();
-        let count = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), count, "duplicate paper size name");
-        for (n, w, h) in PAPER_SIZES {
-            assert!(w > h, "{n} is listed portrait; the table is landscape");
-        }
-    }
-}
-
-#[cfg(test)]
 mod schematic_view_tests {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -6334,6 +6326,347 @@ mod move_connected_tests {
 }
 
 #[cfg(test)]
+mod no_connect_carry_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::{sch_wiring::NoConnectCarry, ServerConfig};
+    use std::sync::Arc;
+
+    use super::component_delete_connectivity_tests::has_junction;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+
+    /// The marker KiCad wrote onto `R2` pin 1, and the one it wrote on nothing.
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+    const DANGLING_MARKER: &str = "493fbe64-0015-4848-87bd-797fff8aa3fd";
+    const STACKED_MARKER: &str = "3627efa6-e463-4121-ac35-b9056319db36";
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("carry.kicad_sch");
+        std::fs::write(&path, CARRY).unwrap();
+        (directory, path)
+    }
+
+    /// The tool's JSON body, whether it succeeded or refused — the caller
+    /// asserts which it expected.
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Where the file now has the marker with this UUID.
+    fn marker_at(content: &str, uuid: &str) -> (f64, f64) {
+        let tree = parse_sexp(content).expect("the written sheet parses");
+        tree.find_all("no_connect")
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(uuid))
+            .and_then(konnect_sexp::schematic::parse_at)
+            .map(|(x, y, _)| (x, y))
+            .unwrap_or_else(|| panic!("no-connect {uuid} is missing from the written sheet"))
+    }
+
+    #[tokio::test]
+    async fn a_move_carries_the_marker_and_leaves_the_protected_pin_off_the_wire() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 154.94, "y": 163.83 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        let moved = &response["no_connects_moved"][0];
+        assert_eq!(moved["uuid"], R2_MARKER, "{response}");
+        assert_eq!(
+            moved["from"],
+            json!({ "x": 158.75, "y": 156.21 }),
+            "{response}"
+        );
+        assert_eq!(
+            moved["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        // The pin lands mid-span on the NETB wire. KiCad reaches it only
+        // through a junction dot, so the carried marker must stop the dot
+        // being written — otherwise the pin joins /NETB (#626).
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+        assert!(!has_junction(&committed, 154.94, 160.02));
+    }
+
+    #[tokio::test]
+    async fn a_region_move_carries_the_marker_in_the_same_atomic_write() {
+        let (_directory, path) = fixture();
+        let result = handle_move_region(
+            &json!({
+                "schematic": path,
+                "x1": 158.0, "y1": 159.0,
+                "x2": 159.0, "y2": 161.0,
+                "dx": -3.81, "dy": 3.81
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["moved"], json!(["R2"]), "{response}");
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(
+            response["no_connects_moved"][0]["uuid"], R2_MARKER,
+            "{response}"
+        );
+        assert_eq!(
+            response["no_connects_moved"][0]["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+        assert!(!has_junction(&committed, 154.94, 160.02));
+    }
+
+    #[tokio::test]
+    async fn a_turn_carries_the_marker_the_same_way_a_move_does() {
+        let (_directory, path) = fixture();
+        let result = handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "rotation": 90 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        let moved = &response["no_connects_moved"][0];
+        assert_eq!(moved["uuid"], R2_MARKER, "{response}");
+        assert_eq!(
+            moved["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+        assert_eq!(response["junctions_pruned_count"], 0, "{response}");
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+        assert!(!has_junction(&committed, 154.94, 160.02));
+    }
+
+    #[tokio::test]
+    async fn a_placement_change_carrying_nothing_leaves_every_marker_alone() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R4", "x": 139.7, "y": 175.26 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 0, "{response}");
+        assert_eq!(response["no_connects_moved"], json!([]), "{response}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (158.75, 156.21));
+        assert_eq!(marker_at(&committed, DANGLING_MARKER), (180.34, 120.65));
+        assert_eq!(marker_at(&committed, STACKED_MARKER), (114.3, 105.41));
+    }
+
+    #[tokio::test]
+    async fn a_marker_under_two_pins_refuses_the_move_and_writes_nothing() {
+        for (reference, x, y) in [("R3", 101.6, 101.6), ("R5", 101.6, 109.22)] {
+            let (_directory, path) = fixture();
+            let result = handle_move_schematic_component(
+                &json!({ "schematic": path, "reference": reference, "x": x, "y": y }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            let response = body(&result);
+
+            assert_eq!(
+                extract_error_kind(&result),
+                Some("ambiguous_target".to_string()),
+                "{response}"
+            );
+            assert_eq!(
+                response["error"]["target"],
+                format!("no-connect {STACKED_MARKER} at (114.3, 105.41)"),
+                "{response}"
+            );
+            let candidates = response["error"]["candidates"]
+                .as_array()
+                .expect("candidates are listed")
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 2, "{response}");
+            assert!(
+                candidates
+                    .iter()
+                    .any(|c| c.contains("R3") && c.contains("pin 2")),
+                "{response}"
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|c| c.contains("R5") && c.contains("pin 1")),
+                "{response}"
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                CARRY,
+                "refusing {reference} must leave the file byte-identical"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_region_carry_refuses_before_writing() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_region(
+            &json!({
+                "schematic": path,
+                "x1": 113.0, "y1": 100.0,
+                "x2": 115.0, "y2": 103.0,
+                "dx": -12.7, "dy": 0.0
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{:?}",
+            body(&result)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_marker_the_written_file_does_not_show_makes_the_outcome_uncertain() {
+        // The report is read back from the file, never from the plan: a marker
+        // the write did not land is the difference between "your pin is still
+        // protected" and "your pin may be on a net".
+        let (_directory, path) = fixture();
+        let landed = crate::tools::sch_wiring::NoConnectCarry {
+            uuid: R2_MARKER.to_owned(),
+            from: (158.75, 156.21),
+            to: (158.75, 156.21),
+        };
+        let reported = observed_no_connect_moves(
+            &path,
+            "move_schematic_component",
+            std::slice::from_ref(&landed),
+        )
+        .unwrap()
+        .expect("the fixture does have that marker at that point");
+        assert_eq!(reported[0]["to"], json!({ "x": 158.75, "y": 156.21 }));
+
+        let elsewhere = NoConnectCarry {
+            to: (1.0, 1.0),
+            ..landed
+        };
+        let result = observed_no_connect_moves(&path, "move_schematic_component", &[elsewhere])
+            .unwrap()
+            .expect_err("the marker is not at (1, 1), so the outcome is not proven");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("mutation_outcome_uncertain".to_string()),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_with_an_empty_uuid_refuses_on_the_typed_path_too() {
+        // The typed model reads a missing UUID as "" and writes it back as
+        // (uuid ""), so a marker that the S-expression path refuses must not
+        // slip through here keyed on the empty string — two of them would
+        // share that key and the carry would follow the wrong one.
+        let (_directory, path) = fixture();
+        let anonymous = CARRY.replace(&format!("\t\t(uuid \"{R2_MARKER}\")\n"), "");
+        assert!(!anonymous.contains(R2_MARKER));
+        std::fs::write(&path, &anonymous).unwrap();
+
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 154.94, "y": 163.83 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("stale_target".to_string()),
+            "{:?}",
+            body(&result)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), anonymous);
+    }
+
+    #[tokio::test]
+    async fn a_carry_that_would_stack_two_markers_refuses_and_writes_nothing() {
+        // R2 pin 1 lands exactly on the marker that is dangling on purpose.
+        // Two markers on one point belong to neither pin, so this refuses
+        // rather than writing a sheet no caller can read back.
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 180.34, "y": 124.46 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{response}"
+        );
+        let candidates = response["error"]["candidates"].to_string();
+        assert!(candidates.contains(R2_MARKER), "{response}");
+        assert!(candidates.contains(DANGLING_MARKER), "{response}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CARRY);
+    }
+}
+
+#[cfg(test)]
 mod component_delete_connectivity_tests {
     use super::*;
     use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
@@ -6372,7 +6705,7 @@ mod component_delete_connectivity_tests {
         serde_json::from_str(text).unwrap()
     }
 
-    fn has_junction(content: &str, x: f64, y: f64) -> bool {
+    pub(super) fn has_junction(content: &str, x: f64, y: f64) -> bool {
         let tree = parse_sexp(content).unwrap();
         konnect_sexp::schematic::extract_junctions(&tree)
             .iter()
@@ -7922,6 +8255,67 @@ mod multi_unit_component_tests {
     }
 
     #[tokio::test]
+    async fn get_reads_the_lowest_unit_and_list_reads_each_unit() {
+        // `Note` is on the unit saved first: the lowest as written, and not
+        // once it is renumbered 3.
+        let renumbered = SCHEMATIC.replace("(unit 1)", "(unit 3)");
+        assert_ne!(renumbered, SCHEMATIC);
+        for (source, lowest_has_note) in [(SCHEMATIC.to_owned(), true), (renumbered, false)] {
+            let (_directory, path) = fixture();
+            std::fs::write(&path, source).unwrap();
+            let has_note = |value: &serde_json::Value| value["properties"].get("Note").is_some();
+
+            let component = body(
+                handle_get_schematic_component(
+                    &json!({ "schematic": path, "reference": "U1" }),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(has_note(&component), lowest_has_note, "{component}");
+
+            let listed = body(
+                handle_list_schematic_components(&json!({ "schematic": path }), &context())
+                    .await
+                    .unwrap(),
+            );
+            for row in listed["components"].as_array().unwrap() {
+                assert_eq!(has_note(row), row["y"] == 100.0, "{listed}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_property_reads_its_first_value() {
+        let property = "    (property \"Value\" \"OLD\" (at 100 102 0))\n";
+        let repeated = property.replace("OLD", "NEW");
+        let source = SCHEMATIC.replacen(property, &format!("{property}{repeated}"), 1);
+        assert_ne!(source, SCHEMATIC);
+        let (_directory, path) = fixture();
+        std::fs::write(&path, source).unwrap();
+
+        let component = body(
+            handle_get_schematic_component(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(component["properties"]["Value"], "OLD", "{component}");
+        assert_eq!(component["value"], "OLD", "{component}");
+        let listed = body(
+            handle_list_schematic_components(&json!({ "schematic": path }), &context())
+                .await
+                .unwrap(),
+        );
+        for row in listed["components"].as_array().unwrap() {
+            assert_eq!(row["properties"]["Value"], row["value"], "{listed}");
+        }
+    }
+
+    #[tokio::test]
     async fn replace_changes_every_unit_and_preserves_unit_numbers() {
         let (_directory, path) = fixture();
         let result = body(
@@ -8358,5 +8752,598 @@ mod multi_unit_component_tests {
             .as_str()
             .unwrap()
             .contains("may have changed"));
+    }
+}
+
+/// A field's `(at …)` is an absolute sheet coordinate, not an offset from the
+/// body, so a turn owes each field the same rotation it gives the symbol
+/// (#612).
+///
+/// Every case runs on `rotate_fields_kicad10.kicad_sch`, which is KiCad
+/// 10.0.6's own serialization — see its README for provenance and for the
+/// `kicad-cli sch export svg` anchors these expectations come from.
+///
+/// The sheet is built in twins: a symbol placed unrotated, and the same
+/// symbol placed at 90° outright `TWIN_OFFSET_MM` below it. Turning the first
+/// must land its fields exactly on the second's, less that offset — an
+/// expectation KiCad wrote into the fixture, not one this crate computed.
+#[cfg(test)]
+mod rotate_field_text_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/rotate_fields_kicad10.kicad_sch");
+
+    /// How far below its unrotated twin each pre-rotated symbol sits.
+    const TWIN_OFFSET_MM: f64 = 25.4;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rotate-fields.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn rotate(path: &std::path::Path, reference: &str, rotation: f64) -> CallToolResult {
+        handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": reference, "rotation": rotation }),
+            &context(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Sheet position and stored angle of a symbol's Reference and Value text.
+    /// The angle comes back because the turn must leave it alone: KiCad adds
+    /// the symbol's rotation when it draws, so turning the stored angle here
+    /// would draw the text at twice the angle.
+    pub(super) fn field_positions(source: &str, reference: &str) -> [(f64, f64, f64); 2] {
+        let schematic =
+            cse::Schematic::from_source(std::path::Path::new("sheet"), source.to_string())
+                .expect("fixture parses");
+        let symbol = schematic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some(reference))
+            .expect("placed symbol");
+        ["Reference", "Value"].map(|name| {
+            let at = symbol
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .expect("field")
+                .sub_nodes
+                .iter()
+                .find_map(cse::types::At::from_sexp)
+                .expect("field position");
+            (at.x, at.y, at.rotation.unwrap_or(0.0))
+        })
+    }
+
+    /// The fields of `twin`, lifted by the offset that separates the two
+    /// placements — where `reference`'s fields have to land once it turns.
+    fn twin_target(reference_twin: &str) -> [(f64, f64, f64); 2] {
+        field_positions(SHEET, reference_twin).map(|(x, y, angle)| (x, y - TWIN_OFFSET_MM, angle))
+    }
+
+    /// KiCad writes these coordinates to four decimals. Compare on that scale,
+    /// so the last bit of the twin subtraction does not decide a geometric
+    /// claim — 50.8 and 50.800000000000004 are the same point on a sheet.
+    pub(super) fn to_nanometres(fields: [(f64, f64, f64); 2]) -> [(i64, i64, i64); 2] {
+        fields.map(|(x, y, angle)| {
+            (
+                (x * 1_000_000.0).round() as i64,
+                (y * 1_000_000.0).round() as i64,
+                (angle * 1_000_000.0).round() as i64,
+            )
+        })
+    }
+
+    /// Turning a placed symbol used to leave its field text where the body had
+    /// been. A `Device:LED` turned to 90° kept its Reference 2.54mm above the
+    /// origin — the middle of the now-vertical body, under the wire into its
+    /// anode.
+    ///
+    /// D2 is the same LED, placed at 90° outright, so the fixture carries the
+    /// answer. The literal is stated too, so the two agreeing on a wrong point
+    /// would still fail.
+    #[tokio::test]
+    async fn turning_a_symbol_carries_its_field_text_around() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "D1", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "D1");
+        // 2.54mm above the origin becomes 2.54mm to its left, clearing the
+        // vertical body instead of lying along it.
+        assert_eq!(turned, [(99.06, 50.8, 0.0), (104.14, 50.8, 0.0)]);
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("D2")));
+    }
+
+    /// A placement rotates before it mirrors, and a reflection reverses the
+    /// sense of any rotation conjugated by it, so a mirrored body turns its
+    /// fields the other way. The case needs an anchor off both axes — a
+    /// `Device:LED`'s anchors are symmetric about the origin, so the reversal
+    /// only swaps the two fields and lands on the same pair of points.
+    #[tokio::test]
+    async fn turning_a_mirrored_symbol_turns_its_fields_the_other_way() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "U1", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "U1");
+        assert_eq!(turned[0], (133.985, 45.72, 0.0));
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("U2")));
+    }
+
+    /// The same part, same turn, no mirror: the Reference lands on the other
+    /// side of the body. This is the control that makes the case above bite —
+    /// ignore the reflection and the mirrored symbol lands here instead.
+    #[tokio::test]
+    async fn turning_an_unmirrored_symbol_turns_its_fields_the_plain_way() {
+        let (_directory, path) = fixture();
+
+        assert!(!rotate(&path, "U3", 90.0).await.is_error);
+
+        let turned = field_positions(&std::fs::read_to_string(&path).unwrap(), "U3");
+        assert_eq!(turned[0], (172.085, 55.88, 0.0));
+        assert_eq!(to_nanometres(turned), to_nanometres(twin_target("U4")));
+        assert_ne!(
+            turned[0].1 - 50.8,
+            twin_target("U2")[0].1 - 50.8,
+            "the mirrored and unmirrored turns must not agree, or neither case proves the parity"
+        );
+    }
+
+    /// The turn carries a field the caller positioned by hand as readily as
+    /// one still on its library anchor: the offset turns, it is not reset.
+    /// `reset_schematic_field_positions` is the tool that discards a manual
+    /// offset, and it must stay the only one. D3's Reference was dragged to
+    /// 10mm right and 10mm up of its origin before the resave.
+    #[tokio::test]
+    async fn turning_a_symbol_carries_a_hand_placed_field_offset_round() {
+        let (_directory, path) = fixture();
+        assert_eq!(field_positions(SHEET, "D3")[0], (111.6, 91.6, 0.0));
+
+        assert!(!rotate(&path, "D3", 90.0).await.is_error);
+
+        // (10, -10) from the origin, turned a quarter: (-10, -10).
+        assert_eq!(
+            field_positions(&std::fs::read_to_string(&path).unwrap(), "D3")[0],
+            (91.6, 91.6, 0.0)
+        );
+    }
+
+    /// A full turn must land back where it started, with no drift accumulated
+    /// through the trigonometry — byte for byte, so a field angle nudged by a
+    /// quarter of a degree would show up too.
+    #[tokio::test]
+    async fn turning_a_symbol_the_whole_way_round_restores_the_sheet() {
+        let (_directory, path) = fixture();
+        // The first write reserializes KiCad's formatting into Konnect's, so
+        // the baseline is the sheet after a no-op turn, not the fixture bytes.
+        assert!(!rotate(&path, "D1", 0.0).await.is_error);
+        let baseline = std::fs::read_to_string(&path).unwrap();
+
+        for rotation in [90.0, 180.0, 270.0, 0.0] {
+            assert!(!rotate(&path, "D1", rotation).await.is_error);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            baseline,
+            "a full turn must land back where it started, byte for byte"
+        );
+    }
+
+    /// One turn now does three things in the same mutation: it carries the
+    /// field text (#612), it reconciles the junctions the pins leave and reach
+    /// (#615), and it moves the no-connect flag with the pin it protects
+    /// (#626). R1 stands on the NETJ wire with a marker on pin 2; turned, pin
+    /// 1 lands mid-span and pin 2 swings clear of the wire's end.
+    ///
+    /// `kicad-cli sch export netlist` is the oracle for the connectivity half:
+    /// `/NETJ` carries `R2.1` before the turn and `R2.1, R1.1` after it.
+    #[tokio::test]
+    async fn one_turn_carries_fields_junctions_and_no_connects_together() {
+        let (_directory, path) = fixture();
+        // R1's Reference sits 2.032mm right of the origin at a stored 90°.
+        assert_eq!(field_positions(SHEET, "R1")[0], (103.632, 139.7, 90.0));
+
+        let response = body(&rotate(&path, "R1", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 1);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        assert_eq!(response["no_connects_moved_count"], 1);
+        // 2.032mm to the right becomes 2.032mm above, and the stored angle is
+        // untouched — the field carry did not skip a handler that reconciles.
+        assert_eq!(
+            field_positions(&std::fs::read_to_string(&path).unwrap(), "R1")[0],
+            (101.6, 137.668, 90.0)
+        );
+    }
+}
+
+/// Reflecting a placed symbol owes its field text the same reflection (#613):
+/// a field's `(at …)` is an absolute sheet coordinate, so writing the token
+/// alone leaves Reference and Value on the unreflected side of the body.
+///
+/// No tool mirrors a placed symbol yet (#450), so these cases drive
+/// `Symbol::set_mirror` directly, on `mirror_fields_kicad10.kicad_sch` —
+/// KiCad 10.0.6's own serialization, built in twins like
+/// `rotate_fields_kicad10`: a symbol, and the same symbol placed with the
+/// target reflection `TWIN_OFFSET_MM` below it. See its README for provenance
+/// and the `kicad-cli sch export svg` anchors.
+#[cfg(test)]
+mod mirror_field_text_tests {
+    use super::rotate_field_text_tests::{field_positions, to_nanometres};
+    use super::*;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/mirror_fields_kicad10.kicad_sch");
+    /// Drawn in KiCad, not built by Konnect: its mirrored connectors carry
+    /// fields on the reflected library anchors, as eeschema wrote them.
+    const DEMO: &str =
+        include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
+
+    /// How far below each symbol its reflected twin sits.
+    const TWIN_OFFSET_MM: f64 = 25.4;
+
+    /// Reflect `reference` to `mirror` and read its fields back from the
+    /// written sheet.
+    fn mirrored(source: &str, reference: &str, mirror: Option<&str>) -> [(f64, f64, f64); 2] {
+        let mut schematic =
+            cse::Schematic::from_source(std::path::Path::new("sheet"), source.to_string())
+                .expect("fixture parses");
+        schematic
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some(reference))
+            .expect("placed symbol")
+            .set_mirror(mirror);
+        field_positions(&schematic.to_source(), reference)
+    }
+
+    /// `twin`'s fields, lifted by the offset between the two placements.
+    fn twin(reference: &str) -> [(i64, i64, i64); 2] {
+        to_nanometres(
+            field_positions(SHEET, reference).map(|(x, y, angle)| (x, y - TWIN_OFFSET_MM, angle)),
+        )
+    }
+
+    /// A `Device:LED` anchors Reference above the origin and Value below;
+    /// `(mirror x)` negates screen-Y, so the two trade sides — landing on D2,
+    /// the same LED placed reflected. The literal is stated too, so the
+    /// fixture and the code agreeing on a wrong point would still fail.
+    #[test]
+    fn mirroring_x_reflects_field_text_across_the_body() {
+        let reflected = mirrored(SHEET, "D1", Some("x"));
+        assert_eq!(reflected, [(101.6, 53.34, 0.0), (101.6, 48.26, 0.0)]);
+        assert_eq!(to_nanometres(reflected), twin("D2"));
+    }
+
+    /// `(mirror y)` negates screen-X. U1's Reference sits off both axes, so
+    /// only the X offset may change.
+    #[test]
+    fn mirroring_y_reflects_field_text_left_to_right() {
+        let reflected = mirrored(SHEET, "U1", Some("y"));
+        assert_eq!(reflected[0], (144.78, 45.085, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U2"));
+    }
+
+    /// A placement rotates first and mirrors second, so on a turned body
+    /// `(mirror x)` still negates *screen*-Y: U3 at 90° keeps its Reference's
+    /// X offset and flips its Y. U4 was placed by the same transform, so this
+    /// shows reflecting agrees with placing reflected; the order itself is
+    /// pinned by the KiCad-drawn L2 case below.
+    #[test]
+    fn mirroring_a_turned_symbol_reflects_in_sheet_axes() {
+        let reflected = mirrored(SHEET, "U3", Some("x"));
+        assert_eq!(reflected[0], (172.085, 45.72, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U4"));
+    }
+
+    /// Swapping one axis for the other is two reflections — both offsets flip.
+    #[test]
+    fn swapping_the_mirror_axis_flips_both_offsets() {
+        let reflected = mirrored(SHEET, "U5", Some("y"));
+        assert_eq!(reflected[0], (220.98, 45.085, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U6"));
+    }
+
+    /// Clearing the mirror is a reflection too: U7 comes back to U8's fields.
+    #[test]
+    fn clearing_the_mirror_reflects_field_text_back() {
+        let reflected = mirrored(SHEET, "U7", None);
+        assert_eq!(reflected[0], (134.62, 95.885, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U8"));
+    }
+
+    /// KiCad drew these, not Konnect. P102 is a `CONN_2` placed `(mirror y)`
+    /// whose library anchors put Reference at local x = −1.27 and Value at
+    /// +1.27; eeschema wrote them reflected, at 43.18 and 40.64 about the
+    /// origin at 41.91. Clearing the mirror must put each on its library side.
+    #[test]
+    fn clearing_a_kicad_drawn_mirror_restores_the_library_anchors() {
+        assert_eq!(
+            field_positions(DEMO, "P102"),
+            [(43.18, 66.04, 90.0), (40.64, 66.04, 90.0)]
+        );
+
+        assert_eq!(
+            mirrored(DEMO, "P102", None),
+            [(40.64, 66.04, 90.0), (43.18, 66.04, 90.0)]
+        );
+    }
+
+    /// The twins above take their answer from Konnect's own placement
+    /// transform, so they cannot tell whether that transform mirrors before or
+    /// after it turns. KiCad can. L2 is an `INDUCTOR` at 270° with
+    /// `(mirror x)`, whose library anchors its Value at (2.54, 0); eeschema
+    /// wrote it 2.54mm *above* the origin, where rotate-then-mirror puts it
+    /// and mirror-then-rotate does not. Unreflected, the turn alone puts it
+    /// 2.54mm below. A reflection taken in the symbol's own frame would move X
+    /// instead and leave it above.
+    ///
+    /// The sheet is KiCad's `video` demo, read from the local install because
+    /// its CC BY-SA licence keeps it out of the repo. The test skips when no
+    /// install is found, or when the installed sheet no longer places L2 so.
+    #[test]
+    fn clearing_a_kicad_drawn_mirror_on_a_turned_symbol_reflects_in_sheet_axes() {
+        let Some(video) = installed_demo("video/modul.kicad_sch") else {
+            eprintln!("SKIP: no KiCad demos found (set KICAD_DEMOS to enable)");
+            return;
+        };
+        let schematic = cse::Schematic::from_source(std::path::Path::new("sheet"), video.clone())
+            .expect("demo parses");
+        let Some(l2) = schematic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("L2"))
+            .filter(|l2| l2.at.rotation == Some(270.0) && l2.mirror.as_deref() == Some("x"))
+        else {
+            eprintln!("SKIP: video/modul.kicad_sch no longer places L2 at 270° with (mirror x)");
+            return;
+        };
+        // Offsets from L2's origin, so a demo that moves L2 still checks.
+        let (x, y) = (l2.at.x, l2.at.y);
+        let value_offset = |fields: [(f64, f64, f64); 2]| {
+            to_nanometres(fields.map(|(fx, fy, angle)| (fx - x, fy - y, angle)))[1]
+        };
+        let expected = |dy: f64| to_nanometres([(0.0, dy, 90.0); 2])[1];
+
+        assert_eq!(value_offset(field_positions(&video, "L2")), expected(-2.54));
+
+        assert_eq!(value_offset(mirrored(&video, "L2", None)), expected(2.54));
+    }
+
+    /// A KiCad demo sheet under `KICAD_DEMOS`, else under the standard install
+    /// paths — the lookup `tests/conformance_test.rs` uses.
+    fn installed_demo(sheet: &str) -> Option<String> {
+        let override_dir = std::env::var_os("KICAD_DEMOS").map(std::path::PathBuf::from);
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &[
+                r"C:\KiCad\10.0\share\kicad\demos",
+                r"C:\Program Files\KiCad\10.0\share\kicad\demos",
+            ]
+        } else if cfg!(target_os = "macos") {
+            &["/Applications/KiCad/KiCad.app/Contents/SharedSupport/demos"]
+        } else {
+            &["/usr/share/kicad/demos", "/usr/local/share/kicad/demos"]
+        };
+        override_dir
+            .into_iter()
+            .chain(candidates.iter().map(std::path::PathBuf::from))
+            .find(|dir| dir.exists())
+            .and_then(|dir| std::fs::read_to_string(dir.join(sheet)).ok())
+    }
+
+    /// A field the caller moved by hand keeps its offset, reflected with the
+    /// body rather than reset. D3's Reference was dragged 10mm right of and
+    /// 10mm above its origin before the resave.
+    #[test]
+    fn mirroring_carries_a_hand_placed_field_offset_across() {
+        assert_eq!(field_positions(SHEET, "D3")[0], (111.6, 91.6, 0.0));
+
+        assert_eq!(mirrored(SHEET, "D3", Some("x"))[0], (111.6, 111.6, 0.0));
+    }
+
+    /// Reflecting and reflecting back restores the sheet byte for byte.
+    #[test]
+    fn mirroring_there_and_back_restores_the_sheet() {
+        let parse = || {
+            cse::Schematic::from_source(std::path::Path::new("sheet"), SHEET.to_string())
+                .expect("fixture parses")
+        };
+        let baseline = parse().to_source();
+        let mut schematic = parse();
+        for symbol in &mut schematic.symbols {
+            let mirror = symbol.mirror.clone();
+            for step in [Some("x"), Some("y"), None] {
+                symbol.set_mirror(step);
+            }
+            symbol.set_mirror(mirror.as_deref());
+        }
+        assert_eq!(schematic.to_source(), baseline);
+    }
+}
+
+/// A turn relocates pin endpoints exactly as a move does, so it owes the sheet
+/// the same junction reconciliation (#615).
+///
+/// Every case runs on `rotate_junctions_kicad10.kicad_sch`, which is KiCad
+/// 10.0.6's own serialization — see its README for provenance and for the
+/// netlist KiCad answers with, which is where these expectations come from.
+#[cfg(test)]
+mod rotate_junction_reconciliation_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/rotate_junctions_kicad10.kicad_sch");
+
+    /// The dot `move_schematic_component` left under R1 pin 1, mid-span on the
+    /// NETA wire.
+    const STRANDED_DOT: (f64, f64) = (127.0, 97.79);
+    /// Where R2 pin 1 lands once R2 is turned to 90°: mid-span on the NETB wire.
+    const LANDING_POINT: (f64, f64) = (154.94, 160.02);
+    /// The wire T in the corner of the sheet, which no turn here goes near.
+    const UNRELATED_DOT: (f64, f64) = (190.5, 88.9);
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rotate.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn has_junction(content: &str, (x, y): (f64, f64)) -> bool {
+        let tree = parse_sexp(content).unwrap();
+        konnect_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+    }
+
+    async fn rotate(path: &std::path::Path, reference: &str, rotation: f64) -> CallToolResult {
+        handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": reference, "rotation": rotation }),
+            &context(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn turning_a_pin_off_a_wire_prunes_the_dot_it_strands() {
+        let (_directory, path) = fixture(SHEET);
+        assert!(has_junction(SHEET, STRANDED_DOT));
+
+        let response = body(&rotate(&path, "R1", 90.0).await);
+
+        assert_eq!(response["junctions_pruned_count"], 1);
+        assert_eq!(response["junctions_added_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !has_junction(&committed, STRANDED_DOT),
+            "the dot has only the wire passing through it now"
+        );
+        assert!(
+            has_junction(&committed, UNRELATED_DOT),
+            "the wire T is justified independently of R1"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_a_pin_onto_a_wire_adds_the_junction_it_needs() {
+        let (_directory, path) = fixture(SHEET);
+        assert!(!has_junction(SHEET, LANDING_POINT));
+
+        let response = body(&rotate(&path, "R2", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 1);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            has_junction(&committed, LANDING_POINT),
+            "without the dot KiCad leaves the pin on unconnected-(R2-Pad1)"
+        );
+        assert!(
+            has_junction(&committed, STRANDED_DOT),
+            "R1's dot is nowhere near the turn and stays as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_connect_at_the_landing_point_keeps_the_dot_away() {
+        // The caller has said this pin stays unconnected; a turn must not
+        // overrule that by wiring it into the net it lands on.
+        let closing = SHEET.rfind("\n)").unwrap();
+        let marker = format!(
+            "\t(no_connect\n\t\t(at {} {})\n\t\t(uuid \"no-connect-on-the-landing-point\")\n\t)\n",
+            LANDING_POINT.0, LANDING_POINT.1
+        );
+        let original = format!("{}{marker}{}", &SHEET[..closing + 1], &SHEET[closing + 1..]);
+        let (_directory, path) = fixture(&original);
+
+        let response = body(&rotate(&path, "R2", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(!has_junction(&committed, LANDING_POINT));
+        assert!(committed.contains("no-connect-on-the-landing-point"));
+    }
+
+    #[tokio::test]
+    async fn a_pin_leaving_a_wire_end_neither_adds_nor_prunes() {
+        // R0 pin 1 turns off the *end* of the NETA wire, not its interior. A
+        // wire end needs no dot, so there is none to prune and none to add —
+        // and the counts are still reported rather than omitted.
+        let (_directory, path) = fixture(SHEET);
+
+        let response = body(&rotate(&path, "R0", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 0);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(has_junction(&committed, STRANDED_DOT));
+        assert!(has_junction(&committed, UNRELATED_DOT));
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_writes_nothing() {
+        let (_directory, path) = fixture(SHEET);
+
+        let result = rotate(&path, "R404", 90.0).await;
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 }

@@ -5,14 +5,13 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
-use anyhow::Context;
+use crate::tools::{
+    get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+};
 use konnect_sexp::writer::write_atomic;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
-
-use super::cli;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -30,6 +29,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
+                    "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
+                    "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -47,7 +48,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD project file.",
+            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
+             project file. Refuses while KiCad holds the board open, because KiCad's next save \
+             rewrites the project file from its own copy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -124,7 +127,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_kicad_ui",
-            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout.",
+            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout. When IPC does not answer, ipc_failure.kind says why: not_configured, no_listener, access_denied (the operating system refused this account; likely a different account or a restrictive ACL, as with a sandboxed client), handshake_failed (the listener did not complete NNG's handshake, so it is probably not KiCad; this takes NNG's 10 s limit, so pass timeout_seconds above 10 to see it), transport_error, or request_failed (the request did not complete and may have reached the endpoint; an explicit KiCad status such as AS_NOT_READY proves receipt, a timeout or malformed reply does not). ipc_failure is null when no kind was established: the Ping succeeded with AS_OK, or this check's own timeout expired first (timed_out: true).",
             json!({
                 "type": "object",
                 "properties": {
@@ -177,6 +180,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "dest_y": { "type": "number", "description": "Destination anchor Y (maps to src_y1)" },
                     "net_map": {
                         "type": "object",
+                        "additionalProperties": true,
                         "description": "Optional mapping from source net names to destination net names"
                     }
                 },
@@ -201,18 +205,26 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_clearance",
-            "Measure the straight-line distance between two footprints' placement anchors \
-             on the saved board, in mm. This is anchor-to-anchor only: it does not account \
-             for footprint size or shape, so it is NOT pad, trace, copper or courtyard \
-             clearance and cannot predict a DRC clash — two parts whose courtyards nearly \
-             touch can be tens of mm apart by this measure. For real clearance run \
-             `run_drc`; for pad geometry use `get_component_pads`.",
+            "Measure spacing between two footprints on the requested board. `mode: anchor` \
+             (the compatibility default) returns straight-line placement-anchor distance. \
+             `mode: courtyard` returns edge-to-edge distance between transformed, authored \
+             courtyard bounding boxes for same-side footprints. It refuses missing or \
+             malformed courtyard geometry and does not substitute pads or anchors. Neither \
+             mode measures pad, trace or copper clearance; use `run_drc` for electrical \
+             clearance and `get_component_pads` for pad geometry. Reads the live KiCad board \
+             when open, otherwise the saved file, and reports the source.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "ref1":  { "type": "string", "description": "First component reference (e.g. 'U1')" },
-                    "ref2":  { "type": "string", "description": "Second component reference (e.g. 'C1')" }
+                    "ref2":  { "type": "string", "description": "Second component reference (e.g. 'C1')" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["anchor", "courtyard"],
+                        "default": "anchor",
+                        "description": "anchor: placement-origin distance; courtyard: authored courtyard bbox edge distance"
+                    }
                 },
                 "required": ["board", "ref1", "ref2"]
             }),
@@ -240,13 +252,17 @@ async fn handle_run_drc(
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let report = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
         let json = serde_json::to_string_pretty(&report)?;
-        write_report(out_path, &json).await?;
+        if let Err(error) = write_report(out_path, &json).await {
+            return super::drc::report_write_failure(&provenance, &board, out_path, error);
+        }
     }
 
     // Every category, not just `violations`. An unrouted net is reported under
@@ -266,6 +282,10 @@ async fn handle_run_drc(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "total_violations": report.all().count(),
+            "source": provenance.source,
+            "live_board_synced": provenance.live_board_synced,
+            "zones_refilled": provenance.zones_refilled,
+            "zone_refill_source": provenance.zone_refill_source,
             "design_rule_violations": report.violations.len(),
             // Null, not zero, when this kicad-cli did not report the category:
             // "none found" and "never asked" are different answers.
@@ -300,16 +320,7 @@ async fn handle_run_drc(
 /// naming what was missing — the export tools next door already call
 /// `create_dir_all` first.
 async fn write_report(out_path: &str, contents: &str) -> anyhow::Result<()> {
-    let path = Path::new(out_path);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("could not create report directory {}", parent.display()))?;
-    }
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("could not write report to {}", path.display()))?;
-    Ok(())
+    super::drc::write_report(out_path, contents).await
 }
 
 // ─── Design rules helpers ────────────────────────────────────────────────────
@@ -414,9 +425,17 @@ fn layer_rule(name: &str, constraint: &str, value: f64, layer: &str) -> String {
 
 async fn handle_set_design_rules(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    // KiCad rewrites the project file from memory when it saves the board, so
+    // a rule written here while it holds the board is reverted (#791). Asked
+    // before the read too: the file can be older than what KiCad holds.
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "design rule").await?
+    {
+        return Ok(refusal);
+    }
     let project_path = sibling_project_path(&board);
     let project_content = tokio::fs::read_to_string(&project_path).await?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
@@ -827,22 +846,22 @@ async fn handle_check_kicad_ui(
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
-        let ipc_responsive = task::spawn_blocking(move || {
-            konnect_ipc::client::KiCadIpcClient::new(&addr)
-                .ping()
-                .unwrap_or(false)
+        let ipc = task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr).ping_outcome()
         })
         .await?;
-        Ok::<_, tokio::task::JoinError>((process_detected, ipc_responsive))
+        Ok::<_, tokio::task::JoinError>((process_detected, ipc))
     };
 
     match bounded_health_check(std::time::Duration::from_secs(timeout_seconds), check).await {
         Ok(result) => {
-            let (process_detected, ipc_responsive) = result?;
+            let (process_detected, ipc) = result?;
+            let ipc_responsive = ipc.is_responsive();
             Ok(CallToolResult::json(&json!({
                 "running": ui_running(process_detected, ipc_responsive),
                 "process_detected": process_detected,
                 "ipc_responsive": ipc_responsive,
+                "ipc_failure": crate::tools::ipc_failure_evidence(&ipc),
                 "timed_out": false,
                 "timeout_seconds": timeout_seconds,
                 "elapsed_ms": started.elapsed().as_millis() as u64
@@ -852,6 +871,7 @@ async fn handle_check_kicad_ui(
             "running": null,
             "process_detected": null,
             "ipc_responsive": false,
+            "ipc_failure": null,
             "timed_out": true,
             "timeout_seconds": timeout_seconds,
             "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -1207,7 +1227,7 @@ async fn handle_set_layer_constraints(
 
 async fn handle_check_clearance(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let ref1 = match require_str(args, "ref1") {
@@ -1218,9 +1238,46 @@ async fn handle_check_clearance(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let mode = opt_str(args, "mode").unwrap_or("anchor");
+    if !matches!(mode, "anchor" | "courtyard") {
+        return Ok(CallToolResult::error(format!(
+            "Invalid mode '{mode}'; expected 'anchor' or 'courtyard'"
+        )));
+    }
 
-    let content = std::fs::read_to_string(&board)?;
+    // Prefer the exact unsaved board KiCad owns. Falling back only when the
+    // requested board is not open gives both modes the same live/file
+    // semantics and prevents a plausible answer from stale placement data.
+    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    let (content, source) = match live {
+        Ok(content) => (content, "ipc"),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            (std::fs::read_to_string(&board)?, "saved_file")
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
+            (std::fs::read_to_string(&board)?, "saved_file")
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message));
+        }
+        Err(konnect_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message));
+        }
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message));
+        }
+    };
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
+
+    if mode == "courtyard" {
+        return courtyard_clearance_result(&tree, &ref1, &ref2, source);
+    }
 
     let pos1 = find_footprint_position(&tree, &ref1)?;
     let pos2 = find_footprint_position(&tree, &ref2)?;
@@ -1239,6 +1296,8 @@ async fn handle_check_clearance(
     Ok(CallToolResult::json(&json!({
         "ref1": ref1,
         "ref2": ref2,
+        "mode": "anchor",
+        "source": source,
         "pos1": { "x": pos1.0, "y": pos1.1 },
         "pos2": { "x": pos2.0, "y": pos2.1 },
         "measurement": MEASUREMENT_ANCHOR_TO_ANCHOR,
@@ -1252,29 +1311,205 @@ async fn handle_check_clearance(
     })))
 }
 
-/// What `check_clearance` measures today. A stage-2 physical-spacing mode
-/// will add its own value; this one never changes meaning.
+/// Compatibility measurement retained by the default `anchor` mode. The
+/// courtyard mode has its own explicitly named result; this value never
+/// changes meaning.
 const MEASUREMENT_ANCHOR_TO_ANCHOR: &str = "anchor_to_anchor";
+const MEASUREMENT_COURTYARD_BBOX_EDGE: &str = "courtyard_bbox_edge_to_edge";
+
+fn footprint_reference(fp: &konnect_sexp::parser::SexpNode) -> Option<&str> {
+    fp.find_all("property")
+        .iter()
+        .find_map(|property| {
+            (property.get(1).and_then(|n| n.as_str()) == Some("Reference"))
+                .then(|| property.get(2).and_then(|n| n.as_str()))
+                .flatten()
+        })
+        .or_else(|| {
+            fp.find_all("fp_text").iter().find_map(|text| {
+                (text.get(1).and_then(|n| n.as_str()) == Some("reference"))
+                    .then(|| text.get(2).and_then(|n| n.as_str()))
+                    .flatten()
+            })
+        })
+}
+
+fn authored_courtyard(
+    tree: &konnect_sexp::parser::SexpNode,
+    reference: &str,
+) -> anyhow::Result<Result<konnect_sexp::board::FootprintCourtyard, &'static str>> {
+    let footprint_count = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|fp| footprint_reference(fp) == Some(reference))
+        .count();
+    match footprint_count {
+        0 => anyhow::bail!("Footprint '{}' not found on board", reference),
+        1 => {}
+        count => anyhow::bail!(
+            "Footprint reference '{}' is ambiguous: found {} instances",
+            reference,
+            count
+        ),
+    }
+
+    let scan = konnect_sexp::board::footprint_courtyards(tree);
+    let Some(courtyard) = scan
+        .items
+        .iter()
+        .find(|item| item.reference.as_deref() == Some(reference))
+    else {
+        return Ok(Err("courtyard_geometry_unreadable"));
+    };
+    if courtyard.bbox_source != konnect_sexp::board::CourtyardSource::Courtyard {
+        return Ok(Err("authored_courtyard_missing"));
+    }
+    Ok(Ok(courtyard.clone()))
+}
+
+fn side_name(side: konnect_sexp::board::Side) -> &'static str {
+    match side {
+        konnect_sexp::board::Side::Front => "front",
+        konnect_sexp::board::Side::Back => "back",
+    }
+}
+
+fn bbox_json(bbox: (f64, f64, f64, f64)) -> serde_json::Value {
+    json!({
+        "min_x": bbox.0,
+        "min_y": bbox.1,
+        "max_x": bbox.2,
+        "max_y": bbox.3
+    })
+}
+
+fn courtyard_bbox_spacing(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> (f64, bool) {
+    let dx = (a.0 - b.2).max(b.0 - a.2).max(0.0);
+    let dy = (a.1 - b.3).max(b.1 - a.3).max(0.0);
+    let clearance = ((dx * dx + dy * dy).sqrt() * 1000.0).round() / 1000.0;
+    let overlaps = a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
+    (clearance, overlaps)
+}
+
+fn courtyard_clearance_result(
+    tree: &konnect_sexp::parser::SexpNode,
+    ref1: &str,
+    ref2: &str,
+    source: &str,
+) -> anyhow::Result<CallToolResult> {
+    let first = authored_courtyard(tree, ref1)?;
+    let second = authored_courtyard(tree, ref2)?;
+    if let Err(reason_code) = first {
+        return Ok(courtyard_unavailable(ref1, ref2, source, ref1, reason_code));
+    }
+    if let Err(reason_code) = second {
+        return Ok(courtyard_unavailable(ref1, ref2, source, ref2, reason_code));
+    }
+    let first = first.expect("checked above");
+    let second = second.expect("checked above");
+    let side1 = side_name(first.layer_side);
+    let side2 = side_name(second.layer_side);
+    if first.layer_side != second.layer_side {
+        return Ok(CallToolResult::json(&json!({
+            "ref1": ref1,
+            "ref2": ref2,
+            "mode": "courtyard",
+            "source": source,
+            "measurement": MEASUREMENT_COURTYARD_BBOX_EDGE,
+            "available": false,
+            "applicable": false,
+            "courtyard_clearance_mm": serde_json::Value::Null,
+            "overlaps": serde_json::Value::Null,
+            "side1": side1,
+            "side2": side2,
+            "reason_code": "opposite_board_sides",
+            "note": "Opposite-side courtyard spacing is not a same-side placement collision. Use run_drc for through-board and copper clearance."
+        })));
+    }
+
+    let a = first.bbox;
+    let b = second.bbox;
+    let (clearance, overlaps) = courtyard_bbox_spacing(a, b);
+    Ok(CallToolResult::json(&json!({
+        "ref1": ref1,
+        "ref2": ref2,
+        "mode": "courtyard",
+        "source": source,
+        "measurement": MEASUREMENT_COURTYARD_BBOX_EDGE,
+        "available": true,
+        "applicable": true,
+        "courtyard_clearance_mm": clearance,
+        "overlaps": overlaps,
+        "side1": side1,
+        "side2": side2,
+        "geometry1": {
+            "source": "authored_courtyard_bbox",
+            "bbox": bbox_json(a),
+            "rotation_deg": first.rotation_deg
+        },
+        "geometry2": {
+            "source": "authored_courtyard_bbox",
+            "bbox": bbox_json(b),
+            "rotation_deg": second.rotation_deg
+        },
+        "note": "Axis-aligned board-space hull distance between authored courtyards; zero with overlaps=true means the hulls overlap. This is not copper clearance; use run_drc for electrical clearance."
+    })))
+}
+
+fn courtyard_unavailable(
+    ref1: &str,
+    ref2: &str,
+    source: &str,
+    unavailable_reference: &str,
+    reason_code: &str,
+) -> CallToolResult {
+    CallToolResult::json(&json!({
+        "ref1": ref1,
+        "ref2": ref2,
+        "mode": "courtyard",
+        "source": source,
+        "measurement": MEASUREMENT_COURTYARD_BBOX_EDGE,
+        "available": false,
+        "applicable": serde_json::Value::Null,
+        "courtyard_clearance_mm": serde_json::Value::Null,
+        "overlaps": serde_json::Value::Null,
+        "unavailable_reference": unavailable_reference,
+        "reason_code": reason_code,
+        "note": "An authored, fully readable courtyard is required for each footprint; pads and anchors are not substituted."
+    }))
+}
 
 /// Look up the board-space (x, y) position of a footprint by its reference designator.
 fn find_footprint_position(
     tree: &konnect_sexp::parser::SexpNode,
     reference: &str,
 ) -> anyhow::Result<(f64, f64)> {
-    let fp_node = tree
+    let matches: Vec<_> = tree
         .find_all("footprint")
         .into_iter()
-        .find(|fp| {
-            fp.find_all("property").iter().any(|p| {
-                p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                    && p.get(2).and_then(|n| n.as_str()) == Some(reference)
-            })
-        })
-        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on board", reference))?;
+        .filter(|fp| footprint_reference(fp) == Some(reference))
+        .collect();
+    let fp_node = match matches.as_slice() {
+        [] => anyhow::bail!("Footprint '{}' not found on board", reference),
+        [fp] => *fp,
+        many => anyhow::bail!(
+            "Footprint reference '{}' is ambiguous: found {} instances",
+            reference,
+            many.len()
+        ),
+    };
 
-    let fp_at = fp_node.find("at");
-    let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
-    let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
+    let fp_at = fp_node
+        .find("at")
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no placement anchor", reference))?;
+    let fp_x = fp_at
+        .get_f64(1)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has an invalid X anchor", reference))?;
+    let fp_y = fp_at
+        .get_f64(2)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has an invalid Y anchor", reference))?;
 
     Ok((fp_x, fp_y))
 }
@@ -1332,6 +1567,33 @@ mod tests {
         assert!(ui_running(false, true));
         assert!(ui_running(true, false));
         assert!(!ui_running(false, false));
+    }
+
+    #[tokio::test]
+    async fn check_kicad_ui_names_why_ipc_did_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address =
+            format!("ipc://{}", dir.path().join("no-kicad-here.sock").display());
+
+        let result = handle_check_kicad_ui(&json!({ "timeout_seconds": 60 }), &ctx)
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(response["timed_out"], false, "{response}");
+        assert_eq!(response["ipc_responsive"], false, "{response}");
+        assert_eq!(response["ipc_failure"]["kind"], "no_listener", "{response}");
+        assert!(
+            response["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Nothing is listening there")),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -1607,6 +1869,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
 
         assert_eq!(value["measurement"], MEASUREMENT_ANCHOR_TO_ANCHOR);
+        assert_eq!(value["mode"], "anchor");
+        assert_eq!(value["source"], "saved_file");
         // The alias is the same number, not a second measurement.
         assert_eq!(value["anchor_distance_mm"], value["distance_mm"]);
         assert_eq!(value["deprecated_fields"], json!(["distance_mm"]));
@@ -1623,24 +1887,183 @@ mod tests {
             .contains("not pad, trace or courtyard clearance"));
     }
 
+    fn sexp_fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-sexp/tests/fixtures")
+            .join(name)
+    }
+
+    /// #410 stage 2: values are pinned independently in the konnect-sexp
+    /// fixture tests from KiCad-authored geometry. C1 and R1 are both rotated;
+    /// their transformed courtyard hulls have a 4.455 mm vertical gap.
+    /// Anchor distance is deliberately much larger, which is the negative
+    /// control against restoring the original implementation.
+    #[tokio::test]
+    async fn check_clearance_measures_rotated_authored_courtyards_not_anchors() {
+        let board = sexp_fixture("ecc83-pp.kicad_pcb");
+        let courtyard = handle_check_clearance(
+            &json!({
+                "board": board,
+                "ref1": "C1",
+                "ref2": "R1",
+                "mode": "courtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!courtyard.is_error, "{}", text_of(&courtyard));
+        let courtyard: serde_json::Value = serde_json::from_str(&text_of(&courtyard)).unwrap();
+        assert_eq!(courtyard["measurement"], MEASUREMENT_COURTYARD_BBOX_EDGE);
+        assert_eq!(courtyard["available"], true);
+        assert_eq!(courtyard["applicable"], true);
+        assert_eq!(courtyard["courtyard_clearance_mm"], 4.455);
+        assert_eq!(courtyard["overlaps"], false);
+        assert_eq!(courtyard["geometry1"]["rotation_deg"], 90.0);
+        assert_eq!(courtyard["geometry2"]["rotation_deg"], -90.0);
+
+        let anchor = handle_check_clearance(
+            &json!({ "board": board, "ref1": "C1", "ref2": "R1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let anchor: serde_json::Value = serde_json::from_str(&text_of(&anchor)).unwrap();
+        assert!(anchor["anchor_distance_mm"].as_f64().unwrap() > 8.0);
+        assert_ne!(
+            anchor["anchor_distance_mm"],
+            courtyard["courtyard_clearance_mm"]
+        );
+    }
+
+    #[tokio::test]
+    async fn check_clearance_refuses_pad_or_anchor_fallback_as_courtyard() {
+        let result = handle_check_clearance(
+            &json!({
+                "board": sexp_fixture("RoyalBlue54L-NFC-Antenna.kicad_pcb"),
+                "ref1": "J1",
+                "ref2": "REF**",
+                "mode": "courtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(value["available"], false);
+        assert_eq!(value["courtyard_clearance_mm"], serde_json::Value::Null);
+        assert_eq!(value["unavailable_reference"], "J1");
+        assert_eq!(value["reason_code"], "authored_courtyard_missing");
+    }
+
+    #[tokio::test]
+    async fn check_clearance_reports_malformed_courtyard_as_unavailable() {
+        let original = std::fs::read_to_string(sexp_fixture("ecc83-pp.kicad_pcb")).unwrap();
+        let malformed = original.replacen("(end 7.75 0)", "(end unreadable 0)", 1);
+        assert_ne!(malformed, original, "fixture premise changed");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("malformed.kicad_pcb");
+        std::fs::write(&board, malformed).unwrap();
+
+        let result = handle_check_clearance(
+            &json!({
+                "board": board,
+                "ref1": "C1",
+                "ref2": "R1",
+                "mode": "courtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(value["available"], false);
+        assert_eq!(value["unavailable_reference"], "C1");
+        assert_eq!(value["reason_code"], "courtyard_geometry_unreadable");
+    }
+
+    #[tokio::test]
+    async fn check_clearance_reports_same_side_courtyard_overlap_explicitly() {
+        let original = std::fs::read_to_string(sexp_fixture("ecc83-pp.kicad_pcb")).unwrap();
+        let overlapping =
+            original.replacen("(at 136.271 107.95 -90)", "(at 141.605 99.695 -90)", 1);
+        assert_ne!(overlapping, original, "fixture premise changed");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("overlap.kicad_pcb");
+        std::fs::write(&board, overlapping).unwrap();
+
+        let result = handle_check_clearance(
+            &json!({
+                "board": board,
+                "ref1": "C1",
+                "ref2": "R1",
+                "mode": "courtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(value["available"], true);
+        assert_eq!(value["courtyard_clearance_mm"], 0.0);
+        assert_eq!(value["overlaps"], true);
+    }
+
+    #[tokio::test]
+    async fn check_clearance_marks_opposite_board_sides_not_applicable() {
+        let result = handle_check_clearance(
+            &json!({
+                "board": sexp_fixture("pic_programmer.kicad_pcb"),
+                "ref1": "C1",
+                "ref2": "JP1",
+                "mode": "courtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(value["available"], false);
+        assert_eq!(value["applicable"], false);
+        assert_eq!(value["reason_code"], "opposite_board_sides");
+        assert_eq!(value["side1"], "front");
+        assert_eq!(value["side2"], "back");
+    }
+
+    #[test]
+    fn courtyard_bbox_spacing_distinguishes_overlap_from_touching() {
+        assert_eq!(
+            courtyard_bbox_spacing((0.0, 0.0, 2.0, 2.0), (1.0, 1.0, 3.0, 3.0)),
+            (0.0, true)
+        );
+        assert_eq!(
+            courtyard_bbox_spacing((0.0, 0.0, 2.0, 2.0), (2.0, 0.0, 4.0, 2.0)),
+            (0.0, false)
+        );
+    }
+
     /// The description is the contract an LLM reads before calling. It must
     /// not claim clearance again; this pins the wording, not just the code.
     #[test]
-    fn check_clearance_description_claims_no_clearance() {
+    fn check_clearance_schema_and_description_name_both_measurements() {
         let tool = tools()
             .into_iter()
             .find(|tool| tool.name == "check_clearance")
             .expect("check_clearance is registered");
         let description = tool.description.to_lowercase();
         assert!(description.contains("anchor"), "{description}");
+        assert!(description.contains("courtyard"), "{description}");
         assert!(
-            description.contains("not pad, trace, copper or courtyard clearance"),
+            description.contains("neither mode measures pad, trace or copper clearance"),
             "{description}"
         );
-        assert!(
-            !description.starts_with("check the physical clearance"),
-            "{description}"
-        );
+        let modes = &tool.input_schema["properties"]["mode"]["enum"];
+        assert_eq!(modes, &json!(["anchor", "courtyard"]));
+        assert_eq!(tool.input_schema["properties"]["mode"]["default"], "anchor");
     }
 }
 

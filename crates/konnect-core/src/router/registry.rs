@@ -34,9 +34,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_components",
-        description: "Add, edit, move, rotate, and delete schematic symbols, and set the page size",
+        description: "Add, edit, move, rotate, and delete schematic symbols",
         category: "schematic",
-        tool_count: 20,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "sch_wiring",
@@ -70,21 +70,21 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
+        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "pcb_routing",

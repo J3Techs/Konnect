@@ -125,6 +125,13 @@ impl McpHandler {
         self.reload.enable();
     }
 
+    /// Let `initialize` and `get_installation_info` report installed guidance
+    /// drift. Only the standalone binary, which embeds the bundle, calls this;
+    /// a second call is ignored.
+    pub fn set_guidance_probe(&self, probe: Arc<dyn crate::guidance::GuidanceProbe>) {
+        let _ = self.ctx.guidance.set(probe);
+    }
+
     pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
         self.reload.take()
     }
@@ -211,7 +218,12 @@ impl McpHandler {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
                 self.adapt_to_client(req.params.as_ref()).await;
-                let result = McpServerState::build_initialize_result();
+                let notice = self
+                    .ctx
+                    .guidance
+                    .get()
+                    .and_then(|probe| probe.take_notice());
+                let result = McpServerState::build_initialize_result(notice);
                 Ok(Some(serde_json::to_value(result)?))
             }
             "notifications/initialized" => Ok(None),
@@ -760,6 +772,70 @@ mod required_argument_dispatch_tests {
         }
     }
 
+    /// The advertised `side` enum is enforced at dispatch, so widening it to
+    /// four edges is what makes `top` and `bottom` reachable at all. Every
+    /// other test of this feature calls the handlers directly and never passes
+    /// through this validator, so a schema narrowed back to two edges would
+    /// leave the whole feature unreachable with the entire suite still green.
+    /// The `middle` case is this test's own positive control: if it stops
+    /// being refused, the validator is not running and the rest proves nothing.
+    #[tokio::test]
+    async fn the_dispatch_accepts_all_four_sheet_pin_edges_and_refuses_a_fifth() {
+        let handler = handler().await;
+        let schematic_path = std::env::temp_dir().join("konnect-sides.kicad_sch");
+        let schematic_path_string = schematic_path.display().to_string();
+
+        // Each tool gets only its own arguments: the records are closed, so a
+        // stray key is refused before `side` is ever looked at.
+        let args_for = |tool: &str, side: &str| match tool {
+            "add_sheet_pin" => {
+                json!({ "schematic": schematic_path_string, "sheet_name": "A", "pin_name": "P",
+                                       "pin_type": "input", "x": 50.0, "y": 60.0, "side": side })
+            }
+            "edit_sheet_pin" => {
+                json!({ "schematic": schematic_path_string, "sheet_name": "A", "pin_name": "P",
+                                        "side": side })
+            }
+            _ => json!({ "schematic": schematic_path_string, "sheet_name": "A", "side": side }),
+        };
+
+        for tool in ["add_sheet_pin", "edit_sheet_pin", "import_sheet_pins"] {
+            for side in ["right", "left", "top", "bottom"] {
+                let args = args_for(tool, side);
+                let (result, _, _) = handler.dispatch_tool(tool, &args).await;
+                if result.is_error {
+                    let text = match result.content.first() {
+                        Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                        other => panic!("{tool}/{side}: expected text, got {other:?}"),
+                    };
+                    let parsed: Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{tool}/{side}: {e}: {text}"));
+                    assert_ne!(
+                        parsed["error"]["field"], "side",
+                        "{tool}: the schema refused the advertised edge {side}: {text}"
+                    );
+                }
+            }
+
+            let args = args_for(tool, "middle");
+            let (result, _, _) = handler.dispatch_tool(tool, &args).await;
+            assert!(
+                result.is_error,
+                "{tool}: control — an edge that does not exist must be refused"
+            );
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool}: expected text, got {other:?}"),
+            };
+            let parsed: Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}"));
+            assert_eq!(
+                parsed["error"]["field"], "side",
+                "{tool}: control — the refusal must name `side`, or this test is inert: {text}"
+            );
+        }
+    }
+
     /// An explicitly empty list is a coherent request — "operate on nothing" —
     /// and must stay distinguishable from forgetting to say what to operate
     /// on. Refusing both would trade one conflated pair for another.
@@ -1008,6 +1084,549 @@ mod reliability_contract_dispatch_tests {
             "served tools/call lost the shared outcome: {body}"
         );
         assert_eq!(body["outcome"]["target"], schematic.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod no_connect_carry_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, name: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .expect("request returns a response");
+        response.result.expect("successful JSON-RPC response")
+    }
+
+    fn text_body(result: &Value) -> Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    /// `no_connects_moved` and `no_connects_moved_count` are public response
+    /// fields (#626); prove they survive the served `tools/call` boundary with
+    /// the marker actually written to the file.
+    #[tokio::test]
+    async fn a_move_reports_the_marker_it_carried_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("carry.kicad_sch");
+        std::fs::write(&schematic, CARRY).unwrap();
+
+        let result = call(
+            &handler,
+            "move_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "reference": "R2",
+                "x": 154.94,
+                "y": 163.83
+            }),
+        )
+        .await;
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body = text_body(&result);
+        assert_eq!(body["no_connects_moved_count"], 1, "{body}");
+        assert_eq!(body["no_connects_moved"][0]["uuid"], R2_MARKER, "{body}");
+        assert_eq!(body["junctions_added_count"], 0, "{body}");
+        assert!(std::fs::read_to_string(&schematic)
+            .unwrap()
+            .contains("(at 154.94 160.02)"));
+    }
+
+    /// The refusal has to survive the same boundary, structured and with the
+    /// file untouched — a caller that only sees `isError` still must not be
+    /// told a placement change happened.
+    #[tokio::test]
+    async fn an_unfollowable_marker_refuses_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("carry.kicad_sch");
+        std::fs::write(&schematic, CARRY).unwrap();
+
+        let result = call(
+            &handler,
+            "move_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "reference": "R3",
+                "x": 101.6,
+                "y": 101.6
+            }),
+        )
+        .await;
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let body = text_body(&result);
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), CARRY);
+    }
+}
+
+#[cfg(test)]
+mod active_layer_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn set_active_layer_refusal_survives_served_dispatch_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("safe.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 610,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_active_layer",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "layer": "B.Cu"
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("JSON-RPC tool result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+
+        assert_eq!(body["error"]["kind"], "unsupported_capability");
+        assert_eq!(body["error"]["capability"], "set_active_layer");
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod current_board_template_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn create_project_board_is_refused_by_add_net_without_writing() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+
+        let create = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 631,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {
+                        "path": dir.path().display().to_string(),
+                        "name": "current"
+                    }
+                }
+            }))
+            .await
+            .expect("create_project returns a response");
+        let create_result = create.result.expect("JSON-RPC tool result");
+        assert_ne!(create_result["isError"], true, "{create_result}");
+
+        let board = dir.path().join("current.kicad_pcb");
+        let original = std::fs::read(&board).expect("created board");
+        let original_text = std::str::from_utf8(&original).unwrap();
+        assert!(original_text.contains("(version 20260206)"));
+        assert!(!original_text.contains("\n\t(net "));
+
+        let add_net = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 632,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_net",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "net_name": "PROBE_NET"
+                    }
+                }
+            }))
+            .await
+            .expect("add_net returns a response");
+        let add_net_result = add_net.result.expect("JSON-RPC tool result");
+        assert_eq!(add_net_result["isError"], true, "{add_net_result}");
+        let error_body: Value = serde_json::from_str(
+            add_net_result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text"),
+        )
+        .expect("tool body is JSON");
+        assert_eq!(error_body["error"]["kind"], "unsupported_capability");
+        assert!(
+            error_body["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("KiCad 10")),
+            "{error_body}"
+        );
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            original,
+            "the refused operation must not change the generated board"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_add_net_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::path::Path;
+
+    fn body(response: JsonRpcResponse) -> Value {
+        let result = response.result.expect("JSON-RPC tool result");
+        assert_ne!(result["isError"], true, "{result}");
+        serde_json::from_str(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text"),
+        )
+        .expect("tool body is JSON")
+    }
+
+    async fn call_add_net(handler: &McpHandler, board: &Path, name: &str) -> Value {
+        body(
+            handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 631,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add_net",
+                        "arguments": {
+                            "board": board.display().to_string(),
+                            "net_name": name
+                        }
+                    }
+                }))
+                .await
+                .expect("add_net returns a response"),
+        )
+    }
+
+    #[tokio::test]
+    async fn served_add_net_is_idempotent_and_reaches_the_board_logic() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("legacy.kicad_pcb");
+        let original = b"(kicad_pcb\n\t(version 20241229)\n\t(net 0 \"\")\n\t(net 7 \"GND\")\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let existing = call_add_net(&handler, &board, "GND").await;
+        assert_eq!(existing["net_id"], 7);
+        assert_eq!(existing["created"], false);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+
+        let created = call_add_net(&handler, &board, "PROBE_NET").await;
+        assert_eq!(created["net_id"], 8);
+        assert_eq!(created["created"], true);
+        let after_create = std::fs::read(&board).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&after_create)
+                .matches("\"PROBE_NET\"")
+                .count(),
+            1
+        );
+
+        let repeated = call_add_net(&handler, &board, "PROBE_NET").await;
+        assert_eq!(repeated["net_id"], 8);
+        assert_eq!(repeated["created"], false);
+        assert_eq!(std::fs::read(&board).unwrap(), after_create);
+    }
+}
+
+#[cfg(test)]
+mod annotate_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `annotate_schematic`'s `outcome`, `assigned` and `unresolved` are
+    /// public response fields (#454); prove they survive the served
+    /// `tools/call` boundary on the KiCad-authored duplicate fixture.
+    #[tokio::test]
+    async fn annotate_outcome_and_unresolved_survive_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("annotate.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/annotate_duplicates.kicad_sch"),
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "annotate_schematic",
+                    "arguments": {"schematic": schematic.display().to_string()}
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["outcome"]["status"], "partial", "{body}");
+        assert_eq!(body["assigned"].as_array().map(Vec::len), Some(2), "{body}");
+        assert_eq!(body["unresolved"][0]["reference"], "R1", "{body}");
+        assert_eq!(body["written"], true, "{body}");
+        // The fixture names one project and no .kicad_pro sits beside it, so
+        // that project is selected and reported.
+        assert_eq!(body["project"], "adj", "{body}");
+        assert_eq!(body["assigned"][0]["project"], "adj", "{body}");
+        assert_eq!(body["unresolved"][0]["project"], "adj", "{body}");
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// The canonical hierarchy footer is a file-format compatibility guard,
+    /// so prove it is present after the deployed `tools/call` path rather than
+    /// testing only the private handler (#643).
+    #[tokio::test]
+    async fn add_hierarchical_sheet_writes_kicad10_root_footer_through_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("root.kicad_sch");
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 643,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_hierarchical_sheet",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "sheet_file": "power.kicad_sch",
+                        "sheet_name": "Power"
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+
+        let source = std::fs::read_to_string(&schematic).unwrap();
+        let tree = konnect_sexp::parse_sexp(&source).unwrap();
+        let root_path = tree
+            .find("sheet_instances")
+            .and_then(|instances| instances.find("path"))
+            .expect("served add writes the root sheet instance");
+        assert_eq!(root_path.get(1).and_then(|value| value.as_str()), Some("/"));
+        assert_eq!(tree.find_str("embedded_fonts"), Some("no"));
+        assert!(source.contains("(exclude_from_sim no)"));
+        assert!(source.contains("(do_not_autoplace no)"));
+    }
+}
+
+#[cfg(test)]
+mod rotate_junction_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `rotate_schematic_component`'s `junctions_added_count` and
+    /// `junctions_pruned_count` are public response fields (#615); prove they
+    /// survive the served `tools/call` boundary on the KiCad-authored fixture,
+    /// with the dot actually written to the file.
+    #[tokio::test]
+    async fn rotate_reports_the_junction_it_added_across_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("rotate.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/rotate_junctions_kicad10.kicad_sch"),
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "rotate_schematic_component",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "reference": "R2",
+                        "rotation": 90
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["junctions_added_count"], 1, "{body}");
+        assert_eq!(body["junctions_pruned_count"], 0, "{body}");
+        // R2 pin 1 turns onto the NETB wire mid-span; without the dot KiCad
+        // leaves it on unconnected-(R2-Pad1).
+        assert!(std::fs::read_to_string(&schematic)
+            .unwrap()
+            .contains("(at 154.94 160.02)"));
+    }
+}
+
+#[cfg(test)]
+mod ipc_failure_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `ipc_failure` is a public response field (#532), so it has to survive
+    /// the served `tools/call` boundary, not only the handler functions the
+    /// tool tests call directly. The endpoint is a socket nothing listens on.
+    #[tokio::test]
+    async fn ipc_failure_kind_and_message_survive_the_served_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: format!("ipc://{}", dir.path().join("no-kicad-here.sock").display()),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        for (tool, arguments) in [
+            ("check_kicad_ui", json!({"timeout_seconds": 60})),
+            ("open_project", json!({})),
+        ] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}
+                }))
+                .await
+                .expect("request returns a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("tool returns JSON text");
+            let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+            assert_eq!(body["ipc_failure"]["kind"], "no_listener", "{tool}: {body}");
+            assert!(
+                body["ipc_failure"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Nothing is listening there")),
+                "{tool}: {body}"
+            );
+        }
     }
 }
 
@@ -1362,7 +1981,97 @@ mod schema_validation_dispatch_tests {
     }
 
     #[tokio::test]
-    async fn unknown_keys_remain_allowed_where_the_schema_is_open() {
+    async fn a_pad_zone_connect_outside_the_enum_is_refused_without_changing_the_file() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("MountingHole.kicad_mod");
+        let source = include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+
+        assert_invalid_field(
+            &handler,
+            "edit_footprint_pad",
+            json!({
+                "footprint_path": footprint.display().to_string(),
+                "pad_number": "1",
+                "zone_connect": "thermal_pth"
+            }),
+            "zone_connect",
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&footprint).unwrap(), source);
+
+        let (result, _, _) = handler
+            .dispatch_tool(
+                "edit_footprint_pad",
+                &json!({
+                    "footprint_path": footprint.display().to_string(),
+                    "pad_number": "1",
+                    "match_all": true,
+                    "zone_connect": "thermal"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let written = std::fs::read_to_string(&footprint).unwrap();
+        assert_eq!(written.matches("(zone_connect 1)").count(), 3);
+        assert!(!written.contains("(zone_connect 2)"));
+    }
+
+    #[tokio::test]
+    async fn an_omitted_pad_zone_connect_is_left_alone_and_null_is_refused() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("MountingHole.kicad_mod");
+        let source = include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+
+        assert_invalid_field(
+            &handler,
+            "edit_footprint_pad",
+            json!({
+                "footprint_path": footprint.display().to_string(),
+                "pad_number": "1",
+                "match_all": true,
+                "zone_connect": null
+            }),
+            "zone_connect",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&footprint).unwrap(),
+            source,
+            "a null zone_connect must be refused before the footprint writer runs"
+        );
+
+        let (result, _, _) = handler
+            .dispatch_tool(
+                "edit_footprint_pad",
+                &json!({
+                    "footprint_path": footprint.display().to_string(),
+                    "pad_number": "1",
+                    "match_all": true,
+                    "width": 6.6,
+                    "height": 6.6
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let written = std::fs::read_to_string(&footprint).unwrap();
+        assert_eq!(
+            written.matches("(size 6.6 6.6)").count(),
+            3,
+            "the other edit applies"
+        );
+        assert_eq!(
+            written.matches("(zone_connect 2)").count(),
+            3,
+            "omitting zone_connect keeps every pad's own override"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pad_typo_is_refused_without_creating_a_footprint() {
         let handler = handler().await;
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("open-schema.kicad_mod");
@@ -1386,12 +2095,108 @@ mod schema_validation_dispatch_tests {
             )
             .await;
 
-        assert_ne!(kind.as_deref(), Some("invalid_argument"));
-        assert!(
-            !result.is_error,
-            "open schemas retain their declared behavior"
-        );
-        assert!(output.is_file());
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert!(result.is_error);
+        assert_eq!(error_json(&result)["error"]["field"], "pads[0].rotaton");
+        assert!(!output.exists(), "refusal must precede creation");
+        let (result, _, _) = handler
+            .dispatch_tool(
+                "create_footprint",
+                &json!({
+                    "output": output.display().to_string(), "name": "Corrected",
+                    "pads": [{"number": "1", "type": "smd", "shape": "rect", "x": 0, "y": 0,
+                        "width": 1, "height": 1, "rotation": 90}]
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("(at 0 0 90)"));
+    }
+
+    #[tokio::test]
+    async fn a_search_argument_typo_is_refused_over_json_rpc() {
+        let handler = handler().await;
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 546, "method": "tools/call",
+                "params": {"name": "search_symbols", "arguments": {"query": "R", "part_name": "R"}}
+            }))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.is_error);
+        let body = error_json(&result);
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "part_name");
+    }
+
+    #[tokio::test]
+    async fn meta_tool_typos_are_refused() {
+        let handler = handler().await;
+        assert_invalid_field(&handler, "get_recent_calls", json!({"limti": 5}), "limti").await;
+    }
+
+    #[tokio::test]
+    async fn custom_fields_and_fixed_field_placements_have_distinct_contracts() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&schematic, source).unwrap();
+        let args = json!({
+            "schematic": schematic.display().to_string(), "reference": "U1",
+            "fields": {"My private supplier": "Example Electronics"}
+        });
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 547, "method": "tools/call",
+                "params": {"name": "edit_schematic_component", "arguments": args}
+            }))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&schematic).unwrap();
+        assert!(after.contains("(property \"My private supplier\" \"Example Electronics\""));
+        assert_invalid_field(
+            &handler,
+            "edit_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(), "reference": "U1",
+                "field_placements": {"My private supplier": {"rotaton": 90}}
+            }),
+            "field_placements.My private supplier.rotaton",
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), after);
+    }
+
+    #[tokio::test]
+    async fn net_maps_and_arbitrary_configuration_values_remain_accepted() {
+        let handler = handler().await;
+        for (tool, args) in [
+            (
+                "apply_template",
+                json!({"schematic": "missing.kicad_sch", "template_id": "ldo_3v3", "net_mappings": {"My net": "Other net"}}),
+            ),
+            (
+                "copy_routing_pattern",
+                json!({"board": "missing.kicad_pcb", "src_x1": 0, "src_y1": 0, "src_x2": 1, "src_y2": 1, "dest_x": 2, "dest_y": 2, "net_map": {"My net": "Other net"}}),
+            ),
+        ] {
+            let (_, _, kind) = handler.dispatch_tool(tool, &args).await;
+            assert_ne!(kind.as_deref(), Some("invalid_argument"), "{tool}");
+        }
+        // No write to real preferences: test the advertised validator directly.
+        let tool = handler
+            .ctx
+            .router
+            .get_tool("save_user_config")
+            .await
+            .unwrap();
+        assert!(tool.input_validator.is_valid(&json!({"key_path": "private", "value": {"properties": {"type": "object", "free": [1, 2]}}})));
     }
 }
 
@@ -1561,6 +2366,47 @@ mod client_adaptation_tests {
         assert_eq!(listed_tool_count(&handler).await, starter);
     }
 
+    struct FixedProbe(Option<&'static str>);
+
+    impl crate::guidance::GuidanceProbe for FixedProbe {
+        fn detail(&self) -> Value {
+            json!({"probe_status": "ok"})
+        }
+
+        fn take_notice(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    async fn initialize_result(handler: &McpHandler) -> Value {
+        handler
+            .dispatch(&request("initialize", initialize_from("claude-code")))
+            .await
+            .expect("initialize dispatches")
+            .expect("initialize returns a result")
+    }
+
+    /// Drift reaches the model through `instructions` (#728); with nothing
+    /// to report, or no probe at all, the field is absent rather than empty.
+    #[tokio::test]
+    async fn initialize_carries_a_guidance_notice_only_when_there_is_one() {
+        let bare = lazy_handler().await;
+        assert!(initialize_result(&bare).await.get("instructions").is_none());
+
+        let quiet = lazy_handler().await;
+        quiet.set_guidance_probe(Arc::new(FixedProbe(None)));
+        assert!(initialize_result(&quiet)
+            .await
+            .get("instructions")
+            .is_none());
+
+        let drifted = lazy_handler().await;
+        drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run konnect init"))));
+        let result = initialize_result(&drifted).await;
+        assert_eq!(result["instructions"], "run konnect init");
+        assert_eq!(result["serverInfo"]["name"], "konnect");
+    }
+
     /// Claude Code honours list_changed and must not be swept up by a loose
     /// "claude" match: the cost is ~23K tokens on every listing.
     #[test]
@@ -1571,5 +2417,657 @@ mod client_adaptation_tests {
         assert!(!client_caches_tool_list("claude-code"));
         assert!(!client_caches_tool_list("Claude Code"));
         assert!(!client_caches_tool_list(""));
+    }
+}
+
+#[cfg(test)]
+mod config_state_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> (bool, Value) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        (
+            result["isError"] == json!(true),
+            serde_json::from_str(text).expect("tool body is JSON"),
+        )
+    }
+
+    /// #580 through the served boundary: a project configuration that exists
+    /// and cannot be parsed is a structured refusal from every tool that reads
+    /// it, and no tool that writes it replaces it with the defaults.
+    #[tokio::test]
+    async fn a_malformed_project_configuration_is_refused_and_never_overwritten() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".konnect").join("project.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = r#"{"design_rules": ["keep me"],"#;
+        std::fs::write(&config, original).unwrap();
+        let project_dir = dir.path().display().to_string();
+
+        for (tool, arguments) in [
+            ("load_project_config", json!({ "project_dir": project_dir })),
+            (
+                "save_project_config",
+                json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+            ),
+            (
+                "add_design_rule",
+                json!({ "project_dir": project_dir, "rule": "second", "scope": "project" }),
+            ),
+        ] {
+            let (is_error, body) = call(&handler, tool, arguments).await;
+            assert!(is_error, "{tool}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "invalid_configuration",
+                "{tool}: {body}"
+            );
+            assert!(
+                body["error"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("malformed_json:")),
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                original,
+                "{tool} left the user's file exactly as it was"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_configuration_says_defaults_and_a_save_creates_it() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().display().to_string();
+
+        let (is_error, loaded) = call(
+            &handler,
+            "load_project_config",
+            json!({ "project_dir": project_dir }),
+        )
+        .await;
+        assert!(!is_error, "{loaded}");
+        assert_eq!(loaded["source"], "defaults", "{loaded}");
+        assert!(
+            !dir.path().join(".konnect").exists(),
+            "a load of an absent project file writes nothing"
+        );
+
+        let (is_error, saved) = call(
+            &handler,
+            "save_project_config",
+            json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+        )
+        .await;
+        assert!(!is_error, "{saved}");
+        assert_eq!(saved["created"], true, "{saved}");
+
+        let (_, reloaded) = call(
+            &handler,
+            "load_project_config",
+            json!({ "project_dir": project_dir }),
+        )
+        .await;
+        assert_eq!(reloaded["source"], "file", "{reloaded}");
+        assert_eq!(reloaded["config"]["fab"]["house"], "JLCPCB", "{reloaded}");
+    }
+}
+
+#[cfg(test)]
+mod erc_report_shape_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// KiCad-authored fixture copied from the official `complex_hierarchy` demo.
+    const KICAD_AUTHORED_SCHEMATIC: &str =
+        include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
+
+    /// A stand-in kicad-cli that exits 0 and writes `report` to the `--output`
+    /// path (`sch erc --output <path> …`, so the fourth argument).
+    fn erc_cli_writing(dir: &std::path::Path, stem: &str, report: &str) -> std::path::PathBuf {
+        crate::tools::cli::test_support::write_script(
+            dir,
+            stem,
+            &format!("#!/bin/sh\nprintf '%s' '{report}' > \"$4\"\nexit 0\n"),
+            &format!("@echo off\r\n> \"%~4\" echo {report}\r\nexit /b 0\r\n"),
+        )
+    }
+
+    async fn run_erc_through_dispatch(stem: &str, report: &str) -> (bool, String) {
+        let control = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("clock.kicad_sch");
+        std::fs::write(&schematic, KICAD_AUTHORED_SCHEMATIC).unwrap();
+        let cli = erc_cli_writing(control.path(), stem, report);
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_erc",
+                    "arguments": { "schematic": schematic.display().to_string() }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns text")
+            .to_string();
+        (result["isError"] == json!(true), text)
+    }
+
+    /// #581 through the served boundary: a kicad-cli that exits 0 and writes
+    /// something that is not an ERC report must not come back as a clean ERC.
+    #[tokio::test]
+    async fn an_unrecognised_erc_report_is_an_error_not_zero_violations() {
+        for (stem, report) in [
+            ("erc-empty-object", "{}"),
+            ("erc-drc-shaped", r#"{"violations":[]}"#),
+            ("erc-no-sheets", r#"{"sheets":[]}"#),
+            (
+                "erc-sheet-without-violations",
+                r#"{"sheets":[{"path":"/"}]}"#,
+            ),
+        ] {
+            let (is_error, text) = run_erc_through_dispatch(stem, report).await;
+            assert!(is_error, "{report} was served as a result: {text}");
+            assert!(text.contains("ERC report"), "{report}: {text}");
+            assert!(
+                !text.contains("\"total\""),
+                "{report}: no violation count may be reported: {text}"
+            );
+        }
+    }
+
+    /// The control: a report kicad-cli could write for a clean schematic is a
+    /// clean result, so the refusal above is about shape and not about zero.
+    #[tokio::test]
+    async fn a_conforming_clean_report_is_still_a_clean_result() {
+        let (is_error, text) =
+            run_erc_through_dispatch("erc-clean", r#"{"sheets":[{"path":"/","violations":[]}]}"#)
+                .await;
+        assert!(!is_error, "{text}");
+        let body: Value = serde_json::from_str(&text).expect("tool body is JSON");
+        assert_eq!(body["total"], 0, "{body}");
+        assert_eq!(body["errors"], 0, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod sheet_pin_geometry_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const ROOT: &str =
+        include_str!("../../tests/fixtures/sheet_pin_edges/sheet_pin_edges.kicad_sch");
+    const CHILD: &str = include_str!("../../tests/fixtures/sheet_pin_edges/child.kicad_sch");
+    const LEFT_PIN: &str = "(at 101.6 106.68 180)";
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn validate(handler: &McpHandler, placement: &str, child_present: bool) -> Value {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sheet_pin_edges.kicad_sch");
+        let child = dir.path().join("child.kicad_sch");
+        assert_eq!(ROOT.matches(LEFT_PIN).count(), 1);
+        let source = ROOT.replace(LEFT_PIN, placement);
+        std::fs::write(&root, &source).unwrap();
+        if child_present {
+            std::fs::write(&child, CHILD).unwrap();
+        }
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 687, "method": "tools/call",
+                "params": { "name": "validate_sheet_pins", "arguments": { "schematic": root } }
+            }))
+            .await
+            .expect("served tools/call response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            source,
+            "validator must not repair the parent"
+        );
+        if child_present {
+            assert_eq!(
+                std::fs::read_to_string(&child).unwrap(),
+                CHILD,
+                "validator must not change the child"
+            );
+        } else {
+            assert!(
+                !child.exists(),
+                "validator must not create the missing child"
+            );
+        }
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sheet_pin_geometry_reports_the_silent_net_merge_repro_through_dispatch() {
+        let report = validate(&handler().await, "(at 101.6 106.68 0)", true).await;
+        assert_eq!(report["issue_count"], 1, "{report}");
+        let issue = &report["issues"][0];
+        assert_eq!(issue["kind"], "pin_position_mismatch");
+        assert_eq!(issue["sheet"], "child");
+        assert_eq!(issue["pin"], "A");
+        assert_eq!(issue["file"], "child.kicad_sch");
+        assert!(issue["schematic"]
+            .as_str()
+            .unwrap()
+            .ends_with("sheet_pin_edges.kicad_sch"));
+        assert_eq!(
+            issue["stored_position"],
+            json!({"x":101.6,"y":106.68,"rotation":0.0})
+        );
+        let edge = &issue["expected_edge"];
+        assert_eq!(edge["side"], "right");
+        assert_eq!(edge["axis"], "x");
+        assert_eq!(edge["span_axis"], "y");
+        for (field, expected) in [
+            ("coordinate", 152.4),
+            ("span_start", 101.6),
+            ("span_end", 132.08),
+        ] {
+            assert!((edge[field].as_f64().unwrap() - expected).abs() < 1e-6);
+        }
+        assert!(issue["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("edit_sheet_pin"));
+    }
+
+    #[tokio::test]
+    async fn sheet_pin_geometry_checks_all_edges_and_their_spans_through_dispatch() {
+        let handler = handler().await;
+        for (placement, side) in [
+            ("(at 101.6 106.68 0)", "right"),
+            ("(at 152.4 106.68 180)", "left"),
+            ("(at 110 132.08 90)", "top"),
+            ("(at 110 101.6 270)", "bottom"),
+            ("(at 101.6 99 180)", "left"),
+            ("(at 152.4 134 0)", "right"),
+            ("(at 99 101.6 90)", "top"),
+            ("(at 154 132.08 270)", "bottom"),
+        ] {
+            let report = validate(&handler, placement, true).await;
+            assert_eq!(report["issue_count"], 1, "{placement}: {report}");
+            assert_eq!(report["issues"][0]["expected_edge"]["side"], side);
+        }
+        for placement in [
+            LEFT_PIN,
+            "(at 152.4 110 0)",
+            "(at 110 101.6 90)",
+            "(at 110 132.08 270)",
+            "(at 101.6 101.6 180)",
+            "(at 152.4 132.08 0)",
+            "(at 101.6000005 106.68 180)",
+        ] {
+            let report = validate(&handler, placement, true).await;
+            assert_eq!(report["issue_count"], 0, "{placement}: {report}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sheet_pin_geometry_checks_parent_even_when_child_is_missing() {
+        let report = validate(&handler().await, "(at 101.6 106.68 0)", false).await;
+        assert_eq!(report["issue_count"], 2, "{report}");
+        assert_eq!(report["issues"][0]["kind"], "pin_position_mismatch");
+        assert_eq!(report["issues"][1]["error"], "child file not found on disk");
+    }
+
+    #[tokio::test]
+    async fn sheet_pin_geometry_reports_a_rotation_that_names_no_edge() {
+        let report = validate(&handler().await, "(at 101.6 106.68 45)", true).await;
+        assert_eq!(report["issue_count"], 1, "{report}");
+        assert_eq!(report["issues"][0]["kind"], "invalid_pin_rotation");
+        assert_eq!(report["issues"][0]["stored_position"]["rotation"], 45.0);
+        assert!(report["issues"][0]["expected_edge"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod ipc_uncertainty_dispatch_tests {
+    use super::*;
+    use crate::test_support::MockIpcServer;
+    use crate::tools::{pcb_board::board_mock::board_document, ServerConfig};
+    use konnect_ipc::{builders::pack_any, gen::kiapi};
+
+    #[tokio::test]
+    async fn served_write_preserves_unknown_outcome_and_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let before = include_str!("../../../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb");
+        std::fs::write(&board, before).unwrap();
+        let document = board_document(&board.to_string_lossy());
+        let mock = MockIpcServer::spawn("unknown-write", move |request| {
+            let command = request.message.unwrap();
+            if command.type_url.ends_with("GetOpenDocuments") {
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: Some(pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![document.clone()],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                }
+            } else {
+                kiapi::common::ApiResponse {
+                    status: None,
+                    header: None,
+                    message: None,
+                }
+            }
+        });
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: mock.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 658, "method": "tools/call",
+                "params": { "name": "add_mounting_hole", "arguments": {
+                    "board": board.to_string_lossy(), "x": 5.0, "y": 6.0, "reference": "H1"
+                }}
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["error"]["kind"], "ipc_outcome_unknown", "{value}");
+        assert_eq!(value["error"]["retry_safe"], false);
+        assert_eq!(value["error"]["board_state"], "unknown");
+        assert!(!text.contains("was not modified"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod component_properties_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/component_fields_kicad10.kicad_sch");
+    const R1_UUID: &str = "8b9b7750-3421-4b18-92a3-4bddb63e9056";
+    const U1_UNIT_1: &str = "db4e5e3c-9adc-40eb-a748-d1a1a0578a45";
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 679,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    fn schematic(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("properties.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        path.display().to_string()
+    }
+
+    /// R1 as the fixture stores it: every existing field of its list row, and
+    /// its properties with the standard and empty ones included.
+    fn r1_row() -> Value {
+        json!({
+            "reference": "R1",
+            "value": "10k",
+            "footprint": "",
+            "lib_id": "Device:R",
+            "x": 101.6,
+            "y": 76.2,
+            "rotation": 0.0,
+            "mirror_x": false,
+            "mirror_y": false,
+            "properties": {
+                "Reference": "R1",
+                "Value": "10k",
+                "Footprint": "",
+                "Datasheet": "",
+                "Description": "Resistor",
+                "LCSC": "C679001",
+                "MPN": "MPN-679-R1"
+            }
+        })
+    }
+
+    /// `properties` is a public response field (#679); prove KiCad-saved
+    /// `LCSC` and `MPN` survive the served `tools/call` boundary and leave
+    /// every existing field as it was.
+    #[tokio::test]
+    async fn get_reports_custom_properties_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = schematic(&dir);
+
+        let r1 = call(
+            &handler,
+            "get_schematic_component",
+            json!({ "schematic": schematic, "reference": "R1" }),
+        )
+        .await;
+        let mut expected = r1_row();
+        expected["uuid"] = json!(R1_UUID);
+        expected["unit_count"] = json!(1);
+        expected["units"] = json!([{
+            "unit": 1,
+            "x": 101.6,
+            "y": 76.2,
+            "rotation": 0.0,
+            "mirror_x": false,
+            "mirror_y": false,
+            "uuid": R1_UUID
+        }]);
+        assert_eq!(r1, expected);
+
+        // KiCad saved U1's unit 2 first; the component is still unit 1.
+        let u1 = call(
+            &handler,
+            "get_schematic_component",
+            json!({ "schematic": schematic, "reference": "U1" }),
+        )
+        .await;
+        assert_eq!(u1["uuid"], U1_UNIT_1, "{u1}");
+        assert_eq!(u1["properties"]["LCSC"], "C679002", "{u1}");
+        assert_eq!(u1["properties"]["MPN"], "MPN-679-U1", "{u1}");
+    }
+
+    /// The same through `list_schematic_components`, one object on each placed
+    /// unit's row.
+    #[tokio::test]
+    async fn list_reports_custom_properties_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let listed = call(
+            &handler,
+            "list_schematic_components",
+            json!({ "schematic": schematic(&dir) }),
+        )
+        .await;
+        assert_eq!(listed["count"], 4, "{listed}");
+        for row in listed["components"].as_array().unwrap() {
+            match row["reference"].as_str() {
+                Some("R1") => assert_eq!(*row, r1_row()),
+                Some("U1") => {
+                    assert_eq!(row["properties"]["LCSC"], "C679002", "{listed}");
+                    assert_eq!(row["properties"]["MPN"], "MPN-679-U1", "{listed}");
+                }
+                other => panic!("unexpected reference {other:?}: {listed}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod label_children_dispatch_tests {
+    //! An unrelated schematic edit must keep every child KiCad wrote on a label,
+    //! `(fields_autoplaced …)` in particular, in the form the file used (#695).
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const KICAD7: &str =
+        include_str!("../../../konnect-schematic-editor/tests/fixtures/labels_kicad7.kicad_sch");
+    const KICAD9: &str =
+        include_str!("../../../konnect-schematic-editor/tests/fixtures/labels_kicad9.kicad_sch");
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Serve one `add_wire` far from every label and return the file it wrote.
+    async fn add_unrelated_wire(source: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let sheet = dir.path().join("labels.kicad_sch");
+        std::fs::write(&sheet, source).unwrap();
+        let response = handler()
+            .await
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 695, "method": "tools/call",
+                "params": { "name": "add_wire", "arguments": {
+                    "schematic": sheet, "x1": 12.7, "y1": 12.7, "x2": 25.4, "y2": 12.7
+                } }
+            }))
+            .await
+            .expect("served tools/call response");
+        let result = response.result.expect("JSON-RPC result");
+        assert_ne!(result["isError"], true, "{result}");
+        let written = std::fs::read_to_string(&sheet).unwrap();
+        assert!(written.contains("(wire"), "the edit was not written");
+        written
+    }
+
+    /// The text that follows `anchor` in `text`, from its next child on.
+    fn after<'a>(text: &'a str, anchor: &str) -> &'a str {
+        let at = text
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} missing"));
+        text[at + anchor.len()..].trim_start()
+    }
+
+    #[tokio::test]
+    async fn a_kicad8_or_later_token_keeps_its_value_and_position() {
+        let written = add_unrelated_wire(KICAD9).await;
+        assert_eq!(written.matches("(fields_autoplaced yes)").count(), 1);
+        assert!(after(&written, "(at 226.695 151.13 180)").starts_with("(fields_autoplaced yes)"));
+        // The label that never had the token still does not.
+        let cc2 = &written[written.find("(label \"CC2\"").unwrap()..];
+        assert!(!cc2[..cc2.find("(uuid").unwrap()].contains("fields_autoplaced"));
+    }
+
+    #[tokio::test]
+    async fn a_kicad7_bare_token_stays_bare_on_both_label_types() {
+        let written = add_unrelated_wire(KICAD7).await;
+        assert_eq!(
+            written.matches("(fields_autoplaced)").count(),
+            2,
+            "{written}"
+        );
+        assert!(!written.contains("fields_autoplaced yes"), "{written}");
+        assert!(after(&written, "(at 187.96 275.59 0)").starts_with("(fields_autoplaced)"));
+        assert!(after(&written, "(at 394.97 69.85 0)").starts_with("(fields_autoplaced)"));
     }
 }

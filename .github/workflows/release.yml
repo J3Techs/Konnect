@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Pre-tag release smoke: run the exact build/package/real-KiCad graph against
+  # a candidate ref without creating a GitHub release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Synthetic package version used by the non-publishing dry run
+        required: false
+        default: '0.0.0'
+        type: string
 
 # Job-level permissions only: the build jobs never need write access, so the
 # `release` job below is the sole holder of contents: write.
@@ -12,11 +21,19 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: konnect
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  RELEASE_ARTIFACT_LABEL: ${{ github.event_name == 'workflow_dispatch' && format('v{0}-smoke', inputs.version) || github.ref_name }}
   # Embedded into get_installation_info so release artifacts identify the
   # exact source commit even when built outside a Git working tree.
   KONNECT_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
+  real-kicad-acceptance:
+    name: Real KiCAD acceptance
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e-kicad.yml
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -53,11 +70,12 @@ jobs:
       - name: Add matrix target to the pinned toolchain
         run: rustup target add ${{ matrix.target }}
 
-      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.23.4
+          fallback: none
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
@@ -68,20 +86,20 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path "${{ env.BINARY_NAME }}.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "${{ env.BINARY_NAME }}.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.*
+          path: ${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.*
 
   pcm-package:
     name: KiCAD PCM plugin package (${{ matrix.platform }})
@@ -111,11 +129,12 @@ jobs:
         if: matrix.platform == 'macos'
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
-      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.23.4
+          fallback: none
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: pcm-package-${{ matrix.platform }}
 
@@ -188,7 +207,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = "${{ env.RELEASE_VERSION }}".TrimStart('v')
           ./packaging/build-pcm.ps1 -Version $version `
             -BinaryPath target/release/konnect.exe `
             -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
@@ -198,7 +217,7 @@ jobs:
       - name: Assemble PCM package (macOS)
         if: matrix.platform == 'macos'
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
             --binary dist/universal/konnect \
             --viewer dist/universal/schematic-viewer \
@@ -207,7 +226,7 @@ jobs:
       - name: Assemble PCM package (Linux)
         if: matrix.platform == 'linux'
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_VERSION#v}"
           ./packaging/build-pcm.sh --version "$version" \
             --binary target/release/konnect \
             --viewer crates/schematic-viewer/target/release/schematic-viewer \
@@ -224,7 +243,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install jsonschema
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_VERSION#v}"
           python packaging/validate-pcm.py \
             --zip "dist/konnect-pcm-v$version-${{ matrix.platform }}.zip"
 
@@ -236,7 +255,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, pcm-package]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [real-kicad-acceptance, build, pcm-package]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

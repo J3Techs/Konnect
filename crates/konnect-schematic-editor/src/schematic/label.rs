@@ -52,6 +52,31 @@ fn reface_justify(effects: &Effects, rotation: f64, plain: bool) -> Effects {
     Effects(SexpNode::List(out))
 }
 
+// ---- Children the label types do not model ---------------------------------
+
+/// The `(fields_autoplaced …)` child of a label block, kept verbatim.
+///
+/// KiCad writes it in two forms: the bare `(fields_autoplaced)` in KiCad 7 files
+/// (format `20230819`) and `(fields_autoplaced yes)` from KiCad 8 on. Keeping the
+/// node rather than a flag writes back whichever form the file had (#695).
+fn fields_autoplaced(node: &SexpNode) -> Option<SexpNode> {
+    node.find("fields_autoplaced").cloned()
+}
+
+/// The children of a label block that `to_sexp` does not rebuild from a typed
+/// field, carried through so a round-trip does not delete them (#695).
+///
+/// The label's text is the block's first argument, a bare string rather than a
+/// tagged child, so it is the one argument left out; it would otherwise be
+/// written a second time.
+fn unmodelled_label_children(node: &SexpNode, text: &str, modelled: &[&str]) -> Vec<SexpNode> {
+    let mut rest = super::unmodelled_children(node, modelled);
+    if rest.first().and_then(SexpNode::text) == Some(text) {
+        rest.remove(0);
+    }
+    rest
+}
+
 // ---- Label ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -61,6 +86,10 @@ pub struct Label {
     pub shape: Option<String>,
     pub uuid: String,
     pub effects: Option<Effects>,
+    /// `(fields_autoplaced …)` as the file wrote it, placed directly after `at`.
+    pub fields_autoplaced: Option<SexpNode>,
+    /// Every other child the model does not rebuild, kept verbatim.
+    pub raw_sub_nodes: Vec<SexpNode>,
 }
 
 impl Label {
@@ -71,6 +100,8 @@ impl Label {
             shape: None,
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
+            fields_autoplaced: None,
+            raw_sub_nodes: vec![],
         }
     }
 
@@ -89,12 +120,16 @@ impl Label {
             .map(str::to_owned);
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
         let effects = node.find("effects").and_then(Effects::from_sexp);
+        const MODELLED: &[&str] = &["at", "shape", "fields_autoplaced", "effects", "uuid"];
+        let raw_sub_nodes = unmodelled_label_children(node, &text, MODELLED);
         Ok(Label {
             text,
             at,
             shape,
             uuid,
             effects,
+            fields_autoplaced: fields_autoplaced(node),
+            raw_sub_nodes,
         })
     }
 
@@ -103,10 +138,12 @@ impl Label {
         if let Some(s) = &self.shape {
             c.push(tagged("shape", vec![atom(s.clone())]));
         }
+        c.extend(self.fields_autoplaced.iter().cloned());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
+        c.extend(self.raw_sub_nodes.iter().cloned());
         SexpNode::List(c)
     }
 
@@ -138,6 +175,10 @@ pub struct GlobalLabel {
     pub uuid: String,
     pub properties: Vec<Property>,
     pub effects: Option<Effects>,
+    /// `(fields_autoplaced …)` as the file wrote it, placed directly after `at`.
+    pub fields_autoplaced: Option<SexpNode>,
+    /// Every other child the model does not rebuild, kept verbatim.
+    pub raw_sub_nodes: Vec<SexpNode>,
 }
 
 impl GlobalLabel {
@@ -149,6 +190,8 @@ impl GlobalLabel {
             uuid: uuid::Uuid::new_v4().to_string(),
             properties: vec![],
             effects: None,
+            fields_autoplaced: None,
+            raw_sub_nodes: vec![],
         }
     }
 
@@ -172,6 +215,15 @@ impl GlobalLabel {
             .iter()
             .filter_map(|n| Property::from_sexp(n))
             .collect();
+        const MODELLED: &[&str] = &[
+            "shape",
+            "at",
+            "fields_autoplaced",
+            "effects",
+            "uuid",
+            "property",
+        ];
+        let raw_sub_nodes = unmodelled_label_children(node, &text, MODELLED);
         Ok(GlobalLabel {
             text,
             shape,
@@ -179,6 +231,8 @@ impl GlobalLabel {
             uuid,
             properties,
             effects,
+            fields_autoplaced: fields_autoplaced(node),
+            raw_sub_nodes,
         })
     }
 
@@ -189,6 +243,7 @@ impl GlobalLabel {
             tagged("shape", vec![atom(self.shape.clone())]),
             self.at.to_sexp(),
         ];
+        c.extend(self.fields_autoplaced.iter().cloned());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
@@ -196,6 +251,7 @@ impl GlobalLabel {
         for p in &self.properties {
             c.push(p.to_sexp());
         }
+        c.extend(self.raw_sub_nodes.iter().cloned());
         SexpNode::List(c)
     }
 
@@ -240,6 +296,10 @@ pub struct HierarchicalLabel {
     pub at: At,
     pub uuid: String,
     pub effects: Option<Effects>,
+    /// `(fields_autoplaced …)` as the file wrote it, placed directly after `at`.
+    pub fields_autoplaced: Option<SexpNode>,
+    /// Every other child the model does not rebuild, kept verbatim.
+    pub raw_sub_nodes: Vec<SexpNode>,
 }
 
 impl HierarchicalLabel {
@@ -255,12 +315,16 @@ impl HierarchicalLabel {
             .ok_or(Error::MissingField("at"))?;
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
         let effects = node.find("effects").and_then(Effects::from_sexp);
+        const MODELLED: &[&str] = &["shape", "at", "fields_autoplaced", "effects", "uuid"];
+        let raw_sub_nodes = unmodelled_label_children(node, &text, MODELLED);
         Ok(HierarchicalLabel {
             text,
             shape,
             at,
             uuid,
             effects,
+            fields_autoplaced: fields_autoplaced(node),
+            raw_sub_nodes,
         })
     }
 
@@ -270,10 +334,12 @@ impl HierarchicalLabel {
             c.push(tagged("shape", vec![atom(s.clone())]));
         }
         c.push(self.at.to_sexp());
+        c.extend(self.fields_autoplaced.iter().cloned());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
+        c.extend(self.raw_sub_nodes.iter().cloned());
         SexpNode::List(c)
     }
 

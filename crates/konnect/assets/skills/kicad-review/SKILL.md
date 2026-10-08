@@ -20,7 +20,7 @@ Load the required toolsets for design review:
 
 ```
 load_toolset('sch_analysis')     # find_orphan_items, find_shorted_nets, find_single_pin_nets
-load_toolset('verification')     # run_drc, check_clearance, get_design_rules
+load_toolset('verification')     # run_drc; check_clearance anchor/courtyard spacing; rules
 load_toolset('sch_export')       # run_erc
 load_toolset('pcb_export')       # get_drc_violations
 load_toolset('manufacturing')    # validate_for_manufacturing

@@ -3,6 +3,1339 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
+
+`create_symbol` no longer places every coordinate-less rectangular-unit pin at
+one point. On each angle-selected edge (left by default), omitted `y` values
+for left/right pins or omitted `x` values for top/bottom pins are spaced at
+2.54 mm pitch in input order. Supplied edge-axis coordinates are preserved and
+automatic slots avoid them. Repeated physical pin numbers share an automatic
+slot on the same edge, preserving intentional graphical stacks.
+
+This shared rectangle behavior applies to `pins`, `units[].pins`, and a glyph
+that falls back to a rectangle. Existing body sizing can still move the other
+coordinate outward to meet the body; use the returned resolved pin coordinates
+for wiring. Custom `graphics` still require explicit coordinates and glyphs
+that fit retain their established layout. Tool schemas and response shapes are
+unchanged; this does not infer electrical pin roles or redesign a supplied layout.
+
+## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
+
+`set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
+board's sibling `.kicad_pro`. When KiCad saves a board it holds, it rewrites
+that file from its own copy. So an edit made while KiCad held the board was
+reported as a success and then reverted on KiCad's next save, with no warning.
+On KiCad 10.0.5, all three values went back as soon as `run_drc` with
+`sync_live_board` saved the board.
+
+All three tools now run the check `set_predefined_sizes` already runs. While
+KiCad holds the board, they refuse and leave the project file untouched. The
+check comes before the file is read as well as before it is written, so a call
+that would change nothing is refused too: while KiCad holds the board, the file
+can be older than what KiCad holds. Close the board in KiCad, or make the
+change there, and retry. A KiCad that holds a different board, or none, does
+not affect these tools. Response shapes are unchanged (#791).
+
+## Unreleased: `get_board_extents` names what KiCad will not list, and measures text boxes (minor release)
+
+KiCad 10 will not list tables or generators through `GetItems`; it answers
+`AS_BAD_REQUEST`. The live read used to skip both without a word, so an answer
+read as complete bounds when it was not. It now asks for both on every read and
+adds `unavailable_item_classes`, one entry per class it could not measure:
+
+- `{"class": "tables", "reason": "refused", "kiapi_status": "AS_BAD_REQUEST",
+  "message": "…"}` carries KiCad's own answer;
+- `{"class": …, "reason": "undecodable", "listed_count": n}` is for a KiCad that
+  does list a class the bundled protocol has no message for, so the items
+  cannot be measured.
+
+A class that Konnect does measure, if KiCad refuses it the same way, is now
+named there too, and the rest of the read still answers. It used to fail the
+whole read. Any other failure still fails the read. A saved-file answer
+carries `unavailable_item_classes: []`, since it lists every item and names
+what it cannot measure in `unmeasured_item_counts`.
+
+The saved file now measures text boxes, as KiCad does: their corners, or the
+four `pts` KiCad writes for a turned box, plus half the stroke width whether or
+not the border is drawn. Text overflowing the box does not count. Board text
+boxes move from `unmeasured_item_counts` to `measured_item_counts`
+(`text_boxes`). Footprint text boxes count toward their footprint's box, except
+on `Cmts.User`, `Dwgs.User`, `Eco1.User`, `Eco2.User` or a private layer, and
+`footprint_text_boxes` is gone from `unmeasured_item_counts`. A saved-file
+extent can therefore grow where a board has text boxes.
+
+A footprint point or a via layer whose `size` is present but unreadable is now
+skipped and counted in `skipped_item_count`. The point used to take the 1 mm
+default, and the via used to keep its base diameter (#688).
+
+## Unreleased: `update_pcb_from_schematic` places footprints with their library data (patch release)
+
+Footprints that `update_pcb_from_schematic` added used to reach the board with
+only their pads, drawings and Reference/Value fields. Everything else the library
+footprint carries was left at its default:
+
+- the mounting style (`smd`, `through_hole`) and exclusion flags from `(attr …)`;
+- the description and keywords;
+- every 3D model.
+
+As a result, KiCad treated each synced part as unspecified. `export_3d` with its
+default arguments left all of them out of the STEP, and KiCad's DRC flagged each
+one as `lib_footprint_mismatch`.
+
+A footprint the sync adds now carries all of these from its library. DNP still
+comes from the schematic, overriding a library `dnp`, as in KiCad's own Update
+PCB from Schematic.
+
+The post-apply readback also checks each footprint's instance attributes and 3D
+model files against what was sent. The attributes are the mounting style,
+`board_only`, `exclude_from_pos_files`, `exclude_from_bom`,
+`allow_missing_courtyard`, `allow_soldermask_bridges` and `dnp` (DNP as finally
+sent, after the schematic's override). A difference is reported in `diagnostics`
+as `board_readback_differs`, the same way a changed drawing count is reported.
+
+`update_footprints_from_library` uses the same readers, so it now accepts a 3D
+model hidden with KiCad 10's `(hide yes)`. 16 models in KiCad 10.0.5's own
+library are written that way, and the refresh used to refuse those footprints.
+Both tools now refuse a model whose `(opacity …)` is present but not a number,
+where it used to be read as fully opaque. An absent opacity still defaults to
+fully opaque.
+
+Library properties (Datasheet, Description and custom fields) and each field's
+layer and visibility are not part of this change (#789).
+
+## Unreleased: grid-snapped coordinates are written as KiCad writes them (patch release)
+
+A point snapped to the 1.27 mm grid is now rounded to the six decimals KiCad
+writes. `bulk_move_schematic_components` used to write a symbol at
+132 × 1.27 as `(at … 167.64000000000001 …)` and report the same value as
+`placements[].new_y`. It now writes and reports `167.64`, and `add_wire`'s
+`added_wire` echo is rounded the same way. The values differ by less than
+1e-12 mm; nothing else in the request or response changes (#744).
+
+## Unreleased: `open_schematic_viewer` reports a viewer that exits during startup (patch release)
+
+`open_schematic_viewer` used to return `launched: true` as soon as the viewer
+process spawned, even when it crashed straight away, for example on Linux with
+no `DISPLAY` or `WAYLAND_DISPLAY`. It now watches the viewer for one second. If
+the viewer exits in that time, the call is an error whose message gives the exit
+status and the last 20 lines of the viewer's stderr, each cut to 500
+characters. A viewer that is still running after that second gets the same
+successful response as before. Every successful call now takes about one second
+longer, and on the stdio transport no other request is answered during it.
+
+The viewer no longer inherits the server's stdin and stdout, which carry the
+stdio transport's JSON-RPC stream. Its stderr is read by the server and written
+to the server log as `schematic_viewer` warnings, so that output now stops when
+the server exits (#702).
+
+## Unreleased: `get_board_extents` reads the live board and measures every item (minor release)
+
+`get_board_extents` used to ask KiCad for the box of an empty item list.
+KiCad 10.0.5 answers that with no boxes on every board, so the IPC branch never
+answered. The tool then discarded the failure and answered from the saved file,
+using only top-level `gr_line` endpoints and footprint anchor points (#688).
+
+It now lists each class of board item and has KiCad measure every one in
+`BBM_ITEM_ONLY` mode, which leaves footprint text out. It reads through the same
+board-source contract as `get_layer_list`:
+
+- **New argument:** an optional `board_source` (`auto`, `live`, `saved`). The
+  default, `auto`, answers from KiCad when it holds the board.
+- **When KiCad holds the board but cannot complete the read,** the call is
+  refused rather than answered from a file that may be older than the editor.
+- **The saved file is measured the way KiCad measures a live board:** pads,
+  graphics with stroke width, tracks and arcs with width, vias and zone outlines.
+  It agrees with KiCad item by item on its demo boards.
+- **What the file cannot be measured for, it names:** board text, dimensions,
+  text boxes, targets and the like are counted in `unmeasured_item_counts`.
+
+Response changes:
+
+- **New fields:**
+  - `item_count`;
+  - `measured_item_counts` and `unmeasured_item_counts`, objects keyed by item class;
+  - `skipped_item_count` (unreadable items in the saved file);
+  - `shared_kiid_count` (items KiCad listed under a KIID it had already listed);
+  - `sources` (`{"bounds": "ipc"}` or `{"bounds": "saved_board"}`);
+  - `source_evidence`.
+- **`source`** still reads `ipc` or `file`.
+- **A board with no items** now returns `null` for `x_min`, `y_min`, `x_max`,
+  `y_max`, `width` and `height`, with `item_count: 0`. It used to return a zero
+  box with `source: "empty"`.
+- **Values change:** a saved-file answer now includes pads, tracks, vias, zones
+  and stroke widths, so it is usually larger than before; a live answer is
+  KiCad's own measurement.
+
+`update_pcb_from_schematic` measures the live board the same way, and stages new
+footprints 5 mm to the right of it. It used to stage them beside the page origin
+(0, 0), because it read KiCad's empty answer as an empty board. Staged positions,
+and therefore `plan_revision`, differ from plans computed before this change.
+Apply already requires a fresh dry run.
+
+`update_pcb_from_schematic` stages the footprints it adds beside the same live
+measurement, and now says what that measurement covered. Its dry-run and apply
+responses gain `staging`:
+
+- `basis` is one of:
+  - `complete_geometry`: every class was listed and measured;
+  - `partial_geometry`: staged beside what KiCad measured, without the classes
+    listed below (on KiCad 10.0.5, every board's tables and generators);
+  - `empty_board`: every class was listed and none held an item;
+  - `no_measured_geometry`: nothing was measured, but some classes could not
+    be listed, so the board is not known to be empty. Staging starts at the
+    origin.
+- `unavailable_item_classes` uses the same shape as `get_board_extents`.
+
+`staging` is `null` when the sync was refused before it read the board. It
+never refuses a sync: staging is a starting position.
+
+## Unreleased: `check_freerouting` reports where it searched (minor release)
+
+The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
+described as "uses config default", but no Freerouting setting exists. Both
+descriptions now list where discovery looks, in order: the directories named
+by `KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY`; the KiCad
+10.0, 9.0 and 8.0 plugin folders `$HOME/Documents/KiCad/<version>/3rdparty/plugins`,
+`$HOME/.local/share/kicad/<version>/3rdparty/plugins` and, on Windows,
+`$USERPROFILE/Documents/KiCad/<version>/3rdparty/plugins`; `freerouting.jar` in
+the server's working directory; `/usr/local/lib/freerouting` and
+`/opt/freerouting`; then every directory on `PATH`. The search and both
+descriptions are built from the same table of places, and the search itself is
+unchanged.
+
+When nothing is found, `check_freerouting` adds `searched_locations`: one
+entry per location visited, with `kind`, `location_path`, `max_depth` and
+`exists`, read from the server's own environment. `location_path` is always
+absolute: a relative value from the environment is reported against the
+server's working directory, where the search reads it. A location reached twice, such as the
+`Documents` plugin folders when `HOME` and `USERPROFILE` are the same
+directory, is searched once. When `jar_path` is passed and is not a file, it
+reports `checked_path` and says so instead of giving download advice.
+`route_specctra_dsn` now refuses such a `jar_path` with `file_not_found` naming
+the path, where it used to answer "install Freerouting or pass jar_path"
+(#787).
+
+## Unreleased: `suggest_jlcpcb_alternatives` matches KiCad footprints and ranks by library type (minor release)
+
+`suggest_jlcpcb_alternatives` used the last `_` segment of the footprint ID as
+the package, so every standard KiCad footprint (`C_0402_1005Metric` becomes
+`1005Metric`) matched nothing and returned `[]`. It now maps the footprint to
+the package names LCSC uses: two-terminal chip parts to their imperial size
+(`0402`), named discrete packages through a measured alias table (`SOT-23`,
+`SOT-223`, `SOD-123`, `SMA` and others), and SOIC, SOP, TSSOP, MSOP, SSOP,
+quad flat and leadless ICs by pin count and body size. Packages are compared
+exactly, so `0402` no longer also matches `0402x4` arrays. A value without a
+library prefix is still taken as LCSC's own package name, so `footprint: "0402"`
+keeps working. A library footprint with no known LCSC package is refused with
+`invalid_argument` on `footprint`, where it used to return an empty list.
+
+The value now matches as a whole value in the description or the
+manufacturer part number: no digit or `.` may come directly before or after
+it. `10k` used to match `110kΩ` and `510kΩ`, and `20pF` matched `220pF`. Unit
+spellings are not converted; `100nF` does not find `0.1uF`. An empty value is
+refused.
+
+Results used to be ordered by price alone. Parts with fewer than `min_stock_count`
+units in stock (new, default 100) are now excluded. The rest are ranked Basic,
+then Preferred, then Extended when `prefer_basic` (new, default true) is on,
+then known price before unknown, price ascending, stock descending and LCSC
+number. A stored price of 0 is treated as unknown (#582): it sorts after every
+known price, and `max_price_usd` excludes it. The response adds
+`package_match` (the rule and the LCSC names searched), `value_match`,
+`ranking` (the criteria and the effective settings), `count`, `matched_count`
+and `exclusions`, which counts the parts the stock floor and the price limit
+removed (#785).
+
+## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
+
+A hook's `matcher` is built from the tool registry, so it changes when a board
+tool is added, renamed or reclassified. `konnect init` used to skip any hook
+whose command was already in `~/.claude/settings.json`, leaving an older
+install matching the old tool set. It now rewrites the matcher of an entry that
+holds only Konnect's handler. When a user handler shares that entry, Konnect's
+handler moves to a new entry with the current matcher, and the user's handler
+keeps its own. An install whose matcher is already current is not rewritten.
+Extra copies of Konnect's handler, such as a hand edit can leave, are removed
+so that each hook runs once.
+The `Hooks: N entries patched` count now includes refreshed entries and a
+removed legacy handler, so it is non-zero whenever the hook settings changed
+(#739).
+
+## Unreleased: `create_schematic` and `set_schematic_page` move to `sch_hierarchy` (minor release)
+
+`create_schematic` and `set_schematic_page` move from the `sch_components`
+toolset to `sch_hierarchy`. Both act on a whole sheet file rather than on a
+symbol: one creates the file, the other sets its paper size and orientation.
+Their names, arguments and responses are unchanged.
+
+A client that loads only `sch_components` and then calls either tool now gets
+`toolset_not_loaded` naming `sch_hierarchy`; load that toolset as well. With
+`auto_load_toolsets` enabled the call loads it automatically, as before.
+
+`sch_components` drops to 18 tools and `sch_hierarchy` rises to 14. The two
+freed slots leave room under the 20-tool toolset cap for a symbol-mirroring
+tool (#450).
+
+## Unreleased: autonomous placement apply retired and decoupling evidence narrowed (#754)
+
+`auto_place_from_schematic` is now a deprecated diagnostic planner only. Its
+default dry-run still returns the deterministic proposed layout and placement
+scores, with `applied: false`, `plan_status: "blocked"`, and a reason explaining
+that autonomous whole-board mutation is retired. Passing `dry_run: false`
+returns structured `plan_blocked` before any board write. Callers should make
+small, explicit `move_component` operations, read the requested board back
+after each batch, and run placement scoring and DRC before continuing.
+
+`score_placement` no longer treats a shared ground rail as proof that a
+capacitor decouples the nearest IC. A decoupling-distance deduction now requires
+the capacitor and IC to share a non-ground net used by no more than eight
+distinct references. The response adds `decoupling_associations`, which names
+the qualifying net and its fanout, and `unproven_decoupling_caps`, which explains
+why no conservative association was made. The existing `uncoupled_caps` field
+is retained for compatibility. Scores can therefore increase on boards whose
+previous apparent cap-to-IC pairing was supported only by a board-wide rail.
+
+The deprecated `refine_placement_force_directed` planner continues to block
+non-improving plans, including score ties. Use explicit moves when a
+score-neutral change is justified by design intent rather than weakening this
+safety gate.
+
+## Unreleased: bounded schematic-transfer create groups (#658, terminal increment)
+
+`update_pcb_from_schematic` now sends creates in ordered groups of at most 32
+footprints. All groups and updates remain inside one recovery-enabled KiCad
+commit: successful publication produces one Undo entry. Applied counts are
+reported only after the whole transaction publishes. The first rejected,
+malformed or late response stops the apply; there is no automatic group retry
+or partial publication. Known failures drop the transaction; bounded late-reply
+recovery and unknown-outcome reporting remain as described below.
+
+This is an item-count bound, not a request-byte bound or a guarantee against
+KiCad listener limits/timeouts. There is no new input, general timeout setting,
+automatic publish-on-readback, or change to other creation tools.
+
+Live acceptance on KiCad 10.0.6 / Windows created 70 real-footprint instances
+in 32/32/6 groups, observed all references, and verified one native Undo restored
+the entire pre-apply serialized board. Redo restored the entire published state;
+a final Undo left the disposable board unchanged. The ignored regression is
+`sync_chunk_live_one_undo_restores_entire_board`; run it only with a disposable
+sole open board identified by `KONNECT_LIVE_CHUNK_BOARD`. Its native action names
+are version-specific test probes, not a new production API.
+
+## Unreleased: unknown IPC outcomes (#658, first increment)
+
+A delivered IPC request whose receive fails, whose envelope cannot be decoded,
+or whose status is missing is no longer reported as a KiCad rejection. A failed
+transaction rollback also makes the outcome unknown and preserves the original
+error. Shared live-board reads/writes return an error with
+`error.kind: ipc_outcome_unknown`, `error.board_state: unknown`,
+`error.retry_safe: false`, and `error.reason`. `update_pcb_from_schematic`
+preserves this error instead of converting it to a preflight `conflict`.
+
+Do not retry a mutation or edit the saved file on this result. Inspect and
+reconcile the requested live board first: some or all of the mutation may have
+been applied. Konnect does not send a blind transaction drop after an uncertain
+operation or publish. The diagnostic includes the known commit identifier, but
+does not claim a successful rollback. Known API refusals retain their existing
+classification and ordinary failed batches still attempt a drop.
+
+The second increment opts only `update_pcb_from_schematic` into bounded
+late-reply recovery. It captures the serialized live target before beginning
+the transaction. One receive remains alive for the ordinary 30-second window
+plus a 30-second recovery allowance; NNG cancels the request if the receive
+itself times out, so Konnect does not cancel at the ordinary boundary or resend
+the request. A reply arriving after the ordinary window aborts the apply.
+The remaining recovery allowance is shared by exact-target checks, dropping
+the known commit, and observing a fresh serialized snapshot. Confirmed drop
+plus a byte-identical snapshot of the same document returns an **error**, not
+success: `error.kind: ipc_batch_recovered`, `board_state: unchanged`,
+`drop_confirmed: true`, `retry_safe: false`, and `reason`.
+
+No reply, malformed envelope, failed drop, changed target, unequal snapshot,
+or exhausted recovery budget remains `ipc_outcome_unknown`. A late publish
+reply never triggers an automatic drop. Request-timer resends are disabled
+on this scoped client; NNG peer-disconnect retransmission is not an exactly-once
+guarantee. Neither outcome authorizes automatic retry or saved-file fallback.
+Other tools keep their existing timeout. No new tool or timeout setting is
+introduced. Chunking and its live one-step-undo evidence remain tracked in
+#658, which this partial increment does not close.
+
+## Unreleased: sheet-pin geometry findings
+
+`validate_sheet_pins` keeps its read-only `issue_count` / `issues` response,
+and now counts stored sheet pins whose position disagrees with their
+rotation-selected edge or lies past its corner. New geometry entries have
+`kind: pin_position_mismatch` (or `invalid_pin_rotation` when no edge is
+identified), `schematic`, `sheet`, `file`, `pin`, `stored_position`,
+`expected_edge`, `error`, and `recovery`. An expected edge names its side,
+fixed axis/coordinate and the other axis's finite span. An invalid rotation
+has no expected edge. Existing label-name and missing-child findings remain.
+
+Inspect these findings before loading/resaving in KiCad: KiCad may relocate
+an inconsistent pin onto another pin and join their nets without an ERC
+warning. Correct the intended side/position explicitly with `edit_sheet_pin`
+and verify the netlist. The validator does not modify either schematic, and
+the existing add/edit behavior when `side` is omitted is unchanged (#687).
+## Unreleased: reading the board's physical stackup (minor release)
+
+The `pcb_board` toolset adds `get_board_stackup`. It reads the physical
+stackup of the board KiCad holds open through `GetBoardStackup`: each layer's
+type, thickness and material, dielectric εr and loss tangent, the copper
+finish, impedance control, edge settings, and the board thickness KiCad
+computes from the stack.
+
+`findings` lists fabrication values the board leaves unspecified and, when the
+optional `expected` stackup is given, every value that differs from it. The
+tool is read-only and requires the requested board to be open in KiCad; it
+never reads the board file in its place. KiCad 10 declares
+`UpdateBoardStackup` but does not implement it, so changes are made in Board
+Setup (#716). This is an additive tool and response surface planned for the
+next minor release.
+
+## Unreleased: installed guidance drift is reported (minor release)
+
+`get_installation_info` adds a `guidance` object (#728). From the standalone
+binary it holds `probe_status: "ok"`, `bundle_version`, and one entry each for
+`claude` and `codex`: a `state` (`not_installed`, `current`, `out_of_sync`),
+the install `marker` (`path`, `version`, `legacy`) or `null`, and per-item
+`files` and `hooks` whose `status` is `current`, `different`, `missing`, or
+`unreadable`. A `different` hook adds a `reason`: `legacy_handler` or
+`other_executable`. `marker.version` is `null` when the marker is not a plain
+version string. A client with no marker and no installed file is
+`not_installed` even if hooks remain, since `uninstall` removes only the hooks
+of the binary that runs it. An embedded or library server reports
+`probe_status: "not_available"`.
+
+The server checks each client once per installed guidance version, identified
+by the install marker alone. A new binary over the same marker does not
+rescan. The first start for a marker scans and records the
+state in `~/.konnect/.guidance-checked-claude` or `.guidance-checked-codex`.
+`konnect init` and `konnect uninstall` delete that client's record, so a
+re-init with the same version is checked again.
+Each client entry carries `checked`: `now` when this process scanned, or
+`earlier` when it reuses the record. An `earlier` entry has `state` and
+`marker` but no `files` or `hooks`.
+
+The `initialize` result gains `instructions`, present only on the first
+`initialize` after a scan that found a client `out_of_sync`. It holds one line
+per such client, naming the marker version and the `konnect init` command to
+run. Later starts with the same install marker omit it.
+
+`konnect status` prints `[current]`, `[different]`, `[missing]`, or
+`[unreadable]` for each skill file, agent, and hook in place of `[+]`/`[-]`,
+and a closing `Guidance:` state line.
+
+Nothing is installed or rewritten; the only files written are the two
+records. A differing file is not classified as stale
+or user-modified, because the version-only marker cannot tell them apart.
+
+## Unreleased: opt-in custom fields in `batch_edit_schematic_components` (minor release)
+
+`batch_edit_schematic_components` adds an optional `create_missing` boolean,
+defaulting to `false`. Existing calls remain update-only. When it is `true`, a
+missing custom field from an edit's `fields` object is created on every placed
+unit of that component; a field already present on some units is updated there
+and created on the remaining units in the same atomic file write.
+
+Built-in properties remain update-only, and `Reference` cannot be routed
+through `fields`. Custom field values must be strings. Duplicate assignments to
+the same component and field are skipped after the first and reported in
+`errors`, preserving the tool's existing partial-batch response contract.
+
+Each successful field result adds `updated_units` and `created_units`; each
+component result adds `updated_fields` and `created_fields`; the top-level
+response adds `updated_unit_copies` and `created_unit_copies`. The existing
+`updated_count`, `updated`, and `errors` fields keep their meanings.
+
+## Unreleased: placed-footprint 3D-model editing (minor release)
+
+The `pcb_components` toolset adds `set_placed_footprint_models`. It can inspect
+the ordered 3D-model entries on one exact placed footprint, then append,
+replace, or remove one zero-based entry. Every mutation requires the exact
+`models_revision` returned by a current inspection and updates the complete
+parent footprint through live KiCad IPC in one undo step.
+
+Each model carries its path, offset, rotation, scale, visibility, and opacity.
+Success is derived from a fresh readback; a changed precondition is refused as
+`stale_target`, and an unconfirmed post-mutation state is reported as
+`mutation_outcome_uncertain`. The tool requires the requested board to be open
+in KiCad and never rewrites the board file behind the editor. This is an
+additive tool and response surface planned for the next minor release.
+
+## Unreleased: `route_pad_to_pad` reads its pads from the live board (patch release)
+
+`route_pad_to_pad` wrote its tracks to the board open in KiCad but read the two
+pad positions from the saved `.kicad_pcb`. After any unsaved move, including
+one made by `move_component`, the track ended where the pad had been and the
+call still reported `routed: true` (#700).
+
+Both pads are now read from the board open in KiCad, the same lookup
+`get_component_pads` makes first. The response adds `source: "ipc"`, and
+`from` / `to` carry the live coordinates the tracks were drawn between. The two
+segments of an L-bend are sent in one `CreateItems` rather than two. Arguments
+are unchanged.
+
+A footprint that is in the saved file but not on the live board is refused
+with `Footprint 'X' not found on the board open in KiCad`, and a missing pad
+with `Pad 'N' not found on 'X'`. Both are tool errors, and no track is written.
+Before, the first case routed to the saved position, and a pad missing from
+the file failed as an unclassified error rather than a tool result.
+
+## Unreleased: `side` on the sheet-pin tools (minor release)
+
+`add_sheet_pin`, `edit_sheet_pin`, and `import_sheet_pins` take one optional
+`side`: `right`, `left`, `top`, or `bottom`, written as the KiCad rotations
+`0`, `180`, `90`, and `270`. KiCad reads a sheet pin's edge from that rotation,
+so `top` and `bottom` were unreachable: `add_sheet_pin` and `edit_sheet_pin`
+had no rotation input at all and always wrote `0`, and `import_sheet_pins.side`
+accepted only `right` and `left`.
+
+Omitting `side` keeps the existing behavior exactly — the pin is written at
+rotation `0`, on the right edge, and its position is not checked. **No existing
+call changes meaning**, and nothing a caller could do before is refused now.
+
+Supplying `side` also selects validation. The position is checked against the
+named edge on both axes — the coordinate the edge pins the pin to, and the span
+it runs along, corners inclusive — and a point that is not on it is refused with
+`invalid_argument` naming the offending axis, before anything is written. Such a
+point was previously written and then relocated by KiCad on load, so a caller
+that starts passing `side` can see a refusal where it used to see a success
+whose file did not describe the pin the editor showed. Surfacing that is what
+the argument is for; omit `side` to keep the old behavior.
+
+`import_sheet_pins` stacks a `top` or `bottom` import along the edge in x, as a
+`right` or `left` import stacks down it in y, and continues after the pin that
+reaches furthest along the edge it was given rather than after every pin on the
+sheet or after a count of them — an edge holding pins in slots 1 and 3 is filled
+through slot 3, so the import takes slot 4 and the gap at slot 2 is left alone.
+
+**This can refuse an import that previously succeeded.** A single pin sitting on
+an edge's last slot fills it through that slot while every slot before it stays
+empty; the import continues after the furthest pin rather than filling the gap,
+so it now returns an error where it used to place pins into the free space. The
+refusal says how many slots below the outlying pin are empty and names moving or
+deleting that pin as the remedy, rather than sending the caller to `edit_sheet`.
+An imported pin is never written onto a coordinate something already stands on.
+The stack still continues after the furthest pin genuinely on the edge rather
+than filling gaps below it, but any slot already occupied is stepped over — by a
+pin the rotation cannot attribute to an edge, by one `edit_sheet` stranded past
+the end when it shrank the sheet, and by the corner KiCad would clamp such a pin
+back onto. A count of those pins is not enough: it says how many to step past,
+not where they are, so an import of several labels used to walk onto them.
+
+Edge capacity is measured with the same slack the slot arithmetic uses. A span
+that is an exact number of slots long does not divide to an exact integer once
+it has been through a subtraction, so an edge could be judged one slot shorter
+than it is — which decided whether a pin counted as being on the edge at all,
+and so whether an import could overwrite it. It
+derives every position itself, so it validates every one of them against that
+edge before it writes any: an import that would run past a corner is refused
+entire, with nothing written, rather than letting KiCad clamp the overflow onto
+the corner. A sheet whose labels no longer fit on one edge therefore returns an
+error where it previously returned success over a silently relocated pin.
+
+Response `x`, `y`, and `side` are derived from the sheet pin read back out of
+the committed file rather than echoed from the request; `import_sheet_pins`
+reads `side` off a pin it actually saved and reports `null` when it saved none.
+
+`edit_sheet_pin` gains `changed` and `requested_fields` next to the existing
+`changed_fields`, matching `edit_sheet`. `changed_fields` now carries `side`
+only when the rotation actually differs, so restating the edge a pin is already
+on is reported as the no-op it is and commits nothing. The other fields keep the
+behavior they had. Existing response fields keep their names and their meanings.
+
+No tool, argument, or existing response field was renamed or removed. This
+additive schema and response change is planned for the next minor release.
+
+## Unreleased: `batch_connect_to_net` takes `connect_to_net`'s placement options (minor release)
+
+`batch_connect_to_net` could only put a local label on each pin endpoint.
+`connect_to_net` draws a wire stub, lets the caller choose its direction and
+can place a global label, so a sheet built with the batch tool looked
+different from one built pin by pin (#701).
+
+The batch tool now takes `stub_length`, `direction` and `label_type`. Each one
+applies to every pin in the call, and an explicit value places exactly what
+`connect_to_net` places with the same value. The defaults keep the old output:
+`stub_length: 0` (label on the endpoint, no wire), `direction: "auto"` and
+`label_type: "net_label"`. `stub_length` must be `0` or more. Unlike
+`connect_to_net`, `0` draws no wire at all rather than a zero-length one.
+
+Each pin gets its own stub wire. Where a label of the net already sits at a
+stub's end, from the file or from an earlier pin in the call, the batch reuses
+that label instead of stacking a second one. An entry is `deduplicated` only
+when the pin's wire and label both already exist.
+
+`net` is accepted as an alias of `net_name`. Giving both with different values
+is refused with `invalid_argument` on `net`, and nothing is written. Giving
+neither is `invalid_argument` on `net_name`, as before.
+
+A call that uses the defaults gets the same response as before. When any
+option differs from its default, each `added` entry also reports `direction`,
+`label` (`x`, `y`, `rotation`) and, for a drawn stub, `wire`. The top level
+then also reports `stub_length` and `label_type`.
+
+## Unreleased: `reload_server` and `get_installation_info` follow a replaced binary on Linux (patch release)
+
+On Linux, once an update replaced the file at the serving binary's path,
+`/proc/self/exe` gained a ` (deleted)` suffix. Both tools used that path
+literally: `reload_server` failed with "could not open the Konnect binary at
+… (deleted)", and `get_installation_info` reported
+`binary_on_disk.probe_status: "launch_failed"` (#699).
+
+When that suffixed path does not exist, both now use it without the suffix,
+which is the installed path holding the update. `reload_server` probes and
+loads that file under its existing version checks. `get_installation_info`
+reports it as `runtime.executable_path` and probes it for `binary_on_disk`, so
+`newer_than_running` reflects the pending update. Other platforms, and a
+Linux binary that was not replaced, are unaffected.
+
+## Unreleased: an omitted reference keeps the library prefix (patch release)
+
+`add_schematic_component` and `batch_place_components` wrote a bare `?` when
+the caller passed no `reference`, dropping the library symbol's prefix.
+`annotate_schematic` then numbered the symbol `1`, and a `#`-prefixed symbol
+such as `power:PWR_FLAG` lost the `#` that keeps it off the board (#669).
+
+The default is now the library `Reference` property plus `?` (`R?`, `#FLG?`),
+as eeschema places a symbol, so annotation yields `R1` and `#FLG01`. It
+appears in the written symbol, its `(instances …)` records and the response's
+`fields.Reference`. A library symbol with no `Reference` property still gets
+`?`. An explicit `reference` is unchanged, and so is `batch_place_components`'
+failure entry, which still reports `"reference": "?"` for an entry that named
+none.
+
+## Unreleased: `run_erc` reports coordinates that can be found on the sheet (minor release)
+
+KiCad's ERC **JSON** writer divided every violation coordinate by 100, from
+the release that introduced it (8.0) through 10.0.6: it formatted schematic
+internal units through `pcbIUScale` (1e6 IU/mm) where the text report used
+`schIUScale` (1e4 IU/mm). `run_erc` reads that JSON, so a pin
+`get_schematic_pin_locations` puts at `(100.33, 104.14)` came back from
+`run_erc` at `(1.0033, 1.0414)` — a location that cannot be found on the sheet
+(#541). Upstream fixed it in `6d8e1fe` for KiCad 10.0.7
+([kicad#25582](https://gitlab.com/kicad/code/kicad/-/issues/25582)).
+
+`run_erc` now checks the `kicad_version` the report states — the binary that
+wrote those numbers — and says what it did in a new `coordinates` object:
+
+- `status: "corrected"` — an affected version wrote the report; every `x`/`y`
+  was multiplied by 100, and `scale_applied` says so. This is the change a
+  caller sees: coordinates from KiCad 10.0.6 and earlier are now 100× larger,
+  and match `get_schematic_pin_locations` for the same pin.
+- `status: "verbatim"` — KiCad 10.0.7 or newer wrote it; coordinates are
+  KiCad's own, untouched.
+- `status: "withheld"` — the version could not be placed on either side of the
+  fix (no `kicad_version`, an unrecognized one, or a development build, whose
+  version cannot date it against the fix). No `x`/`y` is reported at all;
+  KiCad's raw numbers ride along as `kicad_reported_x`/`kicad_reported_y` on
+  the violation and on each item, deliberately under a name that is not a
+  location. `coordinates.reason` says why.
+
+`run_erc`'s optional `output` file changes with it: it used to hold the
+filtered violation array alone, and now holds the whole response — the same
+JSON the tool returns, with `violations` under that key beside `coordinates`.
+That file is the copy handed to another tool or another person, so it must not
+carry a coordinate without the block saying what the coordinate is worth. A
+consumer of that file reads `<file>.violations` where it used to read the
+top-level array.
+
+One case the boundary cannot see: a KiCad built from the 10.0 branch between
+the 10.0.6 release and the 10.0.7 one carries the fix but still stamps its
+reports `10.0.6`, because `kicad_version` comes from `KICAD_SEMANTIC_VERSION`,
+which upstream leaves at the last released version until the release commit
+bumps it. Such a build reports correct coordinates and `run_erc` will multiply
+them by 100. Nothing in the report distinguishes it from the affected release.
+Released KiCad builds are unaffected, and only released builds are the
+supported contract: an in-between branch build is outside it (maintainer
+decision on #541). If you run a self-built 10.0-branch KiCad, check `coordinates.kicad_version` against your own build and treat a
+`"corrected"` status from it as the one case where the correction is wrong.
+
+`pcb drc` has its own report writer and never carried the defect, so
+`run_drc`, `get_drc_violations` and every DRC coordinate are unchanged.
+
+A caller that compensated for the scaling itself must stop: read
+`coordinates.status` instead, and multiply only when something else says to. A
+caller that reads `x`/`y` unconditionally must handle their absence when
+`status` is `withheld` — where it previously received a number that could be
+off by 100× with nothing saying so. KiCad scales the lengths quoted inside its
+own violation *text* the same way ("Horizontal Wire, length 0.1270 mm" for a
+12.70 mm wire); Konnect does not rewrite KiCad's prose, and
+`coordinates.reason` states that.
+
+## Unreleased: `run_erc` refuses a report it does not recognise (patch release)
+
+`run_erc` decoded kicad-cli's JSON report leniently: a missing or wrong-typed
+`sheets` array produced an empty violation list, and a sheet without a
+`violations` array was skipped. Zero violations is what a clean schematic looks
+like, so a report Konnect did not recognise — the configured `kicad_cli` not
+being KiCad's, a wrapper script, a truncated file, a future schema — was served
+as `total: 0, errors: 0, warnings: 0` (#581). `run_drc` already refused the
+equivalent DRC case.
+
+`run_erc` now returns an error that says what was wrong: no `sheets` array
+(naming the top-level keys it found), an empty `sheets` array, or a sheet with
+no `violations` array (naming the sheet). kicad-cli writes all three for every
+schematic; a blank sheet still reports its root with `"violations": []`
+(measured on 10.0.5), so a real ERC run is unaffected. Fields the schema leaves
+optional (`items`, `pos`, `uuid`) stay optional. No argument or success-path
+response field changed.
+
+## Unreleased: placement stops trusting the outline's bounding box (minor release)
+
+`score_placement`, `auto_place_from_schematic` and
+`refine_placement_force_directed` treated every Edge.Cuts outline as its
+bounding box (#594). On a concave, notched, rounded, rotated or
+multi-boundary board, a part could sit inside the bounding box but off the
+board and still score as inside it, or be placed there.
+
+Konnect now classifies the outline. It is `rectangular` only when it is
+provably an axis-aligned rectangle: a single `gr_rect`, a four-vertex
+`gr_poly` whose edges are the rectangle's four sides in order, or four
+`gr_line` segments that are its four sides, each once. Any other outline
+that parses is `unproven`, and there is no containment engine for those
+shapes: the bounding box is reported as advice, never as proof.
+
+- **`score_placement`** adds `outline_shape` (`"rectangular"`, `"unproven"`
+  or `"missing"`) and `outline_unproven: bool`. On an unproven outline the
+  `outside_outline` hard failure and the connector-edge check are skipped,
+  and the verdict is the new `outline_unproven` instead of `pass`. Verdict
+  precedence is `hard_fail`, then `outline_missing`, then
+  `outline_unproven`, then `pass`. A rectangular outline scores exactly as
+  before.
+- **`auto_place_from_schematic`** and **`refine_placement_force_directed`**
+  refuse an unproven outline with `error.kind: "plan_blocked"`, naming the
+  operation and the advisory bounding box, whether `dry_run` or apply was
+  asked for. Nothing is planned or written. A rectangular or missing
+  outline behaves as before.
+- **`place_decoupling_caps`** reports `outline_unproven` in its planned
+  verdict and blocks application on an unproven outline. A dry-run can
+  expose the blocked plan, but its advisory bounding box cannot authorize
+  a write.
+
+No argument changed. A caller that treated `score_placement`'s `pass` as the
+only non-failing verdict must also handle `outline_unproven`. On such a
+board, place parts with small explicit moves and check the saved board with
+KiCad DRC.
+
+## Unreleased: configuration tools refuse a file they cannot use (minor release)
+
+`load_user_config`, `save_user_config`, `load_project_config`,
+`save_project_config`, `get_effective_config`, `add_design_rule` and
+`list_design_rules` treated a preferences file that failed to parse, or failed
+to read for any reason, as if it did not exist. The load answered with
+Konnect's defaults and said "User preferences loaded."; the next save then
+wrote those defaults, plus the one key being set, over the user's file (#580).
+
+A configuration file now has four states that are never merged:
+
+- **absent** — the defaults, and the response says so: `source: "defaults"`
+  (`"file"` otherwise). `load_user_config` still leaves the defaults on disk
+  for the user to edit, and reports `persisted: true|false` with
+  `persist_error` instead of discarding a failed write. `load_project_config`
+  writes nothing, as before.
+- **loaded** — unchanged.
+- **malformed** (invalid JSON, or a root that is not an object) and
+  **unreadable** (permissions, a directory at the path, invalid UTF-8) — a
+  structured refusal, `error.kind: "invalid_configuration"`, carrying `path`
+  and a `reason` starting `malformed_json:` or `unreadable:`. Nothing is
+  written. Repair or move the file and retry.
+
+The saves (`save_*_config`, `add_design_rule`) refuse in the same two states,
+keep every other key, persist with an atomic conditional write against the
+text that was read (an atomic no-clobber create when there was no file), and
+answer from the file as read back. They add `path` and `created`. A
+persistence error, including the conditional writer's `conflict`, is
+`mutation_outcome_uncertain`: that writer reports a conflict both before a
+replacement and after one whose readback differs, so the response does not
+claim nothing was written — read the file before retrying. The one no-write
+statement is a file that appears while Konnect is creating one, which is a
+`conflict`. `get_effective_config` and `list_design_rules` add `sources:
+{user, project}` (`"file"`, `"defaults"`, or `"not_configured"` when there is
+no project directory) and refuse, naming which file, rather than merge
+defaults in place of one that cannot be used.
+
+No argument changed. A caller that relied on a broken preferences file being
+silently reset must now repair or remove it.
+
+## Unreleased: `get_schematic_component` and `list_schematic_components` return every property (minor release)
+
+Both tools answered from a fixed list of keys, so neither reported a custom
+property such as `LCSC` or `MPN` (#679).
+
+Each now carries one `properties` object: every property on the placed symbol
+by name, standard and custom alike. `get_schematic_component` reads it from the
+lowest-numbered unit, the unit that already supplies `x`, `y` and `uuid`; each
+`list_schematic_components` row reads its own unit. A name repeated on one
+symbol reports its first value, the one `value` and `footprint` are read from.
+
+No tool, argument, or existing response field was renamed or removed.
+
+## Unreleased: `add_power_symbol` snaps to the schematic grid (patch release)
+
+`add_schematic_component` and `batch_place_components` snap the requested
+position to KiCad's 1.27 mm schematic grid; `add_power_symbol` wrote it as
+given (#662). Wires and labels are snapped too, so a power symbol left off the
+grid could not be reached by them: ERC reported the endpoint off grid and the
+power pin unconnected.
+
+`add_power_symbol` now snaps like the other two placers. No argument or
+response field changed. `x` and `y` in the response were already read back
+from the committed file, so they now report the snapped position. A request
+that was on the grid, which includes any pin endpoint of a placed component,
+lands exactly where it did before; only an off-grid request moves, by at most
+0.635 mm on each axis.
+
+## Unreleased: `update_pcb_from_schematic` names every footprint it cannot place (minor release)
+
+One library footprint the typed placement path cannot carry (custom-shape pads
+today) turned the whole dry run into a `conflict` with a single diagnostic that
+named neither the footprint nor a part: `reference: null`, no footprint id, and
+preparation stopped at the first failure, so a second unusable footprint stayed
+hidden until the first was replaced. Separately, a connected pad the footprint
+does not have was checked only during apply, so a dry run could say `ready` for a
+plan whose apply then failed with `footprint J601 has no pad 3`.
+
+Both are now found while planning, and named. Status is still `conflict` and
+nothing is planned or applied.
+
+- Every diagnostic gains `references`, the list of every part it concerns, and
+  `footprint_id`, the library footprint it is about or `null`. `reference` keeps
+  its meaning: the one part concerned, or `null` when there are several or none.
+  For the existing single-part diagnostics `references` holds that one part.
+  This includes the single `preflight_conflict` diagnostic of a refusal before
+  any plan exists (saved hierarchy, netlist export, IPC preflight), which used
+  to carry only `code` and `message` and now carries `reference: null`,
+  `references: []` and `footprint_id: null` as well.
+- There is one diagnostic per footprint that cannot be prepared, listing every
+  part that needs it. Its `code` says which stage failed, in the vocabulary
+  `update_footprints_from_library` already uses:
+  `footprint_library_resolution_failed` (the library id does not resolve),
+  `footprint_library_read_failed` (the file cannot be read) and
+  `unsupported_library_footprint` (it holds something Konnect cannot place).
+  **Changed value:** the custom-pad case was reported as
+  `footprint_library_resolution_failed`, although the library resolved; it is
+  now `unsupported_library_footprint`.
+- New code `footprint_pad_missing`: the schematic connects a pad the library
+  footprint (for an addition) or the live footprint (for an update) does not
+  have. It carries `reference` and `footprint_id`, and the message names the pads.
+
+Callers do not change their requests. A caller that matched
+`footprint_library_resolution_failed` to detect custom-shape pads should match
+`unsupported_library_footprint` instead. Custom-shape pads are still not
+supported; the fix is that the refusal now says which footprint to substitute
+and for which parts.
+
+## Unreleased: `get_layer_list` and `get_netclasses` answer about the live board (minor release)
+
+Both tools previously parsed the saved `.kicad_pcb` unconditionally. A board
+open in KiCad with unsaved changes was therefore answered from the file on
+disk, and nothing in `get_layer_list`'s response said so.
+
+Both now take an optional `board_source` selector:
+
+- `auto` (the default, and what an existing caller gets) uses the exact board
+  KiCad holds open, and reads the saved file only when the response can state
+  why no live observation was used;
+- `live` returns a structured error unless the exact board is open in a
+  reachable KiCad;
+- `saved` inspects the last saved file and reports that unsaved editor changes
+  are excluded.
+
+Under `auto` and `live`, a query that fails after KiCad has positively
+identified the board — a rejection, or an editor this session had reached that
+is no longer reachable — is returned as an error rather than answered from the
+saved file.
+
+Under `live`, a reachable KiCad that holds some other board returns the
+established `wrong_document` error naming the boards it does hold, rather than
+a generic unavailability.
+
+A KiCad running with no PCB editor open — the project manager alone, which
+refuses `GetOpenDocuments` itself — is not a live board and never identified
+one, so `auto` answers from the saved file and reports
+`no_pcb_editor_at_endpoint` (or its `…_with_editor_lock` /
+`…_with_uninspectable_lock` forms). `live` refuses. A board this server
+observed live before that editor closed is the exception and still refuses, as
+`unsafe_file_fallback`. Mutating tools treat this state exactly as they did
+before it had a name.
+
+An endpoint whose build does not implement `GetOpenDocuments` at all falls back
+the same way, under its own reason `open_documents_unimplemented_at_endpoint`
+(with the same two lock forms). It is reported separately because it is not
+evidence about KiCad's editors: nothing was identified, and a board may still
+be open with unsaved changes behind a command that was never answered.
+
+Both responses gain a `sources` object naming the origin of each domain
+(`ipc`, `saved_board`, `project_file`, `derived`, `unavailable`) and a
+`source_evidence` object carrying `board_state`,
+`excludes_unsaved_editor_state`, a machine-readable `reason` and its prose
+`detail`. `get_layer_list` additionally reports `copper_layer_count` and a
+per-layer `display_name`; its `id`, `type` and `user_name` remain file-backed
+and are `null` for a layer the live editor has enabled that the saved file does
+not carry. `get_netclasses` keeps its existing `nets_source` string, whose
+wording now also covers the live case.
+
+`get_layer_list` also refuses, rather than answering, when KiCad returns an
+`AS_OK` with no enabled-layer set: no board has zero enabled layers, and
+reporting that non-answer as a live stackup of nothing would be a confident
+lie about a board whose real stackup is in the file. A layer whose *name*
+KiCad declines is different — the enabled set it did give still stands, and
+that layer reports its canonical name.
+
+The `display_name` lookups are one IPC round trip per layer, and together they
+get ten seconds of KiCad's time. That is a bound on the waiting, not only on
+when the last lookup may start: the lookups stop once it is spent, and each one
+that starts waits at most what is left of it rather than the client's usual
+30-second reply timeout. A live read of a KiCad that slows to a crawl therefore
+returns inside the bound, with `display_name: null` on the layers it did not
+get to and the canonical `name` on every layer as always.
+
+`error.kind: "unsafe_file_fallback"` can now be returned by a read. It carries
+the same `reason` as the write path — the fact is the same one — but nothing
+was going to be written: reporting the saved file as current is the unsafe act
+it refuses. `board_source: "saved"` inspects that snapshot deliberately.
+
+Callers that want the previous behaviour exactly should pass
+`board_source: "saved"`.
+
+## Unreleased: `add_power_symbol` spells designators as eeschema does (patch release)
+
+`add_power_symbol` numbered its hidden designators `#PWR001`, `#PWR002`, and
+past ninety-nine `#PWR100`. eeschema writes the prefix, a `0`, then the number:
+`#PWR01`, `#PWR010`, `#PWR0100`. `annotate_schematic` already follows eeschema,
+so one sheet could carry both spellings of the same series.
+
+`add_power_symbol` now uses the same rule. The `reference` it reports, and
+writes to the `Reference` property and to each instance record, changes for
+numbers 1 to 9 (`#PWR001` becomes `#PWR01`) and from 100 upward (`#PWR100`
+becomes `#PWR0100`). For 10 to 99 the two spellings are the same text. No field
+is added, removed or renamed.
+
+Designators already in a file are not rewritten. The older spellings still
+count toward the free-number search, so a sheet holding `#PWR001` and `#PWR002`
+is handed `#PWR03`, never a duplicate. A caller that matched the literal text
+`#PWR001` should read `reference` from the response instead.
+
+## Unreleased: force-directed refinement refuses unsafe plans
+
+`refine_placement_force_directed` is deprecated as a recommended bulk-cleanup
+workflow. Its global-net spring model can pull one footprint toward every
+other footprint sharing a board-wide rail, and a non-converged plan previously
+applied without proving that it improved placement.
+
+Dry-run responses now include `plan_status`, `blocking_reasons`, and
+`displacement_mm` for each planned move. A plan is blocked when it does not
+converge, does not improve the shared placement score, retains a hard-fail
+verdict, places a courtyard outside the board outline, exceeds the optional
+positive `max_displacement_mm`, or omits that limit. Dry-run still returns a
+blocked plan for diagnosis. Apply mode returns structured `plan_blocked` before
+the first mutation, and therefore requires `max_displacement_mm` even though
+the argument remains optional for diagnostic dry-runs.
+
+Use bounded explicit `move_component` / `rotate_component` operations derived
+from schematic function, with `score_placement` and KiCad DRC after each small
+batch, instead of treating the deprecated heuristic as an automatic placer.
+
+## Unreleased: hierarchical sheets open without KiCad repair (patch release)
+
+`add_hierarchical_sheet` and `duplicate_sheet` previously omitted canonical
+KiCad 10 sheet defaults and the root schematic's page-one instance/footer
+records. CLI ERC and PDF export still succeeded, but opening the generated root
+in Eeschema displayed an automatic-repair warning and changed the file on save.
+
+New and duplicated sheets now carry the defaults observed in a real KiCad
+10.0.6 repaired-save, and a hierarchy root gains `sheet_instances` and
+`embedded_fonts` only when those records are absent. Existing footer records
+are preserved. Callers do not need to change their requests.
+
+## Unreleased: `place_decoupling_caps` requires exact references
+
+`place_decoupling_caps` no longer discovers capacitors by looking for any net
+shared with the target IC. A board-wide net such as GND made that inference
+select unrelated parts and could generate a row far outside the board.
+
+Callers must now supply a non-empty `capacitor_references` array containing the
+exact existing footprints to move. Those references are trusted as the
+caller's design intent; Konnect does not apply a reference-prefix or value
+heuristic to second-guess them. Missing, duplicate, unknown, or geometrically
+unplaceable references return structured invalid input before planning.
+
+Dry runs now report `plan_status` (`applicable` or `blocked`) and
+`blocking_reasons`. A target outside the board outline, a non-improving score,
+or a newly introduced hard failure blocks the plan. Apply mode evaluates the
+same plan and returns a structured `plan_blocked` error with the same reasons
+before writing. Existing net-inference callers must choose the exact references
+from schematic evidence and pass them explicitly.
+
+## Unreleased: component replacement preserves pin junction and no-connect intent
+
+`replace_component` previously changed a placed symbol's library identity and
+reported success without re-evaluating the junction dots at its old and new
+pin endpoints. A replacement whose new pin landed on a wire could therefore
+look connected while remaining absent from KiCad's netlist; a pin that left a
+wire could strand an unjustified dot.
+
+Replacement now reconciles the whole old/new pin-endpoint difference and
+commits the symbol, carried no-connect markers, and junction changes in one
+conditional atomic write. A no-connect marker follows a protected pin only
+when the old pin maps to exactly one new pin with the same placed-symbol UUID,
+unit, and pin number. Local geometry is intentionally allowed to change;
+removed, renumbered, or duplicated protected pins return a structured refusal
+before writing instead of guessing correspondence.
+
+The response gains `junctions_added_count`, `junctions_pruned_count`,
+`no_connects_moved_count`, and `no_connects_moved`. Existing component fields
+are now bound to the selected UUIDs and read back from the committed file. An
+unprovable committed result returns `mutation_outcome_uncertain` rather than
+echoing the requested library identifier as proof.
+
+## Unreleased: region moves preserve pin junction and no-connect intent
+
+`move_region` previously translated every selected symbol unit and reported a
+successful placement without re-evaluating the junction dots at any moved pin.
+A pin moved onto the interior of a wire therefore looked connected in
+eeschema but remained unconnected in KiCad's netlist; a pin moved away left an
+unjustified dot behind. No-connect markers were also left at their old
+coordinates.
+
+Region movement now treats the selected units as one placement change. It
+carries no-connect markers by stable pin identity, reconciles the whole-sheet
+symmetric pin-endpoint difference once, and commits symbols, markers, and
+junctions in one conditional atomic write. Whole-region reconciliation is
+important when selected pins swap coordinates: processing the symbols one at
+a time could briefly invent or remove a dot that remains justified by the
+complete move.
+
+The response gains `junctions_added_count`, `junctions_pruned_count`,
+`no_connects_moved_count`, and `no_connects_moved`. Returned placements are
+read back from the committed file. If a marker cannot be followed one-to-one,
+the tool returns a structured `ambiguous_target` or `stale_target` error and
+leaves the schematic byte-identical. If committed readback cannot prove the
+selected UUIDs landed at their requested positions, the tool reports
+`mutation_outcome_uncertain` rather than echoing its plan as success.
+
+The tool still moves symbols only; it does not stretch or reroute connected
+wires. Re-route the affected nets after a successful region move.
+
+## Unreleased: batch placement preserves pin-on-wire connectivity
+
+`batch_place_components` previously placed a pin directly on the interior of
+an existing wire without adding the junction KiCad requires at that point. The
+sheet looked connected, the tool reported a complete placement, but KiCad's
+netlister left the pin unconnected. Single-component placement already handled
+the same geometry correctly.
+
+Batch placement now reconciles every new pin endpoint once after planning the
+whole batch and commits the symbols and required junctions in one conditional
+atomic write. Its response gains `junctions_added_count` and
+`junctions_pruned_count`; existing fields keep their meanings. A batch that
+does not change junction state reports zero for both fields.
+
+## Unreleased: `set_active_layer` refuses instead of corrupting KiCad 10 boards
+
+`set_active_layer` previously inserted an `(active_layer "...")` entry into the
+board's `(setup ...)` block. KiCad 10.0.6 does not support that document token:
+active layer is editor-session state, and a board containing the inserted entry
+cannot be loaded.
+
+The tool now returns a structured `unsupported_capability` error and leaves the
+board byte-identical. There is no supported replacement call in the bundled
+stable KiCad IPC protocol. If v0.12.0 already changed a board, close it, make a
+backup, remove only the injected `(active_layer "...")` line, and reopen it.
+See [Troubleshooting](TROUBLESHOOTING.md#a-board-no-longer-opens-after-set_active_layer).
+
+## Unreleased: a stale-target refusal is bounded, not one line per symbol (patch release)
+
+Every mutating schematic tool preflights placed-symbol instance metadata. When
+that check refused, `error.reason` carried one `"{reference}: observed [...],
+expected [...]"` line per stale symbol. A sheet goes stale as a whole — copy a
+`.kicad_sch` to a new filename stem and every symbol records the old project
+name — so the answer repeated one fact once per symbol: 18 535 B of `reason` and
+a 37 301 B response for a 46-symbol sheet, growing linearly with the sheet (#592).
+
+`reason` now names the expected instance identity once, states how many of the
+sheet's placed symbols are stale, and groups the symbols by their diagnosis,
+naming at most three symbols and five distinct diagnoses before counting the
+rest. Instance lists themselves are never sampled — an elided path is one the
+caller cannot write back:
+
+```text
+placed-symbol instance metadata disagrees with project 'demo': 46 of 46 placed
+symbols are stale; every symbol must record exactly [demo:/<root>/<sheet>];
+RV201, C201, R203 and 43 more (46 symbols): observed [old:/<root>/<sheet>]
+```
+
+The same sheet now answers in 1 373 B. Symbols that disagree with each other
+keep separate entries, so a mixed sheet still names each distinct failure.
+
+The guard itself is unchanged: the same documents are refused, `error.kind`
+stays `stale_target`, `error.target` is unchanged, and nothing is written. Only
+the `reason` text — and the `message` that interpolates it — is shorter. Callers
+matching on `error.kind` need no change; a caller parsing individual symbols out
+of `reason` should read the sampled identities and counts instead, or inspect
+the file. `reason` remains prose for a human or a model, not a parsed field.
+## Unreleased: a placement change carries the no-connect on the pin it moves (minor release)
+
+A no-connect marker is a sheet item at a coordinate, so
+`move_schematic_component`, `rotate_schematic_component` and
+`bulk_move_schematic_components` used to leave it where it was while the pin it
+protected moved away. The junction pass then saw
+an unprotected pin, and where that pin had landed mid-span on a wire it wrote a
+dot — putting the pin the caller had explicitly declared unconnected onto that
+net (#626). ERC reported the stranded marker; nothing reported the new
+connection.
+
+All three now treat the marker as intent attached to a pin. The marker is
+followed by symbol instance UUID, unit, pin number and library pin geometry —
+never by coordinate coincidence alone — and moves in the same write as the
+symbol, so the junction pass sees it at the arrival point and adds no dot.
+
+All three responses gain `no_connects_moved_count` and `no_connects_moved`, an array
+of `{ uuid, from: { x, y }, to: { x, y } }` read back from the written file.
+A placement change that carries nothing reports `0` and `[]`. No existing field
+changes meaning, and `junctions_added_count` on a move or bulk shift can now be
+`0` where it was `1`, which is the fix.
+
+`move_region` and `replace_component` now inherit this contract together with
+their whole-mutation junction reconciliation as documented above (#623,
+#625). `batch_place_components` reconciles its newly placed pins as documented
+above (#622).
+
+A placement change that cannot follow a marker one-to-one now **refuses before
+writing** instead of orphaning it:
+
+- `ambiguous_target` when the pins under one marker land on different points —
+  two pins stacked on it with only one of them moving — or when carrying it
+  would stack two markers on one point. `target` names the marker and its
+  position; `candidates` name the competing pins or markers.
+- `stale_target` when the sheet cannot answer for the marker at all: a
+  `lib_symbols` lookup that failed, a placed symbol with no UUID, or a marker
+  with no UUID to follow.
+
+A refusal leaves the file byte-identical. The remedy depends on which one it is:
+
+- For `ambiguous_target`, delete or replace the competing marker with
+  `delete_no_connect` / `add_no_connect`, then repeat the placement change.
+- For `stale_target` naming unresolved pin geometry, repair the sheet rather
+  than the marker: the refusal is sheet-wide, so **one** placed symbol whose
+  `lib_symbols` entry is missing blocks every placement change on a sheet that
+  has any no-connect, including changes nowhere near a marker. An unresolvable
+  symbol means Konnect cannot tell which pins sit under a marker at all, and
+  `delete_schematic_component` already refuses the same way for the same
+  reason. Re-embed the definition (re-place the symbol, or restore the
+  `lib_symbols` entry) and retry.
+- For `stale_target` naming a marker with no UUID, delete and re-add that
+  marker so KiCad's writer gives it one.
+
+## Unreleased: explicit live-board synchronization for CLI DRC
+
+`run_drc` and `get_drc_violations` accept `sync_live_board: false` and
+`refill_zones: false` by default. Existing calls continue to check the saved
+file without requiring IPC. To check recent editor changes, finish other
+mutations first and call either tool with `sync_live_board: true`. Konnect binds
+the exact requested open board, optionally refills and waits for KiCad to stop
+returning `AS_BUSY`, saves that same document, verifies its native snapshot
+against the saved file, and only then runs CLI DRC. A changed source during DRC
+invalidates the result rather than being reported as synchronized evidence.
+
+Both summaries add `source: "saved_file"`, `live_board_synced`,
+`zones_refilled`, and `zone_refill_source` (`"ipc"`, `"kicad_cli"`, or null).
+These do not turn CLI DRC into an unsaved in-memory check. Without synchronization,
+CLI zone refill is analysis-only and does not save the open editor's board.
+Standalone `refill_zones` now binds its requested board, waits for completion,
+returns a structured refusal on failure, and reports `saved: false` on success.
+
+Wrong targets and unavailable IPC stop before mutation/CLI. Once refill/save
+has been attempted, failed or unproven work returns `mutation_outcome_uncertain`
+with the requested path and operation. Inspect/reconcile the editor and saved
+file before retrying; Konnect does not replay a possibly applied mutation or
+fall back to a different board. See [DRC synchronization](DRC_SYNCHRONIZATION.md).
+
+## Unreleased: `rotate_schematic_component` reconciles junctions (minor release)
+
+A turn relocates a symbol's pin endpoints exactly as a move does, but only
+`move_schematic_component` re-judged the junction dots at the points its pins
+left and arrived at. A pin turned off a wire left its dot behind with nothing
+to justify it, and — the half that changes the design rather than the picture —
+a pin turned *onto* a wire mid-span got no dot, so KiCad left it off the net it
+visibly touches (#615).
+
+`rotate_schematic_component` now makes the same reconciliation call, with the
+same rules: a dot is pruned when nothing is left to justify it, and one is
+added only where a pin has landed mid-span on exactly one wire with no
+no-connect flag at the point.
+
+The response gains the two keys the move has always carried, always present:
+
+- `junctions_added_count`
+- `junctions_pruned_count`
+
+Both are derived from the reconciliation that actually ran, not predicted. No
+argument changed and no existing response key changed in name, shape or
+content. A caller that reads only the old keys is unaffected; one that assumed
+a turn never touches junction dots will now see the dots it used to have to
+repair by hand.
+
+Sheets a previous version left behind are not migrated by this change. A
+stranded dot costs no connectivity and can be deleted at leisure; a *missing*
+dot does cost connectivity, and the repair is `add_junction` at the pin's
+coordinate, or re-running the turn.
+
+## Unreleased: fixed tool arguments reject unknown keys (patch release)
+
+Following #551's validator, #546 closes fixed tool argument records before
+advertising and compiling their schemas. Unknown top-level arguments and unknown
+fields in fixed nested records now return `invalid_argument` before a handler
+runs. For example, use `query` rather than `part_name` in `search_symbols`, and
+`rotation` rather than `rotaton` in `create_footprint.pads`. A missing required
+field still takes precedence over other validation errors. Correct the named
+field using the current `tools/list` schema, then retry; a refusal writes nothing.
+
+Intentional caller-keyed maps remain extensible: schematic custom `fields`,
+field-name keys in `field_placements`, routing `net_map`, and template
+`net_mappings`. Fixed placement records inside `field_placements` are closed.
+Arbitrary configuration `value` data remains unrestricted. The optional footprint
+model `offset`, `scale`, and `rotate` records now declare numeric `x`, `y`, `z`
+fields; omission keeps the existing coordinate defaults.
+
+Previously ignored extension keys on fixed records are no longer accepted.
+Tool authors must explicitly declare `additionalProperties: true` or a value
+schema for intentional caller-keyed maps. Catalogue tests inventory those
+exceptions. This changes refusals, not success-response shapes or tool counts.
+
+## Unreleased: `annotate_schematic` reports what it did, and numbers the way eeschema does (minor release)
+
+`annotate_schematic` returned the string "Annotation complete." whatever it
+had done, including nothing: two symbols that already shared a designator were
+never candidates, the file was left byte-identical, and KiCad's netlister then
+merged them into one component (#454). It also rewrote only the
+`(instances …)` reference of a `?` symbol and left its `(property "Reference"
+…)` behind, so KiCad and Konnect's own readers disagreed about the designator.
+
+The response is now JSON, with the shared `outcome` envelope:
+
+- `assigned` — one entry per `(uuid, unit, project, path, from, to)` that was
+  written;
+- `project` — the project whose instance records were annotated; `paths` —
+  its sheet instances in the file; `duplicates_before` and
+  `unannotated_before` — what the file looked like; `outside_project` —
+  symbols whose instance records name only other projects, left untouched;
+- `unresolved` — designator groups the tool will not decide for you, each with
+  its `project`, `paths`, `uuids` and a `reason`;
+- `written`, `dry_run`, `resolve_duplicates`, `remaining_unannotated`;
+- `outcome.status` is `complete` only when the committed file, read back, has
+  no `?` and no duplicate in the project; `partial` when `unresolved` is
+  non-empty; `failed` when the tool refused before writing; `uncertain` when
+  the write or the readback could not be proven.
+
+A caller matching "Annotation complete." must update. No argument was renamed
+or removed. Persistence conflicts return `mutation_outcome_uncertain` with an
+`uncertain` outcome and `inspect_target` retry scope, not a no-write refusal:
+the conditional writer can detect a conflict either before replacement or
+after replacement during readback, without distinguishing that timing in its
+error. Reload and inspect the schematic before retrying; applied work is not
+known on this path and the response does not claim that nothing was written.
+Three optional arguments are added: `resolve_duplicates` (default
+false) renumbers all but the first of each group of separate parts sharing a
+designator, in ascending X, which is what eeschema's "Reset existing
+annotations" produced on the fixture; `dry_run` (default false) returns the
+plan without writing; `project` (string) names the project whose instance
+records to annotate.
+
+References are unique across a project (KiCad's flat list), so numbers are
+reserved per project across every sheet instance the file carries: a reused
+sheet's instances each get their own number, and a designator shared across
+instances is a duplicate unless it is the units of one package. Exactly one
+project's instance records are annotated — the schematic's owning project (its
+`.kicad_pro`, resolved the way #189 resolves ownership), else the only project
+the file names, else `project` — and anything ambiguous is refused with the
+candidates (`invalid_argument`, field `project`). Other projects' records are
+never edited. Multi-unit parts are recognised from the embedded library
+definition: units with the same definition and value, distinct within the
+declared unit count, are one package. Unannotated units of one package get one
+shared number; a shared designator that could be a package (a unit repeats, is
+out of range, the values differ, or the definition is missing) is never
+renumbered, even with `resolve_duplicates`, and is reported with a reason.
+When the owning project is proven, the numbers used on its other sheets are
+reserved by walking the sheet tree from the root (`other_sheets_consulted`
+lists them; `other_sheets_unreadable` names any that could not be read), so a
+child sheet annotated on its own never hands out a number the root owns.
+Duplicates that already exist across sheets are not detected or renumbered
+here; annotating a hierarchy from its root is tracked in #463.
+
+Numbering now follows eeschema's Tools → Annotate defaults, measured on
+eeschema 10.0.5 rather than assumed: ascending X per sheet instance, the first
+free number for a prefix (a gap between `R1` and `R3` is filled; before, the
+next number was always the maximum plus one), and `#`-prefixed designators
+spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
+`#PWR1`). Both places a designator lives are written.
+## Unreleased: `rotate_schematic_component` carries field text round (patch release)
+
+`rotate_schematic_component` wrote the symbol's new angle and nothing else.
+A field's `(at …)` is an absolute sheet coordinate, not an offset from the
+body, so Reference and Value stayed where the old orientation had put them:
+a `Device:LED` placed horizontally and then turned to 90° kept its designator
+2.54mm above the origin, which is the middle of the vertical body and the wire
+into its anode (#612).
+
+The turn now rotates each field's position about the symbol origin, so a
+symbol placed unrotated and turned afterwards ends up field-for-field
+identical to the same symbol placed at that angle outright — the placement
+path has transformed its anchors since #101. A reflected body turns its fields
+the opposite way, matching the rotate-then-mirror order a placement uses —
+counting axes, not the token's presence, so `(mirror xy)` (two reflections, a
+proper 180° turn) and `(mirror none)` turn the unreflected way.
+
+A field's stored *angle* is unchanged, and deliberately so: KiCad adds the
+symbol's rotation to it when drawing, so turning the angle here would draw the
+text at twice the angle.
+
+No argument and no response key changed. A caller that positioned a field by
+hand keeps that offset, carried round with the body rather than reset — the
+offset rotates, so its absolute coordinates change.
+`reset_schematic_field_positions` remains the only tool that discards a manual
+offset and puts fields back on their library anchors; it is also the repair
+for sheets a previous version left behind, and it already accounted for
+rotation.
+
+## Unreleased: `trace_from_point` reports pins and junctions (minor release)
+
+`trace_from_point`'s answer to "what is at this point" listed wires and labels
+only. A component pin and a junction dot at the same coordinate were omitted,
+and no `pins_here` or `junctions_here` key was present to be empty, so a caller
+could not tell the two had been skipped (#539).
+
+The response gains two arrays, always present:
+
+- `pins_here` — every placed pin at the point, each carrying `reference`,
+  `pin`, `pin_name`, `electrical_type`, `x` and `y`, spelled as
+  `find_orphan_items` already spells them. Pins stacked on one point are all
+  reported. Only the unit actually placed contributes, so a multi-unit symbol
+  never answers with another unit's pins.
+- `junctions_here` — every junction dot at the point, as `x`/`y`.
+
+`x`, `y`, `net`, `wires_here` and `labels_here` are unchanged in name, shape
+and content, and the `tolerance` argument governs the two new arrays exactly as
+it governs the existing ones. A caller that reads only the old keys is
+unaffected; one that treated the absence of `pins_here` as "no pin here" was
+reading a key that never existed.
+
+`tolerance` is now declared `exclusiveMinimum: 0` and refused with a structured
+`invalid_argument` when it is zero, negative or not a number — previously any
+value was accepted. `tolerance: -1` used to answer successfully with `net`
+named and all four `*_here` arrays empty: the net comes from the shared net
+graph, which resolves at its own fixed tolerance and never saw the argument, so
+the response asserted a net at a point it also reported as bare. The argument
+still does not reach `net`; what changes is that a value which can only produce
+empty evidence is no longer answered. `find_orphan_items` already refused the
+same input.
+
+Hierarchical sheet pins and no-connect flags can also sit on a point and are
+still not reported. The tool description now names the four kinds it does
+report, and says so, rather than promising "what is at that point" in the
+abstract.
+
 ## Unreleased: tool input schemas are enforced at dispatch (patch release)
 
 Konnect now compiles and caches every advertised Draft 2020-12 tool-input
@@ -81,26 +1414,50 @@ changes for any caller that set the address explicitly. Discovery still only
 ever runs at startup, so a server launched before KiCad stays unresolved for its
 lifetime — see `docs/TROUBLESHOOTING.md`.
 
-## Unreleased: `check_clearance` says what it measures (minor release)
+## Unreleased: `check_clearance` adds explicit courtyard spacing (minor release)
 
 `check_clearance` returned the straight-line distance between two footprints'
 placement anchors under a description that said "physical clearance". Read as
 copper-to-copper spacing, a `21.125` answer stood in for a courtyard gap of
 about 3 mm (#410). Footprint size and shape were never considered.
 
-Stage 1 changes nothing about the number and everything about what the
-response says it is:
+Stage 1 changed nothing about the number and everything about what the response
+says it is:
 
 - `measurement: "anchor_to_anchor"` and `anchor_distance_mm` are added; the
   latter is the value `distance_mm` carried.
 - `distance_mm` is kept, identical, as a **deprecated** alias, listed in a new
-  `deprecated_fields` array so a consumer can see it without reading prose. It
-  will be removed by the stage-2 PR that adds a real physical-spacing mode.
+  `deprecated_fields` array so a consumer can see it without reading prose.
 - `note` states in words that this is not pad, trace or courtyard clearance.
 - The tool description and the directory row no longer claim clearance, and
   point to `run_drc` for the question the old description implied.
 
-No argument changed. This is `Part of #410`; the terminal change is stage 2.
+Stage 2 adds an optional `mode` argument. The compatibility default remains
+`"anchor"`, so existing calls keep the same fields and number. The new
+`"courtyard"` mode returns:
+
+- `measurement: "courtyard_bbox_edge_to_edge"` and
+  `courtyard_clearance_mm`, measured between the axis-aligned board-space hulls
+  of the two transformed, authored courtyards;
+- `geometry1` / `geometry2`, including each measured bbox and footprint
+  rotation, plus `side1`, `side2`, and the actual `source` (`ipc` or
+  `saved_file`);
+- `overlaps: true` with a zero distance when the two same-side hulls overlap;
+  touching hulls have zero distance and `overlaps: false`;
+- a structured unavailable result when either authored courtyard is absent or
+  unreadable. Pad and anchor fallbacks are deliberately not substituted;
+- `reason_code: "opposite_board_sides"` and `applicable: false` for footprints
+  on opposite sides, rather than presenting their projected bboxes as a
+  placement collision.
+
+Both modes read a read-only IPC serialization when the requested board is open
+in KiCad and otherwise read the saved file. This remains a placement-spacing
+tool, not an electrical-clearance oracle: run `run_drc` for copper clearance.
+For non-cardinal footprint rotations, the reported bbox is the conservative
+axis-aligned hull of the rotated courtyard artwork.
+
+`distance_mm` remains available only in `anchor` mode as a deprecated alias;
+this additive release does not remove it. This terminal stage closes #410.
 
 ## Unreleased: `update_pcb_from_schematic` reports an unassigned footprint (minor release)
 
@@ -133,6 +1490,48 @@ Both additions are additive; `status`, `changes`, `diagnostics` and every
 existing count keep their names and meanings. No argument was renamed or
 removed.
 
+## Unreleased: IPC health responses say why KiCad did not answer (minor release)
+
+`check_kicad_ui` and `open_project` gain an `ipc_failure` field (#532). It is
+`{ "kind", "message" }` when a failure kind was established, where `kind` is
+one of `not_configured`, `no_listener`, `access_denied`, `handshake_failed`,
+`transport_error`, or `request_failed`. `request_failed` means the request
+did not complete and may have reached the endpoint: an explicit KiCad error
+status in `message` proves receipt, a receive timeout or malformed reply does
+not. `access_denied` means the operating system refused this account; it does
+not prove who owns the endpoint. Before this, every one of those
+surfaced only as `ipc_responsive: false` or `ipc_available: false`, so a KiCad
+that was listening but refused this account looked exactly like one that was
+closed.
+
+`ipc_failure: null` means **no failure kind was established**. That happens in
+two cases: the Ping succeeded with `AS_OK`, or `check_kicad_ui`'s own
+`timeout_seconds` deadline expired before the Ping finished. The second case
+still reports `timed_out: true`. A listener that accepts but never negotiates
+takes NNG's 10-second limit to report `handshake_failed`, longer than the
+default `timeout_seconds` of 5.
+
+No existing field was removed or renamed. Two existing values change wording:
+
+- `open_project`'s `message` for a KiCad that did not answer now depends on the
+  kind. Before, every unanswered call returned "KiCad IPC is not reachable.
+  Start KiCad and enable the IPC API, or work in file-only mode." That message
+  is kept for `not_configured`, `no_listener`, and `transport_error`. The other
+  three kinds return:
+  - `access_denied`: "The KiCad IPC endpoint refused this account, likely a
+    different account or a restrictive ACL; run Konnect as the same
+    operating-system user as KiCad. See ipc_failure."
+  - `handshake_failed`: "A listener at the KiCad IPC address did not complete
+    NNG's handshake, so it is probably not KiCad; see ipc_failure."
+  - `request_failed`: "The KiCad IPC request did not complete and may have
+    reached the endpoint; a KiCad status in ipc_failure proves receipt, and
+    KiCad may still be starting."
+- An IPC tool whose dial fails now says in its error text why the dial failed
+  ("Nothing is listening there…", "…it refused this account…", "…did not
+  complete NNG's handshake…"), instead of one sentence listing every possible
+  cause. Callers classifying these errors by type are unaffected. Callers
+  matching the old text must update.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and
@@ -158,6 +1557,26 @@ been established.
 
 No tool or argument was renamed or removed. The new error shape is an additive
 public response change and is planned for the next minor release.
+
+## Unreleased: `get_netclasses` names the patterns that fit no net (minor release)
+
+`get_netclasses` reported `orphan_patterns` — patterns naming a class that
+does not exist — but a pattern whose class exists and which fits no net on
+the board was invisible: the class simply governed nothing, and the caller
+had to subtract `matched_nets` from `patterns` by hand, which on a class with
+several patterns does not even say which one is idle. That is the usual trace
+of a renamed net, a pattern carried over from another board, or a glob that
+never fitted the net's real name.
+
+One additive response field, `unmatched_patterns`, lists those patterns in
+the shape of the project file (`{ "pattern", "netclass" }`), the same shape
+as `orphan_patterns`. A pattern is listed in one of the two, never both.
+The nets are the ones the tool already reads, so `board_source` applies.
+When they are unavailable the field is `null` rather than `[]`, because an empty list
+would claim every pattern matched; `nets_source` carries the reason, as
+before. The `sources` map gains a matching `unmatched_patterns` key:
+`"derived"` when the field was computed from `patterns` and `board_nets`,
+`"unavailable"` when it is `null`. Nothing is renamed or removed.
 
 ## Unreleased: mirrored schematic placement (minor release)
 
@@ -649,6 +2068,16 @@ pass `prefer` (use the native export when available, otherwise Rust) or
 `require` (refuse when the native bridge is unavailable). No tool or argument
 was removed.
 
+## Unreleased: JLCPCB CPL uses native pad-box midpoints
+
+JLCPCB assembly packages now require the requested board open in KiCad with IPC
+enabled. `Mid X`/`Mid Y` use the union of KiCad's native board-space pad boxes,
+then apply the existing correction policy. Board exports share one stable live
+snapshot without saving the editor. Missing pad geometry or concurrent edits
+refuse export before creating output. Other manufacturers and no-assembly
+exports are unchanged. Review legacy anchor-compensation offsets to avoid double
+correction; see [coordinates and evidence](JLCPCB_CPL_CORRECTIONS.md#matching-and-coordinates).
+
 ## Unreleased: JLCPCB manufacturing files use vendor-ready names and schema
 
 `export_manufacturing_package(fab_house="jlcpcb", include_assembly=true)` now
@@ -698,3 +2127,58 @@ identical without it.
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.
+
+## Unreleased: `flip_component` on an open board uses KiCad 10.0.6's native `FlipItems`
+
+`flip_component` previously refused unconditionally whenever KiCad was
+reachable, because the vendored IPC protocol had no footprint-flip command
+(#604). KiCad 10.0.6 added a native `FlipItems` command, so a board that is
+open live in KiCad **10.0.6 or newer** now flips through that command inside
+one KiCad undo transaction — the same transform the GUI's **F** key performs,
+including the footprint's 3D-model offset/rotation — and reports
+`"source": "ipc"`. Konnect never saves the board on this path.
+
+A reachable KiCad older than 10.0.6 (or any endpoint without the handler)
+answers `AS_UNHANDLED`; Konnect reports this as a structured
+`unsupported_capability` error naming the observed KiCad version and the
+10.0.6 requirement, rather than falling back to editing the file. A mutation
+that appears to succeed but whose fresh post-flip readback cannot confirm the
+result returns a distinct `mutation_outcome_uncertain` error instead of either
+success or a plain failure — inspect the board in KiCad and reconcile before
+retrying.
+
+The **closed-board** file fallback is unchanged and only reachable when no
+live KiCad holds the named board at all: it keeps refusing any footprint whose
+3D model carries a non-zero `offset.y`, `rotate.x`, or `rotate.y`, since
+reproducing KiCad's own 3D-model flip transform for that path remains out of
+scope. `flip_component`'s tool description and `BoardAccess` classification
+changed from "requires a closed board" to live-preferred-with-fallback to
+reflect this; existing closed-board callers are unaffected.
+
+## Unreleased: `add_net` is idempotent on legacy boards
+
+`add_net` now returns an existing legacy net's observed numeric ID without
+writing when the requested name is already declared. Its JSON response adds a
+`created` boolean so callers can distinguish a new insertion from an idempotent
+no-op. New declarations use the board's newline convention, canonical tab
+indentation, escaped S-expression text, and an ID one greater than the highest
+observed top-level declaration.
+
+KiCad 10 boards still refuse the operation before writing because they have no
+top-level numeric net table. That refusal is now the structured
+`unsupported_capability` kind. Create a KiCad 10 net by naming it on a pad or
+copper item instead.
+
+## Unreleased: `score_placement` discloses whether it scored a live or saved board (patch release)
+
+`score_placement` always read the saved `.kicad_pcb` file, even when KiCad held
+that exact board open live with unsaved moves or edits. A hard courtyard-overlap
+introduced by a live `move_component` could be entirely absent from the response
+with no error and no indication the answer was stale (#595).
+
+The tool now prefers the exact board's live IPC snapshot (via `SaveDocumentToString`,
+the same read-only mechanism `run_drc`'s `sync_live_board` uses) when KiCad has it
+open, falling back to the saved file otherwise. Scoring policy and every existing
+field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
+(matching `run_drc`'s own source-disclosure convention), so a caller can tell
+which board state was judged.

@@ -243,10 +243,36 @@ impl std::fmt::Display for IpcSelectionObservationError {
 
 impl std::error::Error for IpcSelectionObservationError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,
     pub y: f64,
+}
+
+/// One copper-layer shape from a KiCad pad stack.
+///
+/// `layer` is the native KiCad layer name.  A normal stack may expose one
+/// representative copper entry while `IpcPad::layers` still names every layer
+/// on which the pad exists. Front/inner/back stacks retain every distinct
+/// entry here; custom shapes are identified as `custom` rather than reduced to
+/// a guessed ordinary outline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcPadLayerGeometry {
+    pub layer: String,
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub offset: Option<IpcVector2>,
+    pub corner_rounding_ratio: Option<f64>,
+    pub chamfer_ratio: Option<f64>,
+}
+
+/// Native drill information for a pad, when it has a drilled hole.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcPadDrill {
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub start_layer: Option<String>,
+    pub end_layer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +292,9 @@ pub struct IpcFootprint {
 /// so no anchor or rotation transform is applied on the way out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcPad {
+    /// Stable KiCad item identifier, or `None` when the source did not carry
+    /// one.  Never synthesize an identifier for a pad that KiCad did not name.
+    pub uuid: Option<String>,
     pub number: String,
     pub x: f64,
     pub y: f64,
@@ -273,6 +302,20 @@ pub struct IpcPad {
     pub net: String,
     /// KiCad layer names from the live pad stack.
     pub layers: Vec<String>,
+    /// Native KiCad pad type (`smd`, `thru_hole`, `np_thru_hole`, or
+    /// `edge_connector`), or `None` for an unknown future type.
+    pub pad_type: Option<String>,
+    /// Effective pad-stack rotation in board space, in degrees.
+    pub rotation_deg: Option<f64>,
+    /// Compact geometry for ordinary pads.  These mirror the first copper
+    /// entry; callers needing custom/front-inner-back detail use
+    /// `copper_layers` instead.
+    pub shape: Option<String>,
+    pub size: Option<IpcVector2>,
+    pub drill: Option<IpcPadDrill>,
+    /// Every copper geometry entry KiCad supplied.  This prevents custom and
+    /// front/inner/back pad stacks from being flattened into a guessed shape.
+    pub copper_layers: Vec<IpcPadLayerGeometry>,
 }
 
 /// The document's title block, which the board file also carries.
@@ -483,6 +526,11 @@ pub struct IpcLayer {
     pub name: String,
     pub id: i32,
     pub kind: String,
+    /// The name KiCad shows for the layer, which the user may have renamed.
+    /// `None` when the enabled set was read without asking for it — an empty
+    /// string is a name KiCad could have answered with, so absence needs its
+    /// own spelling.
+    pub display_name: Option<String>,
 }
 
 /// The enabled layer set as KiCad reports it.
@@ -496,10 +544,107 @@ pub struct IpcEnabledLayers {
     pub layers: Vec<IpcLayer>,
 }
 
+/// A board's physical stackup, as KiCad's `GetBoardStackup` serves it.
+///
+/// KiCad answers with the board's own stackup, or with its default one when
+/// the board defines none (`BOARD::GetStackupOrDefault`), and the message does
+/// not say which. Values KiCad marks "Not specified" are kept as it sends them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcBoardStackup {
+    /// The copper finish KiCad names, e.g. "ENIG"; empty or "Not specified"
+    /// when the board names none.
+    pub finish: String,
+    pub impedance_controlled: bool,
+    /// "none", "plain", "beveled" or "unknown".
+    pub edge_connector: String,
+    pub has_edge_plating: bool,
+    /// Top to bottom, in KiCad's order.
+    pub layers: Vec<IpcStackupLayer>,
+}
+
+/// One entry of a physical stackup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcStackupLayer {
+    /// KiCad's canonical layer name, e.g. "F.Cu" or "F.Mask". `None` for a
+    /// dielectric, which is not a board layer of its own.
+    pub layer: Option<String>,
+    /// The name the board gives the layer, when KiCad reports one.
+    pub user_name: Option<String>,
+    /// "copper", "dielectric", "soldermask", "silkscreen", "solderpaste" or
+    /// "undefined".
+    pub kind: String,
+    pub enabled: bool,
+    /// The entry's thickness in nanometres. A dielectric's own value is its
+    /// first sub-layer's; `dielectric` carries every sub-layer.
+    pub thickness_nm: i64,
+    /// Empty when KiCad reports none. A dielectric's materials are per
+    /// sub-layer, in `dielectric`.
+    pub material: String,
+    /// `#RRGGBBAA`, only when the board specifies a color.
+    pub color: Option<String>,
+    /// "core", "prepreg", "none", or "unknown" for a value this crate does not
+    /// know, for a dielectric.
+    pub dielectric_type: Option<String>,
+    /// A dielectric's physical sub-layers, top to bottom.
+    pub dielectric: Vec<IpcStackupDielectric>,
+    /// A solder mask's relative permittivity.
+    pub epsilon_r: Option<f64>,
+    /// A solder mask's loss tangent.
+    pub loss_tangent: Option<f64>,
+}
+
+/// One physical sub-layer of a dielectric slot. A slot between two copper
+/// layers can be built from several.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcStackupDielectric {
+    pub thickness_nm: i64,
+    pub material: String,
+    pub epsilon_r: f64,
+    pub loss_tangent: f64,
+    pub thickness_locked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcBoardExtents {
     pub min: IpcVector2,
     pub max: IpcVector2,
+}
+
+/// What [`crate::client::KiCadIpcClient::get_board_bounds_in`] measured on a
+/// live board.
+#[derive(Debug, Clone)]
+pub struct IpcBoardBounds {
+    /// The union of every item's box; `None` only for a board with no items.
+    pub extents: Option<IpcBoardExtents>,
+    /// How many items of each class KiCad listed and measured, by the name a
+    /// response reports the class under. Classes with no items are absent.
+    pub measured: std::collections::BTreeMap<String, usize>,
+    /// Items KiCad listed under a KIID it had already listed. Each KIID is
+    /// measured once, so these have no box of their own.
+    pub shared_kiid_count: usize,
+    /// Board item classes whose items are not in `extents`, because KiCad
+    /// would not list them or listed them in a form this protocol cannot read.
+    pub unavailable: Vec<IpcUnavailableItemClass>,
+}
+
+/// A class of board items a live bounds read could not measure, and why. A
+/// class is named here rather than left out, so an answer never reads as
+/// complete when it is not (#688).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcUnavailableItemClass {
+    /// The class, by the name a response reports it under (`tables`).
+    pub class: String,
+    pub reason: UnavailableReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// KiCad declined to list the class. KiCad 10.0.5 answers `GetItems` for
+    /// tables and generators with `AS_BAD_REQUEST`.
+    Refused { status: String, message: String },
+    /// KiCad listed items of a class the bundled protocol has no message for,
+    /// so their KIIDs cannot be read to measure them.
+    Undecodable { listed_count: usize },
 }
 
 /// Footprint-local placement of the Reference and Value text fields, read
@@ -512,4 +657,119 @@ pub struct IpcFieldPlacement {
     pub reference_at: Option<(f64, f64, f64)>,
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
     pub value_at: Option<(f64, f64, f64)>,
+}
+
+/// A three-component value as KiCad's `Vector3D` message carries it.
+///
+/// The enclosing field names the quantity and unit. KiCad reuses this wire
+/// shape for unitless scale, rotation in degrees, and offset in millimetres,
+/// so a bare vector must never be exposed without that context.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IpcVector3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+/// A footprint's associated 3D model, as read back from a placed instance.
+/// `flip_footprint` reports these so a caller can independently confirm the
+/// model transform native `FlipItems` applied, without Konnect reimplementing
+/// KiCad's own 3D-model flip math.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprint3DModel {
+    pub filename: String,
+    /// Footprint-local model offset in millimetres.
+    pub offset_mm: IpcVector3,
+    /// Model rotation around each axis in degrees.
+    pub rotation_degrees: IpcVector3,
+    /// Unitless model scale along each axis.
+    pub scale: IpcVector3,
+    pub visible: bool,
+    pub opacity: f64,
+}
+
+/// One exact live footprint and the ordered 3D-model entries KiCad returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprint3DModelSnapshot {
+    pub reference: String,
+    pub kiid: String,
+    pub models: Vec<IpcFootprint3DModel>,
+}
+
+/// A bounded edit to the ordered 3D-model entries on one placed footprint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprint3DModelEdit {
+    Append {
+        model: IpcFootprint3DModel,
+    },
+    Replace {
+        index: usize,
+        model: IpcFootprint3DModel,
+    },
+    Remove {
+        index: usize,
+    },
+}
+
+/// Readback-derived result of editing a placed footprint's 3D-model entries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprint3DModelEditOutcome {
+    Conflict {
+        expected: IpcFootprint3DModelSnapshot,
+        observed: IpcFootprint3DModelSnapshot,
+    },
+    Applied {
+        before: IpcFootprint3DModelSnapshot,
+        after: IpcFootprint3DModelSnapshot,
+        changed: bool,
+    },
+    Uncertain {
+        reference: String,
+        kiid: String,
+        expected_models: Vec<IpcFootprint3DModel>,
+        observed_models: Option<Vec<IpcFootprint3DModel>>,
+        reason: String,
+    },
+}
+
+/// The result of a `flip_footprint` call against a live KiCad IPC session.
+///
+/// Three outcomes, not two (accepted contract for issue #604): a definite
+/// success (`Flipped`), authoritative evidence that this KiCad build has no
+/// native `FlipItems` handler (`Unsupported`), and a distinct "reconcile
+/// before retrying" state for when the mutation looked like it went through
+/// but a fresh readback could not confirm it (`Uncertain`). A hard failure
+/// (footprint not found, wrong KIID/type, a non-`ISC_OK` per-item status, or
+/// any other rejected request) is not represented here — it is returned as
+/// `Err` and classified by the caller's normal IPC-failure handling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFlipOutcome {
+    /// KiCad flipped the footprint (or it already sat on the requested
+    /// layer, in which case no `FlipItems` call was made at all) and a fresh
+    /// readback — never the mutation response — independently confirmed the
+    /// requested layer and the footprint's identity.
+    Flipped {
+        reference: String,
+        kiid: String,
+        previous_layer: String,
+        layer: String,
+        already_on_layer: bool,
+        models: Vec<IpcFootprint3DModel>,
+    },
+    /// KiCad answered `AS_UNHANDLED`/`AS_UNIMPLEMENTED` for `FlipItems`,
+    /// which the 10.0.6 protocol treats as authoritative capability
+    /// evidence. Never inferred from a version string.
+    Unsupported {
+        kicad_version: Option<IpcKiCadVersion>,
+    },
+    /// The mutation appeared to succeed, but a fresh post-flip readback
+    /// disagreed with it or could not be resolved. The board may or may not
+    /// have changed; the caller must reconcile before retrying rather than
+    /// reporting either success or failure.
+    Uncertain {
+        reference: String,
+        kiid: String,
+        requested_layer: String,
+        reason: String,
+    },
 }

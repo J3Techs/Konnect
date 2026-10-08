@@ -9,6 +9,9 @@
 
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
+use konnect_ipc::types::{
+    IpcFootprint3DModel, IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome, IpcVector3,
+};
 use konnect_ipc::KiCadIpcClient;
 use nng::options::Options;
 use prost::Message;
@@ -86,6 +89,17 @@ fn reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
     }
 }
 
+fn error_response(message: &str) -> kiapi::common::ApiResponse {
+    kiapi::common::ApiResponse {
+        status: Some(kiapi::common::ApiResponseStatus {
+            status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+            error_message: message.to_string(),
+        }),
+        header: None,
+        message: None,
+    }
+}
+
 fn mk_field(name: &str, text: &str, x_mm: f64, y_mm: f64) -> kiapi::board::types::Field {
     kiapi::board::types::Field {
         name: name.to_string(),
@@ -115,10 +129,31 @@ fn mk_pad(x_mm: f64, y_mm: f64) -> prost_types::Any {
     )
 }
 
+fn mk_model(filename: &str) -> prost_types::Any {
+    builders::pack_any(
+        &kiapi::board::types::Footprint3DModel {
+            filename: filename.to_string(),
+            scale: Some(kiapi::common::types::Vector3D {
+                x_nm: 1.0,
+                y_nm: 1.0,
+                z_nm: 1.0,
+            }),
+            rotation: Some(Default::default()),
+            offset: Some(Default::default()),
+            visible: true,
+            opacity: 1.0,
+        },
+        "kiapi.board.types.Footprint3DModel",
+    )
+}
+
 /// An R1 footprint anchored at (100,100) with two pads, a silk segment, and
 /// a reference field, all in absolute board coordinates like KiCAD sends.
 fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
     kiapi::board::types::FootprintInstance {
+        id: Some(kiapi::common::types::Kiid {
+            value: "r1-kiid".to_string(),
+        }),
         position: Some(builders::vec2(100.0, 100.0)),
         orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
         reference_field: Some(mk_field("Reference", "R1", 100.0, 98.0)),
@@ -130,6 +165,7 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
                     &builders::board_segment("F.SilkS", 0.12, 99.5, 99.0, 100.5, 99.0),
                     "kiapi.board.types.BoardGraphicShape",
                 ),
+                mk_model("original.step"),
             ],
             ..Default::default()
         }),
@@ -139,6 +175,13 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
 
 type CapturedUpdate = Arc<Mutex<Option<kiapi::common::commands::UpdateItems>>>;
 
+#[derive(Clone, Copy)]
+enum UpdateBehavior {
+    Apply,
+    Reject,
+    Ignore,
+}
+
 /// Mock KiCAD serving `fp` for GetItems and recording the UpdateItems it
 /// receives.
 fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKicad, CapturedUpdate) {
@@ -147,6 +190,13 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
 
 fn spawn_footprints_mock(
     footprints: Vec<kiapi::board::types::FootprintInstance>,
+) -> (MockKicad, CapturedUpdate) {
+    spawn_footprints_mock_with_behavior(footprints, UpdateBehavior::Apply)
+}
+
+fn spawn_footprints_mock_with_behavior(
+    footprints: Vec<kiapi::board::types::FootprintInstance>,
+    behavior: UpdateBehavior,
 ) -> (MockKicad, CapturedUpdate) {
     let captured: CapturedUpdate = Arc::new(Mutex::new(None));
     let captured_in_mock = captured.clone();
@@ -208,6 +258,10 @@ fn spawn_footprints_mock(
         } else if msg.type_url.ends_with("UpdateItems") {
             let update =
                 kiapi::common::commands::UpdateItems::decode(msg.value.as_slice()).unwrap();
+            *captured_in_mock.lock().unwrap() = Some(update.clone());
+            if matches!(behavior, UpdateBehavior::Reject) {
+                return Some(error_response("mock rejected parent-footprint update"));
+            }
             let updated_items = update
                 .items
                 .iter()
@@ -220,7 +274,7 @@ fn spawn_footprints_mock(
                     item: Some(item),
                 })
                 .collect();
-            {
+            if matches!(behavior, UpdateBehavior::Apply) {
                 // Keep the mock stateful: a later GetItems must observe what
                 // UpdateItems wrote (the pad-readback test relies on it), and
                 // a batch update replaces every matching footprint.
@@ -238,7 +292,6 @@ fn spawn_footprints_mock(
                     }
                 }
             }
-            *captured_in_mock.lock().unwrap() = Some(update);
             Some(reply_with(builders::pack_any(
                 &kiapi::common::commands::UpdateItemsResponse {
                     header: None,
@@ -444,6 +497,201 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
         .collect();
     assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
+}
+
+fn added_model() -> IpcFootprint3DModel {
+    IpcFootprint3DModel {
+        filename: "added.step".to_string(),
+        offset_mm: IpcVector3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        rotation_degrees: IpcVector3 {
+            x: 10.0,
+            y: 20.0,
+            z: 30.0,
+        },
+        scale: IpcVector3 {
+            x: 0.5,
+            y: 1.5,
+            z: 2.0,
+        },
+        visible: false,
+        opacity: 0.4,
+    }
+}
+
+fn model_document(client: &KiCadIpcClient) -> kiapi::common::types::DocumentSpecifier {
+    client
+        .find_open_board(&std::path::PathBuf::from(mock_project_dir()).join("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb")
+}
+
+#[test]
+fn placed_model_append_updates_the_complete_parent_and_confirms_readback() {
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = model_document(&client);
+    let before = client
+        .footprint_3d_model_snapshot_in(document.clone(), "R1")
+        .unwrap();
+    let outcome = client
+        .edit_footprint_3d_models_in(
+            document,
+            "R1",
+            before.clone(),
+            IpcFootprint3DModelEdit::Append {
+                model: added_model(),
+            },
+        )
+        .unwrap();
+    let IpcFootprint3DModelEditOutcome::Applied { after, changed, .. } = outcome else {
+        panic!("expected confirmed apply, got {outcome:?}");
+    };
+    assert!(changed);
+    assert_eq!(after.models.len(), 2);
+    assert_eq!(after.models[0], before.models[0]);
+    assert_eq!(after.models[1], added_model());
+
+    let update = captured.lock().unwrap().take().expect("UpdateItems sent");
+    assert_eq!(update.items.len(), 1);
+    let sent =
+        kiapi::board::types::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+    let items = &sent.definition.unwrap().items;
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.type_url.ends_with("Footprint3DModel"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.type_url.ends_with("Pad"))
+            .count(),
+        2,
+        "unrelated nested footprint data must survive"
+    );
+}
+
+#[test]
+fn changed_precondition_returns_conflict_without_opening_a_commit() {
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = model_document(&client);
+    let mut stale = client
+        .footprint_3d_model_snapshot_in(document.clone(), "R1")
+        .unwrap();
+    stale.models[0].filename = "stale.step".to_string();
+    let outcome = client
+        .edit_footprint_3d_models_in(
+            document,
+            "R1",
+            stale,
+            IpcFootprint3DModelEdit::Append {
+                model: added_model(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        IpcFootprint3DModelEditOutcome::Conflict { .. }
+    ));
+    assert!(captured.lock().unwrap().is_none());
+}
+
+#[test]
+fn rejected_update_is_an_error_when_readback_proves_no_change() {
+    let (mock, _) =
+        spawn_footprints_mock_with_behavior(vec![mk_footprint_r1()], UpdateBehavior::Reject);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = model_document(&client);
+    let before = client
+        .footprint_3d_model_snapshot_in(document.clone(), "R1")
+        .unwrap();
+    let error = client
+        .edit_footprint_3d_models_in(
+            document,
+            "R1",
+            before,
+            IpcFootprint3DModelEdit::Append {
+                model: added_model(),
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("fresh readback confirmed the footprint is unchanged"));
+}
+
+#[test]
+fn accepted_update_without_matching_readback_is_uncertain() {
+    let (mock, _) =
+        spawn_footprints_mock_with_behavior(vec![mk_footprint_r1()], UpdateBehavior::Ignore);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = model_document(&client);
+    let before = client
+        .footprint_3d_model_snapshot_in(document.clone(), "R1")
+        .unwrap();
+    let outcome = client
+        .edit_footprint_3d_models_in(
+            document,
+            "R1",
+            before,
+            IpcFootprint3DModelEdit::Append {
+                model: added_model(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        IpcFootprint3DModelEditOutcome::Uncertain { .. }
+    ));
+}
+
+#[test]
+fn model_target_must_be_present_and_unique() {
+    let (missing_mock, _) = spawn_footprints_mock(vec![]);
+    let missing_client = KiCadIpcClient::new(&missing_mock.url);
+    let missing_document = model_document(&missing_client);
+    let missing = missing_client
+        .footprint_3d_model_snapshot_in(missing_document, "R1")
+        .unwrap_err();
+    assert!(matches!(
+        missing.downcast_ref::<konnect_ipc::client::FootprintTargetError>(),
+        Some(konnect_ipc::client::FootprintTargetError::Missing { .. })
+    ));
+
+    let (ambiguous_mock, _) = spawn_footprints_mock(vec![mk_footprint_r1(), mk_footprint_r1()]);
+    let ambiguous_client = KiCadIpcClient::new(&ambiguous_mock.url);
+    let ambiguous_document = model_document(&ambiguous_client);
+    let ambiguous = ambiguous_client
+        .footprint_3d_model_snapshot_in(ambiguous_document, "R1")
+        .unwrap_err();
+    assert!(matches!(
+        ambiguous.downcast_ref::<konnect_ipc::client::FootprintTargetError>(),
+        Some(konnect_ipc::client::FootprintTargetError::Ambiguous { matches: 2, .. })
+    ));
+}
+
+#[test]
+fn out_of_range_model_index_is_refused_before_update() {
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = model_document(&client);
+    let before = client
+        .footprint_3d_model_snapshot_in(document.clone(), "R1")
+        .unwrap();
+    let error = client
+        .edit_footprint_3d_models_in(
+            document,
+            "R1",
+            before,
+            IpcFootprint3DModelEdit::Remove { index: 3 },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("out of range"));
+    assert!(captured.lock().unwrap().is_none());
 }
 
 /// Absolute on the platform running the test — a POSIX-rooted path is not

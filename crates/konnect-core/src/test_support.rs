@@ -23,11 +23,25 @@ impl MockIpcServer {
     ) -> Self {
         static NEXT_SERVER: AtomicU64 = AtomicU64::new(0);
         let sequence = NEXT_SERVER.fetch_add(1, Ordering::Relaxed);
-        let address = format!(
-            "inproc://konnect-core-{}-{sequence}-{purpose}",
-            std::process::id()
-        );
+        Self::spawn_at(
+            format!(
+                "inproc://konnect-core-{}-{sequence}-{purpose}",
+                std::process::id()
+            ),
+            respond,
+        )
+    }
 
+    /// As [`Self::spawn`], on an endpoint the caller names.
+    ///
+    /// Lets one test replace the KiCad behind a *running* server without
+    /// rebuilding it — the only way to exercise a session whose editor changes
+    /// under it, since the endpoint is fixed when the server is configured.
+    /// The previous guard must be dropped first; it releases the name.
+    pub(crate) fn spawn_at(
+        address: String,
+        respond: impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static,
+    ) -> Self {
         let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
         socket
             .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))

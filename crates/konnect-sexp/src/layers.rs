@@ -32,14 +32,21 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Copper is decided by the canonical name, not by `kind`.
-    ///
-    /// KiCad marks copper with four different kinds (`signal`, `power`,
-    /// `mixed`, `jumper`) and a board that uses `power` for a plane would be
-    /// undercounted by a kind allow-list. The `.Cu` suffix is the invariant.
+    /// Copper is decided by the canonical name, not by `kind`. See
+    /// [`is_copper_name`].
     pub fn is_copper(&self) -> bool {
-        self.name.ends_with(".Cu")
+        is_copper_name(&self.name)
     }
+}
+
+/// Is this canonical layer name a copper layer?
+///
+/// KiCad marks copper with four different kinds (`signal`, `power`, `mixed`,
+/// `jumper`) and a board that uses `power` for a plane would be undercounted
+/// by a kind allow-list. The `.Cu` suffix is the invariant — which is why this
+/// takes a name: a layer read over KiCad's IPC API has no kind at all.
+pub fn is_copper_name(name: &str) -> bool {
+    name.ends_with(".Cu")
 }
 
 /// Read the stackup from a parsed board. Empty if there is no `(layers …)`.

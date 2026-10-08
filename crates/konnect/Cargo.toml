@@ -38,4 +38,5 @@ fs4.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
+serde_yaml_ng = "0.10"
 tempfile = "3"

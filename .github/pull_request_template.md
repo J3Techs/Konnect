@@ -12,6 +12,18 @@ Issue: #
 
 <!-- Explain the root cause, design, and important alternatives or trade-offs. -->
 
+### Architectural fit
+
+<!--
+Does this change extend an existing KiCad capability or shared Konnect module?
+If it introduces a workaround or duplicates behavior, explain why and when it
+can be retired. Keep the answer short; documentation-only changes may say N/A.
+See architectural coordination tracker #590. This is a design review signal,
+not a requirement to migrate unrelated legacy behavior.
+For scope expansion, identify the smallest fix and explicit exclusions under
+GOVERNANCE.md#proportionate-scope-review; a short answer is sufficient.
+-->
+
 ## Branch and dependencies
 
 <!--
@@ -63,9 +75,13 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 
 - [ ] The diff is focused and contains no generated output, personal data, or unrelated cleanup.
 - [ ] The branch includes current `upstream/main`, has no merge conflicts, and CI passed on this exact head.
+- [ ] For a fork PR, maintainer edits are enabled, or the author accepts
+  responsibility for the final current-main refresh.
 - [ ] The branch was based on latest `upstream/main`, not a release tag (unless this is an approved backport).
 - [ ] The PR shows only its unique commits and diff; dependencies and series position are explicit.
-- [ ] Every review conversation is resolved; any post-review push or base change has been reviewed again on the new exact head.
+- [ ] Every review conversation is resolved; any post-review push or base refresh
+  has been reviewed on the new exact head. An unchanged unique diff may use a
+  focused refresh review; changed behavior received substantive re-review.
 - [ ] New names follow `docs/NAMING_CONVENTIONS.md`; public renames include compatibility handling.
 - [ ] New behavior and failure paths have regression coverage.
 - [ ] File mutations are atomic and preserve unrelated content.
@@ -78,6 +94,10 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 
 - [ ] The PR has exactly one current `status:*` workflow label.
 - [ ] `status:ready-to-merge` applies to this exact head SHA.
+- [ ] The completed review is recorded; only stale automatic CODEOWNERS requests
+  were cleared under the review-request workflow (manual requests remain open).
 - [ ] All required checks and review conversations satisfy the `main` ruleset.
+- [ ] Merge authorization is established: standing authorization applies to a
+  `@mixelpixx`/`@neusse` PR, or explicit authorization names this exact head.
 - [ ] Auto-merge uses a merge commit, or an already-green PR will be merged with `gh pr merge N --merge`.
 - [ ] Terminal issue closure and the next PR to promote are identified.

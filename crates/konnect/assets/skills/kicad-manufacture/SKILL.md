@@ -96,6 +96,13 @@ Pass `schematic` when assembly output requires a BOM. The tool attempts Gerber,
 drill, position, and BOM exports according to the request; individual failures
 can still leave a partial directory.
 
+For JLCPCB assembly, open the exact target board with IPC enabled before export.
+The package uses a stable live board snapshot and native pad-box midpoints;
+`placement_orientation.geometry` records the observed source. Saved project
+settings and schematic BOM remain separate inputs. Review legacy position
+offsets that compensated for anchors before retaining them. Read
+`docs/JLCPCB_CPL_CORRECTIONS.md` for coordinates, refusals, and migration details.
+
 For `fab_house="jlcpcb"`, use millimetres (the default) and provide the BOM
 fields, labels, and grouping required by the current order contract. The tool
 emits `BOM-<project>.csv` plus `CPL-<project>.csv`; the CPL uses JLCPCB's

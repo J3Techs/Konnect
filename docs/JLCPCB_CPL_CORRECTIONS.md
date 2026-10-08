@@ -44,6 +44,31 @@ overrides, empty IDs, and non-finite correction values fail the export.
 
 ## Matching and coordinates
 
+JLCPCB assembly export requires the exact board open in KiCad with IPC enabled.
+Konnect asks KiCad for each pad's native axis-aligned bounding box in board
+coordinates and uses the centre of their union, not the footprint anchor or a
+rotated local bounding box. A footprint with no pads uses its observed anchor
+and reports `no_pads_observed_anchor`. Missing geometry or a board change during
+the reads refuses export before output creation; no anchor fallback is guessed.
+
+Footprints excluded from position files (`exclude_from_pos_files`) and DNP
+footprints are skipped during midpoint collection, matching the CPL export's
+selection. Excluded artwork may share placeholder references such as `REF**`
+without blocking assembly export, whether or not it has pads. Duplicate
+references on position-included, populated footprints still refuse export;
+excluding a footprint from the BOM alone does not exclude it from the CPL.
+
+Gerbers, drills, enabled-layer selection, and CPL positions use the same captured
+live board snapshot, including unsaved board edits. The original board is not
+saved or modified. Project settings and the schematic BOM still come from their
+saved files. Other manufacturers and exports without assembly retain saved-file
+behavior. Direct `export_position_file` remains KiCad's anchor-based export.
+
+Midpoint conversion precedes correction-policy offsets. Review old offsets that
+compensated for anchor-based positions: retaining them can double-correct the
+new midpoint. Konnect preserves explicit user policies rather than guessing
+which offsets are obsolete. Model-specific offsets can still be necessary.
+
 Konnect strips a KiCad library prefix such as `Package_SO:` before matching
 `footprint_prefix`. Matching is case-sensitive. Precedence is deterministic:
 
@@ -66,6 +91,8 @@ project.
 
 The tool response contains:
 
+- `geometry`: observed anchor, native pad-box midpoint, and algorithm for every
+  exported designator; these are separate from the policy correction evidence;
 - `applied_corrections`: designator, footprint, side, policy/rule IDs, and the
   position and rotation before and after the correction;
 - `unmatched_footprints`: every exported component for which no rule matched;

@@ -1,6 +1,7 @@
 //! Read-only runtime and installation provenance for the serving process.
 
 use crate::config_resolution::{ConfigResolution, SEARCH_POLICY};
+use crate::guidance::GuidanceProbe;
 use crate::tools::ServerConfig;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -11,9 +12,13 @@ use tokio::process::Command;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const PCM_IDENTIFIER: &str = "com.github.mixelpixx.konnect";
 
-pub(crate) async fn collect(config: &ServerConfig, resolution: &ConfigResolution) -> Value {
+pub(crate) async fn collect(
+    config: &ServerConfig,
+    resolution: &ConfigResolution,
+    guidance: Option<&dyn GuidanceProbe>,
+) -> Value {
     let running_version = env!("CARGO_PKG_VERSION");
-    let executable_path = std::env::current_exe().ok();
+    let executable_path = installed_executable_path().ok();
     let installation = executable_path
         .as_deref()
         .map(classify_installation)
@@ -75,6 +80,7 @@ pub(crate) async fn collect(config: &ServerConfig, resolution: &ConfigResolution
             "endpoint": ipc_endpoint,
         },
         "configuration": configuration_block(resolution),
+        "guidance": guidance_block(guidance),
         "restart_guidance": restart_guidance(installation.name, newer_than_running),
     })
 }
@@ -96,6 +102,18 @@ fn configuration_block(resolution: &ConfigResolution) -> Value {
             .map(|path| display_path(path.as_path()))
             .collect::<Vec<_>>(),
     })
+}
+
+/// Installed guidance compared with the bundle this binary carries (#728).
+/// Read-only: a process without a probe says so rather than guessing.
+fn guidance_block(guidance: Option<&dyn GuidanceProbe>) -> Value {
+    match guidance {
+        Some(probe) => probe.detail(),
+        None => json!({
+            "probe_status": "not_available",
+            "reason": "This process does not carry the guidance bundle (embedded or library use); run `konnect status` from the standalone binary.",
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -228,6 +246,26 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
     }
 }
 
+/// The path the serving binary is installed at. On Linux `current_exe()` reads
+/// `/proc/self/exe`, which gains a ` (deleted)` suffix once an update replaces
+/// the file; the installed path, now holding the update, is the link without it.
+pub(crate) fn installed_executable_path() -> std::io::Result<PathBuf> {
+    let path = std::env::current_exe()?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let path = without_deleted_suffix(path);
+    Ok(path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn without_deleted_suffix(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    match path.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        // A file really named "... (deleted)" keeps its name.
+        Some(installed) if !path.exists() => PathBuf::from(std::ffi::OsStr::from_bytes(installed)),
+        _ => path,
+    }
+}
+
 /// Probe a Konnect executable for the version it reports. Reload validation
 /// uses the same parser and timeout as installation diagnostics so the two
 /// paths cannot disagree about whether a candidate is runnable.
@@ -324,6 +362,50 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DetailProbe;
+
+    impl GuidanceProbe for DetailProbe {
+        fn detail(&self) -> Value {
+            json!({"probe_status": "ok", "claude": {"state": "out_of_sync"}})
+        }
+
+        fn take_notice(&self) -> Option<String> {
+            unreachable!("get_installation_info must not consume the initialize notice")
+        }
+    }
+
+    #[test]
+    fn guidance_block_is_the_probe_detail_or_says_it_is_unavailable() {
+        assert_eq!(
+            guidance_block(Some(&DetailProbe)),
+            json!({"probe_status": "ok", "claude": {"state": "out_of_sync"}})
+        );
+        let absent = guidance_block(None);
+        assert_eq!(absent["probe_status"], "not_available");
+        assert!(absent["reason"]
+            .as_str()
+            .unwrap()
+            .contains("konnect status"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn only_a_missing_path_loses_the_deleted_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_path = temp.path().join("konnect (deleted)");
+        std::fs::write(&real_path, b"").unwrap();
+        assert_eq!(without_deleted_suffix(real_path.clone()), real_path);
+
+        let unlinked_path = temp.path().join("gone (deleted)");
+        assert_eq!(
+            without_deleted_suffix(unlinked_path),
+            temp.path().join("gone")
+        );
+
+        let missing_path = temp.path().join("missing");
+        assert_eq!(without_deleted_suffix(missing_path.clone()), missing_path);
+    }
 
     #[test]
     fn verified_pcm_manifest_is_required_for_pcm_classification() {

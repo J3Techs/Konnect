@@ -1,7 +1,8 @@
-//! `sch_hierarchy` toolset — sheet object lifecycle (PR-A) plus sheet pin
-//! lifecycle (PR-B): add, edit, move, delete, duplicate a sheet; recursive
-//! hierarchy/page-numbering queries; import/add/edit/delete sheet pins and a
-//! read-only pin/label sync check.
+//! `sch_hierarchy` toolset — sheet files, sheet object lifecycle (PR-A) plus
+//! sheet pin lifecycle (PR-B): create a schematic file and set its page size;
+//! add, edit, move, delete, duplicate a sheet; recursive hierarchy/page-numbering
+//! queries; import/add/edit/delete sheet pins and a read-only pin/label sync
+//! check.
 //!
 //! Every handler here is file-editing only — KiCAD's own IPC API has no
 //! schematic-editing commands upstream (`schematic_commands.proto` is empty),
@@ -10,21 +11,74 @@
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_positive_f64, opt_str, project_name_for, require_f64, require_str,
-    ToolContext, ToolDef,
+    get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, project_name_for, require_f64,
+    require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use konnect_sexp::{
     commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
     FileTransition, ItemAnchor, ItemId, SchematicCommand,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        tool!(
+            "create_schematic",
+            "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
+             size is given. Use set_schematic_page to change it later.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'USLetter' (default 'A4')",
+                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
+                                 "A", "B", "C", "D", "E",
+                                 "USLetter", "USLegal", "USLedger"],
+                        "default": "A4"
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
+                },
+                "required": ["path"]
+            }),
+            |args, ctx| async move { handle_create_schematic(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_page",
+            "Set the sheet's paper size (A0-A5, A-E, USLetter, USLegal, USLedger) and \
+             orientation. Content outside the frame still exports and still nets up, so a \
+             too-small page is a silent defect — check the layout extents against the size.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'A2', 'USLetter'",
+                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
+                                 "A", "B", "C", "D", "E",
+                                 "USLetter", "USLegal", "USLedger"]
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
+                },
+                "required": ["schematic", "size"]
+            }),
+            |args, ctx| async move { handle_set_page(args, ctx).await }
+        ),
         tool!(
             "add_hierarchical_sheet",
             "Insert a hierarchical sheet into a parent schematic, linking it to a child \
@@ -163,7 +217,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_name": { "type": "string" },
-                    "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" }
+                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": "Which edge to place new pins on; new pins stack down a left/right edge and along a top/bottom one, below the pins already on that edge. Sets each pin's rotation, which is what KiCad reads the edge from. An import that would not fit on the named edge is refused entire and writes nothing, because KiCad clamps a pin placed past a corner back onto the box. Default: 'right'" }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -173,7 +227,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_sheet_pin",
             "Manually add a single pin to an existing sheet block. Prefer import_sheet_pins \
              for the common case; use this when a hierarchical_label hasn't been written yet \
-             or a pin needs to exist ahead of the label.",
+             or a pin needs to exist ahead of the label. Pass 'side' to put the pin on the \
+             top or bottom edge; without it the pin is written on the right edge as before.",
             json!({
                 "type": "object",
                 "properties": {
@@ -181,7 +236,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "sheet_name": { "type": "string" },
                     "pin_name": { "type": "string" },
                     "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
-                    "x": { "type": "number" }, "y": { "type": "number" }
+                    "x": { "type": "number" }, "y": { "type": "number" },
+                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": SHEET_PIN_SIDE_DESC }
                 },
                 "required": ["schematic", "sheet_name", "pin_name", "pin_type", "x", "y"]
             }),
@@ -189,8 +245,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_sheet_pin",
-            "Rename a sheet pin, change its electrical type, or reposition it along the \
-             sheet border. Provide at least one of: new_name, pin_type, or both x+y.",
+            "Rename a sheet pin, change its electrical type, move it, or move it to a \
+             different edge of the sheet box. Provide at least one of: new_name, pin_type, \
+             side, or both x+y.",
             json!({
                 "type": "object",
                 "properties": {
@@ -199,7 +256,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "pin_name": { "type": "string", "description": "Current pin name to look up" },
                     "new_name": { "type": "string" },
                     "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
-                    "x": { "type": "number" }, "y": { "type": "number" }
+                    "x": { "type": "number" }, "y": { "type": "number" },
+                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": SHEET_PIN_SIDE_DESC }
                 },
                 "required": ["schematic", "sheet_name", "pin_name"]
             }),
@@ -223,7 +281,9 @@ pub fn tools() -> Vec<ToolDef> {
             "validate_sheet_pins",
             "Read-only. Walk the whole sheet tree from a root schematic and report \
              hierarchical_labels with no matching parent sheet pin, and sheet pins with no \
-             matching child hierarchical_label. Does not modify anything — use as a pre-ERC \
+             matching child hierarchical_label. Also reports stored pin positions that disagree \
+             with their rotation-selected sheet edge, including positions past a corner. \
+             Does not modify anything — use as a pre-ERC \
              sanity check or to catch drift after manual edits.",
             json!({
                 "type": "object",
@@ -237,11 +297,151 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+pub(crate) async fn handle_create_schematic(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "path")?;
+    let size = opt_str(args, "size").unwrap_or("A4").to_string();
+    let portrait = args["portrait"].as_bool().unwrap_or(false);
+    let (w, h) = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
+    };
+    let (width_mm, height_mm) = if portrait { (h, w) } else { (w, h) };
+
+    // Build a minimal valid schematic and save via cse's atomic writer.
+    let template = crate::tools::blank_schematic_template_with_paper(&size, portrait);
+    // Write the template then immediately load/save through cse so the file
+    // is normalised to cse's writer output format.
+    write_new_atomic(&path, &template)?;
+    let sch = cse::Schematic::load(&path)?;
+    sch.overwrite()?;
+    Ok(CallToolResult::json(&json!({
+        "created": path.display().to_string(),
+        "size": size,
+        "portrait": portrait,
+        "width_mm": width_mm,
+        "height_mm": height_mm
+    })))
+}
+
+/// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
+/// dimensions in mm — reported back so the caller can sanity-check the layout
+/// against the frame instead of discovering the overflow at print time.
+const PAPER_SIZES: &[(&str, f64, f64)] = &[
+    ("A0", 1189.0, 841.0),
+    ("A1", 841.0, 594.0),
+    ("A2", 594.0, 420.0),
+    ("A3", 420.0, 297.0),
+    ("A4", 297.0, 210.0),
+    ("A5", 210.0, 148.0),
+    ("A", 279.4, 215.9),
+    ("B", 431.8, 279.4),
+    ("C", 558.8, 431.8),
+    ("D", 863.6, 558.8),
+    ("E", 1117.6, 863.6),
+    ("USLetter", 279.4, 215.9),
+    ("USLegal", 355.6, 215.9),
+    ("USLedger", 431.8, 279.4),
+];
+
+/// Landscape width and height of a named paper size, or the `invalid_argument`
+/// refusal naming every size that would have worked.
+fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
+    match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
+        Some(&(_, w, h)) => Ok((w, h)),
+        None => {
+            let valid = PAPER_SIZES
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "size".into(),
+                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
+                },
+                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
+            ))
+        }
+    }
+}
+
+async fn handle_set_page(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let size = match require_str(args, "size") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let portrait = args["portrait"].as_bool().unwrap_or(false);
+
+    let dims = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
+    };
+    let (w, h) = if portrait { (dims.1, dims.0) } else { dims };
+
+    let node = if portrait {
+        format!("(paper \"{size}\" portrait)")
+    } else {
+        format!("(paper \"{size}\")")
+    };
+
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+    match content.find("(paper ") {
+        Some(start) => {
+            let end = start
+                + content[start..]
+                    .find(')')
+                    .map(|p| p + 1)
+                    .unwrap_or(content.len() - start);
+            content.replace_range(start..end, &node);
+        }
+        None => {
+            // A freshly created blank sheet has no paper node; it belongs in
+            // the header, right after the uuid.
+            let anchor = content
+                .find("(uuid ")
+                .and_then(|p| content[p..].find(')').map(|q| p + q + 1))
+                .unwrap_or_else(|| content.find('\n').map(|p| p + 1).unwrap_or(0));
+            content.insert_str(anchor, &format!("\n  {node}"));
+        }
+    }
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "size": size,
+        "portrait": portrait,
+        "width_mm": w,
+        "height_mm": h
+    })))
+}
+
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 pub(crate) const MAX_HIERARCHY_DEPTH: usize = 20;
 const ALLOWED_PIN_TYPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
 const SHEET_PIN_SPACING_MM: f64 = 2.54;
+
+/// Slack for turning a coordinate into a slot index.
+///
+/// Both directions of the conversion divide by the spacing, and neither the
+/// spacing nor a span subtraction is exact in binary. A thousandth of the
+/// nanometre KiCad stores a coordinate in is far below anything a file can
+/// express and far above the error the division introduces.
+const SLOT_EPSILON: f64 = 1e-9;
+const SHEET_PIN_SIDE_DESC: &str =
+    "Which edge of the sheet box the pin sits on. This is what KiCad reads the pin's \
+     orientation from (right 0°, top 90°, left 180°, bottom 270°); it is not \
+     inferred from the position. When given, the position must already be on that edge or \
+     the call is refused, because KiCad would otherwise move the pin to the named edge on \
+     load. Default: 'right', which is what these tools have always written.";
+
 const PROJECT_NAME_DESC: &str =
     "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
 
@@ -255,6 +455,232 @@ fn validate_pin_type(pin_type: &str) -> Result<(), CallToolResult> {
             ALLOWED_PIN_TYPES.join(", ")
         )))
     }
+}
+
+/// The four sheet-box edges a pin may sit on, in the order the schema lists them.
+const SHEET_PIN_SIDES: &[&str] = &["right", "left", "top", "bottom"];
+
+/// One nanometre in millimetres — KiCad's own schematic resolution, and so the
+/// most a pin position may differ from an edge before it is a different point.
+const SHEET_PIN_EDGE_TOLERANCE_MM: f64 = 1e-6;
+
+/// The rotation KiCad reads as "this pin is on that edge".
+///
+/// KiCad does not derive a sheet pin's edge from its position: the rotation in
+/// the pin's `at` selects the edge, and a pin whose position sits on a
+/// different one is *relocated* on load. So the rotation is the side, and
+/// writing the wrong one produces a file that stops describing what the editor
+/// shows.
+fn rotation_for_sheet_pin_side(side: &str) -> Option<f64> {
+    match side {
+        "right" => Some(0.0),
+        "top" => Some(90.0),
+        "left" => Some(180.0),
+        "bottom" => Some(270.0),
+        _ => None,
+    }
+}
+
+/// Inverse of [`rotation_for_sheet_pin_side`], so a response can name the side
+/// the written pin actually carries instead of echoing the requested one.
+/// `None` for a rotation KiCad does not map to an edge.
+fn sheet_pin_side_for_rotation(rotation: Option<f64>) -> Option<&'static str> {
+    let rotation = rotation?;
+    SHEET_PIN_SIDES
+        .iter()
+        .copied()
+        .find(|side| rotation_for_sheet_pin_side(side) == Some(rotation))
+}
+
+/// Accept a `side` argument, returning the rotation it selects.
+fn sheet_pin_rotation_for(side: &str) -> Result<f64, CallToolResult> {
+    rotation_for_sheet_pin_side(side).ok_or_else(|| {
+        invalid_arg(
+            "side",
+            &format!(
+                "'{}' is not a sheet edge — must be one of: {}",
+                side,
+                SHEET_PIN_SIDES.join(", ")
+            ),
+        )
+    })
+}
+
+/// A sheet block's box: top-left corner plus size, in schematic millimetres.
+#[derive(Clone, Copy)]
+struct SheetBox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl SheetBox {
+    fn of(sheet: &cse::Sheet) -> Self {
+        let (x, y) = sheet.position();
+        SheetBox {
+            x,
+            y,
+            width: sheet.width,
+            height: sheet.height,
+        }
+    }
+
+    /// The edge `side` names, or `None` for a name that is not one.
+    fn edge(&self, side: &str) -> Option<SheetEdge> {
+        let (axis, coordinate) = match side {
+            "right" => ("x", self.x + self.width),
+            "left" => ("x", self.x),
+            "top" => ("y", self.y),
+            "bottom" => ("y", self.y + self.height),
+            _ => return None,
+        };
+        let (span_axis, span_start, span_end) = if axis == "x" {
+            ("y", self.y, self.y + self.height)
+        } else {
+            ("x", self.x, self.x + self.width)
+        };
+        Some(SheetEdge {
+            axis,
+            coordinate,
+            span_axis,
+            span_start,
+            span_end,
+        })
+    }
+}
+
+/// One edge of a sheet box: the axis a pin on it is pinned to and the
+/// coordinate it must hold there, plus how far the edge runs along the other
+/// axis. KiCad constrains a pin on both — a position past a corner is clamped
+/// to that corner, corners themselves included.
+struct SheetEdge {
+    axis: &'static str,
+    coordinate: f64,
+    span_axis: &'static str,
+    span_start: f64,
+    span_end: f64,
+}
+
+/// Refuse a position that is not on the edge the caller named.
+///
+/// KiCad would accept the write and then move the pin to the edge the rotation
+/// selects, leaving the tool reporting a position the editor does not use. A
+/// refusal at Konnect's boundary is the only point at which the caller still
+/// learns that the request cannot be carried out.
+fn ensure_pin_is_on_sheet_edge(
+    sheet_box: SheetBox,
+    sheet_name: &str,
+    side: &str,
+    x: f64,
+    y: f64,
+) -> Result<(), CallToolResult> {
+    let Some(edge) = sheet_box.edge(side) else {
+        return Ok(());
+    };
+    let coordinate_on = |axis: &str| if axis == "x" { x } else { y };
+
+    let axis = edge.axis;
+    let actual = coordinate_on(axis);
+    let expected = edge.coordinate;
+    if (actual - expected).abs() > SHEET_PIN_EDGE_TOLERANCE_MM {
+        return Err(invalid_arg(
+            axis,
+            &format!(
+                "{axis} = {actual} is not on the '{side}' edge of sheet '{sheet_name}', which is \
+                 {axis} = {expected}. KiCad relocates a sheet pin whose position and side \
+                 disagree, so the pin would not stay where this call puts it"
+            ),
+        ));
+    }
+
+    // On the right line but past the end of it: KiCad pulls the pin back to the
+    // corner, which is the same failure one axis over.
+    let span_axis = edge.span_axis;
+    let along = coordinate_on(span_axis);
+    let (start, end) = (edge.span_start, edge.span_end);
+    if along < start - SHEET_PIN_EDGE_TOLERANCE_MM || along > end + SHEET_PIN_EDGE_TOLERANCE_MM {
+        return Err(invalid_arg(
+            span_axis,
+            &format!(
+                "{span_axis} = {along} is past the end of the '{side}' edge of sheet \
+                 '{sheet_name}', which runs from {span_axis} = {start} to {end}. KiCad clamps a \
+                 sheet pin to the nearest corner rather than leaving it off the box, so the pin \
+                 would not stay where this call puts it"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a whole import that would run an edge past its corner.
+///
+/// `import_sheet_pins` derives every position itself, so the caller cannot see
+/// the overflow in its own arguments the way `add_sheet_pin`'s caller can. The
+/// message therefore has to say how many pins the edge holds and how far down it
+/// is already filled, and that nothing was written — the import is refused entire.
+///
+/// `filled_through` is a slot, not a pin count: an edge holding two pins in slots
+/// 1 and 3 is filled through slot 3, and saying it "carries 2" would leave the
+/// reader unable to work out why the import ran out of room.
+/// How many 2.54 mm slots an edge has room for, counting from the corner.
+///
+/// Both the refusal below and `import_sheet_pins` need this number, and they
+/// have to agree: the import decides a pin is off the edge by it, and the
+/// refusal tells the caller how many the edge holds. Two copies of the
+/// expression could drift into saying different things about the same edge.
+fn sheet_pin_edge_capacity(sheet_box: SheetBox, side: &str) -> usize {
+    sheet_box
+        .edge(side)
+        .map(|edge| {
+            // The span is a subtraction, so an edge that is an exact number of
+            // slots long rarely divides to an exact integer: a 5.08 mm edge at
+            // y = 50 measures 5.079999999999998, and an untoleranced floor()
+            // calls it one slot instead of two. That undercount is not cosmetic
+            // — it decides which pins count as being on the edge at all, so it
+            // strands a valid last-slot pin and lets an import write over it.
+            (((edge.span_end - edge.span_start) / SHEET_PIN_SPACING_MM) + SLOT_EPSILON).floor()
+                as usize
+        })
+        .unwrap_or(0)
+}
+
+fn sheet_pin_edge_is_full(
+    sheet_box: SheetBox,
+    sheet_name: &str,
+    side: &str,
+    filled_through: usize,
+    free_below: usize,
+    first_that_did_not_fit: &str,
+) -> CallToolResult {
+    let capacity = sheet_pin_edge_capacity(sheet_box, side);
+    // One pin parked at the far end fills the edge "through" its slot while
+    // leaving the slots before it empty. Telling that caller to enlarge the
+    // sheet sends them to the wrong remedy, so the gap is named instead.
+    let gaps = if free_below > 0 {
+        format!(
+            " {free_below} slot(s) before it are empty, but an import continues after the \
+             furthest pin rather than filling gaps, so moving or deleting the outlying pin is \
+             the smaller fix here."
+        )
+    } else {
+        String::new()
+    };
+    // An edge with nothing on it is not "filled through slot 0".
+    let filled = if filled_through == 0 {
+        "is empty".to_string()
+    } else {
+        format!("is already filled through slot {filled_through}")
+    };
+    CallToolResult::error(format!(
+        "The '{side}' edge of sheet '{sheet_name}' holds {capacity} sheet pins at \
+         {SHEET_PIN_SPACING_MM} mm apart and {filled}, \
+         so '{first_that_did_not_fit}' \
+         and everything after it would be placed past a corner. KiCad clamps such a pin back onto \
+         the box, piling the overflow on the corner instead of leaving it where it was written, \
+         so the import is refused entire and nothing was written.{gaps} Enlarge the sheet with \
+         edit_sheet, or import onto more than one side."
+    ))
 }
 
 fn parent_dir(sch_path: &Path) -> PathBuf {
@@ -339,6 +765,56 @@ fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
         )],
     );
     Ok((updated, uuid))
+}
+
+/// Ensure the root schematic carries the canonical hierarchy footer KiCad
+/// writes for a page-one root.  Without these records Eeschema repairs the
+/// file on open, even when every hierarchical sheet block is otherwise valid.
+fn ensure_hierarchy_root_footer(source: &str) -> anyhow::Result<String> {
+    fn direct_child(source: &str, wanted: &str) -> Option<(usize, usize)> {
+        konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch")
+            .into_iter()
+            .find(|(start, end)| {
+                parse_sexp(&source[*start..*end])
+                    .ok()
+                    .and_then(|node| node.head().map(str::to_owned))
+                    .as_deref()
+                    == Some(wanted)
+            })
+    }
+
+    fn line_start(source: &str, offset: usize) -> usize {
+        source[..offset]
+            .rfind('\n')
+            .map_or(offset, |newline| newline + 1)
+    }
+
+    fn root_close_line(source: &str) -> anyhow::Result<usize> {
+        let root_start = konnect_sexp::writer::find_block_starts(source, "kicad_sch")
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("schematic has no kicad_sch root"))?;
+        let (_, root_end) = konnect_sexp::writer::find_balanced_block(source, root_start)
+            .ok_or_else(|| anyhow::anyhow!("schematic root is not balanced"))?;
+        Ok(line_start(source, root_end - 1))
+    }
+
+    let mut updated = source.to_owned();
+    if direct_child(&updated, "sheet_instances").is_none() {
+        let anchor = direct_child(&updated, "embedded_fonts")
+            .map(|(start, _)| line_start(&updated, start))
+            .map(Ok)
+            .unwrap_or_else(|| root_close_line(&updated))?;
+        updated.insert_str(
+            anchor,
+            "  (sheet_instances\n    (path \"/\"\n      (page \"1\")\n    )\n  )\n",
+        );
+    }
+    if direct_child(&updated, "embedded_fonts").is_none() {
+        let anchor = root_close_line(&updated)?;
+        updated.insert_str(anchor, "  (embedded_fonts no)\n");
+    }
+    Ok(updated)
 }
 
 /// Give every item in a duplicated document its own UUID.
@@ -617,6 +1093,34 @@ fn commit_edited_sheet_item(
     commit_verified_sheet_mutation(path, before, &command, &intent, label)
 }
 
+/// Read one sheet pin back off the file a write has just committed, so a
+/// response can describe the pin that was *saved* rather than the request that
+/// produced it.
+///
+/// The two are not interchangeable. The schematic writer holds six decimal
+/// places, so a finer position reaches the file rounded and a response that
+/// restated its arguments would name a position no reader will ever see. More
+/// to the point, `side` exists precisely because a sheet pin does not always
+/// end up where the caller put it — a response that echoes the request cannot
+/// report that, which would leave the argument unable to prevent the failure it
+/// was added for.
+fn read_back_sheet_pin(
+    path: &Path,
+    sheet_name: &str,
+    pin_name: &str,
+) -> anyhow::Result<cse::SheetPin> {
+    let saved = cse::Schematic::load(path)?;
+    let sheet = saved.sheets.by_name(sheet_name).ok_or_else(|| {
+        anyhow::anyhow!("sheet '{sheet_name}' is not in the schematic that was just written")
+    })?;
+    sheet.pin_by_name(pin_name).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pin '{pin_name}' is not on sheet '{sheet_name}' in the schematic that was just \
+             written"
+        )
+    })
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 async fn handle_add_hierarchical_sheet(
@@ -689,6 +1193,7 @@ async fn handle_add_hierarchical_sheet(
     }
     let page = next_free_page(&parent, &project_name).to_string();
     let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &sheet_name,
@@ -1012,6 +1517,7 @@ async fn handle_duplicate_sheet(
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
     let page = next_free_page(&parent, &project_name).to_string();
     let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &new_name,
@@ -1298,30 +1804,28 @@ async fn handle_import_sheet_pins(
         Err(e) => return Ok(e),
     };
     let side = opt_str(args, "side").unwrap_or("right").to_string();
-    if side != "right" && side != "left" {
-        return Ok(CallToolResult::error(format!(
-            "Invalid side '{}' — must be 'right' or 'left'",
-            side
-        )));
-    }
+    let rotation = match sheet_pin_rotation_for(&side) {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
 
     let before = read_consistent(&sch_path)?;
     let mut parent = cse::Schematic::load(&sch_path)?;
     let dir = parent_dir(&sch_path);
 
-    let (child_path, sheet_x, sheet_y, sheet_w, existing_pin_count) =
-        match parent.sheets.by_name(&sheet_name) {
-            Some(s) => {
-                let (x, y) = s.position();
-                (dir.join(s.file()), x, y, s.width, s.pins.len())
-            }
-            None => {
-                return Ok(CallToolResult::error(format!(
-                    "Sheet '{}' not found",
-                    sheet_name
-                )))
-            }
-        };
+    let (child_path, sheet_x, sheet_y, sheet_w, sheet_h) = match parent.sheets.by_name(&sheet_name)
+    {
+        Some(s) => {
+            let (x, y) = s.position();
+            (dir.join(s.file()), x, y, s.width, s.height)
+        }
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Sheet '{}' not found",
+                sheet_name
+            )))
+        }
+    };
 
     if !child_path.exists() {
         return Ok(CallToolResult::error(format!(
@@ -1346,19 +1850,133 @@ async fn handle_import_sheet_pins(
         .by_name_mut(&sheet_name)
         .expect("looked up above");
     let sheet_uuid = sheet.uuid.clone();
+    let sheet_box = SheetBox::of(sheet);
 
+    // A left/right edge runs down the box, so pins stack in y along it; a
+    // top/bottom edge runs across, so they stack in x. Either way the pinned
+    // coordinate is the edge's own, and the rotation says which edge that is.
+    let stacks_in_y = side == "right" || side == "left";
     let edge_x = if side == "right" {
         sheet_x + sheet_w
     } else {
         sheet_x
     };
-    let rotation = if side == "right" { 0.0 } else { 180.0 };
+    let edge_y = if side == "bottom" {
+        sheet_y + sheet_h
+    } else {
+        sheet_y
+    };
 
-    let mut imported = Vec::new();
+    // The stack continues after the pin that reaches furthest down *this* edge.
+    // How many pins are on the edge does not say where they are: an edge holding
+    // pins in slots 1 and 3 holds two, and starting at slot 3 puts the import on
+    // top of the second one. Only the coordinate can answer where the stack ends,
+    // so the slot each pin occupies is derived from it and the largest is taken.
+    // The rotation is what says which edge a pin is on, so it is what selects
+    // the pins to measure.
+    //
+    // A coordinate that is not on a slot rounds outward, so the next slot clears
+    // it, and one before the edge's origin cannot drag the stack backwards. The
+    // tolerance absorbs the division's own error — 7.62 / 2.54 is 3.0000000000000004
+    // and must be slot 3, not 4 — while staying a thousand times finer than the
+    // nanometre KiCad stores a coordinate in.
+    let slot_origin = if stacks_in_y { sheet_y } else { sheet_x };
+    let slot_of = |coord: f64| -> usize {
+        (((coord - slot_origin) / SHEET_PIN_SPACING_MM) - SLOT_EPSILON)
+            .ceil()
+            .max(0.0) as usize
+    };
+    //
+    // Two kinds of pin cannot say where the stack ends, and neither may be
+    // measured. A pin whose rotation names no edge — absent, or an angle KiCad
+    // does not map — belongs to no edge, and one sitting on the opposite edge
+    // would measure as this edge's far corner. A pin that names this edge but
+    // lies past the end of it is the same problem from the other direction:
+    // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
+    // strands them beyond the new corner, and measuring such a pin refuses
+    // every later import onto an edge that holds no valid pin at all — a call
+    // that used to work, turned into an error by the precision.
+    //
+    // Both reserve a slot instead. That pushes the stack outward, which is
+    // always safe, without ever inventing an overflow. A well-formed file has
+    // neither kind, so this changes nothing for one.
+    let capacity = sheet_pin_edge_capacity(sheet_box, &side);
+    let (span_start, span_end) = sheet_box
+        .edge(&side)
+        .map(|e| (e.span_start, e.span_end))
+        .unwrap_or((slot_origin, slot_origin));
+
+    // Two questions, and they are not the same one. *Where does the stack end?*
+    // is answered only by the pins that are genuinely on this edge. *Which slots
+    // must an imported pin avoid?* is answered by every pin that could occupy
+    // one — and a bare count cannot answer it, because a count says how many
+    // pins to step over, not which coordinates they are sitting on. An import of
+    // several labels steps past the count and then writes straight onto the pin.
+    // That was this tool's original defect and it survived one round of fixing it
+    // for the pins that could be measured.
+    //
+    // A pin that cannot be attributed to this edge still contributes its
+    // coordinate, and so does the point KiCad would clamp it to: a pin past the
+    // end of the edge does not stay there, it is pulled back to the corner, and
+    // on an edge whose length is an exact number of slots that corner *is* a
+    // slot an import would otherwise use.
+    let mut furthest = 0usize;
+    let mut taken: BTreeSet<usize> = BTreeSet::new();
+    // `f64::clamp` asserts `min <= max` and panics otherwise, and the span is
+    // built as `origin` and `origin + size` — so a sheet with a negative size
+    // inverts it. `edit_sheet` writes any size it is given, so that box is
+    // reachable through this crate's own API, and a panic there takes the server
+    // down instead of returning an error. Order the bounds and use min/max.
+    let (span_lo, span_hi) = if span_start <= span_end {
+        (span_start, span_end)
+    } else {
+        (span_end, span_start)
+    };
+    let block = |coord: f64, taken: &mut BTreeSet<usize>| {
+        taken.insert(slot_of(coord));
+        taken.insert(slot_of(coord.max(span_lo).min(span_hi)));
+    };
+    for pin in &sheet.pins {
+        let coord = if stacks_in_y { pin.at.y } else { pin.at.x };
+        match sheet_pin_side_for_rotation(pin.at.rotation) {
+            Some(pin_side) if pin_side == side.as_str() => {
+                let slot = slot_of(coord);
+                if slot <= capacity {
+                    furthest = furthest.max(slot);
+                }
+                block(coord, &mut taken);
+            }
+            // A pin the rotation puts on another edge shares no coordinate with
+            // this one, so projecting it here would block a slot for nothing.
+            Some(_) => {}
+            None => block(coord, &mut taken),
+        }
+    }
+    let filled_through = taken
+        .iter()
+        .copied()
+        .filter(|s| *s <= capacity)
+        .max()
+        .unwrap_or(0)
+        .max(furthest);
+    let free_below = filled_through.saturating_sub(
+        taken
+            .iter()
+            .filter(|s| **s >= 1 && **s <= filled_through)
+            .count(),
+    );
+
+    // Plan the whole import before any of it is written. These positions are
+    // generated here rather than supplied, so an overflow is not something the
+    // caller can see coming — and a loop that wrote as it went would already
+    // have committed the pins before the one that did not fit. Every generated
+    // point goes through the same edge guard `add_sheet_pin` uses.
+    let mut planned: Vec<(String, String, f64, f64)> = Vec::new();
+    let mut planned_names: HashSet<String> = HashSet::new();
     let mut skipped_existing = Vec::new();
-    let mut slot = existing_pin_count;
+    let mut slot = furthest;
     for (name, shape) in label_names {
-        if sheet.pin_by_name(&name).is_some() {
+        if sheet.pin_by_name(&name).is_some() || planned_names.contains(&name) {
             skipped_existing.push(name);
             continue;
         }
@@ -1367,9 +1985,36 @@ async fn handle_import_sheet_pins(
         } else {
             "passive".to_string()
         };
+        // Step over any slot something already stands on. The stack still
+        // continues after the furthest pin on the edge rather than filling gaps
+        // below it; this only refuses to write on top of what is there.
         slot += 1;
-        let y = sheet_y + SHEET_PIN_SPACING_MM * slot as f64;
-        let mut pin = cse::SheetPin::new(name.as_str(), pin_type.as_str(), edge_x, y);
+        while taken.contains(&slot) {
+            slot += 1;
+        }
+        let offset = SHEET_PIN_SPACING_MM * slot as f64;
+        let (pin_x, pin_y) = if stacks_in_y {
+            (edge_x, sheet_y + offset)
+        } else {
+            (sheet_x + offset, edge_y)
+        };
+        if ensure_pin_is_on_sheet_edge(sheet_box, &sheet_name, &side, pin_x, pin_y).is_err() {
+            return Ok(sheet_pin_edge_is_full(
+                sheet_box,
+                &sheet_name,
+                &side,
+                filled_through,
+                free_below,
+                &name,
+            ));
+        }
+        planned_names.insert(name.clone());
+        planned.push((name, pin_type, pin_x, pin_y));
+    }
+
+    let mut imported = Vec::new();
+    for (name, pin_type, pin_x, pin_y) in planned {
+        let mut pin = cse::SheetPin::new(name.as_str(), pin_type.as_str(), pin_x, pin_y);
         pin.at.rotation = Some(rotation);
         imported.push(pin.name.clone());
         sheet.add_pin(pin);
@@ -1387,8 +2032,20 @@ async fn handle_import_sheet_pins(
         }
     }
 
+    // Read the side back off a pin that was actually saved, rather than echoing
+    // the argument. An import that wrote nothing has no pin to read and reports
+    // no side rather than asserting one.
+    let written_side = match imported.first() {
+        Some(name) => {
+            let saved = read_back_sheet_pin(&sch_path, &sheet_name, name)?;
+            sheet_pin_side_for_rotation(saved.at.rotation)
+        }
+        None => None,
+    };
+
     Ok(CallToolResult::json(&json!({
         "sheet": sheet_name,
+        "side": written_side,
         "imported_pins": imported,
         "skipped_existing": skipped_existing
     })))
@@ -1419,6 +2076,15 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // Absent `side` keeps the behaviour every existing caller has: rotation 0,
+    // and no opinion about where the position sits. The edge check below rides
+    // on the argument, so nothing that used to be accepted starts being refused.
+    let requested_side = opt_str(args, "side");
+    let side = requested_side.unwrap_or("right").to_string();
+    let rotation = match sheet_pin_rotation_for(&side) {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
 
     let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -1432,6 +2098,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         }
     };
     let sheet_uuid = sheet.uuid.clone();
+    let sheet_box = SheetBox::of(sheet);
 
     if sheet.pin_by_name(&pin_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -1440,24 +2107,30 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         )));
     }
 
-    sheet.add_pin(cse::SheetPin::new(
-        pin_name.as_str(),
-        pin_type.as_str(),
-        x,
-        y,
-    ));
+    if requested_side.is_some() {
+        if let Err(e) = ensure_pin_is_on_sheet_edge(sheet_box, &sheet_name, &side, x, y) {
+            return Ok(e);
+        }
+    }
+
+    let mut pin = cse::SheetPin::new(pin_name.as_str(), pin_type.as_str(), x, y);
+    pin.at.rotation = Some(rotation);
+    sheet.add_pin(pin);
     if let Some(error) =
         commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "add_sheet_pin")?
     {
         return Ok(error);
     }
 
+    // Position and side come off the saved pin, not out of the arguments.
+    let saved = read_back_sheet_pin(&sch_path, &sheet_name, &pin_name)?;
     Ok(CallToolResult::json(&json!({
         "added_pin": pin_name,
         "sheet": sheet_name,
         "pin_type": pin_type,
-        "x": x,
-        "y": y
+        "x": saved.at.x,
+        "y": saved.at.y,
+        "side": sheet_pin_side_for_rotation(saved.at.rotation)
     })))
 }
 
@@ -1476,6 +2149,12 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
             return Ok(e);
         }
     }
+    let requested_side = opt_str(args, "side").map(str::to_string);
+    let requested_rotation = match requested_side.as_deref().map(sheet_pin_rotation_for) {
+        Some(Ok(r)) => Some(r),
+        Some(Err(e)) => return Ok(e),
+        None => None,
+    };
 
     let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -1489,6 +2168,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         }
     };
     let sheet_uuid = sheet.uuid.clone();
+    let sheet_box = SheetBox::of(sheet);
     let pin = match sheet.pin_by_name_mut(&pin_name) {
         Some(p) => p,
         None => {
@@ -1499,40 +2179,82 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         }
     };
 
+    // `requested` is what the caller asked to set, `changed` what actually
+    // differs — the same split `edit_sheet` makes, and for the same reason: a
+    // caller that re-asserts the state already there has made a legal request
+    // that changed nothing, and the response has to be able to say so.
+    let mut requested = Vec::new();
     let mut changed = Vec::new();
     if let Some(new_name) = opt_str(args, "new_name") {
+        requested.push("name");
         pin.name = new_name.to_string();
         changed.push("name");
     }
     if let Some(pt) = opt_str(args, "pin_type") {
+        requested.push("pin_type");
         pin.pin_type = pt.to_string();
         changed.push("pin_type");
     }
     if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
+        requested.push("position");
         pin.at.x = x;
         pin.at.y = y;
         changed.push("position");
     }
+    // Checked against where the pin ends up, so `side` and `x`+`y` in one call
+    // are judged together rather than against the position being replaced. The
+    // edge still has to be a legal one for the pin's position even when the pin
+    // is already on it, so the guard runs before the delta is taken.
+    if let (Some(side), Some(rotation)) = (requested_side.as_deref(), requested_rotation) {
+        requested.push("side");
+        if let Err(e) =
+            ensure_pin_is_on_sheet_edge(sheet_box, &sheet_name, side, pin.at.x, pin.at.y)
+        {
+            return Ok(e);
+        }
+        if pin.at.rotation != Some(rotation) {
+            pin.at.rotation = Some(rotation);
+            changed.push("side");
+        }
+    }
 
-    if changed.is_empty() {
+    // `new_name` may have just renamed it, so the read-back below has to look
+    // for the name the pin carries now.
+    let saved_name = pin.name.clone();
+
+    if requested.is_empty() {
         return Ok(CallToolResult::error(
-            "No fields to change — provide at least one of: new_name, pin_type, x+y",
+            "No fields to change — provide at least one of: new_name, pin_type, side, x+y",
         ));
     }
 
-    let summary = json!({
-        "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
-    });
-    if let Some(error) =
-        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet_pin")?
-    {
-        return Ok(error);
+    // Nothing differs, so nothing is written: a commit here would reserialise
+    // the sheet (#210) for a request that asked for the state already on disk.
+    if !changed.is_empty() {
+        if let Some(error) =
+            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet_pin")?
+        {
+            return Ok(error);
+        }
     }
+
+    // Reported off the saved pin rather than the in-memory one, for the same
+    // reason as `add_sheet_pin`: the response has to describe the file.
+    let saved = read_back_sheet_pin(&sch_path, &sheet_name, &saved_name)?;
+    let summary = json!({
+        "name": saved.name,
+        "pin_type": saved.pin_type,
+        "x": saved.at.x,
+        "y": saved.at.y,
+        "side": sheet_pin_side_for_rotation(saved.at.rotation)
+    });
 
     Ok(CallToolResult::json(&json!({
         "edited_pin": pin_name,
         "sheet": sheet_name,
+        "changed": !changed.is_empty(),
         "changed_fields": changed,
+        "requested_fields": requested,
         "pin": summary
     })))
 }
@@ -1627,6 +2349,40 @@ fn collect_pin_mismatches(
 
     for sheet in sch.sheets.iter() {
         let child_path = dir.join(sheet.file());
+        // Check the parent geometry even if its child is unavailable. KiCad
+        // relocates inconsistent pins on load and can silently join their nets.
+        for pin in &sheet.pins {
+            let (x, y) = pin.position();
+            let side = sheet_pin_side_for_rotation(pin.at.rotation);
+            let invalid = match side {
+                Some(side) => {
+                    ensure_pin_is_on_sheet_edge(SheetBox::of(sheet), sheet.name(), side, x, y)
+                        .is_err()
+                }
+                None => true,
+            };
+            if invalid {
+                let expected_edge = side.and_then(|side| SheetBox::of(sheet).edge(side));
+                issues.push(json!({
+                    "schematic": path.display().to_string(),
+                    "sheet": sheet.name(),
+                    "file": sheet.file(),
+                    "pin": pin.name,
+                    "kind": if side.is_some() { "pin_position_mismatch" } else { "invalid_pin_rotation" },
+                    "stored_position": { "x": x, "y": y, "rotation": pin.at.rotation },
+                    "expected_edge": expected_edge.map(|edge| json!({
+                        "side": side,
+                        "axis": edge.axis,
+                        "coordinate": edge.coordinate,
+                        "span_axis": edge.span_axis,
+                        "span_start": edge.span_start,
+                        "span_end": edge.span_end
+                    })),
+                    "error": "Stored sheet-pin position/rotation does not identify a valid point on its sheet edge; KiCad may relocate the pin and merge nets",
+                    "recovery": "Choose the intended side and an on-edge position with edit_sheet_pin, then inspect the KiCad netlist before continuing; this validator does not repair pins"
+                }));
+            }
+        }
         if !child_path.exists() {
             issues.push(json!({
                 "sheet": sheet.name(),
@@ -1689,6 +2445,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_schematic_writes_root_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.kicad_sch");
+        let ctx = test_ctx();
+
+        let result = handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(
+            sch.uuid.is_some(),
+            "root (uuid ...) is required for KiCAD's netlister to resolve instance paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_defaults_to_a4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.kicad_sch");
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &test_ctx())
+            .await
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A4\")"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn create_schematic_honours_size_and_orientation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A3", "portrait": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        // The dimensions are reported swapped for portrait, matching
+        // set_schematic_page.
+        assert!(text.contains("\"width_mm\":297"), "got {text}");
+        assert!(text.contains("\"height_mm\":420"), "got {text}");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+        // The orientation token has to survive cse's normalising rewrite:
+        // KiCad rejects a `(paper …)` it cannot parse.
+        assert_eq!(
+            cse::Schematic::load(&path).unwrap().paper.as_deref(),
+            Some("A3")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_refuses_an_unknown_size_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A9" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(!path.exists(), "a rejected size must leave no file behind");
+    }
+
+    #[tokio::test]
     async fn add_hierarchical_sheet_creates_child_file_and_links_it() {
         let tmp = TempDir::new().unwrap();
         let root = blank_schematic(tmp.path(), "root.kicad_sch");
@@ -1716,6 +2543,35 @@ mod tests {
             parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
         );
+        let source = std::fs::read_to_string(&root).unwrap();
+        let tree = parse_sexp(&source).unwrap();
+        let root_instance = tree
+            .find("sheet_instances")
+            .and_then(|instances| instances.find("path"))
+            .expect("a hierarchical root needs its canonical page-1 instance");
+        assert_eq!(
+            root_instance.get(1).and_then(|value| value.as_str()),
+            Some("/")
+        );
+        assert_eq!(
+            root_instance
+                .find("page")
+                .and_then(|page| page.get(1))
+                .and_then(|value| value.as_str()),
+            Some("1")
+        );
+        assert_eq!(tree.find_str("embedded_fonts"), Some("no"));
+    }
+
+    #[test]
+    fn hierarchy_root_footer_is_idempotent() {
+        let source = crate::tools::blank_schematic_template();
+        let once = ensure_hierarchy_root_footer(&source).unwrap();
+        let twice = ensure_hierarchy_root_footer(&once).unwrap();
+
+        assert_eq!(twice, once, "existing footer records must be preserved");
+        assert_eq!(once.matches("(sheet_instances").count(), 1);
+        assert_eq!(once.matches("(embedded_fonts no)").count(), 1);
     }
 
     fn result_json(result: &CallToolResult) -> Value {
@@ -2562,6 +3418,1330 @@ mod tests {
         assert!(result2.is_error);
     }
 
+    // ─── sheet pin sides ───────────────────────────────────────────────────
+    //
+    // The default sheet `handle_add_hierarchical_sheet` writes is 80 × 50 at
+    // (50, 50), so its edges are x = 50 (left), x = 130 (right), y = 50 (top)
+    // and y = 100 (bottom).
+
+    /// A sheet with the default box, plus the paths to work on it.
+    async fn sheet_for_pins(tmp: &TempDir, ctx: &ToolContext) -> PathBuf {
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            ctx,
+        )
+        .await
+        .unwrap();
+        root
+    }
+
+    fn pin_rotation(root: &Path, pin_name: &str) -> Option<f64> {
+        cse::Schematic::load(root)
+            .unwrap()
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name(pin_name)
+            .unwrap()
+            .at
+            .rotation
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_writes_the_rotation_each_side_selects() {
+        // KiCad reads a sheet pin's edge from its rotation, so `side` has to
+        // reach the file as an angle. 90 and 270 were unreachable from any tool.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        // name, side, position on that edge, the angle KiCad reads it back as
+        let cases = [
+            ("R_PIN", "right", 130.0, 55.0, 0.0),
+            ("T_PIN", "top", 60.0, 50.0, 90.0),
+            ("L_PIN", "left", 50.0, 60.0, 180.0),
+            ("B_PIN", "bottom", 70.0, 100.0, 270.0),
+        ];
+        for (name, side, x, y, expected_rotation) in cases {
+            let result = handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": x, "y": y, "side": side }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{side} pin refused: {:?}", result.content);
+            assert_eq!(
+                result_json(&result)["side"],
+                json!(side),
+                "the reported side must be read back off the written pin"
+            );
+            assert_eq!(
+                pin_rotation(&root, name),
+                Some(expected_rotation),
+                "'{side}' must reach the file as {expected_rotation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_refuses_a_position_off_the_named_edge() {
+        // The whole point of the parameter: KiCad would accept this write and
+        // then move the pin to the top edge, so the file would stop describing
+        // what the editor shows.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "STRAY", "pin_type": "input",
+                     "x": 60.0, "y": 75.0, "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "a position off the named edge must refuse");
+        let message = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            message.contains("'top' edge") && message.contains("y = 50"),
+            "the refusal must name the edge and where it is, got: {message}"
+        );
+        let sheet_pins = cse::Schematic::load(&root)
+            .unwrap()
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pins
+            .len();
+        assert_eq!(sheet_pins, 0, "a refused call must write nothing");
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_without_a_side_still_accepts_any_position() {
+        // Scope test, not coverage: it survives neutering every new guard. It
+        // is here because the change has to be purely additive — the position
+        // check rides on `side`, so a caller that never passed one keeps the
+        // behaviour it had, off-edge position and all.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "LEGACY", "pin_type": "input", "x": 100.0, "y": 105.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "an old-style call must keep working");
+        assert_eq!(pin_rotation(&root, "LEGACY"), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_refuses_a_position_past_the_end_of_the_named_edge() {
+        // Measured against KiCad 10.0.6: a pin on the right edge's x but below
+        // the box was rewritten from `(at 130 140 0)` to `(at 130 100 0)` — the
+        // edge constrains the pin along its length as well as across it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "PAST_END", "pin_type": "input",
+                     "x": 130.0, "y": 140.0, "side": "right" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "a position past the corner must refuse");
+        let message = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            message.contains("past the end of the 'right' edge") && message.contains("to 100"),
+            "the refusal must say the edge ran out and where, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_accepts_a_pin_on_a_corner() {
+        // Both corners of an edge are on it: KiCad left `(at 130 50 0)` and
+        // `(at 130 100 0)` untouched, so the span check has to be inclusive.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        for (name, y) in [("TOP_CORNER", 50.0), ("BOTTOM_CORNER", 100.0)] {
+            let result = handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": 130.0, "y": y, "side": "right" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{name} refused: {:?}", result.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_refuses_a_side_that_is_not_an_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "VCC", "pin_type": "input",
+                     "x": 130.0, "y": 55.0, "side": "north" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "'north' is not a sheet edge");
+    }
+
+    /// The pin the file holds, read back the long way round rather than through
+    /// the handler that is under test.
+    fn saved_pin(root: &Path, pin_name: &str) -> cse::SheetPin {
+        cse::Schematic::load(root)
+            .unwrap()
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name(pin_name)
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_takes_the_rotation_from_the_side_not_the_position() {
+        // Negative control for the rotation write. Every other side case sits on
+        // exactly one edge, so an implementation that inferred the side from the
+        // position — never mind the argument — would pass all of them. A corner
+        // belongs to two edges at once, so the same point has to produce a
+        // different rotation depending on which edge the caller named, and only
+        // an implementation that reads the argument can do that.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        // (130, 50) is the top-right corner of the default box: the right
+        // edge's x and the top edge's y, both exactly.
+        for (name, side, expected_rotation) in
+            [("CORNER_R", "right", 0.0), ("CORNER_T", "top", 90.0)]
+        {
+            let result = handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": 130.0, "y": 50.0, "side": side }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{name} refused: {:?}", result.content);
+            assert_eq!(
+                pin_rotation(&root, name),
+                Some(expected_rotation),
+                "'{side}' at the shared corner must reach the file as {expected_rotation}"
+            );
+            assert_eq!(
+                result_json(&result)["side"],
+                json!(side),
+                "the reported side must follow the written rotation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_reports_the_saved_position_not_the_requested_one() {
+        // The schematic writer holds six decimal places, so a finer position
+        // cannot reach the file intact. That is the one place where the saved
+        // pin and the request differ observably, and it is what tells a response
+        // derived from the file apart from one that restates its arguments.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        // Inside SHEET_PIN_EDGE_TOLERANCE_MM, so the edge guard accepts it —
+        // the subject here is the response, not a refusal.
+        let requested_x = 130.000_000_4_f64;
+        let requested_y = 55.000_000_4_f64;
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "FINE", "pin_type": "input",
+                     "x": requested_x, "y": requested_y, "side": "right" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let saved = saved_pin(&root, "FINE");
+        assert_ne!(
+            saved.at.x, requested_x,
+            "the fixture proves nothing unless the file really does round the request"
+        );
+        assert_ne!(saved.at.y, requested_y);
+
+        let body = result_json(&result);
+        assert_eq!(
+            body["x"],
+            json!(saved.at.x),
+            "x must be read back off the saved pin, got {body}"
+        );
+        assert_eq!(
+            body["y"],
+            json!(saved.at.y),
+            "y must be read back off the saved pin, got {body}"
+        );
+        assert_ne!(body["x"], json!(requested_x), "x must not echo the request");
+        assert_ne!(body["y"], json!(requested_y), "y must not echo the request");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_reports_the_saved_position_not_the_requested_one() {
+        // Same control, one tool over: `edit_sheet_pin` built its summary from
+        // the in-memory pin before the commit, which is the request by another
+        // name.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input",
+                     "x": 130.0, "y": 55.0, "side": "right" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let requested_x = 130.000_000_4_f64;
+        let requested_y = 60.000_000_4_f64;
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "x": requested_x, "y": requested_y,
+                     "side": "right" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let saved = saved_pin(&root, "CLK");
+        assert_ne!(
+            saved.at.x, requested_x,
+            "the fixture proves nothing unless the file really does round the request"
+        );
+        assert_ne!(saved.at.y, requested_y);
+
+        let pin = &result_json(&result)["pin"];
+        assert_eq!(pin["x"], json!(saved.at.x), "x must come off the saved pin");
+        assert_eq!(pin["y"], json!(saved.at.y), "y must come off the saved pin");
+        assert_ne!(pin["x"], json!(requested_x), "x must not echo the request");
+        assert_ne!(pin["y"], json!(requested_y), "y must not echo the request");
+        assert_eq!(pin["side"], json!("right"));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_reports_the_name_it_saved_under() {
+        // A rename moves the pin the response describes, so the read-back has to
+        // follow it. Reporting the old name would either fail to find the pin or
+        // find a different one.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "OLD", "pin_type": "input",
+                     "x": 130.0, "y": 55.0, "side": "right" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "OLD", "new_name": "NEW", "pin_type": "output" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let pin = &result_json(&result)["pin"];
+        assert_eq!(pin["name"], json!("NEW"));
+        assert_eq!(pin["pin_type"], json!("output"));
+        assert_eq!(saved_pin(&root, "NEW").pin_type, "output");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_moves_a_pin_to_another_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "x": 65.0, "y": 100.0, "side": "bottom" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_json(&result);
+        assert_eq!(body["changed_fields"], json!(["position", "side"]));
+        assert_eq!(body["pin"]["side"], json!("bottom"));
+        assert_eq!(pin_rotation(&root, "CLK"), Some(270.0));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_judges_the_side_against_the_position_it_is_given() {
+        // `side` and `x`+`y` in one call describe the pin's end state, so the
+        // check has to run after the move, not against the position replaced.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // The pin is on the right edge; the new position is on the top edge.
+        // Judged against the old position this would refuse, and it must not.
+        let ok = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "x": 65.0, "y": 50.0, "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error, "{:?}", ok.content);
+        assert_eq!(pin_rotation(&root, "CLK"), Some(90.0));
+
+        // And the reverse: a move that lands off the named edge is refused.
+        let refused = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "x": 65.0, "y": 60.0, "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error, "a move off the named edge must refuse");
+        assert_eq!(
+            pin_rotation(&root, "CLK"),
+            Some(90.0),
+            "a refused edit leaves the pin as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_refuses_a_side_the_pin_is_not_already_on() {
+        // `side` with no position: the pin does not move, so it has to already
+        // be on that edge.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "side": "bottom" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(pin_rotation(&root, "CLK"), Some(0.0), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_counts_side_on_its_own_as_a_change() {
+        // `side` on its own is a legal one-field edit, not the "no fields to
+        // change" refusal — and here it is a real one, moving the pin from the
+        // right edge it defaulted to onto the left.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input", "x": 50.0, "y": 60.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_json(&result);
+        assert_eq!(body["changed_fields"], json!(["side"]));
+        assert_eq!(body["requested_fields"], json!(["side"]));
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(pin_rotation(&root, "CLK"), Some(180.0));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_does_not_count_a_restated_side_as_a_change() {
+        // `changed_fields` describes the delta that was saved, not the
+        // arguments that were sent. A caller that sets `side` unconditionally
+        // restates the edge the pin is already on, and reporting that as a
+        // change would make the response say the file moved when it did not.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input",
+                     "x": 60.0, "y": 100.0, "side": "bottom" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let before = std::fs::read(&root).unwrap();
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "side": "bottom" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_json(&result);
+        assert_eq!(
+            body["changed_fields"],
+            json!([]),
+            "nothing differed, so nothing may be reported as changed"
+        );
+        assert_eq!(body["changed"], json!(false));
+        assert_eq!(
+            body["requested_fields"],
+            json!(["side"]),
+            "the request is still reported — it was made, it just changed nothing"
+        );
+        assert_eq!(body["pin"]["side"], json!("bottom"));
+        assert!(
+            std::fs::read(&root).unwrap() == before,
+            "a no-op edit must not rewrite the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_stacks_along_a_top_or_bottom_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        add_label(&child_path, "GND", "passive", 5.0, 10.0);
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(result_json(&result)["side"], json!("top"));
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        for name in ["VIN", "GND"] {
+            let pin = sheet.pin_by_name(name).unwrap();
+            assert_eq!(pin.at.rotation, Some(90.0), "{name} must face the top edge");
+            assert_eq!(pin.at.y, 50.0, "{name} must sit on the top edge itself");
+        }
+        // Stacked along the edge rather than piled on one point.
+        assert_ne!(
+            sheet.pin_by_name("VIN").unwrap().at.x,
+            sheet.pin_by_name("GND").unwrap().at.x
+        );
+        assert!(
+            sheet.pins.iter().all(|p| p.at.x >= 50.0),
+            "a top-edge stack runs across the box from its left corner"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_keeps_placing_a_left_or_right_stack_down_the_edge() {
+        // Scope test: it survives neutering the new guards, and exists because
+        // the two old sides must land exactly where they always did.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        add_label(&child_path, "GND", "passive", 5.0, 10.0);
+
+        handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.x, 50.0);
+        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.y, 52.54);
+        assert_eq!(sheet.pin_by_name("GND").unwrap().at.y, 55.08);
+        assert_eq!(sheet.pin_by_name("GND").unwrap().at.rotation, Some(180.0));
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_reports_no_side_when_it_saved_no_pin() {
+        // The reported side is read off a pin the import actually wrote. An
+        // import that wrote nothing has none to read, and has to say so rather
+        // than assert the side it was asked for — the only case in which a
+        // derived answer and an echoed one differ.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+
+        handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Second pass: the only label already has a pin, so nothing is saved —
+        // and a different side is asked for, so an echo would be visibly wrong.
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "bottom" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_json(&result);
+        assert_eq!(body["imported_pins"], json!([]));
+        assert_eq!(body["skipped_existing"], json!(["VIN"]));
+        assert_eq!(
+            body["side"],
+            serde_json::Value::Null,
+            "an import that saved no pin has no side to report"
+        );
+    }
+
+    /// Give a pin a rotation that names no edge — the shape a file written by
+    /// something other than these tools can carry.
+    fn set_pin_rotation(root: &Path, pin_name: &str, rotation: Option<f64>) {
+        let mut sch = cse::Schematic::load(root).unwrap();
+        sch.sheets
+            .by_name_mut("A")
+            .unwrap()
+            .pin_by_name_mut(pin_name)
+            .unwrap()
+            .at
+            .rotation = rotation;
+        sch.overwrite().unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_counts_a_pin_whose_rotation_names_no_edge() {
+        // Counting only the pins on the selected edge is more precise than
+        // counting every pin on the sheet, and precision cost a safety margin
+        // the blunt count had by accident: a pin whose rotation names no edge
+        // belongs to no edge under that filter, so the stack walks over it.
+        // If we cannot tell which edge a pin is on, we have to assume it could
+        // be this one — stacking further out is safe, stacking over it is not.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "ODD", "pin_type": "passive",
+                     "x": 50.0, "y": 52.54, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Exactly where the first imported left-edge pin would otherwise land.
+        set_pin_rotation(&root, "ODD", None);
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let vin = sheet.pin_by_name("VIN").unwrap();
+        let odd = sheet.pin_by_name("ODD").unwrap();
+        assert_ne!(
+            (vin.at.x, vin.at.y),
+            (odd.at.x, odd.at.y),
+            "an import must not stack over a pin whose edge it cannot determine"
+        );
+        assert_eq!(
+            vin.at.y, 55.08,
+            "the unattributable pin has to occupy a slot, so the import starts at the next one"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_refuses_a_left_edge_import_that_runs_past_the_corner() {
+        // The sheet box is 80 x 50 mm, so its left edge holds 19 pins at
+        // 2.54 mm. The nineteenth is the last that fits; the twentieth lands at
+        // y = 100.8, past the corner at y = 100, and KiCad would pull it back
+        // onto the corner. The import has to refuse before writing any of it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let child_path = tmp.path().join("a.kicad_sch");
+        for n in 0..19 {
+            add_label(
+                &child_path,
+                &format!("NET{n}"),
+                "passive",
+                5.0,
+                5.0 + n as f64,
+            );
+        }
+
+        // A full edge is not an overflowing one: all nineteen must land.
+        let filled = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!filled.is_error, "{:?}", filled.content);
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert_eq!(parent.sheets.by_name("A").unwrap().pins.len(), 19);
+        assert_eq!(
+            parent
+                .sheets
+                .by_name("A")
+                .unwrap()
+                .pin_by_name("NET18")
+                .unwrap()
+                .at
+                .y,
+            98.26,
+            "the last pin that fits sits 2.54 mm short of the corner"
+        );
+
+        // One more label, and the edge is out of room.
+        add_label(&child_path, "ONE_TOO_MANY", "passive", 5.0, 30.0);
+        let before = std::fs::read(&root).unwrap();
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "an import past the corner must refuse");
+        let message = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            message.contains("'left' edge")
+                && message.contains("19 sheet pins")
+                && message.contains("ONE_TOO_MANY"),
+            "the refusal must name the edge, its capacity and the pin that did not fit, got: \
+             {message}"
+        );
+        assert!(
+            std::fs::read(&root).unwrap() == before,
+            "a refused import must leave the file byte-identical"
+        );
+        let after = cse::Schematic::load(&root).unwrap();
+        let sheet = after.sheets.by_name("A").unwrap();
+        assert_eq!(sheet.pins.len(), 19, "no pin was written");
+        assert!(
+            sheet.pin_by_name("ONE_TOO_MANY").is_none(),
+            "the overflowing pin must not be on the sheet"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_refuses_a_top_edge_import_that_runs_past_the_corner() {
+        // Same failure one axis over: the 80 mm top edge holds 31 pins, so the
+        // thirty-second lands at x = 131.28 against a corner at x = 130. This
+        // one overflows from an empty sheet, so a loop that wrote as it went
+        // would leave thirty-one pins behind — the assertion below is that the
+        // file is untouched, not merely that an error came back.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let child_path = tmp.path().join("a.kicad_sch");
+        for n in 0..32 {
+            add_label(
+                &child_path,
+                &format!("BUS{n}"),
+                "passive",
+                5.0,
+                5.0 + n as f64,
+            );
+        }
+        let before = std::fs::read(&root).unwrap();
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "an import past the corner must refuse");
+        let message = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            message.contains("'top' edge")
+                && message.contains("31 sheet pins")
+                && message.contains("is empty"),
+            "the refusal must name the edge and its capacity, got: {message}"
+        );
+        assert!(
+            std::fs::read(&root).unwrap() == before,
+            "a refused import must leave the file byte-identical"
+        );
+        assert_eq!(
+            cse::Schematic::load(&root)
+                .unwrap()
+                .sheets
+                .by_name("A")
+                .unwrap()
+                .pins
+                .len(),
+            0,
+            "not one of the thirty-two pins was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_stacks_below_the_pins_already_on_that_edge() {
+        // The stack used to start below *every* pin on the sheet, so pins on
+        // one edge pushed the next import down another edge and eventually off
+        // the end of it. Only the pins carrying this edge's rotation count.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        for (name, y) in [("R0", 60.0), ("R1", 70.0), ("R2", 80.0)] {
+            handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": 130.0, "y": y, "side": "right" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+
+        handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let vin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VIN")
+            .unwrap()
+            .clone();
+        assert_eq!(vin.at.x, 50.0);
+        assert_eq!(
+            vin.at.y, 52.54,
+            "the left edge is empty, so the first imported pin takes its first slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_starts_after_the_furthest_pin_on_a_sparse_edge() {
+        // The next slot came from the *count* of pins on the edge, not from how
+        // far down the edge they actually reach. Two pins in slots 1 and 3 count
+        // as two, so the import took slot 3 and landed on top of the second one.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        for (name, y) in [("A1", 52.54), ("A3", 57.62)] {
+            handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": 50.0, "y": y, "side": "left" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let vin = sheet.pin_by_name("VIN").unwrap();
+        let a3 = sheet.pin_by_name("A3").unwrap();
+        assert_ne!(
+            (vin.at.x, vin.at.y),
+            (a3.at.x, a3.at.y),
+            "an import must not stack over a pin already on the selected edge"
+        );
+        assert_eq!(
+            vin.at.y, 60.16,
+            "the stack continues after the furthest pin on the edge, not after the count of them"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_reads_a_slot_the_division_cannot_represent_exactly() {
+        // Deriving a slot from a coordinate is a division, and the spacing does
+        // not divide cleanly in binary: (62.7 - 50.0) / 2.54 is 5.000000000000001,
+        // so rounding outward without a tolerance reads slot 5 as slot 6 and the
+        // import skips a slot. It goes wrong at slots 5, 10, 12, 13, 17, 24, 26
+        // and 31 within one sheet; the other tests here sit on 1, 3 and 19, where
+        // the error happens to fall the harmless way, so none of them can see it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "FIFTH", "pin_type": "input",
+                     "x": 50.0, "y": 62.7, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let vin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VIN")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            vin.at.y, 65.24,
+            "a pin on slot 5 must be read as slot 5, so the import takes slot 6"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_ignores_a_pin_the_sheet_shrank_away_from() {
+        // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
+        // strands them past the new corner. Such a pin names the edge but is not
+        // on it, and measuring it would report the edge filled through a slot it
+        // no longer has — refusing an import onto an edge that holds no valid pin
+        // at all. Its coordinate still blocks a slot, and so does the corner
+        // KiCad would clamp it to; here both are off the shortened edge, so the
+        // import correctly starts at the first slot.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "DEEP", "pin_type": "input",
+                     "x": 50.0, "y": 98.26, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // The 50 mm left edge becomes a 20 mm one; DEEP is now off the box.
+        handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 20.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "a pin the sheet shrank away from must not refuse the import: {:?}",
+            result.content
+        );
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let vin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VIN")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            vin.at.y, 52.54,
+            "the stranded pin cannot say where the stack ends, and the slots it and its clamp \
+             point occupy are both off the shortened edge, so the first slot is genuinely free"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_names_the_free_slots_when_one_outlying_pin_fills_the_edge() {
+        // Continuing after the furthest pin is what #514's review asked for, and
+        // it has a consequence worth stating: one pin parked on the last slot
+        // fills the edge "through" that slot while every slot before it is free,
+        // so the import refuses where it used to place pins into the gap. The
+        // behaviour is intended; sending that caller to `edit_sheet` would not be.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "LAST", "pin_type": "input",
+                     "x": 50.0, "y": 98.26, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "the edge is filled through its last slot");
+
+        let message = format!("{:?}", result.content);
+        assert!(
+            message.contains("18 slot(s) before it are empty"),
+            "the refusal must say the slots below the outlying pin are free: {message}"
+        );
+        assert!(
+            message.contains("moving or deleting the outlying pin"),
+            "and must name the remedy that actually applies: {message}"
+        );
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert_eq!(
+            parent.sheets.by_name("A").unwrap().pins.len(),
+            1,
+            "no pin was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_does_not_walk_onto_a_pin_whose_rotation_names_no_edge() {
+        // The reserve used to be a COUNT. It stepped the stack past one slot per
+        // unattributable pin, wherever that pin actually sat, so a single-label
+        // import cleared it and a multi-label import walked straight over it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "ODD", "pin_type": "passive",
+                     "x": 50.0, "y": 62.7, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        set_pin_rotation(&root, "ODD", None);
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        for n in ["N1", "N2", "N3", "N4", "N5"] {
+            add_label(&child_path, n, "input", 5.0, 5.0);
+        }
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        assert_eq!(sheet.pins.len(), 6, "all five labels were imported");
+        let odd = sheet.pin_by_name("ODD").unwrap().clone();
+        let on_top: Vec<_> = sheet
+            .pins
+            .iter()
+            .filter(|p| p.name != "ODD" && (p.at.x, p.at.y) == (odd.at.x, odd.at.y))
+            .map(|p| p.name.clone())
+            .collect();
+        assert!(
+            on_top.is_empty(),
+            "an import must step over the pin at ({}, {}), not onto it: {:?}",
+            odd.at.x,
+            odd.at.y,
+            on_top
+        );
+    }
+
+    #[tokio::test]
+    async fn sheet_pin_edge_capacity_counts_an_exact_multiple_span() {
+        // (50.0 + 5.08) - 50.0 is 5.079999999999998, so an untoleranced floor()
+        // reads a two-slot edge as one. The undercount decides which pins count
+        // as being on the edge, so it stranded a valid pin and let an import
+        // write over it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 5.08 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet_box = SheetBox::of(parent.sheets.by_name("A").unwrap());
+        assert_eq!(
+            sheet_pin_edge_capacity(sheet_box, "left"),
+            2,
+            "a 5.08 mm edge is exactly two slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_does_not_overwrite_a_pin_on_an_exact_multiple_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 5.08 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "LAST", "pin_type": "input",
+                     "x": 50.0, "y": 55.08, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let before = std::fs::read(&root).unwrap();
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let last = sheet.pin_by_name("LAST").unwrap().clone();
+        if let Some(vin) = sheet.pin_by_name("VIN") {
+            assert_ne!(
+                (vin.at.x, vin.at.y),
+                (last.at.x, last.at.y),
+                "the last slot is occupied, so the import must not take it"
+            );
+        } else {
+            assert!(result.is_error, "an import that wrote nothing must say why");
+            assert_eq!(
+                std::fs::read(&root).unwrap(),
+                before,
+                "a refused import must leave the file byte-identical"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_blocks_the_slot_a_stranded_pin_will_be_clamped_onto() {
+        // A pin past the end of an edge does not stay there — KiCad pulls it back
+        // to the corner. On an edge whose length is an exact number of slots that
+        // corner IS a slot, so the stranded pin's own coordinate is not the only
+        // one an import has to avoid. Here the edge becomes 5.08 mm (two slots)
+        // with a pin at y = 60 left outside it, which clamps onto slot 2.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "STRANDED", "pin_type": "input",
+                     "x": 50.0, "y": 60.0, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 5.08 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "ONE", "input", 5.0, 5.0);
+        add_label(&child_path, "TWO", "input", 5.0, 5.0);
+        let before = std::fs::read(&root).unwrap();
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Only slot 1 is free: slot 2 is where the stranded pin will be clamped.
+        // Two labels therefore cannot both fit, and the import refuses entire.
+        assert!(
+            result.is_error,
+            "slot 2 belongs to the pin KiCad will clamp back onto the corner"
+        );
+        assert_eq!(
+            std::fs::read(&root).unwrap(),
+            before,
+            "a refused import must leave the file byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_survives_a_sheet_with_a_negative_size() {
+        // A backwards span is no longer reachable through `edit_sheet` — it
+        // refuses a non-positive size — but a file written by an older Konnect,
+        // by hand, or by another tool can still carry one, so the guard still
+        // has a job. Turning a coordinate into a slot must not assert on the
+        // bound order: a panic here takes the server down, where an error or a
+        // placement does not.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        let added = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "P", "pin_type": "input",
+                     "x": 50.0, "y": 60.0, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!added.is_error, "the pin must exist before the resize");
+        // Invert the span in the file itself, and prove the inversion landed.
+        // The previous version of this test asked `edit_sheet` to do it and
+        // discarded the result; once that call began refusing, the sheet stayed
+        // rectangular and this test passed while exercising nothing.
+        let written = std::fs::read_to_string(&root).unwrap();
+        let inverted = written.replace("(size 80 50)", "(size 80 -20)");
+        assert_ne!(
+            inverted, written,
+            "fixture: the sheet's size literal was not found, so the span was never inverted"
+        );
+        std::fs::write(&root, &inverted).unwrap();
+        assert_eq!(
+            cse::Schematic::load(&root)
+                .unwrap()
+                .sheets
+                .by_name("A")
+                .unwrap()
+                .height,
+            -20.0,
+            "fixture: the sheet must read back with a backwards span"
+        );
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a backwards span must not panic — it is a malformed box, not a crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_refuses_a_side_that_is_not_an_edge() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "middle" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+    }
+
     #[tokio::test]
     async fn add_sheet_pin_rejects_invalid_pin_type() {
         let tmp = TempDir::new().unwrap();
@@ -2714,7 +4894,7 @@ mod tests {
         // Label with no pin, and (below) a pin with no label — deliberate mismatch.
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
         handle_add_sheet_pin(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "pin_name": "GND", "pin_type": "passive", "x": 90.0, "y": 55.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "pin_name": "GND", "pin_type": "passive", "x": 130.0, "y": 55.0 }),
             &ctx,
         )
         .await
@@ -2850,5 +5030,91 @@ mod tests {
             before,
             "delete_sheet must leave the real KiCad file byte-identical"
         );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::{tools, PAPER_SIZES};
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    async fn set_page(body: &str, size: &str, portrait: bool) -> String {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "set_schematic_page")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let ctx = Arc::new(ToolContext::new(
+            cfg,
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let args = json!({
+            "schematic": f.path().to_str().unwrap(),
+            "size": size, "portrait": portrait
+        });
+        (def.handler)(&args, ctx).await.unwrap();
+        std::fs::read_to_string(f.path()).unwrap()
+    }
+
+    const WITH_PAPER: &str =
+        "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (paper \"A4\")\n  (symbol)\n)\n";
+    const NO_PAPER: &str = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (symbol)\n)\n";
+
+    #[tokio::test]
+    async fn replaces_an_existing_paper_node() {
+        let out = set_page(WITH_PAPER, "A2", false).await;
+        assert!(out.contains("(paper \"A2\")"), "got {out}");
+        assert!(!out.contains("A4"), "old size must be gone: {out}");
+        assert_eq!(out.matches("(paper").count(), 1);
+    }
+
+    /// A sheet written without a paper node — KiCad treats it as A4 — takes the
+    /// new one in the header, before any element.
+    #[tokio::test]
+    async fn inserts_when_absent_and_stays_in_the_header() {
+        let out = set_page(NO_PAPER, "A3", false).await;
+        assert!(out.contains("(paper \"A3\")"), "got {out}");
+        assert!(out.find("(paper").unwrap() < out.find("(symbol").unwrap());
+    }
+
+    #[tokio::test]
+    async fn portrait_is_marked_on_the_node() {
+        let out = set_page(WITH_PAPER, "A3", true).await;
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn unknown_size_leaves_the_file_alone() {
+        let out = set_page(WITH_PAPER, "A9", false).await;
+        assert!(
+            out.contains("(paper \"A4\")"),
+            "must not have written: {out}"
+        );
+    }
+
+    #[test]
+    fn paper_table_is_landscape_and_unique() {
+        let mut names: Vec<_> = PAPER_SIZES.iter().map(|(n, _, _)| *n).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate paper size name");
+        for (n, w, h) in PAPER_SIZES {
+            assert!(w > h, "{n} is listed portrait; the table is landscape");
+        }
     }
 }

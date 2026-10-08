@@ -1,23 +1,23 @@
 //! `sch_batch` toolset — bulk/batch operations on schematic elements.
 //!
 //! **Critical invariant**: every write handler performs a single file read,
-//! collects ALL mutations as `SexpEdit` values against the original content,
-//! then calls `write_atomic` exactly once. This fixes the Python bug where
-//! `batch_connect_to_net` did N separate read/write cycles.
+//! plans or applies all mutations in memory, then commits exactly once. This
+//! fixes the Python bug where `batch_connect_to_net` did N separate read/write
+//! cycles.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, opt_u32, require_array, require_f64,
-    require_str, ToolDef,
+    find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
+    require_array, require_f64, require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
-        read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
@@ -26,11 +26,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
+use super::sch_annotate::opt_string;
 use super::sch_components::{
     commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
-    plan_component_and_item_deletions, ComponentDeleteTargetError,
+    plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
-use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
+use super::sch_wiring::{
+    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -38,8 +41,10 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "batch_connect_to_net",
-            "Connect multiple component pins to a named net by adding net labels at each pin \
-             endpoint. Single file read → all labels inserted → single file write. \
+            "Connect multiple component pins to a named net. By default it adds a net label \
+             at each pin endpoint with no wire. Pass stub_length, direction and label_type \
+             for connect_to_net's placement, applied to every pin in the call. \
+             Single file read → all edits → single file write. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -49,6 +54,23 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "net_name": { "type": "string", "description": "Name of the net to connect pins to" },
+                    "net": { "type": "string",
+                        "description": "Alias of net_name, as connect_to_net names it. Giving both with different values is an error." },
+                    "direction": {
+                        "type": "string",
+                        "description": "Direction of each pin's stub, and of its label text. 'auto' (default) \
+                                        points away from the symbol body.",
+                        "enum": ["auto", "right", "left", "up", "down"],
+                        "default": "auto"
+                    },
+                    "stub_length": { "type": "number", "minimum": 0, "default": 0,
+                        "description": "Length in mm of the wire stub at each pin. 0 (default) puts the \
+                                        label on the pin endpoint with no wire; connect_to_net uses 2.54." },
+                    "label_type": {
+                        "type": "string",
+                        "enum": ["net_label", "global_label"],
+                        "default": "net_label"
+                    },
                     "pins": {
                         "type": "array",
                         "description": "List of {reference, pin_number} objects to connect",
@@ -62,7 +84,7 @@ pub fn tools() -> Vec<ToolDef> {
                         }
                     }
                 },
-                "required": ["schematic", "net_name", "pins"]
+                "required": ["schematic", "pins"]
             }),
             |args, ctx| async move { handle_batch_connect_to_net(args, ctx).await }
         ),
@@ -71,9 +93,12 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. \
-             Pass explicit references -- there is no auto-numbering; an omitted reference \
-             becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
+             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
+             required junction in the same atomic write; the response reports \
+             junctions_added_count and junctions_pruned_count. \
+             There is no auto-numbering: an omitted reference becomes the library prefix \
+             plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
+             add_schematic_component; annotate_schematic numbers it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -152,7 +177,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Move multiple components by a uniform dx/dy offset in a single atomic file \
              write. Junction dots are re-judged where the pins moved: a dot the pins \
              leave unjustified is removed and a pin landing mid-span on a wire gains \
-             one, reported as junctions_pruned_count and junctions_added_count.",
+             one, reported as junctions_pruned_count and junctions_added_count. A \
+             no-connect flag travels with the pin it protects, reported as \
+             no_connects_moved; the shift is refused before writing when that pin \
+             cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -172,11 +200,17 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_edit_schematic_components",
             "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+             in a single atomic file write. Missing custom properties are created on every \
+             placed unit only when create_missing is true.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "create_missing": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Create missing custom properties on every placed unit. Built-in properties remain update-only."
+                    },
                     "edits": {
                         "type": "array",
                         "description": "List of {reference, value?, footprint?, fields?} edit objects",
@@ -188,6 +222,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "footprint": { "type": "string" },
                                 "fields": {
                                     "type": "object",
+                                    "additionalProperties": { "type": "string" },
                                     "description": "Additional property fields as key:value pairs"
                                 }
                             },
@@ -374,19 +409,44 @@ fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/// The net a `batch_connect_to_net` call names: `net_name`, or `net` as
+/// `connect_to_net` spells it. Both may be given only when they agree.
+fn batch_net_name(args: &serde_json::Value) -> Result<String, CallToolResult> {
+    match (opt_string(args, "net_name")?, opt_string(args, "net")?) {
+        (Some(a), Some(b)) if a != b => Err(invalid_arg(
+            "net",
+            "conflicts with 'net_name'; give one, or the same value in both",
+        )),
+        (Some(name), _) | (None, Some(name)) => Ok(name),
+        (None, None) => Err(invalid_arg(
+            "net_name",
+            "missing; give 'net_name' or its alias 'net'",
+        )),
+    }
+}
+
 async fn handle_batch_connect_to_net(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
+    let net_name = match batch_net_name(args) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
     let pins = match args["pins"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'pins' array")),
     };
+    // Defaults are the batch tool's own output from before these options:
+    // a local label on the pin endpoint and no wire (#701).
+    let direction = opt_str(args, "direction").unwrap_or("auto");
+    let stub_length = opt_f64(args, "stub_length").unwrap_or(0.0);
+    let label_type = opt_str(args, "label_type").unwrap_or("net_label");
+    // Plain labels on the pin keep the string splice; anything else goes
+    // through the editor model connect_to_net uses.
+    let is_splice = stub_length == 0.0 && label_type == "net_label";
+    let is_legacy_placement = is_splice && direction == "auto";
 
     let (content, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
@@ -394,12 +454,24 @@ async fn handle_batch_connect_to_net(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let mut sch = if is_splice {
+        None
+    } else {
+        Some(cse::Schematic::from_source(&sch_path, content.clone())?)
+    };
+    // Only a stub wire can pass over a pin mid-segment.
+    let pin_points = if stub_length > 0.0 {
+        crate::tools::all_pin_endpoints(&tree)
+    } else {
+        Vec::new()
+    };
+    let mut is_changed = false;
 
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    // Endpoints already carrying this net's label, so a second never lands
-    // on the first. Seeded from the file, extended as we go.
+    // Label positions already carrying this net, so a second never lands on
+    // the first. Seeded from the file, extended as we go.
     let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
         .iter()
         .filter(|l| l.net == net_name)
@@ -430,17 +502,37 @@ async fn handle_batch_connect_to_net(
             }
         };
         let (px, py) = pin_endpoint(&pin, t);
-        let rotation = pin_label_rotation(&pin, t);
+        // `auto` is pin_label_rotation's direction, so the default rotation
+        // is unchanged.
+        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        let (lx, ly) = dir.end((px, py), stub_length);
+        let rotation = dir.label_rotation;
 
         // Symbols stack several pins on one endpoint; a label each renders as
-        // a smear. They stay connected by that endpoint.
-        let duplicate = labelled
+        // a smear. They stay connected by that endpoint. Two stubs can also
+        // end on one spot, so the label is judged apart from this pin's wire.
+        let needs_label = !labelled
             .iter()
-            .any(|(lx, ly)| points_coincident(*lx, *ly, px, py, 0.01));
-        if !duplicate {
-            inserts.push_str(&format_net_label(&net_name, px, py, rotation));
-            labelled.push((px, py));
+            .any(|(x, y)| points_coincident(*x, *y, lx, ly, 0.01));
+        let needs_wire = match sch.as_ref() {
+            Some(sch) if stub_length > 0.0 => !has_wire(sch, (px, py), (lx, ly)),
+            _ => false,
+        };
+        if needs_wire {
+            if let Some(sch) = sch.as_mut() {
+                add_stub_wire(sch, &pin_points, (px, py), (lx, ly));
+            }
         }
+        if needs_label {
+            if let Some(sch) = sch.as_mut() {
+                add_stub_label(sch, label_type, &net_name, (lx, ly), rotation);
+            } else {
+                inserts.push_str(&format_net_label(&net_name, lx, ly, rotation));
+            }
+            labelled.push((lx, ly));
+        }
+        let duplicate = !needs_wire && !needs_label;
+        is_changed |= !duplicate;
         let mut entry = json!({
             "reference": reference,
             "pin": pin_number,
@@ -448,27 +540,54 @@ async fn handle_batch_connect_to_net(
             "y": py,
             "rotation": rotation
         });
+        if !is_legacy_placement {
+            entry["direction"] = json!(dir.name);
+            entry["label"] = json!({ "x": lx, "y": ly, "rotation": rotation });
+            if needs_wire {
+                entry["wire"] = json!({ "x1": px, "y1": py, "x2": lx, "y2": ly });
+            }
+        }
         if duplicate {
             entry["deduplicated"] = json!(true);
         }
         added.push(entry);
     }
 
-    if !inserts.is_empty() {
-        let expected = content.clone();
-        // Labels are element class 2; symbol instances MUST come last, so a
-        // splice at the file's final `)` puts them after the instances and
-        // KiCad refuses the whole file (#156, same bug as add_schematic_text).
-        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    if is_changed {
+        match sch {
+            // Revision-checked against `content`: a concurrent edit refuses
+            // the write rather than being overwritten.
+            Some(sch) => sch.overwrite()?,
+            None => {
+                let expected = content.clone();
+                // Labels are element class 2; symbol instances MUST come last, so a
+                // splice at the file's final `)` puts them after the instances and
+                // KiCad refuses the whole file (#156, same bug as add_schematic_text).
+                let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+                write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+            }
+        }
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "net": net_name,
         "added": added,
         "added_count": added.len(),
         "errors": errors
-    })))
+    });
+    if !is_legacy_placement {
+        body["stub_length"] = json!(stub_length);
+        body["label_type"] = json!(label_type);
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+/// Whether `sch` already has a wire between `a` and `b`, either way round.
+fn has_wire(sch: &cse::Schematic, a: (f64, f64), b: (f64, f64)) -> bool {
+    let at = |p: (f64, f64), q: (f64, f64)| points_coincident(p.0, p.1, q.0, q.1, 0.01);
+    sch.wires
+        .iter()
+        .any(|w| (at(w.start, a) && at(w.end, b)) || (at(w.start, b) && at(w.end, a)))
 }
 
 /// Extract the message text out of a `CallToolResult` error, for folding a
@@ -490,7 +609,8 @@ async fn handle_batch_place_components(
         None => return Ok(CallToolResult::error("Missing 'components' array")),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
         Ok(context) => context,
         Err(error) => return Ok(error.into_tool_result()),
@@ -537,7 +657,7 @@ async fn handle_batch_place_components(
                 continue;
             }
         };
-        let reference = comp["reference"].as_str().unwrap_or("?");
+        let reference = comp["reference"].as_str();
         let value = comp["value"].as_str();
         let footprint = comp["footprint"].as_str();
         let unit = match opt_u32(comp, "unit") {
@@ -575,7 +695,7 @@ async fn handle_batch_place_components(
                     expected_y,
                     rotation,
                     mirror,
-                    reference,
+                    &placed.reference,
                     &placed.fields,
                     unit,
                 ));
@@ -588,7 +708,7 @@ async fn handle_batch_place_components(
                 failures.push(json!({
                     "index": index,
                     "lib_id": lib_id,
-                    "reference": reference,
+                    "reference": reference.unwrap_or("?"),
                     "kind": kind,
                     "message": message
                 }));
@@ -597,8 +717,15 @@ async fn handle_batch_place_components(
     }
 
     let mut placed = Vec::new();
+    let mut junctions_added = 0;
+    let mut junctions_pruned = 0;
     if !placements.is_empty() {
-        if let Err(error) = sch.overwrite() {
+        let candidate = sch.to_source();
+        let (candidate, added, pruned) =
+            super::sch_wiring::reconcile_junctions_for_placement(&before_source, candidate);
+        junctions_added = added;
+        junctions_pruned = pruned;
+        if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
             let result = super::mutation_outcome_uncertain(
                 &sch_path,
                 "batch_place_components",
@@ -687,6 +814,8 @@ async fn handle_batch_place_components(
     let mut result = CallToolResult::json(&json!({
         "placed": placed,
         "placed_count": placed.len(),
+        "junctions_added_count": junctions_added,
+        "junctions_pruned_count": junctions_pruned,
         "errors": errors,
         "failures": failures
     }));
@@ -950,46 +1079,57 @@ async fn handle_bulk_move(
         }
     }
 
-    // Pin positions before the shift, so a dot the pins vacate can be re-judged
-    // and a pin landing mid-span gets one (#120). A move changes no wires.
-    const TOL: f64 = 0.01;
-    let pins_of = |src: &str| -> Vec<(f64, f64)> {
-        konnect_sexp::parse_sexp(src)
-            .ok()
-            .map(|t| crate::tools::all_pin_endpoints(&t))
-            .unwrap_or_default()
+    // No-connect carry needs the symbols behind its markers (#626). Junction
+    // reconciliation owns the content-to-content pin diff below (#624), so a
+    // sheet without markers skips this separate planning parse entirely.
+    let needs_trees = expected.contains("(no_connect");
+    let tree_of = |src: &str| -> Option<konnect_sexp::SexpNode> {
+        needs_trees
+            .then(|| konnect_sexp::parse_sexp(src).ok())
+            .flatten()
     };
-    // No wires means nothing can be justified and nothing can be landed on, so
-    // the whole pass — including two full symbol/lib_symbols walks — is skipped.
-    let has_wires = expected.contains("(wire");
-    let before_pins = if has_wires {
-        pins_of(&expected)
-    } else {
-        Vec::new()
-    };
+    let before_tree = tree_of(&expected);
 
     let new_content = apply_edits(content, edits);
+    let after_tree = tree_of(&new_content);
 
-    let after_pins = if has_wires {
-        pins_of(&new_content)
+    // A no-connect belongs to the pin, not to the coordinate it was dropped
+    // on, so it travels in this same write — and the reconciliation below then
+    // sees it at the arrival point and adds no dot (#626).
+    let carried = if expected.contains("(no_connect") {
+        let (Some(before), Some(after)) = (&before_tree, &after_tree) else {
+            return Ok(crate::tools::sch_wiring::no_connect_carry_unreadable(
+                &sch_path,
+            ));
+        };
+        match crate::tools::sch_wiring::plan_no_connect_carry(before, after) {
+            Ok(carried) => carried,
+            Err(error) => return Ok(error.into_result(&sch_path)),
+        }
     } else {
         Vec::new()
     };
-    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
-        a.iter()
-            .copied()
-            .filter(|&(x, y)| {
-                !b.iter()
-                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
-            })
-            .collect()
+    let Some(new_content) =
+        crate::tools::sch_wiring::apply_no_connect_carries(new_content, &carried)
+    else {
+        return Ok(crate::tools::sch_wiring::no_connect_carry_unwritable(
+            &sch_path,
+        ));
     };
-    let mut points = differs(&before_pins, &after_pins);
-    points.extend(differs(&after_pins, &before_pins));
+
     let (new_content, junctions_added, junctions_pruned) =
-        crate::tools::sch_wiring::reconcile_junctions_at(new_content, &points);
+        crate::tools::sch_wiring::reconcile_junctions_for_placement(&expected, new_content);
 
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+
+    let moved_markers = match crate::tools::sch_wiring::observed_no_connect_moves(
+        &sch_path,
+        "bulk_move_schematic_components",
+        &carried,
+    )? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
@@ -997,6 +1137,8 @@ async fn handle_bulk_move(
         "dx": dx, "dy": dy,
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers,
         "errors": errors
     })))
 }
@@ -1011,11 +1153,19 @@ async fn handle_batch_edit(
         None => return Ok(CallToolResult::error("Missing 'edits' array")),
     };
 
-    let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut file_edits: Vec<SexpEdit> = Vec::new();
+    let create_missing = match args.get("create_missing") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Ok(invalid_arg("create_missing", "must be a boolean")),
+    };
+
+    let expected = read_consistent(&sch_path)?;
+    let mut content = expected.clone();
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut seen_assignments = HashSet::new();
+    let mut updated_unit_copies = 0;
+    let mut created_unit_copies = 0;
 
     for edit_spec in &edits_arr {
         let reference = match edit_spec["reference"].as_str() {
@@ -1027,51 +1177,112 @@ async fn handle_batch_edit(
         };
 
         let mut component_changes: Vec<String> = Vec::new();
+        let mut field_results = Vec::new();
+        let mut updated_fields = BTreeSet::new();
+        let mut created_fields = BTreeSet::new();
 
         // Standard fields, then arbitrary extra fields from the "fields" object.
         // Each is rewritten in every unit's block, which is where a multi-unit
         // part keeps its copies of the value.
-        let extra = edit_spec["fields"].as_object();
-        let specs = [("Value", "value"), ("Footprint", "footprint")]
-            .into_iter()
-            .filter_map(|(field, key)| Some((field.to_string(), edit_spec[key].as_str()?)))
-            .chain(
-                extra
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?))),
-            );
+        let extra = match edit_spec.get("fields") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(fields)) => Some(fields),
+            Some(_) => {
+                errors.push(format!("'fields' for '{reference}' must be an object"));
+                None
+            }
+        };
+        let mut specs: Vec<(String, String, bool)> =
+            [("Value", "value"), ("Footprint", "footprint")]
+                .into_iter()
+                .filter_map(|(field, key)| {
+                    edit_spec[key]
+                        .as_str()
+                        .map(|value| (field.to_string(), value.to_string(), false))
+                })
+                .collect();
 
-        for (field, new_val) in specs {
-            let ranges = field_value_ranges(&content, reference, &field);
-            if ranges.is_empty() {
+        if let Some(extra) = extra {
+            for (name, value) in extra {
+                let Some(value) = value.as_str() else {
+                    errors.push(format!(
+                        "Field '{name}' on '{reference}' must have a string value"
+                    ));
+                    continue;
+                };
+                if name == "Reference" {
+                    errors.push(format!(
+                        "Field 'Reference' on '{reference}' cannot be edited through 'fields'"
+                    ));
+                    continue;
+                }
+                let may_create =
+                    create_missing && !matches!(name.as_str(), "Value" | "Footprint" | "Datasheet");
+                specs.push((name.clone(), value.to_string(), may_create));
+            }
+        }
+
+        for (field, new_val, may_create) in specs {
+            if !seen_assignments.insert((reference.to_string(), field.clone())) {
+                errors.push(format!(
+                    "Duplicate assignment for field '{field}' on '{reference}'"
+                ));
+                continue;
+            }
+
+            if !may_create && field_value_ranges(&content, reference, &field).is_empty() {
                 errors.push(format!("Field '{}' not found on '{}'", field, reference));
                 continue;
             }
-            let units = ranges.len();
-            for (start, end) in ranges {
-                file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+
+            let (next, counts) =
+                match set_property_value(&content, reference, &field, &new_val, may_create) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+            content = next;
+            updated_unit_copies += counts.updated;
+            created_unit_copies += counts.added;
+            if counts.updated > 0 {
+                updated_fields.insert(field.clone());
             }
+            if counts.added > 0 {
+                created_fields.insert(field.clone());
+            }
+            let units = counts.updated + counts.added;
             component_changes.push(if units > 1 {
                 format!("{} → {} ({} units)", field, new_val, units)
             } else {
                 format!("{} → {}", field, new_val)
             });
+            field_results.push(json!({
+                "name": field,
+                "value": new_val,
+                "updated_units": counts.updated,
+                "created_units": counts.added
+            }));
         }
 
         if !component_changes.is_empty() {
             changed.push(json!({
                 "reference": reference,
-                "changes": component_changes
+                "changes": component_changes,
+                "fields": field_results,
+                "updated_fields": updated_fields,
+                "created_fields": created_fields
             }));
         }
     }
 
-    let new_content = apply_edits(content, file_edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
+        "updated_unit_copies": updated_unit_copies,
+        "created_unit_copies": created_unit_copies,
         "updated": changed,
         "errors": errors
     })))
@@ -1631,8 +1842,9 @@ async fn handle_validate_wire_connections(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     let labels = extract_all_net_labels(&tree);
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tol);
 
     let floating: Vec<serde_json::Value> = index
         .floating_wire_ends()
@@ -1663,8 +1875,9 @@ async fn handle_validate_component_connections(
     let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     let labels = extract_all_net_labels(&tree);
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
 
@@ -2076,6 +2289,42 @@ mod batch_place_and_connect_tests {
                 .lines()
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
+        );
+    }
+
+    /// An entry without `reference` keeps the stock library prefix (#669).
+    // Holds the env guard across awaits on purpose; see the note on
+    // `sch_components::tests`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn batch_place_without_reference_keeps_library_prefix() {
+        let (dir, _env) = crate::tools::stock_reference_prefix_libraries();
+        let path = dir.path().join("prefix.kicad_sch");
+        std::fs::write(&path, crate::tools::blank_schematic_template()).unwrap();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 101.6, "y": 101.6 },
+                    { "lib_id": "power:PWR_FLAG", "x": 127.0, "y": 101.6 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        assert_eq!(
+            crate::tools::placed_references(&path),
+            vec![
+                ("Device:R".into(), "R?".into(), vec!["R?".into()]),
+                (
+                    "power:PWR_FLAG".into(),
+                    "#FLG?".into(),
+                    vec!["#FLG?".into()]
+                ),
+            ]
         );
     }
 
@@ -2963,6 +3212,259 @@ mod multi_unit_handler_tests {
                 .value,
             original_r1
         );
+        assert_eq!(result["updated_unit_copies"], 6);
+        assert_eq!(result["created_unit_copies"], 0);
+        assert_eq!(result["updated"][0]["fields"][0]["updated_units"], 3);
+        assert_eq!(result["updated"][0]["fields"][1]["updated_units"], 3);
+    }
+
+    #[tokio::test]
+    async fn batch_edit_missing_custom_field_is_opt_in_and_multi_unit_safe() {
+        let schematic = fixture_file();
+        let original = std::fs::read_to_string(schematic.path()).unwrap();
+        let refused = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(refused["updated_count"], 0);
+        assert_eq!(refused["created_unit_copies"], 0);
+        assert_eq!(
+            refused["errors"],
+            json!(["Field 'Tolerance' not found on 'U1'"])
+        );
+        assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), original);
+
+        let created = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(created["updated_count"], 1);
+        assert_eq!(created["updated_unit_copies"], 0);
+        assert_eq!(created["created_unit_copies"], 3);
+        assert_eq!(
+            created["updated"][0]["created_fields"],
+            json!(["Tolerance"])
+        );
+        assert_eq!(created["updated"][0]["fields"][0]["created_units"], 3);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "1%""#).count(),
+            3
+        );
+        let units = instances(schematic.path())
+            .into_iter()
+            .filter(|instance| instance.reference == "U1")
+            .collect::<Vec<_>>();
+        let blocks = find_all_symbol_instance_blocks(&committed, "U1");
+        for ((start, end), unit) in blocks.into_iter().zip(units) {
+            let block = &committed[start..end];
+            let property = &block[block.find(r#"(property "Tolerance""#).unwrap()..];
+            assert!(
+                property.contains(&format!("(at {} {} 0)", unit.x, unit.y)),
+                "unit {} field was not anchored at its own placement",
+                unit.unit
+            );
+        }
+
+        let repeated = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "2%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(repeated["updated_unit_copies"], 3);
+        assert_eq!(repeated["created_unit_copies"], 0);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "2%""#).count(),
+            3
+        );
+        assert!(!committed.contains(r#"(property "Tolerance" "1%""#));
+    }
+
+    #[tokio::test]
+    async fn batch_edit_creates_escaped_fields_for_multiple_components() {
+        let schematic = fixture_file();
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [
+                    {"reference": "U1", "fields": {
+                        "Vendor Note": "line 1\n\"quoted\"\\path",
+                        "Tolerance": "5%"
+                    }},
+                    {"reference": "R1", "fields": {"Tolerance": "1%"}}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(result["updated_count"], 2);
+        assert_eq!(result["created_unit_copies"], 7);
+        assert_eq!(result["errors"], json!([]));
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "5%""#).count(),
+            3
+        );
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "1%""#).count(),
+            1
+        );
+        assert_eq!(
+            committed
+                .matches(r#"(property "Vendor Note" "line 1\n\"quoted\"\\path""#)
+                .count(),
+            3
+        );
+        read_schematic(schematic.path()).expect("escaped property remains valid KiCad syntax");
+    }
+
+    #[tokio::test]
+    async fn batch_edit_rejects_non_string_reference_and_duplicate_assignments() {
+        let schematic = fixture_file();
+        let original = std::fs::read_to_string(schematic.path()).unwrap();
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [
+                    {"reference": "U1", "fields": {
+                        "Count": 3,
+                        "Reference": "U99",
+                        "Value": "first"
+                    }},
+                    {"reference": "U1", "value": "second"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(result["updated_count"], 1);
+        assert_eq!(result["created_unit_copies"], 0);
+        assert_eq!(result["updated_unit_copies"], 3);
+        let errors = result["errors"].as_array().unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("must have a string value")));
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("cannot be edited")));
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("Duplicate assignment")));
+
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Reference" "U1""#).count(),
+            3
+        );
+        assert_eq!(committed.matches(r#"(property "Value" "first""#).count(), 3);
+        assert!(!committed.contains(r#"(property "Value" "second""#));
+        assert_ne!(
+            committed, original,
+            "the valid first assignment still applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_edit_repairs_a_partially_populated_multi_unit_field() {
+        let schematic = fixture_file();
+        call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+
+        let content = std::fs::read_to_string(schematic.path()).unwrap();
+        let first_unit = find_all_symbol_instance_blocks(&content, "U1")[0];
+        let relative = content[first_unit.0..first_unit.1]
+            .find(r#"(property "Tolerance" "1%""#)
+            .unwrap();
+        let property_start = first_unit.0 + relative;
+        let (_, property_end) = konnect_sexp::writer::find_balanced_block(&content, property_start)
+            .expect("the inserted property is balanced");
+        let partial = apply_edits(
+            content,
+            vec![SexpEdit::delete(property_start, property_end)],
+        );
+        std::fs::write(schematic.path(), partial).unwrap();
+
+        let repaired = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "2%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(repaired["updated_unit_copies"], 2);
+        assert_eq!(repaired["created_unit_copies"], 1);
+        assert_eq!(repaired["updated"][0]["fields"][0]["updated_units"], 2);
+        assert_eq!(repaired["updated"][0]["fields"][0]["created_units"], 1);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "2%""#).count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_edit_preserves_crlf_when_creating_fields() {
+        let mut schematic = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        let crlf = ECC83.replace('\n', "\r\n");
+        schematic.write_all(crlf.as_bytes()).unwrap();
+        schematic.flush().unwrap();
+
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(result["created_unit_copies"], 3);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert!(!committed.replace("\r\n", "").contains('\n'));
+        assert_eq!(
+            committed.matches("\r\n\t\t(property \"Tolerance\"").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn batch_edit_candidate_refuses_a_concurrent_revision() {
+        let schematic = fixture_file();
+        let expected = read_consistent(schematic.path()).unwrap();
+        let (candidate, counts) =
+            set_property_value(&expected, "U1", "Tolerance", "1%", true).unwrap();
+        assert_eq!(counts.added, 3);
+
+        let external = format!("{expected}\n; external edit\n");
+        std::fs::write(schematic.path(), &external).unwrap();
+        let error = write_atomic_if_unchanged(schematic.path(), &expected, &candidate).unwrap_err();
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), external);
     }
 
     #[tokio::test]
@@ -3303,6 +3805,98 @@ mod insert_order_tests {
     }
 }
 
+#[cfg(test)]
+mod bulk_move_no_connect_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("carry.kicad_sch");
+        std::fs::write(&path, CARRY).unwrap();
+        (directory, path)
+    }
+
+    fn text(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A bulk shift reconciles junctions like the single-component move, so it
+    /// owes the markers the same trip (#626).
+    #[tokio::test]
+    async fn a_bulk_shift_carries_the_marker_and_adds_no_dot() {
+        let (_directory, path) = fixture();
+        // R2 pin 1 goes from (158.75, 156.21) to (154.94, 160.02), mid-span on
+        // the NETB wire — the same arrival the single-component move lands on.
+        let result = handle_bulk_move(
+            &json!({ "schematic": path, "references": ["R2"], "dx": -3.81, "dy": 3.81 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = text(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(
+            response["no_connects_moved"][0]["uuid"], R2_MARKER,
+            "{response}"
+        );
+        assert_eq!(
+            response["no_connects_moved"][0]["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(committed.contains("(at 154.94 160.02)"), "{committed}");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_shift_that_cannot_follow_a_marker_writes_nothing() {
+        let (_directory, path) = fixture();
+        // R3 alone leaves R5 pin 1 behind under the marker they share.
+        let result = handle_bulk_move(
+            &json!({ "schematic": path, "references": ["R3"], "dx": -12.7, "dy": 0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CARRY);
+    }
+}
+
 /// #202: `bulk_move` shifted only the symbol's own `(at …)`. Property `(at …)`
 /// coordinates are absolute in `.kicad_sch`, so Reference and Value text
 /// stayed at the old location while the symbol moved away. The typed path
@@ -3472,6 +4066,83 @@ mod bulk_move_field_tests {
     #[tokio::test]
     async fn field_text_follows_a_negative_move() {
         assert_fields_follow(-25.4, -12.7).await;
+    }
+}
+
+#[cfg(test)]
+mod bulk_move_coordinate_text_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    const SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+
+    /// #744: the snapped grid point is written as KiCad writes it. 132 × 1.27
+    /// is `167.64000000000001` in `f64`, 110 × 1.27 is exactly `139.7`, so
+    /// `#PWR002` exposed the noise and `R8` is the control. Expected text is
+    /// what `kicad-cli sch upgrade --force` writes for the moved sheet.
+    #[tokio::test]
+    async fn bulk_move_writes_kicad_coordinate_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({ "schematic": path.to_str().unwrap(),
+                     "references": ["#PWR002", "R8"], "dx": -5.08, "dy": 0.0 }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // The symbol's own (at …), the first in its block; its fields share
+        // the same point and already went through `fmt_f64`.
+        let symbol_at = |reference: &str| {
+            let (start, end) = find_all_symbol_instance_blocks(&after, reference)[0];
+            let block = &after[start..end];
+            let at = block.find("(at ").unwrap();
+            block[at..at + block[at..].find(')').unwrap() + 1].to_string()
+        };
+        assert_eq!(symbol_at("#PWR002"), "(at 45.72 167.64 0)");
+        assert_eq!(symbol_at("R8"), "(at 54.61 139.7 90)");
+        // KiCad never writes more than six decimals.
+        let noisy: Vec<&str> = after
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .filter(|token| token.parse::<f64>().is_ok())
+            .filter(|token| {
+                token
+                    .split_once('.')
+                    .is_some_and(|(_, frac)| frac.len() > 6)
+            })
+            .collect();
+        assert!(noisy.is_empty(), "unrounded coordinates written: {noisy:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let placement = |reference: &str| {
+            body["moved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["reference"] == reference)
+                .unwrap()["placements"][0]
+                .clone()
+        };
+        assert_eq!(
+            placement("#PWR002"),
+            json!({ "old_x": 50.8, "old_y": 167.64, "new_x": 45.72, "new_y": 167.64 })
+        );
+        assert_eq!(
+            placement("R8"),
+            json!({ "old_x": 59.69, "old_y": 139.7, "new_x": 54.61, "new_y": 139.7 })
+        );
     }
 }
 
@@ -3695,5 +4366,342 @@ mod layout_bounds_tests {
         assert_eq!(result["components"][1]["bounds"], serde_json::Value::Null);
         assert_eq!(result["bounding_box"]["x_max"], 120.0);
         assert_eq!(result["bounding_box"]["y_max"], 60.0);
+    }
+}
+
+#[cfg(test)]
+mod batch_connect_options_tests {
+    //! `batch_connect_to_net`'s stub, direction and label options (#701),
+    //! against a KiCad-resaved sheet. Expected positions are what `main`
+    //! wrote before the change; see the fixture README.
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use konnect_sexp::schematic::LabelKind;
+    use std::sync::Arc;
+
+    const PINS: [(&str, &str); 5] = [
+        ("U1", "5"),
+        ("U1", "8"),
+        ("U1", "4"),
+        ("U2", "5"),
+        ("R1", "1"),
+    ];
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()))
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        fixture_named("batch_connect_kicad10.kicad_sch")
+    }
+
+    fn fixture_named(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.kicad_sch");
+        std::fs::copy(src, &path).unwrap();
+        (dir, path)
+    }
+
+    fn pins() -> Value {
+        json!(PINS
+            .iter()
+            .map(|(r, n)| json!({ "reference": r, "pin_number": n }))
+            .collect::<Vec<_>>())
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        serde_json::from_str(&error_text(result)).unwrap()
+    }
+
+    async fn batch(path: &std::path::Path, options: Value) -> CallToolResult {
+        let mut args = json!({ "schematic": path.display().to_string(), "pins": pins() });
+        for (k, v) in options.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        handle_batch_connect_to_net(&args, &ctx()).await.unwrap()
+    }
+
+    /// Wires, labels (kind, position, rotation) and junctions, rounded and
+    /// sorted, so two files compare by what they draw rather than by UUIDs.
+    fn drawing(path: &std::path::Path) -> Vec<String> {
+        let (_, tree) = read_schematic(path).unwrap();
+        let r = |v: f64| format!("{:.3}", v);
+        let mut out: Vec<String> = extract_wires(&tree)
+            .iter()
+            .map(|w| format!("wire {} {} {} {}", r(w.x1), r(w.y1), r(w.x2), r(w.y2)))
+            .chain(extract_labels(&tree).iter().map(|l| {
+                format!(
+                    "{:?} {} {} {} {}",
+                    l.kind,
+                    l.net,
+                    r(l.x),
+                    r(l.y),
+                    r(l.rotation)
+                )
+            }))
+            .chain(
+                konnect_sexp::schematic::extract_junctions(&tree)
+                    .iter()
+                    .map(|j| format!("junction {} {}", r(j.0), r(j.1))),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn keys(v: &Value) -> BTreeSet<&str> {
+        v.as_object().unwrap().keys().map(|k| k.as_str()).collect()
+    }
+
+    fn close(a: &Value, b: f64) -> bool {
+        (a.as_f64().unwrap() - b).abs() < 1e-6
+    }
+
+    /// Omitting every new option, or passing its default, writes what `main`
+    /// wrote: a local label on each pin endpoint, no wire, and the same
+    /// response keys.
+    #[tokio::test]
+    async fn defaults_keep_the_legacy_output() {
+        // (x, y, rotation) of each pin's label, as main wrote them.
+        let promised = [
+            (116.84, 93.98, 0.0),
+            (101.6, 86.36, 0.0),
+            (101.6, 116.84, 0.0),
+            (162.56, 93.98, 180.0),
+            (59.69, 63.5, 180.0),
+        ];
+        for options in [
+            json!({ "net_name": "N" }),
+            json!({ "net_name": "N", "stub_length": 0, "direction": "auto", "label_type": "net_label" }),
+        ] {
+            let (_d, path) = fixture();
+            let result = batch(&path, options.clone()).await;
+            assert!(!result.is_error, "{result:?}");
+            let body = body(&result);
+            assert_eq!(
+                keys(&body),
+                BTreeSet::from(["net", "added", "added_count", "errors"]),
+                "{options}"
+            );
+            for (entry, (x, y, rot)) in body["added"].as_array().unwrap().iter().zip(promised) {
+                assert_eq!(
+                    keys(entry),
+                    BTreeSet::from(["reference", "pin", "x", "y", "rotation"])
+                );
+                assert!(close(&entry["x"], x) && close(&entry["y"], y), "{entry}");
+                assert!(close(&entry["rotation"], rot), "{entry}");
+            }
+
+            let (_, tree) = read_schematic(&path).unwrap();
+            // Only the fixture's own wire: no stub by default.
+            assert_eq!(extract_wires(&tree).len(), 1, "{options}");
+            let labels = extract_labels(&tree);
+            assert_eq!(labels.len(), 5);
+            assert!(labels.iter().all(|l| l.kind == LabelKind::NetLabel));
+            for (x, y, rot) in promised {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|l| points_coincident(l.x, l.y, x, y, 1e-6) && l.rotation == rot),
+                    "{options}: no label at ({x}, {y}) rot {rot}"
+                );
+            }
+        }
+    }
+
+    /// Each explicit option set draws exactly what one `connect_to_net`
+    /// call per pin draws, and the positions are the ones main's
+    /// `connect_to_net` wrote.
+    #[tokio::test]
+    async fn explicit_options_draw_what_connect_to_net_draws() {
+        let single = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .find(|t| t.name == "connect_to_net")
+            .unwrap();
+        // (options, first pin's promised stub end, label kind, junctions).
+        // U1.5's 2.54 mm stub ends mid-span on the fixture's wire, which
+        // needs a junction; the upward stub misses it.
+        let cases = [
+            (
+                json!({ "stub_length": 2.54 }),
+                (119.38, 93.98),
+                LabelKind::NetLabel,
+                1,
+            ),
+            (
+                json!({ "stub_length": 2.54, "label_type": "global_label" }),
+                (119.38, 93.98),
+                LabelKind::GlobalLabel,
+                1,
+            ),
+            (
+                json!({ "stub_length": 5.08, "direction": "up" }),
+                (116.84, 88.9),
+                LabelKind::NetLabel,
+                0,
+            ),
+        ];
+        for (options, (ex, ey), kind, junctions) in cases {
+            let (_d, batch_path) = fixture();
+            let mut args = options.clone();
+            args["net"] = json!("N");
+            let result = batch(&batch_path, args.clone()).await;
+            assert!(!result.is_error, "{result:?}");
+            let body = body(&result);
+            let first = &body["added"][0];
+            assert!(
+                close(&first["label"]["x"], ex) && close(&first["label"]["y"], ey),
+                "{first}"
+            );
+            assert!(
+                close(&first["wire"]["x2"], ex) && close(&first["wire"]["y2"], ey),
+                "{first}"
+            );
+
+            let (_d2, single_path) = fixture();
+            for (reference, pin_number) in PINS {
+                let mut one = args.clone();
+                one["schematic"] = json!(single_path.display().to_string());
+                one["reference"] = json!(reference);
+                one["pin_number"] = json!(pin_number);
+                let r = (single.handler)(&one, Arc::new(ctx())).await.unwrap();
+                assert!(!r.is_error, "{r:?}");
+            }
+
+            let drawn = drawing(&batch_path);
+            assert_eq!(drawn, drawing(&single_path), "{options}");
+            // The fixture's own wire plus one stub per pin.
+            assert_eq!(
+                drawn.iter().filter(|l| l.starts_with("wire ")).count(),
+                6,
+                "{options}"
+            );
+            let dots: Vec<_> = drawn
+                .iter()
+                .filter(|l| l.starts_with("junction "))
+                .collect();
+            assert_eq!(dots.len(), junctions, "{options}: {dots:?}");
+            if junctions == 1 {
+                assert_eq!(dots[0], "junction 119.380 93.980");
+            }
+            let (_, tree) = read_schematic(&batch_path).unwrap();
+            assert!(
+                extract_labels(&tree).iter().all(|l| l.kind == kind),
+                "{options}"
+            );
+        }
+    }
+
+    /// A stub's label marks the spot, so running the batch again adds
+    /// neither a second wire nor a second label.
+    #[tokio::test]
+    async fn rerunning_a_stubbed_batch_adds_nothing() {
+        let (_d, path) = fixture();
+        let options = json!({ "net_name": "N", "stub_length": 2.54 });
+        assert!(!batch(&path, options.clone()).await.is_error);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = batch(&path, options).await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(body(&result)["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["deduplicated"] == json!(true) && e.get("wire").is_none()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Two stubs can end on one spot, and a label of the net can already sit
+    /// at a stub's end. Each pin still gets its own wire; only the label is
+    /// shared. The wires are the ones main's `connect_to_net` drew, one call
+    /// per pin, and KiCad's netlist puts all three pins on the net.
+    #[tokio::test]
+    async fn stubs_ending_on_one_label_each_get_their_wire() {
+        let (_d, path) = fixture_named("batch_connect_facing_kicad10.kicad_sch");
+        let args = json!({
+            "schematic": path.display().to_string(),
+            "net": "N",
+            "stub_length": 2.54,
+            "pins": [
+                { "reference": "R1", "pin_number": "2" },
+                { "reference": "R2", "pin_number": "1" },
+                { "reference": "R2", "pin_number": "2" }
+            ]
+        });
+        let result = handle_batch_connect_to_net(&args, &ctx()).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        for entry in body(&result)["added"].as_array().unwrap() {
+            assert!(entry.get("wire").is_some(), "{entry}");
+            assert!(entry.get("deduplicated").is_none(), "{entry}");
+        }
+
+        let drawn = drawing(&path);
+        let wires: Vec<_> = drawn.iter().filter(|l| l.starts_with("wire ")).collect();
+        assert_eq!(
+            wires,
+            [
+                "wire 67.310 63.500 69.850 63.500",
+                "wire 72.390 63.500 69.850 63.500",
+                "wire 80.010 63.500 82.550 63.500",
+            ]
+        );
+        // The fixture's own label at (82.55, 63.5), and one shared at the
+        // meeting point.
+        let labels: Vec<_> = drawn
+            .iter()
+            .filter(|l| l.starts_with("NetLabel "))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "NetLabel N 69.850 63.500 0.000",
+                "NetLabel N 82.550 63.500 0.000"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn net_is_an_alias_that_must_agree_with_net_name() {
+        let (_d, path) = fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        for (options, field) in [
+            (json!({ "net_name": "A", "net": "B" }), "net"),
+            (json!({}), "net_name"),
+        ] {
+            let result = batch(&path, options.clone()).await;
+            assert!(result.is_error, "{options}");
+            let body = body(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{options}"
+            );
+        }
+        for options in [
+            json!({ "net": "A" }),
+            json!({ "net_name": "A", "net": "A" }),
+        ] {
+            let (_d, path) = fixture();
+            let result = batch(&path, options.clone()).await;
+            assert!(!result.is_error, "{options}: {result:?}");
+            assert_eq!(body(&result)["net"], "A");
+        }
+    }
+
+    #[test]
+    fn schema_refuses_a_negative_stub() {
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "batch_connect_to_net")
+            .unwrap();
+        let args = |stub: f64| json!({ "schematic": "s.kicad_sch", "net": "N", "pins": [], "stub_length": stub });
+        assert!(def.input_validator.is_valid(&args(0.0)));
+        assert!(def.input_validator.is_valid(&args(2.54)));
+        assert!(!def.input_validator.is_valid(&args(-1.0)));
     }
 }

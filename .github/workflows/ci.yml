@@ -25,9 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.23.4
+          fallback: none
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace --locked
@@ -109,9 +110,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: arduino/setup-protoc@v3
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.23.4
+          fallback: none
       - uses: Swatinem/rust-cache@v2
       # --all-targets so tests, benches and examples are linted too. Without it
       # test code is never checked, and it had accumulated real findings: eight

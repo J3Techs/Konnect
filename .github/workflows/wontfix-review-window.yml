@@ -1,0 +1,127 @@
+name: Wontfix review window
+
+on:
+  issues:
+    types: [labeled, reopened]
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: wontfix-review-window
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile open wontfix issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Start or complete review windows
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const labelName = "wontfix";
+            const windowMs = 30 * 24 * 60 * 60 * 1000;
+
+            async function labelAppliedAt(issueNumber) {
+              const events = await github.paginate(
+                github.rest.issues.listEventsForTimeline,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+              const applications = events
+                .filter(event =>
+                  event.event === "labeled" &&
+                  event.label &&
+                  event.label.name === labelName
+                )
+                .map(event => event.created_at)
+                .filter(Boolean)
+                .sort();
+              return applications.at(-1) ?? null;
+            }
+
+            async function reconcile(issue) {
+              if (issue.pull_request || issue.state !== "open") return;
+              const labels = issue.labels.map(label =>
+                typeof label === "string" ? label : label.name
+              );
+              if (!labels.includes(labelName)) return;
+
+              const appliedAt = await labelAppliedAt(issue.number);
+              if (!appliedAt) {
+                core.warning(
+                  `#${issue.number} has wontfix but no label event; leaving it open`
+                );
+                return;
+              }
+
+              const closesAt = new Date(new Date(appliedAt).getTime() + windowMs);
+              const closeTimestamp = closesAt.toISOString();
+              const closeDate = closeTimestamp.slice(0, 10);
+              const marker =
+                `<!-- konnect:wontfix-window applied=${appliedAt} closes=${closeDate} -->`;
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issue.number, per_page: 100 }
+              );
+
+              if (!comments.some(comment => comment.body?.includes(marker))) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `${marker}\nThis issue is marked \`wontfix\` after maintainer review. ` +
+                    `It will remain open until **${closeTimestamp}** for new evidence ` +
+                    `that could change the decision. If the label remains, automation ` +
+                    `will close it as not planned on or after that date. Removing ` +
+                    `\`wontfix\` cancels the pending closure.`
+                });
+              }
+
+              if (Date.now() < closesAt.getTime()) return;
+
+              const closeMarker =
+                `<!-- konnect:wontfix-window-complete applied=${appliedAt} -->`;
+              if (!comments.some(comment => comment.body?.includes(closeMarker))) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `${closeMarker}\nThe 30-day evidence window has completed and ` +
+                    `the \`wontfix\` disposition remains unchanged. Closing as not planned. ` +
+                    `If a supported capability or materially new evidence becomes available, ` +
+                    `open a focused issue and link this decision.`
+                });
+              }
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: "closed",
+                state_reason: "not_planned"
+              });
+            }
+
+            let issues;
+            if (context.eventName === "issues") {
+              issues = [context.payload.issue];
+            } else {
+              issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner,
+                repo,
+                state: "open",
+                labels: labelName,
+                per_page: 100
+              });
+            }
+
+            for (const issue of issues) {
+              await reconcile(issue);
+            }

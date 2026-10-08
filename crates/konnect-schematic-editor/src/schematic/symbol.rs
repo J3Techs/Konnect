@@ -358,22 +358,82 @@ impl Symbol {
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.x += dx;
         self.at.y += dy;
-        // Property (at) coordinates are absolute in .kicad_sch, so the
-        // Reference/Value text must move with the symbol.
-        for prop in &mut self.properties {
-            for node in &mut prop.sub_nodes {
-                if node.tag() == Some("at") {
-                    if let Some(mut at) = At::from_sexp(node) {
-                        at.translate(dx, dy);
-                        *node = at.to_sexp();
-                    }
-                }
+        self.map_field_positions(|at| at.translate(dx, dy));
+    }
+
+    /// Apply `f` to every field's `(at …)`.
+    ///
+    /// Property coordinates are absolute in `.kicad_sch`, not offsets from the
+    /// body, so every operation that moves or turns a symbol has to walk them.
+    /// A field whose `(at …)` will not parse is left exactly as it was rather
+    /// than reset to a guess.
+    fn map_field_positions(&mut self, mut f: impl FnMut(&mut At)) {
+        for node in self
+            .properties
+            .iter_mut()
+            .flat_map(|prop| prop.sub_nodes.iter_mut())
+            .filter(|node| node.tag() == Some("at"))
+        {
+            if let Some(mut at) = At::from_sexp(node) {
+                f(&mut at);
+                *node = at.to_sexp();
             }
         }
     }
 
+    /// Turn the body to an absolute angle, carrying its field text round with
+    /// it.
+    ///
+    /// Property `(at …)` coordinates are absolute, exactly as [`translate`]
+    /// has to account for, so writing the new angle alone leaves every field
+    /// where the *old* orientation put it. A `Device:LED` anchors its
+    /// Reference above the origin and its Value below, which clears a
+    /// horizontal body; turned to 90° without this, both land on the vertical
+    /// body and the wires into its pins (#612).
+    ///
+    /// Only the position moves. A field's stored angle is relative — KiCad
+    /// adds the symbol's rotation when it draws — so turning the angle here
+    /// too would double-count it.
+    ///
+    /// [`translate`]: Symbol::translate
     pub fn set_rotation(&mut self, rot: f64) {
+        let delta = rot - self.at.rotation.unwrap_or(0.0);
         self.at.rotation = Some(rot);
+        self.rotate_field_text(delta);
+    }
+
+    /// Rotate every field's absolute position about the symbol origin.
+    ///
+    /// A reflected body turns its fields the other way: the placement
+    /// transform rotates first and mirrors second, and a reflection reverses
+    /// the sense of any rotation conjugated by it, so following the stored
+    /// order means negating the delta — not reflecting a second time.
+    ///
+    /// What counts is whether the token is an *odd* number of reflections, not
+    /// whether it is present. `(mirror xy)`, which `konnect_sexp` parses as
+    /// both axes, composes into a proper 180° turn and so does **not** reverse
+    /// the sense; `(mirror none)` is no reflection at all. Testing
+    /// `mirror.is_some()` threw both of those fields to the wrong side of the
+    /// body — the very defect this carry exists to fix.
+    fn rotate_field_text(&mut self, delta_deg: f64) {
+        if delta_deg % 360.0 == 0.0 {
+            return;
+        }
+        let (x, y) = mirror_axes(self.mirror.as_deref());
+        let reflected = x != y;
+        let turn = if reflected { -delta_deg } else { delta_deg };
+        let (origin_x, origin_y) = (self.at.x, self.at.y);
+        self.map_field_positions(|at| {
+            let (x, y) = konnect_sexp::geometry::rotate_about(
+                at.x - origin_x,
+                at.y - origin_y,
+                origin_x,
+                origin_y,
+                turn,
+            );
+            at.x = x;
+            at.y = y;
+        });
     }
 
     /// Set or clear the placement mirror. `Some("x")` / `Some("y")` write
@@ -384,9 +444,42 @@ impl Symbol {
     /// The axes are mutually exclusive in eeschema: a symbol carries at most
     /// one `SYM_MIRROR_*` flag, and mirroring about both axes is rotation by
     /// 180 degrees, which belongs in `at`.
+    ///
+    /// Field text is reflected with the body (#613). The placement transform
+    /// rotates first and mirrors second, so swapping one reflection for
+    /// another leaves the rotation alone and flips each field's offset from
+    /// the origin on every axis whose reflection changed. As in
+    /// [`rotate_field_text`], axes are counted rather than the token trusted:
+    /// `(mirror xy)` flips both, `(mirror none)` neither.
+    ///
+    /// [`rotate_field_text`]: Symbol::rotate_field_text
     pub fn set_mirror(&mut self, mirror: Option<&str>) {
+        let (old_x, old_y) = mirror_axes(self.mirror.as_deref());
+        let (new_x, new_y) = mirror_axes(mirror);
+        // `(mirror x)` negates screen-Y, `(mirror y)` screen-X.
+        let flip_x = old_y != new_y;
+        let flip_y = old_x != new_x;
         self.mirror = mirror.map(str::to_owned);
+        if !flip_x && !flip_y {
+            return;
+        }
+        let (origin_x, origin_y) = (self.at.x, self.at.y);
+        self.map_field_positions(|at| {
+            if flip_x {
+                at.x = 2.0 * origin_x - at.x;
+            }
+            if flip_y {
+                at.y = 2.0 * origin_y - at.y;
+            }
+        });
     }
+}
+
+/// Which axes a mirror token reflects about, as `(x, y)`. Counted from the
+/// token rather than trusted: `(mirror xy)` is both, `(mirror none)` neither.
+fn mirror_axes(token: Option<&str>) -> (bool, bool) {
+    let token = token.unwrap_or_default();
+    (token.contains('x'), token.contains('y'))
 }
 
 impl std::fmt::Display for Symbol {
@@ -566,6 +659,104 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_at(sym: &Symbol) -> (f64, f64) {
+        let at = sym.properties[0]
+            .sub_nodes
+            .iter()
+            .find_map(At::from_sexp)
+            .unwrap();
+        (at.x, at.y)
+    }
+
+    /// An LED at (100, 50) carrying `mirror` and its Reference at `reference`,
+    /// taken as already where that reflection puts it.
+    fn led(mirror: Option<&str>, reference: (f64, f64)) -> Symbol {
+        let mut sym = Symbol::new("Device:LED", 100.0, 50.0);
+        sym.mirror = mirror.map(str::to_owned);
+        let mut field = Property::new("Reference", "D1");
+        field
+            .sub_nodes
+            .push(At::with_rotation(reference.0, reference.1, 0.0).to_sexp());
+        sym.properties.push(field);
+        sym
+    }
+
+    /// A turn reverses its sense for a reflected body, and the token that says
+    /// so is an axis count, not a presence check. `(mirror xy)` is two
+    /// reflections — a proper 180° turn, which `konnect_sexp::schematic`
+    /// parses as both axes — and `(mirror none)` is none; neither reverses
+    /// anything. Reading them as "mirrored" put the field on the opposite side
+    /// of the body from where placing the symbol that way leaves it.
+    #[test]
+    fn only_an_odd_number_of_reflections_reverses_a_turn() {
+        // Reference 5mm right and 5mm above the origin, so the two senses land
+        // on visibly different points.
+        let turned = |mirror: Option<&str>| {
+            // Already reflected, field included: only the turn is under test.
+            let mut sym = led(mirror, (105.0, 45.0));
+            sym.set_rotation(90.0);
+            reference_at(&sym)
+        };
+
+        // No reflection: the offset turns the way the placement transform does.
+        assert_eq!(turned(None), (95.0, 45.0));
+        assert_eq!(turned(Some("none")), (95.0, 45.0));
+        // Two reflections compose into a 180° rotation, determinant +1.
+        assert_eq!(turned(Some("xy")), (95.0, 45.0));
+        // One reflection, determinant -1: the turn runs the other way.
+        assert_eq!(turned(Some("x")), (105.0, 55.0));
+        assert_eq!(turned(Some("y")), (105.0, 55.0));
+    }
+
+    /// Reflecting the body reflects the field offset on each axis whose
+    /// reflection changed (#613). `(mirror x)` negates screen-Y and
+    /// `(mirror y)` screen-X; swapping one for the other flips both.
+    #[test]
+    fn set_mirror_reflects_field_text_on_the_axes_that_changed() {
+        let unmirrored = (105.0, 45.0);
+        let cases = [
+            (None, Some("x"), (105.0, 55.0)),
+            (None, Some("y"), (95.0, 45.0)),
+            (None, Some("xy"), (95.0, 55.0)),
+            (None, Some("none"), (105.0, 45.0)),
+            (None, None, (105.0, 45.0)),
+            (Some("x"), None, (105.0, 55.0)),
+            (Some("x"), Some("x"), (105.0, 45.0)),
+            (Some("x"), Some("y"), (95.0, 55.0)),
+            (Some("xy"), Some("x"), (95.0, 45.0)),
+        ];
+        for (from, to, expected) in cases {
+            let mut sym = led(from, unmirrored);
+            sym.set_mirror(to);
+            assert_eq!(reference_at(&sym), expected, "{from:?} -> {to:?}");
+            assert_eq!(sym.mirror.as_deref(), to);
+        }
+    }
+
+    /// A placement rotates first and mirrors second, whichever mutator runs
+    /// first. Turning then reflecting and reflecting then turning must reach
+    /// the same field position, for every quarter turn and every reflection.
+    #[test]
+    fn set_mirror_and_set_rotation_commute_on_field_text() {
+        for rotation in [90.0, 180.0, 270.0] {
+            for mirror in [Some("x"), Some("y"), Some("xy")] {
+                let mut turn_first = led(None, (105.0, 45.0));
+                turn_first.set_rotation(rotation);
+                turn_first.set_mirror(mirror);
+
+                let mut mirror_first = led(None, (105.0, 45.0));
+                mirror_first.set_mirror(mirror);
+                mirror_first.set_rotation(rotation);
+
+                let (a, b) = (reference_at(&turn_first), reference_at(&mirror_first));
+                assert!(
+                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9,
+                    "{rotation}° {mirror:?}: turn first {a:?}, mirror first {b:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn move_to_carries_property_text_along() {

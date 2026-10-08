@@ -409,6 +409,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
+                    "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
+                    "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
@@ -1043,41 +1045,18 @@ async fn handle_refill_zones(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let _cli = &ctx.config.kicad_cli;
-
-    // kicad-cli pcb export gerber triggers zone fills as a side-effect,
-    // but the proper command is kicad-cli pcb --refill-zones (not in all versions).
-    // Use IPC refill_zones when available, otherwise fall back to file-level
-    // zone fill marker update.
-    let addr = ctx.config.ipc_address.clone();
-    let result = with_ipc(addr, move |client| {
-        client.refill_zones()?;
-        Ok(())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => Ok(CallToolResult::text(
+    match super::drc::refill(ctx, &board).await? {
+        Ok(()) => Ok(CallToolResult::text(
             serde_json::to_string(&json!({
                 "success": true,
                 "method": "ipc",
+                "zones_refilled": true,
+                "saved": false,
                 "board": board.to_str().unwrap_or("")
             }))
             .unwrap(),
         )),
-        _ => {
-            // Fallback: run kicad-cli with zone-fill option if supported
-            // kicad-cli pcb export gerber fills zones as a side effect
-            // For now report the limitation
-            Ok(CallToolResult::text(
-                serde_json::to_string(&json!({
-                    "success": false,
-                    "note": "Zone refill requires a running KiCAD instance with IPC enabled, or manual zone fill in KiCAD GUI",
-                    "board": board.to_str().unwrap_or("")
-                }))
-                .unwrap(),
-            ))
-        }
+        Err(error) => Ok(error),
     }
 }
 
@@ -1089,22 +1068,22 @@ async fn handle_get_drc_violations(
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
 
-    let cli = &ctx.config.kicad_cli;
-    let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let report = cli::run_drc(cli, &board, refill).await?;
+    let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        let json = serde_json::to_string_pretty(&report)?;
-        let path = std::path::Path::new(out_path);
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("could not create report directory {}", parent.display())
-            })?;
+        let publication = async {
+            let json = serde_json::to_string_pretty(&report)?;
+            super::drc::write_report(out_path, &json).await?;
+            Ok::<(), anyhow::Error>(())
         }
-        tokio::fs::write(path, json)
-            .await
-            .with_context(|| format!("could not write report to {}", path.display()))?;
+        .await;
+        if let Err(error) = publication {
+            return super::drc::report_write_failure(&provenance, &board, out_path, error);
+        }
     }
 
     let filtered: Vec<_> = report
@@ -1114,6 +1093,10 @@ async fn handle_get_drc_violations(
 
     let summary = json!({
         "total": report.all().count(),
+        "source": provenance.source,
+        "live_board_synced": provenance.live_board_synced,
+        "zones_refilled": provenance.zones_refilled,
+        "zone_refill_source": provenance.zone_refill_source,
         "design_rule_violations": report.violations.len(),
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),

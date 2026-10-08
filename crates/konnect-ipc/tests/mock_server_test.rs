@@ -10,12 +10,14 @@ use konnect_ipc::gen::kiapi;
 use konnect_ipc::{
     IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
     IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
-    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient,
+    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient, PingOutcome,
 };
 use nng::options::Options;
 use prost::Message;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod common;
 
 /// A rep0 server answering each request via `respond`.
 /// Returns the inproc:// URL to dial. The server thread exits when the socket
@@ -465,6 +467,7 @@ fn ping_roundtrips_through_mock() {
 
     let client = KiCadIpcClient::new(&mock.url);
     assert!(client.ping().unwrap());
+    assert_eq!(client.ping_outcome(), PingOutcome::Responsive);
 }
 
 #[test]
@@ -496,6 +499,15 @@ fn kicad_error_status_maps_to_err() {
     // ping() swallows errors into Ok(false) by design — that's the
     // "KiCAD unreachable" UX. It must not be Ok(true) and must not hang.
     assert!(!client.ping().unwrap());
+
+    // KiCad received this request and refused it, so it is not "unreachable":
+    // ping_outcome must not name a transport reason for it (#532).
+    match client.ping_outcome() {
+        PingOutcome::RequestFailed { message } => {
+            assert!(message.contains("no board open"), "{message}")
+        }
+        other => panic!("a KiCad error status is not a transport failure: {other:?}"),
+    }
 
     // A typed call surfaces the error text.
     let err = client.get_open_documents().unwrap_err().to_string();
@@ -977,6 +989,140 @@ fn failed_multi_step_commit_is_dropped() {
         *actions.lock().unwrap(),
         vec![kiapi::common::commands::CommitAction::CmaDrop]
     );
+}
+
+#[test]
+fn uncertain_batch_does_not_send_a_blind_drop_or_publish() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let observed = commands.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.unwrap();
+        observed.lock().unwrap().push(message.type_url.clone());
+        if message.type_url.ends_with("BeginCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "uncertain-commit".into(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )))
+        } else {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )))
+        }
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .run_commit::<()>("uncertain", |_| {
+            Err(anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
+                command: "CreateItems".into(),
+                reason: "receive timed out".into(),
+            })
+            .context("original operation"))
+        })
+        .unwrap_err();
+    let failure = konnect_ipc::IpcFailure::from_error(error);
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::Uncertain(_)),
+        "{failure:?}"
+    );
+    assert!(failure.message().contains("uncertain-commit"));
+    assert!(failure.message().contains("original operation"));
+    let observed = commands.lock().unwrap();
+    assert_eq!(
+        observed.len(),
+        1,
+        "no EndCommit after uncertain mutation: {observed:?}"
+    );
+}
+
+#[test]
+fn failed_drop_keeps_original_error_and_reports_unknown() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.unwrap();
+        if message.type_url.ends_with("BeginCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "failed-drop".into(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )))
+        } else {
+            Some(kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                    error_message: "drop refused".into(),
+                }),
+                ..ok_response()
+            })
+        }
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .run_commit::<()>("failed", |_| anyhow::bail!("original create failure"))
+        .unwrap_err();
+    let failure = konnect_ipc::IpcFailure::from_error(error);
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::Uncertain(_)),
+        "{failure:?}"
+    );
+    assert!(failure.message().contains("original create failure"));
+    assert!(failure.message().contains("drop refused"));
+}
+
+#[test]
+fn uncertain_publish_is_not_followed_by_drop_and_success_publishes_once() {
+    for uncertain_publish in [false, true] {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let observed = actions.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("BeginCommit") {
+                Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "publish-commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )))
+            } else {
+                let command =
+                    kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+                observed.lock().unwrap().push(command.action());
+                if uncertain_publish {
+                    Some(kiapi::common::ApiResponse {
+                        status: None,
+                        header: None,
+                        message: None,
+                    })
+                } else {
+                    Some(reply_with(builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )))
+                }
+            }
+        });
+        let result = KiCadIpcClient::new(&mock.url).run_commit("publish", |_| Ok(42));
+        if uncertain_publish {
+            let failure = konnect_ipc::IpcFailure::from_error(result.unwrap_err());
+            assert!(
+                matches!(failure, konnect_ipc::IpcFailure::Uncertain(_)),
+                "{failure:?}"
+            );
+            assert!(failure.message().contains("publish-commit"));
+        } else {
+            assert_eq!(result.unwrap(), 42);
+        }
+        assert_eq!(
+            *actions.lock().unwrap(),
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+    }
 }
 
 // ─── IpcFailure classification ────────────────────────────────────────────────
@@ -2707,6 +2853,330 @@ fn invalid_selection_mutations_are_rejected_before_transport() {
                 .expect("typed mutation error")
                 .kind,
             IpcSelectionMutationErrorKind::InvalidRequest
+        );
+    }
+}
+
+/// The per-layer name lookups are cosmetic, and each one is a whole round trip.
+/// A KiCad that answers the enabled set and then slows to a crawl must not hold
+/// the read for a quarter of an hour, so the loop stops when its budget is
+/// spent and the canonical names stand. The budget bounds the waiting, not just
+/// the starting: a lookup begun just under the deadline waits only what is left
+/// of the budget, never the client's default receive timeout.
+mod layer_name_budget {
+    use super::*;
+
+    /// Counts the name lookups, so a test can prove the loop stopped rather
+    /// than inferring it from the absence of names.
+    fn spawn_kicad_naming_layers(asked: Arc<Mutex<usize>>) -> MockKicad {
+        spawn_kicad_naming_layers_after(asked, Duration::ZERO)
+    }
+
+    /// The same, with KiCad taking `delay` to answer each name lookup — a
+    /// KiCad that has slowed to a crawl without dying.
+    fn spawn_kicad_naming_layers_after(asked: Arc<Mutex<usize>>, delay: Duration) -> MockKicad {
+        spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                        copper_layer_count: 2,
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                )));
+            }
+            if command.type_url.ends_with("GetBoardLayerName") {
+                *asked.lock().unwrap() += 1;
+                std::thread::sleep(delay);
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::board::commands::BoardLayerNameResponse {
+                        name: "renamed in the editor".to_string(),
+                    },
+                    "kiapi.board.commands.BoardLayerNameResponse",
+                )));
+            }
+            Some(ok_response())
+        })
+    }
+
+    #[test]
+    fn a_spent_budget_stops_the_lookups_and_keeps_the_enabled_set() {
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers(asked.clone());
+        let client = KiCadIpcClient::new(&server.url);
+
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), Duration::ZERO)
+            .expect("the enabled set is KiCad's answer, not a casualty of the budget");
+
+        assert_eq!(*asked.lock().unwrap(), 0, "no name was worth asking for");
+        assert_eq!(enabled.copper_layer_count, 2);
+        let names: Vec<_> = enabled.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["F.Cu", "B.Cu"]);
+        assert!(
+            enabled.layers.iter().all(|l| l.display_name.is_none()),
+            "the canonical name stands in when the budget is spent"
+        );
+    }
+
+    #[test]
+    fn a_budget_with_room_resolves_every_name() {
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers(asked.clone());
+        let client = KiCadIpcClient::new(&server.url);
+
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), Duration::from_secs(30))
+            .expect("KiCad answered everything");
+
+        assert_eq!(*asked.lock().unwrap(), 2);
+        assert!(enabled
+            .layers
+            .iter()
+            .all(|l| l.display_name.as_deref() == Some("renamed in the editor")));
+    }
+
+    /// The bound the budget advertises is wall clock, so the test measures
+    /// wall clock. KiCad here answers the enabled set at once and then takes
+    /// far longer than the budget over the first name. Waiting for that reply
+    /// is the overrun: the client's own receive timeout is 30 s, so a lookup
+    /// that falls back on it blows a sub-second budget by two orders of
+    /// magnitude while still "stopping" at the deadline afterwards.
+    #[test]
+    fn a_lookup_started_under_the_deadline_still_stops_at_it() {
+        const BUDGET: Duration = Duration::from_millis(400);
+        // Long enough that a reply cannot be what ends the wait, and far below
+        // the 30 s the lookup would otherwise settle for.
+        const KICAD_TAKES: Duration = Duration::from_secs(8);
+
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers_after(asked.clone(), KICAD_TAKES);
+        let client = KiCadIpcClient::new(&server.url);
+
+        let started = std::time::Instant::now();
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), BUDGET)
+            .expect("a slow name lookup is not a failed live read");
+        let elapsed = started.elapsed();
+
+        // Generous against a loaded CI runner, and still nowhere near either
+        // KiCad's reply or the default receive timeout.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the naming loop waited {elapsed:?}, past its {BUDGET:?} budget"
+        );
+        assert!(
+            elapsed < KICAD_TAKES,
+            "the loop waited for KiCad's reply ({elapsed:?}) instead of giving up at its budget"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            1,
+            "the first lookup started inside the budget; the second must not have"
+        );
+        assert_eq!(enabled.copper_layer_count, 2);
+        let names: Vec<_> = enabled.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["F.Cu", "B.Cu"], "the enabled set is still KiCad's");
+        assert!(
+            enabled.layers.iter().all(|l| l.display_name.is_none()),
+            "a name KiCad never delivered is not a name"
+        );
+    }
+
+    /// The remaining budget, not a fresh copy of it, bounds each lookup. KiCad
+    /// here answers each name in well under the budget, so nothing is slow
+    /// enough to stop on its own; what stops the second lookup is that the
+    /// first already spent most of what there was. A budget renewed per call
+    /// would name both layers.
+    #[test]
+    fn the_budget_is_spent_across_the_lookups_not_renewed_by_each() {
+        const KICAD_TAKES: Duration = Duration::from_millis(300);
+        const BUDGET: Duration = Duration::from_millis(500);
+
+        let asked = Arc::new(Mutex::new(0));
+        let server = spawn_kicad_naming_layers_after(asked.clone(), KICAD_TAKES);
+        let client = KiCadIpcClient::new(&server.url);
+
+        let started = std::time::Instant::now();
+        let enabled = client
+            .get_enabled_layers_named_within(doc_for("test.kicad_pcb"), BUDGET)
+            .expect("a budget spent mid-loop is not a failed live read");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            enabled.layers.len(),
+            2,
+            "the enabled set is KiCad's, whatever the budget bought"
+        );
+        assert!(
+            enabled.layers[1].display_name.is_none(),
+            "the first lookup left under {KICAD_TAKES:?} of the budget, so the second could \
+             not have been answered"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the loop took {elapsed:?}: the second lookup waited past the budget"
+        );
+    }
+}
+
+/// `get_board_stackup_in` (#716): one `GetBoardStackup` naming the document
+/// it was given, and a refusal for an answer it cannot read rather than an
+/// empty stackup.
+mod board_stackup {
+    use super::*;
+
+    fn stackup_response() -> prost_types::Any {
+        builders::pack_any(
+            &kiapi::board::commands::BoardStackupResponse {
+                stackup: Some(kiapi::board::BoardStackup {
+                    finish: Some(kiapi::board::BoardFinish {
+                        type_name: "None".to_string(),
+                    }),
+                    layers: vec![kiapi::board::BoardStackupLayer {
+                        thickness: Some(kiapi::common::types::Distance { value_nm: 35_000 }),
+                        layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                        enabled: true,
+                        r#type: kiapi::board::BoardStackupLayerType::BsltCopper as i32,
+                        material_name: "copper".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            "kiapi.board.commands.BoardStackupResponse",
+        )
+    }
+
+    #[test]
+    fn the_request_names_the_document_and_the_answer_is_decoded() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let server = spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardStackup") {
+                let get = kiapi::board::commands::GetBoardStackup::decode(command.value.as_slice())
+                    .unwrap();
+                seen.lock().unwrap().push(get.board);
+                return Some(reply_with(stackup_response()));
+            }
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let stackup = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect("KiCad answered");
+
+        assert_eq!(*asked.lock().unwrap(), [Some(doc_for("stack.kicad_pcb"))]);
+        assert_eq!(stackup.finish, "None");
+        assert_eq!(stackup.layers.len(), 1);
+        assert_eq!(stackup.layers[0].layer.as_deref(), Some("F.Cu"));
+        assert_eq!(stackup.layers[0].thickness_nm, 35_000);
+    }
+
+    /// KiCad 10.0.6's own answer for `four_layer_stackup_kicad10.kicad_pcb`,
+    /// captured unchanged, decodes to the stackup that board's file declares.
+    /// The board and the capture are both KiCad's output; the fixture's README
+    /// says how each was made.
+    #[test]
+    fn kicads_captured_answer_is_the_stackup_its_board_file_declares() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let captured = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.commands.BoardStackupResponse".to_string(),
+            value: include_bytes!("fixtures/four_layer_stackup_kicad10.ipc.bin").to_vec(),
+        };
+        let server = spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardStackup") {
+                return Some(reply_with(captured.clone()));
+            }
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let stackup = client
+            .get_board_stackup_in(doc_for("four_layer_stackup_kicad10.kicad_pcb"))
+            .expect("KiCad answered");
+
+        common::assert_matches_file(
+            &stackup,
+            &fixtures.join("four_layer_stackup_kicad10.kicad_pcb"),
+        );
+        // What this board has that `live_ipc`'s two-layer stackup does not,
+        // so a fixture that lost them would say so here.
+        let kinds: Vec<_> = stackup
+            .layers
+            .iter()
+            .filter_map(|l| l.dielectric_type.as_deref())
+            .collect();
+        assert_eq!(kinds, ["prepreg", "core", "prepreg"]);
+        assert_eq!(
+            stackup.layers.iter().filter(|l| l.kind == "copper").count(),
+            4
+        );
+        assert_eq!(stackup.finish, "ENIG");
+        assert!(stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "beveled");
+        assert!(stackup.has_edge_plating);
+    }
+
+    #[test]
+    fn an_answer_with_no_body_is_refused_not_read_as_an_empty_stackup() {
+        let server = spawn_mock(|_| Some(ok_response()));
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("no body is no answer");
+
+        assert!(
+            format!("{error:#}").contains("returned no stackup"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn an_answer_of_another_type_is_refused() {
+        let server = spawn_mock(|_| {
+            Some(reply_with(builders::pack_any(
+                &kiapi::board::commands::BoardEnabledLayersResponse::default(),
+                "kiapi.board.commands.BoardEnabledLayersResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("a different message is not a stackup");
+
+        assert!(
+            format!("{error:#}").contains("not a BoardStackupResponse"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_response_carrying_no_stackup_is_refused_not_read_as_an_empty_one() {
+        let server = spawn_mock(|_| {
+            Some(reply_with(builders::pack_any(
+                &kiapi::board::commands::BoardStackupResponse { stackup: None },
+                "kiapi.board.commands.BoardStackupResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("a response with no stackup is no answer");
+
+        assert!(
+            format!("{error:#}").contains("carries no stackup"),
+            "{error:#}"
         );
     }
 }

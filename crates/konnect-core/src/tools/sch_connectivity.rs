@@ -22,17 +22,20 @@
 //! KiCad snaps to grid, so exact agreement is the normal case.
 //!
 //! [`ConnectivityIndex`] is built once per tree and holds every item that can
-//! terminate a point — wires, wire endpoints, labels, pins with the reference
-//! that owns them, sheet pins, junctions and no-connects — under a single
-//! tolerance, and the tools express policy over it. One [`seed_net_graph`] is
+//! terminate a point — wires, wire endpoints, verified wire-side bus-entry
+//! corners, labels, pins with the reference that owns them, sheet pins,
+//! junctions and no-connects — under a single tolerance, and the tools express
+//! policy over it. Bus geometry is indexed for attachment decisions but is
+//! intentionally absent from [`NetGraph`]: a bus is a bundle, not one electrical
+//! net. One [`seed_net_graph`] is
 //! the only definition of the graph, so the ten read-only tools that want net
 //! names cannot drift from the three that ask about attachment.
 
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_junctions, extract_no_connects, extract_sheet_pins, pin_endpoint, Label, LabelKind,
-        LibPin, Wire,
+        extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
+        pin_endpoint, Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -51,10 +54,17 @@ fn bucket(value: f64, tolerance: f64) -> i64 {
 /// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
 /// instead of scanning every point. `points_coincident` compares an L∞ box of
 /// side `tol`, which the 3×3 neighbourhood covers exactly.
+///
+/// Each point keeps the position it was built at, so a caller holding the slice
+/// the index was built from can recover the item itself and not only its
+/// coordinates — see [`ConnectivityIndex::point_detail`].
 struct PointIndex {
     tol: f64,
-    buckets: HashMap<(i64, i64), Vec<(f64, f64)>>,
+    buckets: HashMap<(i64, i64), Vec<IndexedPoint>>,
 }
+
+/// An indexed point: where it is, and the position it was built at.
+type IndexedPoint = (f64, f64, usize);
 
 impl PointIndex {
     fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
@@ -62,9 +72,9 @@ impl PointIndex {
             tol,
             buckets: HashMap::new(),
         };
-        for (x, y) in points {
+        for (ordinal, (x, y)) in points.into_iter().enumerate() {
             let key = index.cell(x, y);
-            index.buckets.entry(key).or_default().push((x, y));
+            index.buckets.entry(key).or_default().push((x, y, ordinal));
         }
         index
     }
@@ -73,26 +83,27 @@ impl PointIndex {
         ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
     }
 
+    /// Every indexed point coinciding with `(x, y)`, as `(x, y, build ordinal)`.
+    /// Yielded in bucket order, which is not build order: two coincident points
+    /// can fall in different cells, so a caller that reports them must sort on
+    /// the ordinal rather than inherit whichever cell was probed first.
+    fn hits_at(&self, x: f64, y: f64) -> impl Iterator<Item = IndexedPoint> + '_ {
+        let (cx, cy) = self.cell(x, y);
+        (-1..=1)
+            .flat_map(move |dx| (-1..=1).map(move |dy| (cx + dx, cy + dy)))
+            .filter_map(move |key| self.buckets.get(&key))
+            .flatten()
+            .copied()
+            .filter(move |(px, py, _)| points_coincident(x, y, *px, *py, self.tol))
+    }
+
     /// How many indexed points coincide with `(x, y)`.
     fn count_at(&self, x: f64, y: f64) -> usize {
-        let (cx, cy) = self.cell(x, y);
-        let mut found = 0;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) else {
-                    continue;
-                };
-                found += bucket
-                    .iter()
-                    .filter(|(px, py)| points_coincident(x, y, *px, *py, self.tol))
-                    .count();
-            }
-        }
-        found
+        self.hits_at(x, y).count()
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        self.count_at(x, y) > 0
+        self.hits_at(x, y).next().is_some()
     }
 }
 
@@ -529,11 +540,25 @@ pub(crate) struct PlacedPin {
     pub(crate) at: (f64, f64),
 }
 
+/// The items sitting on one point, rather than the counts and booleans the
+/// attachment predicates ask for. `trace_from_point` is the one tool whose
+/// answer *is* that inventory, so it reads this instead of scanning the tree
+/// again at a tolerance of its own (#539).
+pub(crate) struct PointDetail<'i> {
+    /// Component pins at the point, in the order the sheet places them. One
+    /// entry per pin, so two pins stacked on a point are both here.
+    pub(crate) pins: Vec<&'i PlacedPin>,
+    /// Junction dots at the point, as stored in the file.
+    pub(crate) junctions: Vec<(f64, f64)>,
+}
+
 /// Every item that can terminate a point on one sheet, under one tolerance.
 pub(crate) struct ConnectivityIndex<'a> {
     wires: &'a [Wire],
     labels: &'a [Label],
     on_wire: WireIndex<'a>,
+    on_bus: WireIndex<'a>,
+    bus_entry_wire_points: PointIndex,
     wire_ends: PointIndex,
     label_points: PointIndex,
     pin_points: PointIndex,
@@ -551,6 +576,7 @@ impl<'a> ConnectivityIndex<'a> {
     pub(crate) fn build(
         tree: &SexpNode,
         wires: &'a [Wire],
+        buses: &'a [Wire],
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
@@ -567,11 +593,28 @@ impl<'a> ConnectivityIndex<'a> {
             .collect();
         let junctions = extract_junctions(tree);
         let sheet_pins = extract_sheet_pins(tree);
+        let on_bus = WireIndex::build(buses, tolerance);
+        // An entry terminates a wire only when saved geometry proves exactly
+        // one corner lies on a bus. Zero matches are detached; two matches are
+        // ambiguous between buses. Neither case licenses a guessed wire side.
+        let bus_entry_wire_points = extract_bus_entries(tree)
+            .into_iter()
+            .filter_map(|entry| entry.endpoints())
+            .filter_map(|(at, far)| {
+                match (on_bus.covers(at.0, at.1), on_bus.covers(far.0, far.1)) {
+                    (true, false) => Some(far),
+                    (false, true) => Some(at),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
 
         ConnectivityIndex {
             wires,
             labels,
             on_wire: WireIndex::build(wires, tolerance),
+            on_bus,
+            bus_entry_wire_points: PointIndex::build(bus_entry_wire_points, tolerance),
             wire_ends: PointIndex::build(
                 wires
                     .iter()
@@ -591,6 +634,9 @@ impl<'a> ConnectivityIndex<'a> {
                     .map(|label| (label.x, label.y)),
                 tolerance,
             ),
+            // Built from `placed_pins` in order, so a hit's ordinal indexes
+            // straight back into that slice — which is what lets
+            // `point_detail` report the pin and not just its coordinates.
             pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), tolerance),
             sheet_pin_points: PointIndex::build(sheet_pins, tolerance),
             junction_points: PointIndex::build(junctions, tolerance),
@@ -628,6 +674,18 @@ impl<'a> ConnectivityIndex<'a> {
         self.on_wire.covers_interior(x, y)
     }
 
+    /// Lies anywhere on a bus segment, endpoints included. This is geometric
+    /// attachment only: buses are bundles, never nodes in [`NetGraph`].
+    pub(crate) fn on_bus(&self, x: f64, y: f64) -> bool {
+        self.on_bus.covers(x, y)
+    }
+
+    /// A bus entry whose opposite corner is proven to touch exactly one bus
+    /// has its wire-side endpoint here.
+    pub(crate) fn has_bus_entry_wire_end(&self, x: f64, y: f64) -> bool {
+        self.bus_entry_wire_points.contains(x, y)
+    }
+
     /// How many wires lie under `(x, y)` — endpoint and interior alike. The
     /// booleans above cannot tell one wire passing from two wires crossing,
     /// and the junction reconciler needs that distinction: a dot on a lone
@@ -641,6 +699,35 @@ impl<'a> ConnectivityIndex<'a> {
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {
         self.label_points.contains(x, y)
+    }
+
+    /// What is on `(x, y)`, item by item: the component pins there and the
+    /// junction dots there, under this index's tolerance. The predicates below
+    /// answer whether a point is attached; this answers what is attached, for
+    /// the tool that has to report it.
+    ///
+    /// Sheet pins and no-connect flags are indexed too but are deliberately not
+    /// returned: `trace_from_point` does not report them, and handing them over
+    /// unused would let the two drift apart silently.
+    pub(crate) fn point_detail(&self, x: f64, y: f64) -> PointDetail<'_> {
+        let mut pins: Vec<(usize, &PlacedPin)> = self
+            .pin_points
+            .hits_at(x, y)
+            .map(|(_, _, ordinal)| (ordinal, &self.placed_pins[ordinal]))
+            .collect();
+        let mut junctions: Vec<(usize, (f64, f64))> = self
+            .junction_points
+            .hits_at(x, y)
+            .map(|(jx, jy, ordinal)| (ordinal, (jx, jy)))
+            .collect();
+        // Bucket order is not file order, and a reported list that reorders
+        // itself with the query point is a list a caller cannot diff.
+        pins.sort_by_key(|(ordinal, _)| *ordinal);
+        junctions.sort_by_key(|(ordinal, _)| *ordinal);
+        PointDetail {
+            pins: pins.into_iter().map(|(_, pin)| pin).collect(),
+            junctions: junctions.into_iter().map(|(_, at)| at).collect(),
+        }
     }
 
     /// How many pins lie at `(x, y)`. A point that is itself a pin counts
@@ -675,6 +762,7 @@ impl<'a> ConnectivityIndex<'a> {
             || self.has_sheet_pin(x, y)
             || self.has_junction(x, y)
             || self.has_no_connect(x, y)
+            || self.has_bus_entry_wire_end(x, y)
             || self.wire_ends_at(x, y) >= 2
             || self.on_wire_interior(x, y)
     }
@@ -710,7 +798,9 @@ impl<'a> ConnectivityIndex<'a> {
 mod agreement_tests {
     use super::*;
     use crate::tools::{ServerConfig, ToolContext};
-    use konnect_sexp::schematic::{extract_all_net_labels, extract_wires, read_schematic};
+    use konnect_sexp::schematic::{
+        extract_all_net_labels, extract_buses, extract_wires, read_schematic,
+    };
     use serde_json::json;
     use std::io::Write;
     use std::sync::Arc;
@@ -803,6 +893,37 @@ mod agreement_tests {
         assert_eq!(components["unconnected_count"], 0, "{components}");
     }
 
+    /// The point the validator called connected is the point `trace_from_point`
+    /// inventories, and both read one index: the pins the decision was made on
+    /// are the pins reported. A second scan of its own is how this tool could
+    /// answer with a set the decision never saw (#539).
+    #[tokio::test]
+    async fn a_traced_point_reports_the_pins_the_validator_judged() {
+        let sch = schematic(&format!(
+            "\t(junction (at 100 80) (uuid \"j1\"))\n{}{}",
+            symbol("U1", "u1", 100.0, 80.0),
+            symbol("U2", "u2", 100.0, 80.0),
+        ));
+
+        let components = call("validate_component_connections", &sch, json!({})).await;
+        assert_eq!(components["unconnected_count"], 0, "{components}");
+
+        let trace = call("trace_from_point", &sch, json!({ "x": 100.0, "y": 80.0 })).await;
+        let mut found: Vec<&str> = trace["pins_here"]
+            .as_array()
+            .expect("pins_here is always present")
+            .iter()
+            .map(|pin| pin["reference"].as_str().unwrap())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, ["U1", "U2"], "{trace}");
+        assert_eq!(
+            trace["junctions_here"].as_array().unwrap().len(),
+            1,
+            "{trace}"
+        );
+    }
+
     /// A lone pin is unconnected for both tools — the agreement has to hold in
     /// the direction that still reports a fault, or the fix above is just a
     /// blanket "everything is connected".
@@ -817,6 +938,150 @@ mod agreement_tests {
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 1, "{components}");
         assert_eq!(components["unconnected_pins"][0]["reference"], "U1");
+    }
+
+    fn bus(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {
+        format!("\t(bus (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid \"{uuid}\"))\n")
+    }
+
+    fn bus_entry(x: f64, y: f64, dx: f64, dy: f64, uuid: &str) -> String {
+        format!(
+            "\t(bus_entry (at {x} {y}) (size {dx} {dy}) (stroke (width 0) (type default)) (uuid \"{uuid}\"))\n"
+        )
+    }
+
+    fn wire(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {
+        format!("\t(wire (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid \"{uuid}\"))\n")
+    }
+
+    fn label(net: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!("\t(label \"{net}\" (at {x} {y} 0) (uuid \"{uuid}\"))\n")
+    }
+
+    /// KiCad connects the corner opposite the bus only when the other corner
+    /// really lies on bus geometry. Both public validators consume that same
+    /// decision, and a label directly on the bus is not a floating label.
+    #[tokio::test]
+    async fn a_verified_bus_entry_terminates_only_its_wire_side_for_every_tool() {
+        let sch = schematic(&format!(
+            "{}{}{}{}{}",
+            bus(90.0, 80.0, 110.0, 80.0, "b1"),
+            bus_entry(100.0, 80.0, 2.54, 2.54, "be1"),
+            wire(102.54, 82.54, 120.0, 82.54, "w1"),
+            label("D0", 120.0, 82.54, "l1"),
+            label("D[0..3]", 95.0, 80.0, "l2"),
+        ));
+
+        let orphans = call("find_orphan_items", &sch, json!({})).await;
+        assert_eq!(orphans["orphan_count"], 0, "{orphans}");
+
+        let wires = call("validate_wire_connections", &sch, json!({})).await;
+        assert_eq!(wires["floating_count"], 0, "{wires}");
+
+        let (tree, wires, labels) = index_for(&sch);
+        let buses = extract_buses(&tree);
+        let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+        assert!(index.on_bus(100.0, 80.0), "test setup needs a bus");
+        assert!(index.has_bus_entry_wire_end(102.54, 82.54));
+        assert!(!index.has_bus_entry_wire_end(100.0, 80.0));
+    }
+
+    /// The acceptance fixture was resaved by KiCad 10. Its companion README
+    /// records the CLI ERC comparison: KiCad does not report the wire/entry or
+    /// bus label as dangling (only the deliberately pin-less scalar label).
+    #[tokio::test]
+    async fn kicad_saved_bus_fixture_agrees_across_internal_validators() {
+        let sch = include_str!("../../tests/fixtures/bus_connectivity_kicad10.kicad_sch");
+
+        let orphans = call("find_orphan_items", sch, json!({})).await;
+        assert_eq!(orphans["orphan_count"], 0, "{orphans}");
+
+        let wires = call("validate_wire_connections", sch, json!({})).await;
+        assert_eq!(wires["floating_count"], 0, "{wires}");
+    }
+
+    #[test]
+    fn bus_entry_classification_abstains_for_detached_and_ambiguous_geometry() {
+        struct Case {
+            name: &'static str,
+            body: String,
+            wire_end: (f64, f64),
+        }
+        let cases = [
+            Case {
+                name: "direct wire-to-bus touch has no entry",
+                body: format!(
+                    "{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    wire(100.0, 80.0, 120.0, 80.0, "w1")
+                ),
+                wire_end: (100.0, 80.0),
+            },
+            Case {
+                name: "bus-side corner is not the wire side",
+                body: format!(
+                    "{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus_entry(100.0, 80.0, 2.54, 2.54, "be1"),
+                    wire(100.0, 80.0, 120.0, 80.0, "w1")
+                ),
+                wire_end: (100.0, 80.0),
+            },
+            Case {
+                name: "detached entry cannot infer a wire side",
+                body: format!(
+                    "{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus_entry(100.0, 85.0, 2.54, 2.54, "be1"),
+                    wire(102.54, 87.54, 120.0, 87.54, "w1")
+                ),
+                wire_end: (102.54, 87.54),
+            },
+            Case {
+                name: "entry with both corners on buses is ambiguous",
+                body: format!(
+                    "{}{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus(90.0, 82.54, 110.0, 82.54, "b2"),
+                    bus_entry(100.0, 80.0, 0.0, 2.54, "be1"),
+                    wire(100.0, 82.54, 120.0, 82.54, "w1")
+                ),
+                wire_end: (100.0, 82.54),
+            },
+        ];
+
+        for case in cases {
+            let sch = schematic(&case.body);
+            let (tree, wires, labels) = index_for(&sch);
+            let buses = extract_buses(&tree);
+            let index =
+                ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+            assert!(index.on_bus(100.0, 80.0), "{}", case.name);
+            assert!(
+                !index.has_bus_entry_wire_end(case.wire_end.0, case.wire_end.1),
+                "{}",
+                case.name
+            );
+            assert!(
+                !index.terminates_wire_end(case.wire_end.0, case.wire_end.1),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_near_but_outside_bus_tolerance_stays_floating() {
+        let sch = schematic(&format!(
+            "{}{}",
+            bus(90.0, 80.0, 110.0, 80.0, "b1"),
+            label("NEAR_BUS", 100.0, 80.02, "l1")
+        ));
+
+        let orphans = call("find_orphan_items", &sch, json!({ "tolerance": 0.01 })).await;
+        assert_eq!(orphans["orphan_count"], 1, "{orphans}");
+        assert_eq!(orphans["orphans"][0]["type"], "floating_label");
+        assert_eq!(orphans["orphans"][0]["net"], "NEAR_BUS");
     }
 
     /// The component validator still reports the value it always has, which now
@@ -891,7 +1156,8 @@ mod agreement_tests {
             sheet(120.0, 70.0, 120.0, 80.0),
         ));
         let (tree, wires, labels) = index_for(&sch);
-        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        let buses = Vec::new();
+        let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
         assert!(index.has_sheet_pin(120.0, 80.0));
         let mut graph = net_graph_for(&tree, &wires, &labels);
@@ -916,7 +1182,9 @@ mod agreement_tests {
                 sheet(110.0, 70.0, 120.0, 80.0),
             ));
             let (tree, wires, labels) = index_for(&sch);
-            let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+            let buses = Vec::new();
+            let index =
+                ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
             assert!(index.has_sheet_pin(120.0, 80.0));
             let mut graph = net_graph_for(&tree, &wires, &labels);

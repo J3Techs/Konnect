@@ -6,11 +6,13 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
-    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified,
+    with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
+use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -19,12 +21,22 @@ use std::path::Path;
 use super::cli;
 
 macro_rules! ipc {
-    ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
+    ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {
+        ipc!($ctx, $args, |$c, _| $body)
+    };
+    // The closure also receives the document KiCad resolved for the board.
+    ($ctx:expr, $args:expr, |$c:ident, $doc:pat_param| $body:expr) => {{
         let requested_board = get_path($args, "board")?;
-        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
-            Ok(v) => v,
+        match with_bound_board_ipc_classified($ctx, &requested_board, move |$c, $doc| $body).await?
+        {
+            Ok(BoardBinding::Bound(v)) => v,
             Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
                 return Ok(crate::tools::ipc_target_error_result(&error))
+            }
+            Ok(BoardBinding::Unserved { message, .. }) => {
+                return Ok(CallToolResult::error(format!(
+                    "KiCAD must be running with the board loaded (IPC error: {message})"
+                )))
             }
             Err(error) => {
                 return Ok(CallToolResult::error(format!(
@@ -42,10 +54,11 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "add_net",
-            "Add a new net entry to the top-level net table of a pre-KiCad-10 board \
-             (S-expression insert, no KiCAD IPC required). Fails on a KiCad 10 board, which \
-             has no net table — there, name the net on copper (route_trace, add_via, \
-             add_copper_pour) instead.",
+            "Idempotently add a net to the top-level net table of a pre-KiCad-10 board \
+             (S-expression insert, no KiCAD IPC required). An existing name returns its \
+             observed ID without writing. Fails on a KiCad 10 board, which has no net \
+             table — there, name the net on copper (route_trace, add_via, add_copper_pour) \
+             instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -220,7 +233,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. An update changes only the settings you name. To see what a \
+             to exist. Refuses while KiCad holds the board open, because KiCad's next \
+             save rewrites the project file from its own copy. An update changes only \
+             the settings you name. To see what a \
              class holds, call get_netclasses rather than this tool: naming a class \
              that does not exist here creates it with the defaults, so a call meant \
              as a look writes one instead — and its result is nearly \
@@ -246,30 +261,41 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_netclasses",
             "Read every netclass in the project's design rules, with its settings, \
-             its netclass_patterns and the board nets those patterns match. Reads \
-             the sibling .kicad_pro and the board file; KiCad need not be running. \
-             Call before create_netclass to see what a class holds — an update \
-             changes only the values you name, and this is the only way to see the \
-             rest. A net can match several classes: KiCad takes each property from \
-             the highest-priority class that sets it (lower number = higher \
-             priority) and falls back to Default. Settings are reported \
+             its netclass_patterns and the board nets those patterns match. The \
+             answer is mixed-source and says so in 'sources': definitions and \
+             patterns always come from the sibling .kicad_pro, while the board nets \
+             come from the board KiCad holds open where it can and from the saved \
+             board file otherwise ('board_source' selects that); KiCad need not be \
+             running. Call before create_netclass to see what a class holds — an \
+             update changes only the values you name, and this is the only way to \
+             see the rest. A net can match several classes: KiCad takes each \
+             property from the highest-priority class that sets it (lower number = \
+             higher priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
              Default rather than setting itself; 'missing_fields' on the \
-             Default names settings nothing can resolve.",
+             Default names settings nothing can resolve. 'orphan_patterns' \
+             lists patterns naming a class that does not exist; \
+             'unmatched_patterns' lists patterns whose class exists but which \
+             fit no net on the board read (null when its nets are \
+             unavailable).",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" },
+                    "board_source": board_source::board_source_schema()
                 },
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_netclasses(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "assign_net_to_class",
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
              the sibling .kicad_pro. The class must already exist (create_netclass). \
-             Reassigning moves the net's entry to the new class.",
+             Reassigning moves the net's entry to the new class. Refuses while KiCad \
+             holds the board open, because KiCad's next save rewrites the project \
+             file from its own copy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -320,37 +346,73 @@ async fn handle_add_net(
     let tree = konnect_sexp::parse_sexp(&content)?;
 
     if board_is_kicad_10(&tree) {
-        return Ok(CallToolResult::error(format!(
-            "Cannot add net '{net_name}' to this board: it is in the KiCad 10 format, which has \
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "legacy_top_level_net_table".to_string(),
+                kicad_version: Some("10".to_string()),
+            },
+            format!(
+                "Cannot add net '{net_name}' to this board: it is in the KiCad 10 format, which has \
              no top-level net table. A net exists only by being named on an item — \
              (net \"{net_name}\") on a pad, segment, via or zone — so there is nothing for a \
              file-level insert to add, and appending a net node would report success while \
              KiCad discarded it on load. Create the net by naming it on copper instead: \
              route_trace / add_via / add_copper_pour take a net_name, as does assigning a pad \
              in KiCad. get_nets_list reads the live net list over IPC."
-        )));
+            ),
+        ));
     }
 
     // Pre-KiCad-10: the top-level table is real, so an insert is meaningful.
     // The next id is one past the highest in use — not the number of "(net "
     // occurrences in the file, which counted every reference on every pad,
     // segment and zone and so collided with existing ids almost immediately.
-    let net_id = tree
-        .find_all("net")
-        .iter()
-        .filter_map(|n| konnect_sexp::net::net_id(n))
-        .filter_map(|id| id.parse::<i32>().ok())
-        .max()
-        .map(|max| max + 1)
-        .unwrap_or(1);
-    let net_sexp = format!("\n  (net {net_id} \"{net_name}\")");
+    let declarations = tree
+        .children()
+        .into_iter()
+        .flatten()
+        .filter(|node| node.head() == Some("net"));
+    let mut highest_id = 0_i64;
+    for declaration in declarations {
+        let Some(id) =
+            konnect_sexp::net::net_id(declaration).and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        highest_id = highest_id.max(id);
+        if konnect_sexp::net::net_name(declaration) == Some(net_name.as_str()) {
+            return Ok(CallToolResult::json(&json!({
+                "net_id": id,
+                "net_name": net_name,
+                "created": false
+            })));
+        }
+    }
+    let net_id = highest_id.checked_add(1).context("net ID overflow")?;
+    let escaped_name = net_name
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     // Insert before the last closing paren
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, net_sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    let prefix = if content[..close_pos].ends_with(eol) {
+        ""
+    } else {
+        eol
+    };
+    let net_sexp = format!("{prefix}\t(net {net_id} \"{escaped_name}\"){eol}");
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, net_sexp)]);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(
-        &json!({ "net_id": net_id, "net_name": net_name }),
+        &json!({ "net_id": net_id, "net_name": net_name, "created": true }),
     ))
 }
 
@@ -407,7 +469,6 @@ async fn handle_route_pad_to_pad(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -431,85 +492,63 @@ async fn handle_route_pad_to_pad(
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     let width = args["width"].as_f64().unwrap_or(0.25);
 
-    // Look up pad positions from the PCB S-expression file
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = konnect_sexp::parser::parse_sexp(&content)?;
-
-    let pos1 = find_pad_board_position(&tree, &ref1, &pad1)?;
-    let pos2 = find_pad_board_position(&tree, &ref2, &pad2)?;
-
-    // Route an L-bend: horizontal first, then vertical
-    let (x1, y1) = pos1;
-    let (x2, y2) = pos2;
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single segment
-        ipc!(ctx, args, |c| c
-            .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
-    } else {
-        // L-bend: horizontal then vertical
-        let mid_x = x2;
-        let mid_y = y1;
-        let net_a = net_name.clone();
-        let net_b = net_name.clone();
-        let layer_a = layer.clone();
-        let layer_b = layer.clone();
-        ipc!(ctx, args, |c| {
-            c.add_track(&net_a, &layer_a, width, x1, y1, mid_x, mid_y)?;
-            c.add_track(&net_b, &layer_b, width, mid_x, mid_y, x2, y2)?;
-            Ok(())
-        });
-    }
+    // Both pads come from the board open in KiCad, the one the tracks are
+    // written to. The saved file lags any unsaved move, including
+    // move_component's own, and routing to it left a dangling track (#700).
+    let (net_ipc, layer_ipc) = (net_name.clone(), layer.clone());
+    let ends = [(ref1.clone(), pad1.clone()), (ref2.clone(), pad2.clone())];
+    let routed = ipc!(ctx, args, |c, document| {
+        let [(ref1, pad1), (ref2, pad2)] = &ends;
+        let (x1, y1) = match get_live_pad(c, &document, ref1, pad1)? {
+            Ok(at) => at,
+            Err(message) => return Ok(Err(message)),
+        };
+        let (x2, y2) = match get_live_pad(c, &document, ref2, pad2)? {
+            Ok(at) => at,
+            Err(message) => return Ok(Err(message)),
+        };
+        let segments: &[_] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+            // Already axis-aligned: single segment
+            &[(x1, y1, x2, y2)]
+        } else {
+            // L-bend: horizontal then vertical
+            &[(x1, y1, x2, y1), (x2, y1, x2, y2)]
+        };
+        c.add_tracks_in(document, &net_ipc, &layer_ipc, width, segments)?;
+        Ok(Ok(((x1, y1), (x2, y2))))
+    });
+    let ((x1, y1), (x2, y2)) = match routed {
+        Ok(ends) => ends,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
 
     Ok(CallToolResult::json(&json!({
         "routed": true,
         "net": net_name, "layer": layer, "width": width,
         "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
-        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 }
+        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
+        "source": "ipc"
     })))
 }
 
-/// Look up a pad's board-space (x, y) position from the parsed PCB S-expression tree.
-fn find_pad_board_position(
-    tree: &konnect_sexp::parser::SexpNode,
+/// A pad's board position on the live board, or the tool error naming what
+/// is missing from it.
+fn get_live_pad(
+    c: &konnect_ipc::client::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     reference: &str,
-    pad_number: &str,
-) -> anyhow::Result<(f64, f64)> {
-    let fp_node = tree
-        .find_all("footprint")
-        .into_iter()
-        .find(|fp| {
-            fp.find_all("property").iter().any(|p| {
-                p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                    && p.get(2).and_then(|n| n.as_str()) == Some(reference)
-            })
-        })
-        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on board", reference))?;
-
-    let fp_at = fp_node.find("at");
-    let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
-    let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
-    let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
-
-    let pad = fp_node
-        .find_all("pad")
-        .into_iter()
-        .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(pad_number))
-        .ok_or_else(|| anyhow::anyhow!("Pad '{}' not found on '{}'", pad_number, reference))?;
-
-    let pad_at = pad
-        .find("at")
-        .ok_or_else(|| anyhow::anyhow!("Pad has no (at) node"))?;
-    let local_x = pad_at.get_f64(1).unwrap_or(0.0);
-    let local_y = pad_at.get_f64(2).unwrap_or(0.0);
-
-    // Transform local pad coords to board space (rotation only).
-    // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
-    Ok(konnect_sexp::geometry::transform_pad(
-        local_x, local_y, fp_x, fp_y, fp_rot,
-    ))
+    pad: &str,
+) -> anyhow::Result<Result<(f64, f64), String>> {
+    let Some(pads) = c.get_footprint_pads_in(document.clone(), reference)? else {
+        return Ok(Err(format!(
+            "Footprint '{reference}' not found on the board open in KiCad"
+        )));
+    };
+    Ok(pads
+        .iter()
+        .find(|p| p.number == pad)
+        .map(|p| (p.x, p.y))
+        .ok_or_else(|| format!("Pad '{pad}' not found on '{reference}'")))
 }
 
 async fn handle_add_via(
@@ -595,8 +634,7 @@ async fn handle_plan_specctra_ses_import(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board.display()))?;
     let board_for_ipc = board.clone();
-    let result = with_board_ipc_classified(ctx, &board, move |client| {
-        let document = client.find_open_board(&board_for_ipc)?;
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -741,7 +779,7 @@ async fn handle_apply_specctra_ses(
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    let result = with_board_ipc_classified(ctx, &board, move |client| {
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let open_boards = client.get_open_board_paths()?;
         if open_boards.len() != 1 {
             anyhow::bail!(
@@ -754,7 +792,6 @@ async fn handle_apply_specctra_ses(
                     .join(", ")
             );
         }
-        let document = client.find_open_board(&board_for_ipc)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -995,7 +1032,7 @@ async fn handle_delete_trace(
 
     let board_ipc = board.clone();
     let uuid_ipc = uuid.clone();
-    let deleted = match with_board_ipc_classified(ctx, &board, move |client| {
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client, _| {
         client.delete_trace_segment_verified(&board_ipc, &uuid_ipc)
     })
     .await?
@@ -1279,6 +1316,19 @@ fn load_project_settings(
     Ok(Ok((pro, settings)))
 }
 
+/// The netclass writers' guard. Saving the board in KiCad also rewrites the
+/// project file from KiCad's own copy, so a netclass edit made here while it
+/// holds the board is reported and then silently reverted (#791). It runs
+/// before the read as well as the write: while KiCad holds the board, the
+/// file can be older than what KiCad holds, so even an answer that changes
+/// nothing would come from a stale copy.
+async fn refuse_while_kicad_holds_the_board(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+) -> anyhow::Result<Option<CallToolResult>> {
+    crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, board_path, "netclass change").await
+}
+
 fn save_project_settings(
     pro: &std::path::Path,
     settings: &serde_json::Value,
@@ -1328,13 +1378,16 @@ fn kicad_default_class() -> serde_json::Value {
 
 async fn handle_create_netclass(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let name = match require_str(args, "name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
     // KiCad's key, this tool's argument name, and the value a *new* class
     // takes when the caller says nothing. The defaults belong to creation
     // only: folding them in before an update turned "widen HV's track" into a
@@ -1513,11 +1566,32 @@ const NETCLASS_FIELDS: [(&str, &str); 4] = [
     ("via_diameter", "via_diameter"),
 ];
 
+/// Every distinct net the saved board names, sorted.
+///
+/// Read with `collect_net_keys`, not `find_all("net")` — KiCad 10 writes no
+/// top-level net table at all, so a direct-children scan finds zero nets on
+/// every current board and every pattern would match nothing.
+fn saved_net_names(board_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(board_path)
+        .map_err(|e| format!("board could not be read ({e})"))?;
+    let tree =
+        konnect_sexp::parse_sexp(&text).map_err(|e| format!("board could not be parsed ({e})"))?;
+    let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
+        .into_iter()
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 async fn handle_get_netclasses(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    let source = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
     let (pro, settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
@@ -1532,35 +1606,53 @@ async fn handle_get_netclasses(
         .cloned()
         .unwrap_or_default();
 
-    // The nets come from the board file rather than IPC: this is a read-only
-    // query that must answer with KiCad closed. They are read with
-    // `collect_net_keys`, not `find_all("net")` — KiCad 10 writes no top-level
-    // net table at all, so a direct-children scan finds zero nets on every
-    // current board and every pattern would match nothing. A board held open
-    // with unsaved edits reads as last saved, which the payload says out loud.
-    let (net_names, nets_note): (Vec<String>, String) = match std::fs::read_to_string(&board_path) {
-        Ok(text) => match konnect_sexp::parse_sexp(&text) {
-            Ok(tree) => {
-                let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
-                    .into_iter()
-                    .collect();
-                names.sort();
-                (
+    // Only the board nets have two possible sources. Definitions and patterns
+    // are project-file facts KiCad's IPC API has no complete equivalent for, so
+    // they are read from `.kicad_pro` either way and reported as such.
+    let observation =
+        board_source::read_board(ctx, &board_path, source, "net list", |client, document| {
+            client.get_nets_in(document)
+        })
+        .await?;
+    let (net_names, nets_source, nets_note, evidence) = match observation {
+        board_source::BoardRead::Refused(refusal) => return Ok(refusal),
+        board_source::BoardRead::Live(nets) => {
+            // KiCad reports the unconnected pseudo-net as an empty name. It is
+            // not a net a user has, and the saved-file reader drops it too.
+            let mut names: Vec<String> = nets
+                .into_iter()
+                .map(|net| net.name)
+                .filter(|name| !name.is_empty())
+                .collect();
+            names.sort();
+            names.dedup();
+            (
+                names,
+                board_source::FROM_IPC,
+                "live board in KiCad, read over its IPC API; unsaved edits are included"
+                    .to_string(),
+                board_source::live_evidence(),
+            )
+        }
+        board_source::BoardRead::Saved(why) => {
+            let (names, source, note) = match saved_net_names(&board_path) {
+                Ok(names) => (
                     names,
-                    "board file as last saved; unsaved edits in a running KiCad are not visible"
-                        .to_string(),
-                )
-            }
-            Err(e) => (
-                Vec::new(),
-                format!("board could not be parsed ({e}); nets unavailable"),
-            ),
-        },
-        Err(e) => (
-            Vec::new(),
-            format!("board could not be read ({e}); nets unavailable"),
-        ),
+                    board_source::FROM_SAVED_BOARD,
+                    format!("board file as last saved. {}", why.detail()),
+                ),
+                Err(reason) => (
+                    Vec::new(),
+                    board_source::FROM_UNAVAILABLE,
+                    format!("{reason}; nets unavailable. {}", why.detail()),
+                ),
+            };
+            (names, source, note, why.evidence())
+        }
     };
+    // Without a readable board the nets are unknown, not absent: the patterns
+    // below that fit none of them are reported as null rather than all of them.
+    let nets_readable = nets_source != board_source::FROM_UNAVAILABLE;
 
     // What an omitted key resolves to. A Default in the file is the whole
     // fallback, holes included; KiCad's seeded one applies only when the file
@@ -1654,26 +1746,74 @@ async fn handle_get_netclasses(
         .cloned()
         .collect();
 
+    // A pattern whose class exists but fits no net on the board is just as
+    // silent in KiCad: the class governs nothing, and the dialog shows the
+    // pattern beside the others. It is the usual trace of a renamed net, a
+    // pattern written for another board, or a glob that never fitted the
+    // net's real name. Until now the caller had to subtract `matched_nets`
+    // from `patterns` by hand, and a class with three patterns and five nets
+    // does not even say which pattern is the idle one. Reported in the shape
+    // of the file, like `orphan_patterns`; a pattern with no class is an
+    // orphan, not unmatched, so each is listed once. Without a readable board
+    // the answer is unknown, and the field says so with null rather than an
+    // empty list that would claim every pattern matched.
+    let unmatched_patterns: serde_json::Value = if nets_readable {
+        json!(patterns
+            .iter()
+            .filter(|p| {
+                let target = p["netclass"].as_str().unwrap_or_default();
+                let class_exists = classes.iter().any(|c| c["name"] == json!(target));
+                class_exists
+                    && p["pattern"]
+                        .as_str()
+                        .is_some_and(|pat| !net_names.iter().any(|net| wildcard_matches(pat, net)))
+            })
+            .cloned()
+            .collect::<Vec<_>>())
+    } else {
+        serde_json::Value::Null
+    };
+
     // Netclass membership is many-to-many: KiCad forms an aggregate class per
     // net, taking each property from the highest-priority class that sets it,
     // with Default filling what is left. Naming one winning class per net
     // would be a fiction, so the mapping is reported as it is.
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "file": pro.display().to_string(),
         "count": out.len(),
         "netclasses": out,
         "nets_on_board": net_names.len(),
         "nets_source": nets_note,
         "orphan_patterns": orphan_patterns,
+        "unmatched_patterns": unmatched_patterns,
         "note": "A net can match several classes; KiCad then takes each property from the \
                  highest-priority class that sets it and falls back to Default. Lower \
                  priority numbers rank higher.",
-    })))
+    });
+    board_source::provenance(
+        &mut body,
+        json!({
+            "definitions": board_source::FROM_PROJECT_FILE,
+            "patterns": board_source::FROM_PROJECT_FILE,
+            "board_nets": nets_source,
+            "matched_nets": board_source::FROM_DERIVED,
+            // Computed from `patterns` and `board_nets`, like `matched_nets` —
+            // but a null here is not a computation from an empty list, so it
+            // is named for what it is.
+            "unmatched_patterns": if nets_readable {
+                board_source::FROM_DERIVED
+            } else {
+                board_source::FROM_UNAVAILABLE
+            },
+        }),
+        evidence,
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_assign_net_to_class(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
@@ -1684,6 +1824,9 @@ async fn handle_assign_net_to_class(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
 
     let (pro, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
@@ -2040,6 +2183,10 @@ mod add_net_format_tests {
             \t(segment (start 0 0) (end 1 0) (net \"GND\"))\n)\n";
         let (result, after) = add_net_to(board).await;
         assert!(result.is_error, "must fail closed: {}", text_of(&result));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
+        );
         let msg = text_of(&result);
         assert!(msg.contains("KiCad 10"), "{msg}");
         assert!(msg.contains("route_trace"), "must point somewhere: {msg}");
@@ -2062,7 +2209,49 @@ mod add_net_format_tests {
         let board = "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n)\n";
         let (result, after) = add_net_to(board).await;
         assert!(!result.is_error, "{}", text_of(&result));
-        assert!(after.contains("(net 2 \"NEWNET\")"), "{after}");
+        assert_eq!(
+            after,
+            "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n\t(net 2 \"NEWNET\")\n)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_legacy_net_returns_its_id_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb\n\t(version 20241229)\n\t(net 0 \"\")\n\t(net 7 \"GND\")\n)\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = handle_add_net(
+            &json!({ "board": path.to_str().unwrap(), "net_name": "GND" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should return");
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["net_id"], 7);
+        assert_eq!(body["created"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_new_legacy_net_escapes_its_name_and_preserves_crlf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb\r\n\t(version 20241229)\r\n\t(net 0 \"\")\r\n)\r\n";
+        std::fs::write(&path, original).unwrap();
+        let result = handle_add_net(
+            &json!({ "board": path.to_str().unwrap(), "net_name": "A\\\"B" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should return");
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "(kicad_pcb\r\n\t(version 20241229)\r\n\t(net 0 \"\")\r\n\t(net 1 \"A\\\\\\\"B\")\r\n)\r\n"
+        );
     }
 
     /// The old id was `content.matches("(net ").count()`, which counted every
@@ -2742,6 +2931,58 @@ mod netclass_tests {
         assert_eq!(body["netclasses"][0]["matched_nets"], json!([]));
     }
 
+    /// A pattern whose class exists but fits no net governs nothing, and
+    /// KiCad's dialog shows it beside the ones that work. Subtracting
+    /// `matched_nets` from `patterns` by hand does not even say which pattern
+    /// is idle, so the tool names it — once, and never the orphan too.
+    #[tokio::test]
+    async fn a_pattern_fitting_no_net_is_reported_as_unmatched() {
+        let (_dir, board) = fixture_with_nets(&["GND", "HV_IN"]);
+        create(&board, json!({ "name": "HV" })).await;
+        let pro = board.with_extension("kicad_pro");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pro).unwrap()).unwrap();
+        settings["net_settings"]["netclass_patterns"] = json!([
+            { "pattern": "HV_*", "netclass": "HV" },
+            { "pattern": "LV_*", "netclass": "HV" },
+            { "pattern": "GND",  "netclass": "Vanished" },
+        ]);
+        std::fs::write(&pro, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        assert_eq!(
+            body["unmatched_patterns"],
+            json!([{ "pattern": "LV_*", "netclass": "HV" }]),
+            "{body}"
+        );
+        assert_eq!(body["orphan_patterns"][0]["netclass"], json!("Vanished"));
+        assert_eq!(body["netclasses"][0]["matched_nets"], json!(["HV_IN"]));
+        assert_eq!(body["sources"]["unmatched_patterns"], json!("derived"));
+    }
+
+    /// With no readable board there is no net to fit, and an empty list would
+    /// claim every pattern matched. The field is null, and `nets_source` says
+    /// why.
+    #[tokio::test]
+    async fn unmatched_patterns_is_unknown_without_a_readable_board() {
+        let (_dir, board) = fixture_with_nets(&["GND"]);
+        create(&board, json!({ "name": "HV" })).await;
+        assign(&board, "GND", "HV").await;
+        std::fs::write(&board, "(kicad_pcb (version 20260206").unwrap();
+
+        let body = get_classes(&board).await;
+        assert!(body["unmatched_patterns"].is_null(), "{body}");
+        assert_eq!(body["sources"]["unmatched_patterns"], json!("unavailable"));
+        assert_eq!(body["nets_on_board"], json!(0));
+        assert!(
+            body["nets_source"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nets unavailable"),
+            "{body}"
+        );
+    }
+
     /// Default is KiCad's fallback and its clearance explains DRC results no
     /// explicit class accounts for, so it is reported and marked.
     #[tokio::test]
@@ -2960,5 +3201,263 @@ mod zone_net_format_tests {
         assert!(zone.contains("(name \"pour\")"), "{zone}");
         assert!(zone.contains("(priority 1)"), "{zone}");
         assert!(zone.contains("(connect_pads no (clearance"), "{zone}");
+    }
+}
+
+/// `route_pad_to_pad` writes to the live board, so its pad positions must come
+/// from there too (#700). The saved board is KiCad's own two-resistor fixture;
+/// the mock KiCad holds the same board with R1 moved 10 mm and not saved.
+#[cfg(test)]
+mod route_pad_to_pad_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{
+        board_document, ctx_talking_to, spawn_kicad_holding_board,
+    };
+    use kiapi::common::types::DocumentSpecifier;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    const SAVED: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    /// Each board command the mock served, with the document it named.
+    type Named = Arc<Mutex<Vec<(&'static str, Option<DocumentSpecifier>)>>>;
+    /// The (start, end) of every track KiCad was asked to create.
+    type Tracks = Arc<Mutex<Vec<((f64, f64), (f64, f64))>>>;
+
+    fn footprint(reference: &str, at: (f64, f64), pads: &[(&str, f64, f64)]) -> prost_types::Any {
+        let items = pads
+            .iter()
+            .map(|(number, x, y)| {
+                konnect_ipc::builders::pack_any(
+                    &kiapi::board::types::Pad {
+                        number: number.to_string(),
+                        position: Some(konnect_ipc::builders::vec2(*x, *y)),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Pad",
+                )
+            })
+            .collect();
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::FootprintInstance {
+                position: Some(konnect_ipc::builders::vec2(at.0, at.1)),
+                reference_field: Some(kiapi::board::types::Field {
+                    name: "Reference".to_string(),
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: reference.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint {
+                    items,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    fn result_text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        text
+    }
+
+    fn point_mm(v: &kiapi::common::types::Vector2) -> (f64, f64) {
+        use konnect_ipc::builders::nm_to_mm;
+        (nm_to_mm(v.x_nm), nm_to_mm(v.y_nm))
+    }
+
+    /// A KiCad holding the board at `board_path` with `footprints` on it, recording the
+    /// document each board command names and every track it creates.
+    fn spawn_live_board(
+        board_path: &Path,
+        footprints: Vec<prost_types::Any>,
+        named: Named,
+        tracks: Tracks,
+    ) -> crate::test_support::MockIpcServer {
+        spawn_kicad_holding_board(board_path, move |command| {
+            let bytes = command.value.as_slice();
+            if command.type_url.ends_with("GetItems") {
+                let request = kiapi::common::commands::GetItems::decode(bytes).unwrap();
+                named
+                    .lock()
+                    .unwrap()
+                    .push(("GetItems", request.header.and_then(|h| h.document)));
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: footprints.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("GetNets") {
+                let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
+                named.lock().unwrap().push(("GetNets", request.board));
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![konnect_ipc::builders::net("VCC", 1)],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ));
+            }
+            if command.type_url.ends_with("CreateItems") {
+                let request = kiapi::common::commands::CreateItems::decode(bytes).unwrap();
+                named
+                    .lock()
+                    .unwrap()
+                    .push(("CreateItems", request.header.and_then(|h| h.document)));
+                for item in &request.items {
+                    let track = kiapi::board::types::Track::decode(item.value.as_slice()).unwrap();
+                    tracks.lock().unwrap().push((
+                        point_mm(track.start.as_ref().unwrap()),
+                        point_mm(track.end.as_ref().unwrap()),
+                    ));
+                }
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::CreateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        created_items: request
+                            .items
+                            .into_iter()
+                            .map(|item| kiapi::common::commands::ItemCreationResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: Some(item),
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                ));
+            }
+            None
+        })
+    }
+
+    /// R1 at (100, 60) live, R2 where the file has it. Pad positions are the
+    /// file's local offsets (-0.5 / +0.5) added to each live anchor.
+    fn moved_r1() -> Vec<prost_types::Any> {
+        vec![
+            footprint(
+                "R1",
+                (100.0, 60.0),
+                &[("1", 99.5, 60.0), ("2", 100.5, 60.0)],
+            ),
+            footprint(
+                "R2",
+                (110.0, 50.0),
+                &[("1", 109.5, 50.0), ("2", 110.5, 50.0)],
+            ),
+        ]
+    }
+
+    fn route_args(board_path: &Path, pad1: &str) -> serde_json::Value {
+        json!({
+            "board": board_path, "net_name": "VCC",
+            "ref1": "R1", "pad1": pad1, "ref2": "R2", "pad2": "2"
+        })
+    }
+
+    fn saved_board() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let board_path = dir.path().join("specctra_two_resistors.kicad_pcb");
+        std::fs::write(&board_path, SAVED).unwrap();
+        (dir, board_path)
+    }
+
+    #[tokio::test]
+    async fn routes_between_the_live_pads_not_the_saved_ones() {
+        let (_dir, board_path) = saved_board();
+        let (named, tracks) = (Named::default(), Tracks::default());
+        let server = spawn_live_board(&board_path, moved_r1(), named.clone(), tracks.clone());
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_route_pad_to_pad(&route_args(&board_path, "1"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        // The L-bend the issue's save-then-route control produced on KiCad
+        // 10.0.6: (99.5, 60) → (110.5, 60) → (110.5, 50). Without the save,
+        // the start was the saved (99.5, 50), 10 mm from the live pad.
+        assert_eq!(
+            *tracks.lock().unwrap(),
+            [
+                ((99.5, 60.0), (110.5, 60.0)),
+                ((110.5, 60.0), (110.5, 50.0))
+            ]
+        );
+        let body: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["from"]["x"], 99.5);
+        assert_eq!(body["from"]["y"], 60.0);
+        assert_eq!(body["to"]["x"], 110.5);
+        assert_eq!(body["to"]["y"], 50.0);
+
+        // Both pads are read from, and both tracks written to, the document
+        // KiCad resolved for this board, not a blank or re-selected one.
+        let resolved = Some(board_document(&board_path.to_string_lossy()));
+        assert_eq!(
+            *named.lock().unwrap(),
+            [
+                ("GetItems", resolved.clone()),
+                ("GetItems", resolved.clone()),
+                ("GetNets", resolved.clone()),
+                ("CreateItems", resolved),
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&board_path).unwrap(), SAVED);
+    }
+
+    #[tokio::test]
+    async fn a_footprint_only_in_the_saved_file_is_refused_without_copper() {
+        let (_dir, board_path) = saved_board();
+        let tracks = Tracks::default();
+        let live = vec![footprint("R2", (110.0, 50.0), &[("2", 110.5, 50.0)])];
+        let server = spawn_live_board(&board_path, live, Named::default(), tracks.clone());
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_route_pad_to_pad(&route_args(&board_path, "1"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(
+            result_text(&result).contains("Footprint 'R1' not found on the board open in KiCad"),
+            "{:?}",
+            result.content
+        );
+        assert!(tracks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_live_pad_is_refused_without_copper() {
+        let (_dir, board_path) = saved_board();
+        let tracks = Tracks::default();
+        let server = spawn_live_board(&board_path, moved_r1(), Named::default(), tracks.clone());
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_route_pad_to_pad(&route_args(&board_path, "9"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(
+            result_text(&result).contains("Pad '9' not found on 'R1'"),
+            "{:?}",
+            result.content
+        );
+        assert!(tracks.lock().unwrap().is_empty());
     }
 }
