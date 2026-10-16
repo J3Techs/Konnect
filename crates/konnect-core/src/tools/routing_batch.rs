@@ -313,9 +313,336 @@ pub(crate) fn schema() -> serde_json::Value {
     })
 }
 
+// ─── delete_routing: selecting existing copper ────────────────────────────────
+
+/// One routed item read back from KiCad, reduced to what selection needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CopperItem {
+    pub id: String,
+    pub kind: &'static str,
+    pub net: String,
+    pub layer: String,
+    pub points: Vec<(f64, f64)>,
+    pub locked: bool,
+}
+
+/// Which items `delete_routing` removes. Every given filter must match.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Selection {
+    pub area: Option<(f64, f64, f64, f64)>,
+    pub nets: Option<Vec<String>>,
+    pub kinds: Vec<String>,
+    pub include_locked: bool,
+}
+
+pub(crate) fn parse_selection(args: &serde_json::Value) -> Result<Selection, Refusal> {
+    let area = match args.get("area").filter(|v| !v.is_null()) {
+        None => None,
+        Some(a) => {
+            let o = obj(a, "area", &["x1", "y1", "x2", "y2"])?;
+            let (x1, y1, x2, y2) = (
+                num(o, "area", "x1")?,
+                num(o, "area", "y1")?,
+                num(o, "area", "x2")?,
+                num(o, "area", "y2")?,
+            );
+            if x1 >= x2 || y1 >= y2 {
+                return Err(refuse("area", "needs x1 < x2 and y1 < y2"));
+            }
+            Some((x1, y1, x2, y2))
+        }
+    };
+    let nets = match args.get("nets").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => {
+            let list: Option<Vec<String>> = v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_str().filter(|s| !s.is_empty()).map(String::from))
+                    .collect()
+            });
+            match list {
+                Some(l) if !l.is_empty() && l.len() == v.as_array().map_or(0, Vec::len) => Some(l),
+                _ => return Err(refuse("nets", "must be a non-empty array of net names")),
+            }
+        }
+    };
+    if area.is_none() && nets.is_none() {
+        return Err(refuse(
+            "area",
+            "give an area, nets, or both: deleting all routing is not offered",
+        ));
+    }
+    let kinds = match args.get("kinds").filter(|v| !v.is_null()) {
+        None => vec!["track".to_string(), "arc".to_string(), "via".to_string()],
+        Some(v) => {
+            let list: Vec<String> = v
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|k| k.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if list.is_empty()
+                || list
+                    .iter()
+                    .any(|k| !["track", "arc", "via"].contains(&k.as_str()))
+            {
+                return Err(refuse("kinds", "must list some of track, arc and via"));
+            }
+            list
+        }
+    };
+    let include_locked = args
+        .get("include_locked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(Selection {
+        area,
+        nets,
+        kinds,
+        include_locked,
+    })
+}
+
+impl Selection {
+    /// (selected, locked items the filters matched but that were kept)
+    pub(crate) fn pick<'a>(&self, items: &'a [CopperItem]) -> (Vec<&'a CopperItem>, usize) {
+        let mut picked = Vec::new();
+        let mut kept_locked = 0;
+        for item in items {
+            if !self.kinds.iter().any(|k| k == item.kind) {
+                continue;
+            }
+            if let Some(nets) = &self.nets {
+                if !nets.contains(&item.net) {
+                    continue;
+                }
+            }
+            if let Some((x1, y1, x2, y2)) = self.area {
+                if !item
+                    .points
+                    .iter()
+                    .all(|&(x, y)| x >= x1 && x <= x2 && y >= y1 && y <= y2)
+                {
+                    continue;
+                }
+            }
+            if item.locked && !self.include_locked {
+                kept_locked += 1;
+                continue;
+            }
+            picked.push(item);
+        }
+        (picked, kept_locked)
+    }
+}
+
+pub(crate) fn summarize(items: &[&CopperItem]) -> serde_json::Value {
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut nets: BTreeMap<&str, usize> = BTreeMap::new();
+    for i in items {
+        *kinds.entry(i.kind).or_default() += 1;
+        *nets.entry(i.net.as_str()).or_default() += 1;
+    }
+    json!({ "count": items.len(), "by_kind": kinds, "nets": nets.len(), "locked": items.iter().filter(|i| i.locked).count() })
+}
+
+/// Decode KiCad's tracks, arcs and vias into `CopperItem`s.
+pub(crate) fn decode_copper(items: &[prost_types::Any]) -> anyhow::Result<Vec<CopperItem>> {
+    use konnect_ipc::gen::kiapi::board::types as b;
+    use prost::Message;
+    let pt = |v: &Option<konnect_ipc::gen::kiapi::common::types::Vector2>| {
+        v.as_ref()
+            .map(|v| (builders::nm_to_mm(v.x_nm), builders::nm_to_mm(v.y_nm)))
+    };
+    let locked = |l: i32| l == konnect_ipc::gen::kiapi::common::types::LockedState::LsLocked as i32;
+    let layer = |l: i32| {
+        BoardLayer::try_from(l)
+            .ok()
+            .and_then(builders::layer_name)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let mut out = Vec::new();
+    for any in items {
+        if builders::any_is(any, "kiapi.board.types.Track") {
+            let m = b::Track::decode(any.value.as_slice())?;
+            out.push(CopperItem {
+                id: m.id.map(|k| k.value).unwrap_or_default(),
+                kind: "track",
+                net: m.net.map(|n| n.name).unwrap_or_default(),
+                layer: layer(m.layer),
+                points: [pt(&m.start), pt(&m.end)].into_iter().flatten().collect(),
+                locked: locked(m.locked),
+            });
+        } else if builders::any_is(any, "kiapi.board.types.Arc") {
+            let m = b::Arc::decode(any.value.as_slice())?;
+            out.push(CopperItem {
+                id: m.id.map(|k| k.value).unwrap_or_default(),
+                kind: "arc",
+                net: m.net.map(|n| n.name).unwrap_or_default(),
+                layer: layer(m.layer),
+                points: [pt(&m.start), pt(&m.mid), pt(&m.end)]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                locked: locked(m.locked),
+            });
+        } else if builders::any_is(any, "kiapi.board.types.Via") {
+            let m = b::Via::decode(any.value.as_slice())?;
+            out.push(CopperItem {
+                id: m.id.map(|k| k.value).unwrap_or_default(),
+                kind: "via",
+                net: m.net.map(|n| n.name).unwrap_or_default(),
+                layer: "through".to_string(),
+                points: pt(&m.position).into_iter().collect(),
+                locked: locked(m.locked),
+            });
+        }
+    }
+    anyhow::ensure!(
+        out.iter().all(|i| !i.id.is_empty()),
+        "KiCad sent a routed item without a KIID"
+    );
+    Ok(out)
+}
+
+pub(crate) fn delete_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board": { "type": "string", "description": "Path to the .kicad_pcb KiCad holds open" },
+            "area": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Only items lying wholly inside this box (every end point / the via centre)",
+                "properties": { "x1": { "type": "number" }, "y1": { "type": "number" }, "x2": { "type": "number" }, "y2": { "type": "number" } },
+                "required": ["x1", "y1", "x2", "y2"]
+            },
+            "nets": { "type": "array", "items": { "type": "string" }, "description": "Only items on these nets" },
+            "kinds": { "type": "array", "items": { "type": "string", "enum": ["track", "arc", "via"] }, "description": "Default: all three" },
+            "include_locked": { "type": "boolean", "default": false, "description": "Also delete locked items; otherwise they are kept and counted" },
+            "dry_run": { "type": "boolean", "default": true },
+            "expected_count": { "type": "integer", "minimum": 1, "description": "Required to apply: the count a dry run of the same selection returned" }
+        },
+        "required": ["board"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(
+        id: &str,
+        kind: &'static str,
+        net: &str,
+        points: Vec<(f64, f64)>,
+        locked: bool,
+    ) -> CopperItem {
+        CopperItem {
+            id: id.into(),
+            kind,
+            net: net.into(),
+            layer: "F.Cu".into(),
+            points,
+            locked,
+        }
+    }
+
+    #[test]
+    fn selection_needs_every_filter_and_keeps_locked_by_default() {
+        let items = vec![
+            item("a", "track", "GND", vec![(1.0, 1.0), (2.0, 1.0)], false),
+            item("b", "via", "GND", vec![(1.5, 1.5)], true),
+            item("c", "track", "VCC", vec![(1.0, 1.0), (2.0, 1.0)], false),
+            item("d", "track", "GND", vec![(1.0, 1.0), (9.0, 1.0)], false),
+        ];
+        let s = parse_selection(
+            &json!({ "area": { "x1": 0, "y1": 0, "x2": 3, "y2": 3 }, "nets": ["GND"] }),
+        )
+        .unwrap();
+        let (picked, kept) = s.pick(&items);
+        assert_eq!(
+            picked.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
+        assert_eq!(kept, 1, "the locked via matched but was kept");
+        let s = parse_selection(&json!({ "area": { "x1": 0, "y1": 0, "x2": 3, "y2": 3 }, "include_locked": true, "kinds": ["via"] })).unwrap();
+        assert_eq!(
+            s.pick(&items)
+                .0
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert_eq!(summarize(&s.pick(&items).0)["by_kind"], json!({ "via": 1 }));
+    }
+
+    #[test]
+    fn a_selection_without_area_or_nets_or_with_bad_values_is_refused() {
+        assert_eq!(parse_selection(&json!({})).unwrap_err().0, "area");
+        assert_eq!(
+            parse_selection(&json!({ "area": { "x1": 3, "y1": 0, "x2": 1, "y2": 3 } }))
+                .unwrap_err()
+                .0,
+            "area"
+        );
+        assert_eq!(
+            parse_selection(&json!({ "nets": [] })).unwrap_err().0,
+            "nets"
+        );
+        assert_eq!(
+            parse_selection(&json!({ "nets": ["A"], "kinds": ["zone"] }))
+                .unwrap_err()
+                .0,
+            "kinds"
+        );
+    }
+
+    #[test]
+    fn decoded_copper_carries_net_points_and_lock() {
+        let codes = BTreeMap::from([("GND".to_string(), 1)]);
+        let mut args = sample();
+        args["locked"] = json!(true);
+        args["tracks"] = json!([{ "net": "GND", "layer": "F.Cu", "width": 0.2, "x1": 0, "y1": 0, "x2": 5, "y2": 0 }]);
+        let mut items = parse(&args, None).unwrap().items(&codes).unwrap();
+        // KiCad assigns KIIDs; give the round-trip some
+        for (n, any) in items.iter_mut().enumerate() {
+            use prost::Message;
+            if any.type_url.ends_with("Track") {
+                let mut t =
+                    konnect_ipc::gen::kiapi::board::types::Track::decode(any.value.as_slice())
+                        .unwrap();
+                t.id = Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                    value: format!("t{n}"),
+                });
+                *any = builders::pack_any(&t, "kiapi.board.types.Track");
+            } else {
+                let mut v =
+                    konnect_ipc::gen::kiapi::board::types::Via::decode(any.value.as_slice())
+                        .unwrap();
+                v.id = Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                    value: format!("v{n}"),
+                });
+                *any = builders::pack_any(&v, "kiapi.board.types.Via");
+            }
+        }
+        let copper = decode_copper(&items).unwrap();
+        assert_eq!(copper.len(), 2);
+        assert_eq!(
+            (
+                copper[0].kind,
+                copper[0].net.as_str(),
+                copper[0].points.len(),
+                copper[0].locked
+            ),
+            ("track", "GND", 2, true)
+        );
+        assert_eq!((copper[1].kind, copper[1].points[0]), ("via", (5.0, 0.0)));
+    }
 
     fn sample() -> serde_json::Value {
         json!({

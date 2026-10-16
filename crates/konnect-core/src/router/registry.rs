@@ -88,9 +88,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_routing",
-        description: "Traces, vias, batch routing, copper pours, net classes, differential pairs, and strict Specctra SES import",
+        description: "Traces, vias, batch routing and deletion, copper pours, net classes, differential pairs, and strict Specctra SES import",
         category: "pcb",
-        tool_count: 16,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "placement",

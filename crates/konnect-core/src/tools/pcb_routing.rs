@@ -328,6 +328,18 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "delete_routing",
+            "Delete tracks, arcs and vias from the board KiCad holds open, selected by an area \
+             (items lying wholly inside it), a list of nets, or both, optionally limited to some \
+             kinds. Locked items are kept and counted unless include_locked is set. Defaults to a \
+             dry run that lists what would go; apply needs expected_count equal to that dry run's \
+             count, re-reads the board and refuses if the selection changed, and deletes in one \
+             DeleteItems (one undo step). Footprints, pads and zones are never touched.",
+            super::routing_batch::delete_schema(),
+            |args, ctx| async move { handle_delete_routing(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "route_differential_pair",
             "Route a differential pair (two parallel traces with a specified gap).",
             json!({
@@ -632,6 +644,83 @@ async fn handle_add_routing(
             body["created"] = json!(count);
             body["source"] = json!("ipc");
             body["next"] = json!("Run run_drc to check clearances against the board's rules.");
+            Ok(CallToolResult::json(&body))
+        }
+    }
+}
+
+async fn handle_delete_routing(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use super::routing_batch;
+    let selection = match routing_batch::parse_selection(args) {
+        Ok(s) => s,
+        Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let expected = args
+        .get("expected_count")
+        .and_then(serde_json::Value::as_u64);
+    if !dry_run && expected.is_none() {
+        return Ok(crate::tools::invalid_arg(
+            "expected_count",
+            "apply requires the count a dry run of this selection returned",
+        ));
+    }
+    let outcome = ipc!(ctx, args, |c, document| {
+        use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as K;
+        let items = c.get_items_of_types_in(
+            document.clone(),
+            &[K::KotPcbTrace, K::KotPcbArc, K::KotPcbVia],
+        )?;
+        let copper = routing_batch::decode_copper(&items)?;
+        let (picked, kept_locked) = selection.pick(&copper);
+        let summary = routing_batch::summarize(&picked);
+        let ids: Vec<String> = picked.iter().map(|i| i.id.clone()).collect();
+        if dry_run {
+            return Ok(Ok((summary, kept_locked, false)));
+        }
+        if Some(ids.len() as u64) != expected {
+            return Ok(Err(format!(
+                "The selection now matches {} item(s), not the expected {}; nothing was deleted. Run a fresh dry run.",
+                ids.len(),
+                expected.unwrap_or(0)
+            )));
+        }
+        c.delete_items_in(document.clone(), ids.clone())?;
+        // KiCad 10 leaves DeleteItems' per-item results empty: prove absence by readback
+        let after = routing_batch::decode_copper(
+            &c.get_items_of_types_in(document, &[K::KotPcbTrace, K::KotPcbArc, K::KotPcbVia])?,
+        )?;
+        let gone: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let survivors = after
+            .iter()
+            .filter(|i| gone.contains(i.id.as_str()))
+            .count();
+        if survivors > 0 {
+            return Ok(Err(format!(
+                "KiCad accepted the delete but {survivors} of {} selected item(s) are still on the board.",
+                ids.len()
+            )));
+        }
+        Ok(Ok((summary, kept_locked, true)))
+    });
+    match outcome {
+        Err(message) => Ok(CallToolResult::error(message)),
+        Ok((summary, kept_locked, deleted)) => {
+            let mut body = summary;
+            body["dry_run"] = json!(dry_run);
+            body["deleted"] = json!(deleted);
+            body["locked_kept"] = json!(kept_locked);
+            body["source"] = json!("ipc");
+            if dry_run {
+                body["next"] =
+                    json!("Apply with dry_run false and expected_count set to this count.");
+            }
             Ok(CallToolResult::json(&body))
         }
     }
@@ -1164,6 +1253,123 @@ mod delete_trace_tests {
     use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use konnect_ipc::gen::kiapi;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn delete_routing_dry_runs_applies_by_count_and_proves_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let mut inside =
+            konnect_ipc::builders::build_track("GND", 1, "F.Cu", 0.2, 1.0, 1.0, 2.0, 1.0);
+        inside.id = Some(kiapi::common::types::Kiid {
+            value: "t-in".into(),
+        });
+        let mut outside =
+            konnect_ipc::builders::build_track("GND", 1, "F.Cu", 0.2, 1.0, 1.0, 9.0, 1.0);
+        outside.id = Some(kiapi::common::types::Kiid {
+            value: "t-out".into(),
+        });
+        let mut via = konnect_ipc::builders::build_via("GND", 1, 1.5, 1.5, 0.2, 0.45);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "v-in".into(),
+        });
+        via.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        let alive = Arc::new(Mutex::new(vec![
+            konnect_ipc::builders::pack_any(&inside, "kiapi.board.types.Track"),
+            konnect_ipc::builders::pack_any(&outside, "kiapi.board.types.Track"),
+            konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"),
+        ]));
+        let in_mock = alive.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            use prost::Message;
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: in_mock.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                let req =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                let ids: Vec<String> = req.item_ids.into_iter().map(|k| k.value).collect();
+                in_mock.lock().unwrap().retain(|any| {
+                    let t = kiapi::board::types::Track::decode(any.value.as_slice()).ok();
+                    let id = t.and_then(|t| t.id).map(|k| k.value).unwrap_or_default();
+                    !ids.contains(&id)
+                });
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+        let ctx = ctx_talking_to(server.address().to_string());
+        let area = json!({ "x1": 0, "y1": 0, "x2": 3, "y2": 3 });
+        let body = |r: &CallToolResult| -> serde_json::Value {
+            match r.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                    serde_json::from_str(text).unwrap()
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+
+        let dry = handle_delete_routing(&json!({ "board": board, "area": area }), &ctx)
+            .await
+            .unwrap();
+        let dry = body(&dry);
+        assert_eq!(
+            (
+                dry["count"].clone(),
+                dry["locked_kept"].clone(),
+                dry["deleted"].clone()
+            ),
+            (json!(1), json!(1), json!(false))
+        );
+
+        let no_count = handle_delete_routing(
+            &json!({ "board": board, "area": area, "dry_run": false }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(no_count.is_error);
+        let wrong = handle_delete_routing(
+            &json!({ "board": board, "area": area, "dry_run": false, "expected_count": 2 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(wrong.is_error);
+        assert_eq!(
+            alive.lock().unwrap().len(),
+            3,
+            "a count mismatch deletes nothing"
+        );
+
+        let applied = handle_delete_routing(
+            &json!({ "board": board, "area": area, "dry_run": false, "expected_count": 1 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{:?}", applied.content);
+        assert_eq!(body(&applied)["deleted"], json!(true));
+        assert_eq!(
+            alive.lock().unwrap().len(),
+            2,
+            "only the unlocked track inside the area went"
+        );
+    }
 
     #[tokio::test]
     async fn non_trace_and_missing_uuids_refuse_before_delete_items() {
