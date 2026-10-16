@@ -149,7 +149,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. Job settings are proven applied from Freerouting's answer before the job starts. Progress notifications report the job state while it runs. Konnect enforces the time limit itself (job_timeout_seconds, else overall_timeout_seconds less a margin to download): a job still running then is stopped and its board routed so far is written, marked partial: true.",
             json!({
                 "type": "object",
                 "properties": {
@@ -158,7 +158,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
-                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                    "fanout_enabled": { "type": "boolean", "description": "Freerouting's fanout stage, which escapes every SMD pin with a via before routing starts. Freerouting turns it on by default; on a large board whose escapes are already placed it can take hours. Omit to keep Freerouting's default." },
+                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop routing after this long and keep what is routed (partial: true). Enforced by Konnect, not sent to Freerouting, whose own timeout discards the result." },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
                 "required": ["dsn_path", "ses_output_path"]
@@ -2350,6 +2351,7 @@ async fn handle_route_specctra_dsn(
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
+        fanout_enabled: args["fanout_enabled"].as_bool(),
         job_timeout_seconds,
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
@@ -2381,6 +2383,8 @@ async fn handle_route_specctra_dsn(
         "session_id": evidence.session_id,
         "job_id": evidence.job_id,
         "final_state": evidence.final_state,
+        "partial": evidence.partial,
+        "last_status": evidence.last_status,
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
         "ses_bytes": evidence.ses_bytes

@@ -55,6 +55,7 @@ const REQUIRED_TOOLS: &[&str] = &[
 pub(crate) struct RouteSettings {
     pub max_passes: Option<u32>,
     pub optimizer_enabled: Option<bool>,
+    pub fanout_enabled: Option<bool>,
     pub job_timeout_seconds: Option<u64>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
@@ -65,6 +66,11 @@ pub(crate) struct RouteEvidence {
     pub session_id: String,
     pub job_id: String,
     pub final_state: String,
+    /// Konnect stopped the job at its time limit: the SES holds the routing
+    /// done so far, not a finished run.
+    pub partial: bool,
+    /// The last job state and figures the router reported.
+    pub last_status: String,
     pub poll_count: u32,
     pub elapsed_seconds: f64,
     pub ses_bytes: u64,
@@ -323,59 +329,74 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
+    let job_settings = job_settings(settings);
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
         }
-        client
+        let updated = client
             .call_tool(
                 "update_job_settings",
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        // Freerouting ignores a key it does not know without a word, so
+        // prove from its answer that every setting took.
+        let applied = find_value(&updated, "router_settings");
+        let unapplied = unapplied_settings(&job_settings, applied, "");
+        if !unapplied.is_empty() {
+            bail!(
+                "Freerouting did not apply job setting(s) {}; its router_settings: {}",
+                unapplied.join(", "),
+                applied.map(compact).unwrap_or_else(|| "absent".to_string())
+            );
+        }
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
         .await?;
 
+    // Konnect keeps the time limit itself: Freerouting answers a job that
+    // reached its own timeout with "no valid output", while a running job's
+    // download is the board routed so far. Stop early enough to fetch it
+    // before the overall timeout abandons the job.
+    let margin = (settings.overall_timeout / 4).min(Duration::from_secs(60));
+    let mut limit = settings.overall_timeout.saturating_sub(margin);
+    if let Some(seconds) = settings.job_timeout_seconds {
+        limit = limit.min(Duration::from_secs(seconds));
+    }
+    let deadline = started + limit;
+    let mut stopped_at_deadline = false;
     let mut poll_count = 0u32;
+    let mut last_status: String;
     let final_state = loop {
         let details = client
             .call_tool("get_job_details", json!({ "path": { "jobId": job_id } }))
             .await?;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
+        last_status = format!("{state}{}", job_progress_summary(&details));
         // Keep the client's idle timer from abandoning a long job, and say
         // what the router reports about it.
         crate::mcp::progress::report(
             f64::from(poll_count),
             None,
             &format!(
-                "Freerouting job {job_id}: {state} after {:.0} s{}",
+                "Freerouting job {job_id}: {last_status} after {:.0} s",
                 started.elapsed().as_secs_f64(),
-                job_progress_summary(&details)
             ),
         )
         .await;
-        match state.to_ascii_uppercase().as_str() {
-            "COMPLETED" => break "COMPLETED".to_string(),
-            "FAILED" | "CANCELLED" | "CANCELED" => {
-                bail!("Freerouting job {job_id} ended in state {state}")
+        match job_outcome(&state) {
+            JobOutcome::Running if Instant::now() + settings.poll_interval >= deadline => {
+                stopped_at_deadline = true;
+                break "STOPPED_AT_TIME_LIMIT".to_string();
             }
-            _ => tokio::time::sleep(settings.poll_interval).await,
+            JobOutcome::Running => tokio::time::sleep(settings.poll_interval).await,
+            JobOutcome::Finished => break state.to_ascii_uppercase(),
+            JobOutcome::Failed => {
+                bail!("Freerouting job {job_id} ended in state {state} ({last_status})")
+            }
         }
     };
 
@@ -385,16 +406,93 @@ async fn run_state_machine(
             json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
         )
         .await?;
+    if stopped_at_deadline && tools.contains_key("cancel_job") {
+        // The child is closed next in any case; this only ends the job cleanly.
+        let _ = client
+            .call_tool("cancel_job", json!({ "path": { "jobId": job_id } }))
+            .await;
+    }
     Ok(RouteEvidence {
         session_id,
         job_id,
+        partial: stopped_at_deadline,
         final_state,
+        last_status,
         poll_count,
         elapsed_seconds: started.elapsed().as_secs_f64(),
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
     })
+}
+
+/// The job-settings body, in the names Freerouting's Gson model reads
+/// (`max_passes`, `optimizer.enabled`, `fanout.enabled`). The time limit is
+/// not sent: Konnect enforces it, so the partial result survives.
+fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        body.insert("max_passes".to_string(), json!(max_passes));
+    }
+    if let Some(enabled) = settings.optimizer_enabled {
+        body.insert("optimizer".to_string(), json!({ "enabled": enabled }));
+    }
+    if let Some(enabled) = settings.fanout_enabled {
+        body.insert("fanout".to_string(), json!({ "enabled": enabled }));
+    }
+    body
+}
+
+/// The first value under `key` anywhere in `value`.
+fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .or_else(|| map.values().find_map(|inner| find_value(inner, key))),
+        Value::Array(items) => items.iter().find_map(|inner| find_value(inner, key)),
+        _ => None,
+    }
+}
+
+/// Dotted names of the `wanted` settings that `applied` does not hold.
+fn unapplied_settings(
+    wanted: &Map<String, Value>,
+    applied: Option<&Value>,
+    prefix: &str,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (key, value) in wanted {
+        let name = format!("{prefix}{key}");
+        let got = applied.and_then(|applied| applied.get(key));
+        match value {
+            Value::Object(inner) => {
+                missing.extend(unapplied_settings(inner, got, &format!("{name}.")));
+            }
+            _ if got != Some(value) => missing.push(name),
+            _ => {}
+        }
+    }
+    missing
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobOutcome {
+    Running,
+    Finished,
+    Failed,
+}
+
+/// What a Freerouting 2.x job state means for the poll loop. QUEUED,
+/// READY_TO_START, RUNNING, PAUSED and STOPPING are still on their way.
+fn job_outcome(state: &str) -> JobOutcome {
+    match state.to_ascii_uppercase().as_str() {
+        "COMPLETED" => JobOutcome::Finished,
+        // Freerouting's own job timeout (12 h unless set) leaves no output.
+        "FAILED" | "CANCELLED" | "CANCELED" | "TERMINATED" | "INVALID" | "TIMED_OUT" => {
+            JobOutcome::Failed
+        }
+        _ => JobOutcome::Running,
+    }
 }
 
 /// The numeric and short text fields of a job-details answer, for a
@@ -538,14 +636,25 @@ impl LocalMcpClient {
             .stderr
             .take()
             .context("Freerouting MCP has no stderr")?;
+        // Keep the end of the log: Freerouting's startup alone can fill the
+        // budget, and the routing summary comes last.
         let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut bytes = Vec::new();
-            let _ = reader
-                .take(MAX_STDERR_BYTES as u64)
-                .read_to_end(&mut bytes)
-                .await;
-            String::from_utf8_lossy(&bytes).trim().to_string()
+            let mut reader = BufReader::new(stderr);
+            let mut tail = Vec::new();
+            let mut dropped = 0usize;
+            let mut chunk = vec![0u8; 8192];
+            while let Ok(read) = reader.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                dropped += keep_tail(&mut tail, &chunk[..read], MAX_STDERR_BYTES);
+            }
+            let text = String::from_utf8_lossy(&tail).trim().to_string();
+            if dropped > 0 {
+                format!("[{dropped} earlier bytes of Freerouting stderr dropped]\n{text}")
+            } else {
+                text
+            }
         });
         Ok(Self {
             child: Some(child),
@@ -714,6 +823,15 @@ impl Drop for LocalMcpClient {
     }
 }
 
+/// Append `chunk` to `tail`, then drop the oldest bytes beyond `max`;
+/// returns how many were dropped.
+fn keep_tail(tail: &mut Vec<u8>, chunk: &[u8], max: usize) -> usize {
+    tail.extend_from_slice(chunk);
+    let excess = tail.len().saturating_sub(max);
+    tail.drain(..excess);
+    excess
+}
+
 fn expand_text_content(mut result: Value) -> Value {
     let parsed = result
         .get("content")
@@ -777,13 +895,6 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
         .and_then(|name| name.to_str())
         .context("SES output has no UTF-8 filename")?;
     Ok(parent.join(format!(".{name}.konnect-{}.tmp.ses", uuid::Uuid::new_v4())))
-}
-
-fn duration_string(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -863,9 +974,56 @@ mod tests {
     }
 
     #[test]
-    fn duration_settings_use_documented_shape() {
-        assert_eq!(duration_string(5 * 60), "00:05:00");
-        assert_eq!(duration_string(25 * 60 * 60), "25:00:00");
+    fn only_completed_jobs_finish_and_timed_out_ones_fail() {
+        for state in ["QUEUED", "READY_TO_START", "RUNNING", "PAUSED", "STOPPING"] {
+            assert_eq!(job_outcome(state), JobOutcome::Running, "{state}");
+        }
+        assert_eq!(job_outcome("COMPLETED"), JobOutcome::Finished);
+        for state in ["FAILED", "CANCELLED", "TERMINATED", "INVALID", "timed_out"] {
+            assert_eq!(job_outcome(state), JobOutcome::Failed, "{state}");
+        }
+    }
+
+    #[test]
+    fn job_settings_use_freeroutings_names_and_are_checked_in_its_answer() {
+        let body = job_settings(&RouteSettings {
+            max_passes: Some(8),
+            optimizer_enabled: Some(false),
+            fanout_enabled: Some(false),
+            job_timeout_seconds: Some(3600),
+            poll_interval: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(4000),
+        });
+        assert_eq!(
+            Value::Object(body.clone()),
+            json!({
+                "max_passes": 8,
+                "optimizer": { "enabled": false },
+                "fanout": { "enabled": false }
+            })
+        );
+        // Freerouting 2.3 echoes what it took; an unknown key is dropped.
+        let answer = json!({ "status": 200, "body": { "router_settings": {
+            "max_passes": 8,
+            "optimizer": { "enabled": false }, "fanout": {}, "scoring": {}
+        } } });
+        assert_eq!(
+            unapplied_settings(&body, find_value(&answer, "router_settings"), ""),
+            vec!["fanout.enabled".to_string()]
+        );
+        assert_eq!(
+            unapplied_settings(&body, None, "").len(),
+            3,
+            "no echo proves nothing"
+        );
+    }
+
+    #[test]
+    fn stderr_capture_keeps_the_newest_bytes() {
+        let mut tail = Vec::new();
+        assert_eq!(keep_tail(&mut tail, b"startup ", 10), 0);
+        assert_eq!(keep_tail(&mut tail, b"routed 12", 10), 7);
+        assert_eq!(tail, b" routed 12");
     }
 
     #[test]
@@ -960,6 +1118,7 @@ mod tests {
             &RouteSettings {
                 max_passes: Some(2),
                 optimizer_enabled: Some(false),
+                fanout_enabled: None,
                 job_timeout_seconds: Some(300),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
@@ -968,6 +1127,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(evidence.final_state, "COMPLETED");
+        assert!(evidence.ses_bytes > 0);
+        assert!(ses.is_file());
+    }
+
+    /// A board too big to finish in a minute: Konnect stops the job at its
+    /// time limit, and the SES still arrives with the routing done so far.
+    #[tokio::test]
+    #[ignore = "requires Java, FREEROUTING_JAR and FREEROUTING_LARGE_DSN"]
+    async fn native_mcp_time_limit_returns_the_partial_session() {
+        let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
+        let dsn = PathBuf::from(
+            std::env::var_os("FREEROUTING_LARGE_DSN").expect("set FREEROUTING_LARGE_DSN"),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let ses = temp.path().join("partial.ses");
+
+        let evidence = route_local(
+            &jar,
+            &dsn,
+            &ses,
+            &RouteSettings {
+                max_passes: Some(10),
+                optimizer_enabled: Some(false),
+                fanout_enabled: Some(false),
+                job_timeout_seconds: Some(75),
+                poll_interval: Duration::from_secs(2),
+                overall_timeout: Duration::from_secs(600),
+            },
+        )
+        .await
+        .unwrap();
+        eprintln!("{evidence:#?}");
+        assert_eq!(evidence.final_state, "STOPPED_AT_TIME_LIMIT");
+        assert!(evidence.partial);
         assert!(evidence.ses_bytes > 0);
         assert!(ses.is_file());
     }
@@ -994,6 +1187,7 @@ mod tests {
                 &RouteSettings {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
+                    fanout_enabled: None,
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
@@ -1041,6 +1235,7 @@ mod tests {
                 &RouteSettings {
                     max_passes: Some(100),
                     optimizer_enabled: Some(true),
+                    fanout_enabled: None,
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),

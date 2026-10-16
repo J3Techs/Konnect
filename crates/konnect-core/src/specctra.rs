@@ -1368,7 +1368,14 @@ fn trapezoids(rings: &[Vec<(i64, i64)>]) -> Vec<Vec<(i64, i64)>> {
             (from, y_at(upper, from as f64).round() as i64),
         ];
         ring.dedup();
-        if ring.len() >= 3 {
+        // A hole edge lying on the outline edge makes a zero-height strip:
+        // no copper, so no piece (Freerouting rejects unbounded shapes).
+        let doubled_area = ring
+            .iter()
+            .zip(ring.iter().cycle().skip(1))
+            .map(|(a, b)| i128::from(a.0) * i128::from(b.1) - i128::from(b.0) * i128::from(a.1))
+            .sum::<i128>();
+        if ring.len() >= 3 && doubled_area != 0 {
             let first = ring[0];
             ring.push(first);
             pieces.push(ring);
@@ -3053,6 +3060,28 @@ mod tests {
         assert_eq!(manifest["supported_profile"]["copper_zones"], true);
         assert_eq!(manifest["supported_profile"]["plane_count"], 1);
         assert_eq!(manifest["supported_profile"]["component_side"], "both");
+    }
+
+    #[test]
+    fn a_hole_on_the_outline_edge_leaves_no_zero_area_piece() {
+        // A 100x100 square with a 40x30 notch-like hole sitting on its bottom edge.
+        let outline = vec![(0, 0), (100, 0), (100, 100), (0, 100)];
+        let hole = vec![(30, 0), (30, 30), (70, 30), (70, 0)];
+        let pieces = trapezoids(&[outline, hole]);
+        let mut total = 0i128;
+        for piece in &pieces {
+            let doubled = piece
+                .windows(2)
+                .map(|w| {
+                    i128::from(w[0].0) * i128::from(w[1].1)
+                        - i128::from(w[1].0) * i128::from(w[0].1)
+                })
+                .sum::<i128>()
+                .abs();
+            assert!(doubled > 0, "zero-area piece {piece:?}");
+            total += doubled;
+        }
+        assert_eq!(total, 2 * (100 * 100 - 40 * 30));
     }
 
     #[test]

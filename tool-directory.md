@@ -387,7 +387,7 @@ and Windows servers do not.
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. |
-| `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. |
+| `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. Job settings (`max_passes`, `optimizer_enabled`, `fanout_enabled`) are proven applied from Freerouting's answer; progress notifications report the job while it runs; Konnect enforces the time limit and keeps the board routed so far (`partial: true`). |
 
 Migration from the former `autoroute` tool: use `export_specctra_dsn`,
 `route_specctra_dsn`, then `plan_specctra_ses_import` / `apply_specctra_ses`.

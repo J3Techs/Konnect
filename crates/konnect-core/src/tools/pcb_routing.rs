@@ -2559,6 +2559,7 @@ mod specctra_live_undo_test {
             &crate::freerouting_mcp::RouteSettings {
                 max_passes: Some(20),
                 optimizer_enabled: Some(false),
+                fanout_enabled: None,
                 job_timeout_seconds: Some(120),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
