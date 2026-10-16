@@ -1025,6 +1025,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fields_file_and_report_file_carry_large_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("labels.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        let fields = tmp.path().join("fields.json");
+        std::fs::write(
+            &fields,
+            json!([{ "reference": "U1" }, { "reference": "R4001", "board_x": 52, "board_y": 60 }])
+                .to_string(),
+        )
+        .unwrap();
+        let report = tmp.path().join("report.json");
+        let args = json!({ "board": board, "fields_file": fields, "report_file": report, "report": "all" });
+        let (error, plan) = batch(ctx_talking_to(String::new()), args.clone()).await;
+        assert!(!error, "{plan}");
+        assert_eq!(
+            plan["fields"],
+            Value::Null,
+            "the inline answer drops the list"
+        );
+        assert_eq!(plan["requested_count"], 2);
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        assert_eq!(written["fields"].as_array().unwrap().len(), 2);
+        assert_eq!(written["revision"], plan["revision"]);
+
+        let mut apply = args.clone();
+        apply["dry_run"] = json!(false);
+        apply["expected_revision"] = plan["revision"].clone();
+        let (error, applied) = batch(ctx_talking_to(String::new()), apply).await;
+        assert!(!error, "{applied}");
+        assert_eq!(applied["status"], "applied");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        assert_eq!(written["status"], "applied");
+
+        let both =
+            json!({ "board": board, "fields_file": fields, "fields": [{ "reference": "U1" }] });
+        let (error, refused) = batch(ctx_talking_to(String::new()), both).await;
+        assert!(error);
+        assert!(refused.to_string().contains("fields_file"), "{refused}");
+        std::fs::write(&fields, "[not json").unwrap();
+        let (error, refused) = batch(
+            ctx_talking_to(String::new()),
+            json!({ "board": board, "fields_file": fields }),
+        )
+        .await;
+        assert!(error);
+        assert!(
+            refused.to_string().contains("cannot be read as JSON"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
     async fn open_locked_or_partially_invalid_batches_write_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("labels.kicad_pcb");

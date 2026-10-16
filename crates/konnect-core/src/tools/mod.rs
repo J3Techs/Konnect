@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod board_extents_tests;
+mod board_graphics;
 mod board_session;
 mod board_source;
 #[cfg(test)]

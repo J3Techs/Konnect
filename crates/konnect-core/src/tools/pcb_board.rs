@@ -1262,6 +1262,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_board_text(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        super::board_graphics::tool(),
         tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
@@ -4399,13 +4400,13 @@ mod net_count_tests {
 }
 
 #[cfg(test)]
-mod mounting_hole_tests {
+pub(crate) mod mounting_hole_tests {
     use super::*;
     use crate::router::ToolRouter;
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
-    pub(super) fn ctx_with_ipc(ipc_address: String) -> ToolContext {
+    pub(crate) fn ctx_with_ipc(ipc_address: String) -> ToolContext {
         ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
@@ -4420,7 +4421,7 @@ mod mounting_hole_tests {
         )
     }
 
-    pub(super) fn blank_board(dir: &std::path::Path) -> std::path::PathBuf {
+    pub(crate) fn blank_board(dir: &std::path::Path) -> std::path::PathBuf {
         let board = dir.join("board.kicad_pcb");
         std::fs::write(
             &board,
@@ -4430,7 +4431,7 @@ mod mounting_hole_tests {
         board
     }
 
-    pub(super) fn result_text(res: &CallToolResult) -> String {
+    pub(crate) fn result_text(res: &CallToolResult) -> String {
         match res.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             other => panic!("expected text content, got {other:?}"),
@@ -4440,7 +4441,7 @@ mod mounting_hole_tests {
     /// A rep0 endpoint that completes every round-trip with an error status —
     /// a live KiCAD saying no. Mirrors the helper of the same name in
     /// `pcb_components`, which guards `place_component`'s fallback.
-    pub(super) fn spawn_rejecting_kicad() -> crate::test_support::MockIpcServer {
+    pub(crate) fn spawn_rejecting_kicad() -> crate::test_support::MockIpcServer {
         crate::test_support::MockIpcServer::spawn("rejecting-board", |_| {
             konnect_ipc::gen::kiapi::common::ApiResponse {
                 status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
+- **231 registered tools** + **7 always-visible meta-tools** = **238 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,8 +232,8 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 14 tools
-**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
+### `pcb_board` · 15 tools
+**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, batch silkscreen/fab graphics, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -250,6 +250,7 @@ and Windows servers do not.
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
+| `add_board_graphics` | Add many lines, unfilled rectangles and texts to one non-copper layer in a single write: one KiCad `CreateItems` (one undo step) when KiCad holds the board, else one append to the saved file. Members come inline or from `graphics_file` (a JSON object with `lines`, `rects`, `texts`); every member is validated first and one bad member refuses the batch. Back-side text is mirrored; copper layers are refused. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
@@ -313,7 +314,7 @@ and Windows servers do not.
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | **Deprecated:** diagnostic planning only. It can return a deterministic net-clustered starting plan and before/after scores, but autonomous whole-board mutation is retired. `dry_run: false` returns structured `plan_blocked` without writing; apply bounded, explicit `move_component` operations instead. |
 | `refine_placement_force_directed` | **Deprecated:** diagnostic deterministic spring embedder, not a recommended bulk-placement workflow. Dry-run reports applicability and displacement; non-converged, non-improving (including score ties), hard-fail, off-board, unbounded, or over-limit plans cannot apply. A board outline that is not provably rectangular is refused with `plan_blocked` before any plan is made. Use explicit moves for justified score-neutral changes. |
-| `set_reference_field_presentations` | Set many placed footprints' Reference-field position, angle, width, height and stroke in one atomic write to a closed board's saved file. Only each field's `(at …)`, `(size …)` and `(thickness …)` change; UUID, text, layer, mirror, visibility, pads, nets and models stay byte for byte. One unknown, duplicate or malformed member refuses the whole batch. Dry run by default; apply needs its revision and re-proves the board closed and unlocked. |
+| `set_reference_field_presentations` | Set many placed footprints' Reference-field position, angle, width, height and stroke in one atomic write to a closed board's saved file. Only each field's `(at …)`, `(size …)` and `(thickness …)` change; UUID, text, layer, mirror, visibility, pads, nets and models stay byte for byte. One unknown, duplicate or malformed member refuses the whole batch. Dry run by default; apply needs its revision and re-proves the board closed and unlocked. `fields_file` supplies the fields as a JSON file and `report_file` writes the full report to disk, so a whole board can be read or relabelled without megabytes of inline JSON; a dry run naming only references reads every field's saved presentation. |
 
 ---
 

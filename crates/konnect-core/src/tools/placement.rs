@@ -198,7 +198,10 @@ pub fn tools() -> Vec<ToolDef> {
              field with a saved render cache refuses the whole batch. Defaults to a dry run \
              whose revision covers the saved bytes and the normalized request; apply requires \
              that revision, re-proves the board closed and its KiCad lock absent, and reads \
-             the persisted bytes back. edit_component's reference_field inspects or edits one.",
+             the persisted bytes back. Give the fields inline or as 'fields_file'; \
+             'report_file' writes the full report to disk for large batches. A dry run \
+             naming only references reads every field's saved presentation. \
+             edit_component's reference_field inspects or edits one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -209,6 +212,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "maxItems": 5000,
                         "items": reference_field_item_schema()
                     },
+                    "fields_file": { "type": "string", "description": "Path to a JSON array of fields, used instead of 'fields' for batches too large to pass inline" },
+                    "report_file": { "type": "string", "description": "Write the complete response, field list included, to this path and return only its counts and revision" },
                     "report": {
                         "type": "string",
                         "enum": ["changed", "all"],
@@ -218,7 +223,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "default": true },
                     "expected_revision": { "type": "string", "description": "The revision a current dry run returned; required to apply." }
                 },
-                "required": ["board", "fields"]
+                "required": ["board"]
             }),
             |args, ctx| async move { handle_set_reference_field_presentations(args, ctx).await }
         )
@@ -246,7 +251,37 @@ async fn handle_set_reference_field_presentations(
     const OPERATION: &str = "set_reference_field_presentations";
 
     let board = get_path(args, "board")?;
-    let Some(fields) = args.get("fields").and_then(serde_json::Value::as_array) else {
+    let from_file = match args.get("fields_file").and_then(serde_json::Value::as_str) {
+        None => None,
+        Some(_) if args.get("fields").is_some_and(|value| !value.is_null()) => {
+            return Ok(invalid_arg(
+                "fields_file",
+                "give the fields inline or in fields_file, not both",
+            ))
+        }
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+            }) {
+            Ok(value) => Some(value),
+            Err(reason) => {
+                return Ok(invalid_arg(
+                    "fields_file",
+                    &format!("cannot be read as JSON: {reason}"),
+                ))
+            }
+        },
+    };
+    let report_file = args
+        .get("report_file")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+    let Some(fields) = from_file
+        .as_ref()
+        .or(args.get("fields"))
+        .and_then(serde_json::Value::as_array)
+    else {
         return Ok(invalid_arg(
             "fields",
             "must be an array of Reference fields",
@@ -374,13 +409,13 @@ async fn handle_set_reference_field_presentations(
         "source": "saved",
     });
     if dry_run {
-        return Ok(CallToolResult::json(&body));
+        return reference_field_report(body, report_file.as_deref());
     }
     if expected_revision.as_deref() != Some(revision.as_str()) {
         return Ok(closed_board::stale_revision(&board, OPERATION));
     }
     if prepared.edits.is_empty() {
-        return Ok(CallToolResult::json(&body));
+        return reference_field_report(body, report_file.as_deref());
     }
     let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {
         Ok(closure) => closure,
@@ -403,10 +438,35 @@ async fn handle_set_reference_field_presentations(
                 "Konnect did not run KiCad. Reopen the board in KiCad 10, save it there, and run \
                  DRC (silk_overlap, silk_over_copper, text height) before relying on the labels."
             );
-            Ok(CallToolResult::json(&body))
+            reference_field_report(body, report_file.as_deref())
         }
         Err(refusal) => Ok(refusal),
     }
+}
+
+/// Return `body`, or with `report_file` write it there and return it without
+/// its field list, which for a whole board runs to megabytes.
+fn reference_field_report(
+    mut body: serde_json::Value,
+    report_file: Option<&std::path::Path>,
+) -> anyhow::Result<CallToolResult> {
+    let Some(path) = report_file else {
+        return Ok(CallToolResult::json(&body));
+    };
+    if let Err(error) = std::fs::write(path, serde_json::to_string_pretty(&body)?) {
+        let outcome = if body["status"] == "applied" {
+            "the board WAS written and read back; rerun a dry run to see it"
+        } else {
+            "nothing was written to the board"
+        };
+        return Ok(crate::tools::invalid_arg(
+            "report_file",
+            &format!("cannot be written ({error}); {outcome}"),
+        ));
+    }
+    body["fields"] = json!(null);
+    body["report_file"] = json!(path.display().to_string());
+    Ok(CallToolResult::json(&body))
 }
 
 // ─── Scoring constants ───────────────────────────────────────────────────────
