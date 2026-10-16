@@ -19,7 +19,8 @@ use konnect_ipc::gen::kiapi::board::types::BoardLayer;
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 
-/// Numeric KiCad 10 rule constraints, all taking lengths in mm.
+/// Numeric KiCad 10 rule constraints. All take lengths in mm except
+/// `track_angle`, which takes degrees (see [`unit`]).
 const CONSTRAINTS: &[&str] = &[
     "annular_width",
     "clearance",
@@ -40,9 +41,20 @@ const CONSTRAINTS: &[&str] = &[
     "text_thickness",
     "thermal_relief_gap",
     "thermal_spoke_width",
+    "track_angle",
+    "track_segment_length",
     "track_width",
     "via_diameter",
 ];
+
+/// KiCad's unit suffix for a constraint's values.
+fn unit(kind: &str) -> &'static str {
+    if kind == "track_angle" {
+        "deg"
+    } else {
+        "mm"
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct Constraint {
@@ -60,10 +72,10 @@ struct Rule {
     constraints: Vec<Constraint>,
 }
 
-fn mm(value: f64) -> String {
+fn number(value: f64, unit: &str) -> String {
     let text = format!("{value:.6}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
-    format!("{text}mm")
+    format!("{text}{unit}")
 }
 
 impl Rule {
@@ -83,7 +95,7 @@ impl Rule {
             out.push_str(&format!("\n  (constraint {}", c.kind));
             for (key, value) in [("min", c.min), ("opt", c.opt), ("max", c.max)] {
                 if let Some(v) = value {
-                    out.push_str(&format!(" ({key} {})", mm(v)));
+                    out.push_str(&format!(" ({key} {})", number(v, unit(&c.kind))));
                 }
             }
             out.push(')');
@@ -193,11 +205,16 @@ fn parse(args: &serde_json::Value) -> Result<Rule, Refusal> {
                 ))
             }
         };
+        let limit = if kind == "track_angle" { 180.0 } else { 1000.0 };
         let bound = |key: &str| -> Result<Option<f64>, Refusal> {
             match object.get(key).filter(|v| !v.is_null()) {
                 None => Ok(None),
                 Some(value) => match value.as_f64() {
-                    Some(v) if (0.0..=1000.0).contains(&v) => Ok(Some(v)),
+                    Some(v) if (0.0..=limit).contains(&v) => Ok(Some(v)),
+                    _ if kind == "track_angle" => Err(refuse(
+                        format!("{at}.{key}"),
+                        "must be a number of degrees from 0 to 180",
+                    )),
                     _ => Err(refuse(
                         format!("{at}.{key}"),
                         "must be a number of mm from 0 to 1000",
@@ -275,7 +292,10 @@ pub(crate) fn set_tool() -> ToolDef {
         "Create, replace or remove one named rule in the board's sibling .kicad_dru custom-rules \
          file: an optional KiCad condition expression (single-quoted strings, e.g. \
          \"A.Type == 'Via' && !A.intersectsCourtyard('U5801')\"), an optional layer ('outer', \
-         'inner' or a layer name) and numeric constraints in mm (min/opt/max). A rule of the same \
+         'inner' or a layer name) and numeric constraints in mm (min/opt/max), except \
+         track_angle, which is in degrees: the angle between two connected segments, so a \
+         minimum forbids sharp bends, while track_segment_length's minimum catches slivers and \
+         jogs. A rule of the same \
          name is replaced in place; 'remove' deletes it. Board constraints remain absolute floors \
          that no rule can go below, so an exception needs the floor lowered (set_design_rules) and \
          a rule holding everything else to the stronger value. Konnect checks the rule's shape, \
@@ -452,6 +472,27 @@ mod tests {
             .text()
             .contains("(constraint track_width (min 0.09mm) (opt 0.1064mm) (max 0.2mm))"));
         konnect_sexp::parser::parse_sexp(&named.text()).expect("balanced S-expression");
+    }
+
+    #[test]
+    fn track_geometry_constraints_use_their_own_units() {
+        let r = parse(&rule(json!({ "constraints": [
+            { "type": "track_angle", "min": 135 },
+            { "type": "track_segment_length", "min": 0.2 }
+        ] })))
+        .unwrap();
+        assert!(
+            r.text().contains("(constraint track_angle (min 135deg))"),
+            "{}",
+            r.text()
+        );
+        assert!(r
+            .text()
+            .contains("(constraint track_segment_length (min 0.2mm))"));
+        let over = parse(&rule(
+            json!({ "constraints": [{ "type": "track_angle", "min": 200 }] }),
+        ));
+        assert!(over.unwrap_err().1.contains("degrees"));
     }
 
     #[test]

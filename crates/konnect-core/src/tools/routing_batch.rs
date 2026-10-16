@@ -256,6 +256,20 @@ impl Batch {
         Ok(out)
     }
 
+    /// The batch's tracks as segments for the geometry lint.
+    pub(crate) fn segments(&self) -> Vec<super::route_geometry::Segment> {
+        self.tracks
+            .iter()
+            .map(|t| super::route_geometry::Segment {
+                net: t.net.clone(),
+                layer: t.layer.clone(),
+                width: t.width,
+                a: t.start,
+                b: t.end,
+            })
+            .collect()
+    }
+
     pub(crate) fn summary(&self) -> serde_json::Value {
         let mut per_layer: BTreeMap<&str, usize> = BTreeMap::new();
         for t in &self.tracks {
@@ -273,7 +287,7 @@ impl Batch {
 
 pub(crate) fn schema() -> serde_json::Value {
     let n = |d: &str| json!({ "type": "number", "description": d });
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "board": { "type": "string", "description": "Path to the .kicad_pcb KiCad holds open" },
@@ -310,7 +324,14 @@ pub(crate) fn schema() -> serde_json::Value {
             "locked": { "type": "boolean", "default": false, "description": "Create every item locked, so later bulk edits and autorouters leave it alone" }
         },
         "required": ["board"]
-    })
+    });
+    if let (Some(props), Some(extra)) = (
+        schema["properties"].as_object_mut(),
+        super::route_geometry::schema_properties().as_object(),
+    ) {
+        props.extend(extra.clone());
+    }
+    schema
 }
 
 // ─── delete_routing: selecting existing copper ────────────────────────────────

@@ -127,8 +127,8 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "plan_specctra_ses_import",
-            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
-            json!({
+            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created, plus a geometry lint of the tracks (short jogs, hairpins, acute bends, unsplit T-junctions, redundant vertices); never mutates or saves the board.",
+            with_geometry(json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
@@ -136,14 +136,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" }
                 },
                 "required": ["board", "ses_path", "manifest_path"]
-            }),
+            })),
             |args, ctx| async move { handle_plan_specctra_ses_import(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
-            json!({
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing. Reports a geometry lint of the imported tracks; geometry_check 'strict' refuses a session with defects before anything is created.",
+            with_geometry(json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
@@ -152,7 +152,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
                 },
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
-            }),
+            })),
             |args, ctx| async move { handle_apply_specctra_ses(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
@@ -607,7 +607,31 @@ async fn handle_add_routing(
         Ok(b) => b,
         Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
     };
-    let summary = batch.summary();
+    let (mode, limits) = match super::route_geometry::parse_args(args) {
+        Ok(v) => v,
+        Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
+    };
+    let geometry = (mode != "off").then(|| super::route_geometry::lint(&batch.segments(), &limits));
+    if let Some(report) = geometry
+        .as_ref()
+        .filter(|r| mode == "strict" && r.defects() > 0)
+    {
+        let detail = report.to_json(&limits);
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "tracks".to_string(),
+                reason: format!("{} geometry defect(s) under geometry_check strict", report.defects()),
+            },
+            format!(
+                "Nothing was created: the copper has {} geometry defect(s) (short jogs, hairpins, acute bends or unsplit T-junctions). Details: {detail}",
+                report.defects()
+            ),
+        ));
+    }
+    let mut summary = batch.summary();
+    if let Some(report) = &geometry {
+        summary["geometry"] = report.to_json(&limits);
+    }
     let created = ipc!(ctx, args, |c, document| {
         let codes: BTreeMap<String, i32> = c
             .get_nets_in(document.clone())?
@@ -790,6 +814,31 @@ async fn read_specctra_inputs(
     Ok(Ok((ses_path, ses_source, manifest_source)))
 }
 
+/// Add the geometry lint arguments to a tool schema.
+fn with_geometry(mut schema: serde_json::Value) -> serde_json::Value {
+    if let (Some(props), Some(extra)) = (
+        schema["properties"].as_object_mut(),
+        super::route_geometry::schema_properties().as_object(),
+    ) {
+        props.extend(extra.clone());
+    }
+    schema
+}
+
+/// An SES plan's straight tracks as segments for the geometry lint.
+fn ses_segments(plan: &crate::specctra_ses::SesImportPlan) -> Vec<super::route_geometry::Segment> {
+    plan.tracks
+        .iter()
+        .map(|t| super::route_geometry::Segment {
+            net: t.net_name.clone(),
+            layer: t.layer.clone(),
+            width: t.width_mm,
+            a: (t.x1_mm, t.y1_mm),
+            b: (t.x2_mm, t.y2_mm),
+        })
+        .collect()
+}
+
 async fn handle_plan_specctra_ses_import(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -801,6 +850,10 @@ async fn handle_plan_specctra_ses_import(
             "must have the .kicad_pcb extension",
         ));
     }
+    let (geometry_mode, geometry_limits) = match super::route_geometry::parse_args(args) {
+        Ok(v) => v,
+        Err((field, reason)) => return Ok(invalid_specctra_argument(&field, &reason)),
+    };
     let (_ses_path, ses_source, manifest_source) = match read_specctra_inputs(args).await? {
         Ok(inputs) => inputs,
         Err(error) => return Ok(error),
@@ -828,6 +881,9 @@ async fn handle_plan_specctra_ses_import(
         Ok(plan) => Ok(CallToolResult::json(&json!({
             "success": true,
             "method": "strict_dry_run",
+            "geometry": (geometry_mode != "off").then(|| {
+                super::route_geometry::lint(&ses_segments(&plan), &geometry_limits).to_json(&geometry_limits)
+            }),
             "board": board,
             "source_sha256": plan.source_sha256,
             "session_id": plan.session_id,
@@ -868,6 +924,7 @@ struct ApplyEvidence {
     drc_violations: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
+    geometry: Option<serde_json::Value>,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -941,6 +998,10 @@ async fn handle_apply_specctra_ses(
     {
         tokio::fs::create_dir_all(parent).await?;
     }
+    let (geometry_mode, geometry_limits) = match super::route_geometry::parse_args(args) {
+        Ok(v) => v,
+        Err((field, reason)) => return Ok(invalid_specctra_argument(&field, &reason)),
+    };
     let (_ses_path, ses_source, manifest_source) = match read_specctra_inputs(args).await? {
         Ok(inputs) => inputs,
         Err(error) => return Ok(error),
@@ -974,6 +1035,16 @@ async fn handle_apply_specctra_ses(
             &manifest_source,
             &ses_source,
         )?;
+        let geometry = (geometry_mode != "off")
+            .then(|| super::route_geometry::lint(&ses_segments(&plan), &geometry_limits));
+        if let Some(report) = geometry.as_ref().filter(|r| geometry_mode == "strict" && r.defects() > 0) {
+            anyhow::bail!(
+                "geometry_check strict: the session has {} geometry defect(s); nothing was created. {}",
+                report.defects(),
+                report.to_json(&geometry_limits)
+            );
+        }
+        let geometry = geometry.map(|r| r.to_json(&geometry_limits));
 
         use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
         let existing_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
@@ -1103,6 +1174,7 @@ async fn handle_apply_specctra_ses(
                 drc_violations: drc.violations.len(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
+                geometry: geometry.clone(),
             })
         })();
         match operation {
@@ -1163,6 +1235,7 @@ async fn handle_apply_specctra_ses(
                 "vias": evidence.preserved_locked_via_count
             },
             "ipc_readback": "exact_count_match",
+            "geometry": evidence.geometry,
             "drc": {
                 "clean": evidence.drc_violations == 0
                     && evidence.unconnected_items == 0
@@ -1253,6 +1326,34 @@ mod delete_trace_tests {
     use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use konnect_ipc::gen::kiapi;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn add_routing_strict_geometry_refuses_a_jog_before_kicad_is_asked() {
+        let jog = json!({
+            "board": "unused.kicad_pcb",
+            "geometry_check": "strict",
+            "tracks": [
+                { "net": "A", "layer": "F.Cu", "width": 0.1, "x1": 0, "y1": 0, "x2": 5, "y2": 0 },
+                { "net": "A", "layer": "F.Cu", "width": 0.1, "x1": 5, "y1": 0, "x2": 5, "y2": 0.08 },
+                { "net": "A", "layer": "F.Cu", "width": 0.1, "x1": 5, "y1": 0.08, "x2": 9, "y2": 0.08 }
+            ]
+        });
+        // No KiCad answers this context: a refusal proves no IPC was attempted.
+        let ctx = ctx_talking_to(String::new());
+        let refused = handle_add_routing(&jog, &ctx).await.unwrap();
+        assert!(refused.is_error);
+        let text = match refused.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            text.contains("geometry defect") && text.contains("short_jog"),
+            "{text}"
+        );
+        let mut bad = jog.clone();
+        bad["geometry_check"] = json!("loud");
+        assert!(handle_add_routing(&bad, &ctx).await.unwrap().is_error);
+    }
 
     #[tokio::test]
     async fn delete_routing_dry_runs_applies_by_count_and_proves_absence() {
