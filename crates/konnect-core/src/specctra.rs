@@ -2,8 +2,14 @@
 //!
 //! The input is the exact string returned by KiCad's IPC
 //! `SaveDocumentToString`; this module never reads or edits the live board
-//! file. The first supported profile is intentionally narrow and rejects
-//! every feature it cannot represent without approximation.
+//! file. Every feature is either represented exactly or conservatively (the
+//! router sees at least as much copper as the board has), and anything else is
+//! refused.
+//!
+//! Images are board-oriented: each component is placed front side up with
+//! rotation 0, and every pin carries its board offset and absolute pad angle,
+//! with padstacks on the copper layers the pad really occupies. Back-side and
+//! rotated footprints therefore need no Specctra mirroring convention.
 
 use anyhow::{bail, Context, Result};
 use konnect_ipc::IpcEffectiveRoutingRules;
@@ -19,6 +25,10 @@ use std::path::Path;
 
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
+const MANIFEST_SCHEMA: u32 = 2;
+/// Straight edges per quarter circle when a rounded corner is lowered to a
+/// circumscribed polygon (worst outward error 1.9 % of the corner radius).
+const ARC_SEGMENTS_PER_QUADRANT: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExportBundle {
@@ -29,6 +39,21 @@ pub(crate) struct ExportBundle {
     pub pad_count: usize,
     pub net_count: usize,
     pub class_count: usize,
+    pub copper_layer_count: usize,
+    pub back_component_count: usize,
+    pub skipped_pad_count: usize,
+    pub keepout_count: usize,
+    pub plane_count: usize,
+    pub plane_piece_count: usize,
+}
+
+/// Caller-supplied acknowledgements that widen the exported profile.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExportOptions {
+    /// SHA-256 of the board's `.kicad_dru` when the caller has acknowledged
+    /// that the router sees only net-class rules and KiCad DRC stays the
+    /// authority for the custom ones.
+    pub custom_rules_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -36,25 +61,70 @@ pub(crate) struct ExportBundle {
 enum PadShape {
     Circle,
     Rect,
+    Roundrect,
+    Oval,
+    Custom,
+}
+
+impl PadShape {
+    fn label(self) -> &'static str {
+        match self {
+            PadShape::Circle => "circle",
+            PadShape::Rect => "rect",
+            PadShape::Roundrect => "roundrect",
+            PadShape::Oval => "oval",
+            PadShape::Custom => "custom",
+        }
+    }
+}
+
+/// Copper outline of one pad in its own frame (DSN axes, micrometres,
+/// before the pin rotation).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PadGeometry {
+    Circle { diameter: i64, x: i64, y: i64 },
+    Rect { x1: i64, y1: i64, x2: i64, y2: i64 },
+    Polygon(Vec<(i64, i64)>),
+    Path { width: i64, coords: Vec<(i64, i64)> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PadstackKey {
     shape: PadShape,
     layers: Vec<String>,
+    geometry: PadGeometry,
     size_x_um: i64,
     size_y_um: i64,
     drill_um: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
+struct CopperLayer {
+    name: String,
+    dsn_type: String,
+}
+
+#[derive(Debug, Clone)]
 struct PadModel {
     number: String,
+    pin_id: String,
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
     net: Option<String>,
     padstack: PadstackKey,
+    /// Local pad clearance larger than the board default, with the diameter
+    /// of the circle that encloses the pad copper.
+    clearance_override: Option<(i64, i64)>,
+}
+
+/// A keepout circle in image coordinates.
+#[derive(Debug, Clone)]
+struct KeepoutModel {
+    layers: Vec<String>,
+    diameter_um: i64,
+    x_um: i64,
+    y_um: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +135,17 @@ struct FootprintModel {
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
+    side: String,
     pads: Vec<PadModel>,
+    keepouts: Vec<KeepoutModel>,
+    skipped_pads: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PlaneModel {
+    net: String,
+    layer: String,
+    pieces: Vec<Vec<(i64, i64)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +212,12 @@ struct SupportedProfile {
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
+    #[serde(default)]
+    image_frame: String,
+    #[serde(default)]
+    plane_count: usize,
+    #[serde(default)]
+    custom_rules_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -139,8 +225,12 @@ struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
+    #[serde(default)]
+    dsn_type: String,
 }
 
+/// `x_um`, `y_um`, `rotation_degrees` and `side` are the DSN placement the
+/// session must echo; `kicad_*` record the footprint as KiCad has it.
 #[derive(Debug, Deserialize, Serialize)]
 struct ManifestComponent {
     reference: String,
@@ -150,6 +240,10 @@ struct ManifestComponent {
     y_um: i64,
     rotation_degrees: f64,
     side: String,
+    #[serde(default)]
+    kicad_side: String,
+    #[serde(default)]
+    kicad_rotation_degrees: f64,
     pads: Vec<ManifestPin>,
 }
 
@@ -179,21 +273,41 @@ struct ManifestPadstack {
     drill_um: Option<i64>,
 }
 
+#[cfg(test)]
 pub(crate) fn export_dsn(
     board_path: &Path,
     board_source: &str,
     effective_rules: &IpcEffectiveRoutingRules,
+) -> Result<ExportBundle> {
+    export_dsn_with(
+        board_path,
+        board_source,
+        effective_rules,
+        &ExportOptions::default(),
+    )
+}
+
+pub(crate) fn export_dsn_with(
+    board_path: &Path,
+    board_source: &str,
+    effective_rules: &IpcEffectiveRoutingRules,
+    options: &ExportOptions,
 ) -> Result<ExportBundle> {
     let tree = parse_sexp(board_source).context("parse KiCad IPC board snapshot")?;
     if tree.head() != Some("kicad_pcb") {
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
 
-    let copper_layers = copper_layers(&tree)?;
+    let layers = copper_layers(&tree)?;
+    let copper_layers = layers
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect::<Vec<_>>();
     let outline = simple_closed_outline(&tree)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let footprints = footprints(&tree, &net_table)?;
+    let planes = planes(&tree, &net_table, &layers)?;
+    let footprints = footprints(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
     }
@@ -205,8 +319,17 @@ pub(crate) fn export_dsn(
                 net_pins
                     .entry(net.clone())
                     .or_default()
-                    .push(format!("{}-{}", footprint.reference, pad.number));
+                    .push(format!("{}-{}", footprint.reference, pad.pin_id));
             }
+        }
+    }
+    for plane in &planes {
+        if !net_pins.contains_key(&plane.net) {
+            bail!(
+                "copper zone on {} belongs to net '{}', which no exported pad uses",
+                plane.layer,
+                plane.net
+            );
         }
     }
     if net_pins.is_empty() {
@@ -237,10 +360,19 @@ pub(crate) fn export_dsn(
         .enumerate()
         .map(|(index, key)| (key, format!("konnect_via_{:04}", index + 1)))
         .collect();
+    let fixed_via_names = fixed_via_padstacks(&locked_routing, &class_nets)?;
+
+    let mut footprints = footprints;
+    let min_clearance_um = class_nets
+        .keys()
+        .map(|rule| rule.clearance_um)
+        .min()
+        .context("routing model has no rule class")?;
+    add_clearance_keepouts(&mut footprints, min_clearance_um);
 
     let pcb = build_pcb(
         board_path,
-        &copper_layers,
+        &layers,
         &outline,
         &footprints,
         &net_pins,
@@ -248,20 +380,25 @@ pub(crate) fn export_dsn(
         &net_classes,
         &padstack_names,
         &via_names,
+        &fixed_via_names,
         &locked_routing,
+        &planes,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
     let manifest = build_manifest(
         board_path,
         &source_sha256,
-        &copper_layers,
+        &layers,
         &footprints,
         &net_pins,
         &net_classes,
         &padstack_names,
         &via_names,
+        &fixed_via_names,
         &locked_routing,
+        &planes,
+        options,
     )?;
 
     Ok(ExportBundle {
@@ -275,7 +412,70 @@ pub(crate) fn export_dsn(
             .sum(),
         net_count: net_pins.len(),
         class_count: class_nets.len(),
+        copper_layer_count: layers.len(),
+        back_component_count: footprints
+            .iter()
+            .filter(|footprint| footprint.side == "back")
+            .count(),
+        skipped_pad_count: footprints
+            .iter()
+            .map(|footprint| footprint.skipped_pads)
+            .sum(),
+        keepout_count: footprints
+            .iter()
+            .map(|footprint| footprint.keepouts.len())
+            .sum(),
+        plane_count: planes.len(),
+        plane_piece_count: planes.iter().map(|plane| plane.pieces.len()).sum(),
     })
+}
+
+/// Fixed vias whose size differs from their net's rule via get a padstack
+/// of their own, keyed by diameter and drill.
+fn fixed_via_padstacks(
+    locked_routing: &LockedRouting,
+    class_nets: &RuleGroups,
+) -> Result<BTreeMap<(i64, i64), String>> {
+    let net_rules = class_nets
+        .iter()
+        .flat_map(|(rule, nets)| nets.iter().map(move |net| (net.as_str(), rule)))
+        .collect::<BTreeMap<_, _>>();
+    let mut sizes = BTreeSet::new();
+    for via in &locked_routing.vias {
+        let rule = net_rules
+            .get(via.net.as_str())
+            .with_context(|| format!("locked via uses unknown routing net '{}'", via.net))?;
+        if via.diameter_um != rule.via_diameter_um || via.drill_um != rule.via_drill_um {
+            sizes.insert((via.diameter_um, via.drill_um));
+        }
+    }
+    Ok(sizes
+        .into_iter()
+        .enumerate()
+        .map(|(index, size)| (size, format!("konnect_fixed_via_{:04}", index + 1)))
+        .collect())
+}
+
+/// A pad whose local clearance exceeds every class clearance is surrounded
+/// by a keepout sized so that the router, adding its own class clearance,
+/// keeps at least the local clearance from the pad copper.
+fn add_clearance_keepouts(footprints: &mut [FootprintModel], min_clearance_um: i64) {
+    for footprint in footprints {
+        for pad in &footprint.pads {
+            let Some((clearance_um, enclosing_um)) = pad.clearance_override else {
+                continue;
+            };
+            if clearance_um <= min_clearance_um {
+                continue;
+            }
+            footprint.keepouts.push(KeepoutModel {
+                layers: pad.padstack.layers.clone(),
+                diameter_um: enclosing_um + 2 * (clearance_um - min_clearance_um),
+                x_um: pad.x_um,
+                y_um: pad.y_um,
+            });
+        }
+    }
 }
 
 /// Replace Konnect's deterministic DSN with a KiCad-native DSN while keeping
@@ -399,6 +599,8 @@ enum DsnShapeIdentity {
         x2: i64,
         y2: i64,
     },
+    /// Polygon, path, or offset circle, compared by its exact S-expression.
+    Other(String),
 }
 
 #[derive(Debug, Clone)]
@@ -479,6 +681,12 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .map(|shape| {
                 let geometry = shape.get(1).context("DSN shape has no geometry")?;
                 match geometry.head() {
+                    Some("circle") if geometry.children().is_some_and(|c| c.len() > 3) => {
+                        Ok(DsnShapeIdentity::Other(format!("{geometry:?}")))
+                    }
+                    Some("polygon" | "path") => {
+                        Ok(DsnShapeIdentity::Other(format!("{geometry:?}")))
+                    }
                     Some("circle") => Ok(DsnShapeIdentity::Circle {
                         layer: dsn_atom(geometry, 1, "circle layer")?.to_string(),
                         diameter: dsn_integer(geometry, 2, "circle diameter")?,
@@ -765,12 +973,16 @@ fn locked_routing(
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
 ) -> Result<LockedRouting> {
-    let zone_count = tree.find_all("zone").len();
-    if zone_count > 0 {
-        bail!(
-            "unsupported first routing profile: board contains {zone_count} copper zone or rule area(s)"
-        );
-    }
+    let through_span = [
+        copper_layers
+            .first()
+            .context("board has no copper layers")?
+            .clone(),
+        copper_layers
+            .last()
+            .context("board has no copper layers")?
+            .clone(),
+    ];
     let arc_count = tree.find_all("arc").len();
     if arc_count > 0 {
         let locked = tree
@@ -780,18 +992,16 @@ fn locked_routing(
             .count();
         if locked > 0 {
             bail!(
-                "unsupported first routing profile: board contains {locked} locked routed arc(s), which cannot be represented without approximation"
+                "unsupported routing profile: board contains {locked} locked routed arc(s), which cannot be represented without approximation"
             );
         }
-        bail!(
-            "unsupported first routing profile: board contains {arc_count} existing routed arc(s)"
-        );
+        bail!("unsupported routing profile: board contains {arc_count} existing routed arc(s)");
     }
 
     let mut routing = LockedRouting::default();
     for segment in tree.find_all("segment") {
         if segment.find_str("locked") != Some("yes") {
-            bail!("unsupported first routing profile: board contains an existing track segment that is not locked");
+            bail!("unsupported routing profile: board contains an existing track segment that is not locked");
         }
         let layer = segment
             .find_str("layer")
@@ -824,7 +1034,7 @@ fn locked_routing(
     }
     for via in tree.find_all("via") {
         if via.find_str("locked") != Some("yes") {
-            bail!("unsupported first routing profile: board contains an existing via that is not locked");
+            bail!("unsupported routing profile: board contains an existing via that is not locked");
         }
         if let Some(kind) = via.find_str("type") {
             bail!("unsupported locked via type '{kind}'; only through vias are supported");
@@ -838,11 +1048,11 @@ fn locked_routing(
             .filter_map(SexpNode::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if layers != copper_layers {
+        if layers != through_span {
             bail!(
-                "unsupported locked via layer span [{}]; expected [{}]",
+                "unsupported locked via layer span [{}]; expected a through via [{}]",
                 layers.join(", "),
-                copper_layers.join(", ")
+                through_span.join(", ")
             );
         }
         let net = via
@@ -894,27 +1104,245 @@ fn locked_routing(
     Ok(routing)
 }
 
-fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+/// Copper layers in physical order (F.Cu, In1.Cu.., B.Cu) with the Specctra
+/// layer type taken from KiCad's: `power` layers are planes the router does
+/// not draw tracks on.
+fn copper_layers(tree: &SexpNode) -> Result<Vec<CopperLayer>> {
     let layers = tree.find("layers").context("board has no layers table")?;
-    let mut copper = layers
-        .children()
-        .unwrap_or(&[])
-        .iter()
-        .skip(1)
-        // Layer table rows are `(numeric-id "name" type)`, so the layer name
-        // is the first data item even though the numeric id is the list head.
-        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str))
-        .filter(|name| name.ends_with(".Cu"))
-        .map(str::to_string)
+    let mut copper = Vec::new();
+    for row in layers.children().unwrap_or(&[]).iter().skip(1) {
+        // Layer table rows are `(numeric-id "name" type ["user name"])`, so
+        // the layer name is the first data item.
+        let Some(name) = row.get(1).and_then(SexpNode::as_str) else {
+            continue;
+        };
+        if !name.ends_with(".Cu") {
+            continue;
+        }
+        let order = match name {
+            "F.Cu" => 0,
+            "B.Cu" => usize::MAX,
+            inner => inner
+                .strip_prefix("In")
+                .and_then(|rest| rest.strip_suffix(".Cu"))
+                .and_then(|number| number.parse::<usize>().ok())
+                .with_context(|| format!("unrecognised copper layer name '{inner}'"))?,
+        };
+        let dsn_type = match row.get(2).and_then(SexpNode::as_str) {
+            Some("signal") | None => "signal",
+            Some("power") => "power",
+            Some("mixed") => "mixed",
+            Some(other) => bail!("copper layer {name} has unsupported type '{other}'"),
+        };
+        copper.push((
+            order,
+            CopperLayer {
+                name: name.to_string(),
+                dsn_type: dsn_type.to_string(),
+            },
+        ));
+    }
+    copper.sort_by_key(|(order, _)| *order);
+    copper.dedup_by_key(|(order, _)| *order);
+    let copper = copper
+        .into_iter()
+        .map(|(_, layer)| layer)
         .collect::<Vec<_>>();
-    copper.dedup();
-    if copper != ["F.Cu".to_string(), "B.Cu".to_string()] {
+    let names = copper
+        .iter()
+        .map(|layer| layer.name.as_str())
+        .collect::<Vec<_>>();
+    if names.len() < 2 || names[0] != "F.Cu" || names[names.len() - 1] != "B.Cu" {
         bail!(
-            "unsupported first routing profile: expected exactly F.Cu and B.Cu, got [{}]",
-            copper.join(", ")
+            "unsupported copper stack: expected F.Cu .. B.Cu, got [{}]",
+            names.join(", ")
         );
     }
+    if !copper.iter().any(|layer| layer.dsn_type != "power") {
+        bail!("every copper layer is a power plane; nothing can be routed");
+    }
     Ok(copper)
+}
+
+/// Copper zones on power layers become Specctra planes. A zone outline with
+/// holes is cut into hole-free trapezoids, which together cover exactly the
+/// outline minus its holes. Zones on routing layers and rule areas are
+/// refused: their filled copper depends on what is routed around them.
+fn planes(
+    tree: &SexpNode,
+    net_table: &BTreeMap<String, String>,
+    layers: &[CopperLayer],
+) -> Result<Vec<PlaneModel>> {
+    for footprint in tree.find_all("footprint") {
+        if !footprint.find_all("zone").is_empty() {
+            let reference = property_value(footprint, "Reference").unwrap_or("?");
+            bail!("footprint '{reference}' contains a zone or rule area, which is not supported");
+        }
+    }
+    let mut planes = Vec::new();
+    let mut used_layers = BTreeSet::new();
+    for zone in tree.find_all("zone") {
+        let name = zone.find_str("name").unwrap_or("").to_string();
+        let label = if name.is_empty() {
+            "copper zone".to_string()
+        } else {
+            format!("zone '{name}'")
+        };
+        if zone.find("keepout").is_some() {
+            bail!("{label} is a rule area; rule areas are not supported");
+        }
+        let mut zone_layers = Vec::new();
+        if let Some(layer) = zone.find_str("layer") {
+            zone_layers.push(layer.to_string());
+        }
+        if let Some(list) = zone.find("layers") {
+            zone_layers.extend(
+                list.children()
+                    .unwrap_or(&[])
+                    .iter()
+                    .skip(1)
+                    .filter_map(SexpNode::as_str)
+                    .map(str::to_string),
+            );
+        }
+        if zone_layers.is_empty() {
+            bail!("{label} has no layer");
+        }
+        let net = zone
+            .find("net")
+            .and_then(|node| resolve_net(node, net_table))
+            .with_context(|| format!("{label} has no net"))?;
+        let mut rings = Vec::new();
+        for polygon in zone.find_all("polygon") {
+            let pts = polygon.find("pts").context("zone polygon has no points")?;
+            let mut ring = Vec::new();
+            for point in pts.children().unwrap_or(&[]).iter().skip(1) {
+                match point.head() {
+                    Some("xy") => ring.push((
+                        finite_um(point.get_f64(1), "zone x")?,
+                        -finite_um(point.get_f64(2), "zone y")?,
+                    )),
+                    other => bail!(
+                        "{label} outline contains {other:?}; only straight edges are supported"
+                    ),
+                }
+            }
+            if ring.len() < 3 {
+                bail!("{label} has a polygon with fewer than three points");
+            }
+            rings.push(ring);
+        }
+        if rings.is_empty() {
+            bail!("{label} has no outline");
+        }
+        let pieces = trapezoids(&rings);
+        if pieces.is_empty() {
+            bail!("{label} has an empty outline");
+        }
+        for layer in zone_layers {
+            let copper = layers
+                .iter()
+                .find(|candidate| candidate.name == layer)
+                .with_context(|| format!("{label} is on non-copper layer '{layer}'"))?;
+            if copper.dsn_type != "power" {
+                bail!(
+                    "{label} is on routing layer {layer}; pour zones on routing layers after routing, or make {layer} a power layer"
+                );
+            }
+            if !used_layers.insert(layer.clone()) {
+                bail!("more than one copper zone on {layer}; overlapping planes are not supported");
+            }
+            planes.push(PlaneModel {
+                net: net.clone(),
+                layer,
+                pieces: pieces.clone(),
+            });
+        }
+    }
+    planes.sort_by(|left, right| left.layer.cmp(&right.layer));
+    Ok(planes)
+}
+
+/// Even-odd decomposition of polygon rings (an outline and its holes) into
+/// trapezoids with vertical sides. Slabs are cut at every vertex x, so no
+/// edge starts or ends inside a slab; inside each slab the crossing edges
+/// pair up bottom to top. Consecutive slabs bounded by the same two edges
+/// merge, so a rectilinear outline yields rectangles.
+fn trapezoids(rings: &[Vec<(i64, i64)>]) -> Vec<Vec<(i64, i64)>> {
+    let mut edges = Vec::new();
+    for ring in rings {
+        for index in 0..ring.len() {
+            let a = ring[index];
+            let b = ring[(index + 1) % ring.len()];
+            if a.0 != b.0 {
+                edges.push(if a.0 < b.0 { (a, b) } else { (b, a) });
+            }
+        }
+    }
+    let y_at = |edge: &((i64, i64), (i64, i64)), x: f64| -> f64 {
+        let ((x1, y1), (x2, y2)) = *edge;
+        y1 as f64 + (y2 - y1) as f64 * (x - x1 as f64) / (x2 - x1) as f64
+    };
+    let mut xs = rings
+        .iter()
+        .flatten()
+        .map(|point| point.0)
+        .collect::<Vec<_>>();
+    xs.sort_unstable();
+    xs.dedup();
+
+    // (lower edge, upper edge) -> (x where the piece starts)
+    let mut open: BTreeMap<(usize, usize), i64> = BTreeMap::new();
+    let mut pieces = Vec::new();
+    let close = |pair: (usize, usize), from: i64, to: i64, pieces: &mut Vec<Vec<(i64, i64)>>| {
+        let (lower, upper) = (&edges[pair.0], &edges[pair.1]);
+        let mut ring = vec![
+            (from, y_at(lower, from as f64).round() as i64),
+            (to, y_at(lower, to as f64).round() as i64),
+            (to, y_at(upper, to as f64).round() as i64),
+            (from, y_at(upper, from as f64).round() as i64),
+        ];
+        ring.dedup();
+        if ring.len() >= 3 {
+            let first = ring[0];
+            ring.push(first);
+            pieces.push(ring);
+        }
+    };
+    for window in xs.windows(2) {
+        let (from, to) = (window[0], window[1]);
+        let middle = (from as f64 + to as f64) / 2.0;
+        let mut crossing = edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.0 .0 <= from && edge.1 .0 >= to)
+            .map(|(index, edge)| (y_at(edge, middle), index))
+            .collect::<Vec<_>>();
+        crossing.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let pairs = crossing
+            .chunks_exact(2)
+            .map(|pair| (pair[0].1, pair[1].1))
+            .collect::<BTreeSet<_>>();
+        let ended = open
+            .keys()
+            .filter(|pair| !pairs.contains(pair))
+            .copied()
+            .collect::<Vec<_>>();
+        for pair in ended {
+            let start = open.remove(&pair).unwrap();
+            close(pair, start, from, &mut pieces);
+        }
+        for pair in pairs {
+            open.entry(pair).or_insert(from);
+        }
+    }
+    if let Some(&last) = xs.last() {
+        for (pair, start) in std::mem::take(&mut open) {
+            close(pair, start, last, &mut pieces);
+        }
+    }
+    pieces.sort();
+    pieces
 }
 
 fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
@@ -933,7 +1361,7 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
                 edges.push((start, end));
             }
             Some(tag) if tag.starts_with("gr_") => {
-                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a straight line")
+                bail!("unsupported routing profile: Edge.Cuts '{tag}' is not a straight line")
             }
             _ => {}
         }
@@ -991,6 +1419,7 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
 ) -> Result<Vec<FootprintModel>> {
     let mut output = Vec::new();
     let mut references = BTreeSet::new();
@@ -998,11 +1427,13 @@ fn footprints(
         let layer = footprint
             .find_str("layer")
             .context("footprint has no layer")?;
-        if layer != "F.Cu" {
-            bail!("unsupported first routing profile: footprint on '{layer}'");
-        }
+        let side = match layer {
+            "F.Cu" => "front",
+            "B.Cu" => "back",
+            other => bail!("footprint on unsupported layer '{other}'"),
+        };
         if footprint.find("clearance").is_some() {
-            bail!("unsupported first routing profile: footprint has a local clearance override");
+            bail!("unsupported routing profile: footprint has a local clearance override");
         }
         let reference = property_value(footprint, "Reference")
             .filter(|value| !value.is_empty())
@@ -1019,127 +1450,168 @@ fn footprints(
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
         let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
+        let (sin, cos) = rotation_degrees.to_radians().sin_cos();
         let image_name = format!("konnect_image_{reference}");
 
         let mut pads = Vec::new();
-        let mut pad_numbers = BTreeSet::new();
+        let mut keepouts = Vec::new();
+        let mut skipped_pads = 0;
+        let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+        let mut pin_ids = BTreeSet::new();
         for pad in footprint.find_all("pad") {
             let number = pad
                 .get(1)
                 .and_then(SexpNode::as_str)
-                .filter(|number| !number.is_empty())
-                .context("footprint contains an unnumbered pad")?
+                .unwrap_or("")
                 .to_string();
-            if !pad_numbers.insert(number.clone()) {
-                bail!("footprint '{reference}' has duplicate pad number '{number}'");
-            }
+            let label = format!("{reference}-{number}");
             let pad_type = pad
                 .get(2)
                 .and_then(SexpNode::as_str)
                 .context("pad has no type")?;
-            if !matches!(pad_type, "smd" | "thru_hole") {
-                bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has type '{pad_type}'"
-                );
-            }
-            let shape = match pad.get(3).and_then(SexpNode::as_str) {
-                Some("circle") => PadShape::Circle,
-                Some("rect") => PadShape::Rect,
-                Some(other) => bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has shape '{other}'"
-                ),
-                None => bail!("pad {reference}-{number} has no shape"),
-            };
+            // KiCad stores the pad position relative to the footprint and
+            // unrotated (already mirrored for back-side parts), and the pad
+            // angle as absolute. The image is placed unrotated, so the pin
+            // carries the footprint rotation in its offset.
             let at = pad.find("at").context("pad has no position")?;
-            let x_um = finite_um(at.get_f64(1), "pad x")?;
-            let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
-            let size = pad.find("size").context("pad has no size")?;
-            let size_x_um = positive_um(size.get_f64(1), "pad width")?;
-            let size_y_um = positive_um(size.get_f64(2), "pad height")?;
-            if shape == PadShape::Circle && size_x_um != size_y_um {
-                bail!("circle pad {reference}-{number} does not have equal X/Y size");
-            }
-            if pad.find("clearance").is_some() {
-                bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has a local clearance override"
-                );
-            }
-            if pad.find_str("remove_unused_layers") == Some("yes") {
-                bail!(
-                    "unsupported first routing profile: pad {reference}-{number} removes copper on unused layers"
-                );
-            }
-            if let Some(offset) = pad.find("offset") {
-                let offset_x_um = finite_um(offset.get_f64(1), "pad offset x")?;
-                let offset_y_um = finite_um(offset.get_f64(2), "pad offset y")?;
-                if offset_x_um != 0 || offset_y_um != 0 {
-                    bail!(
-                        "unsupported first routing profile: pad {reference}-{number} has a non-zero shape offset"
-                    );
-                }
-            }
-            let layers = pad
+            let local = (
+                finite_um(at.get_f64(1), "pad x")? as f64,
+                -finite_um(at.get_f64(2), "pad y")? as f64,
+            );
+            let pin_x_um = (local.0 * cos - local.1 * sin).round() as i64;
+            let pin_y_um = (local.0 * sin + local.1 * cos).round() as i64;
+            let pad_rotation = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            let copper = pad
                 .find("layers")
                 .and_then(SexpNode::children)
                 .unwrap_or(&[])
                 .iter()
                 .skip(1)
                 .filter_map(SexpNode::as_str)
-                .filter(|layer| layer.ends_with(".Cu") || *layer == "*.Cu")
+                .filter(|layer| layer.ends_with(".Cu"))
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            let (layers, drill_um) = if pad_type == "smd" {
-                if layers != ["F.Cu".to_string()] {
-                    bail!(
-                        "unsupported SMD pad {reference}-{number}: copper layers are [{}]",
-                        layers.join(", ")
-                    );
+            let drill = pad.find("drill");
+            let oval_drill = drill
+                .and_then(|drill| drill.get(1))
+                .and_then(SexpNode::as_str)
+                == Some("oval");
+            let drill_size = |drill: &SexpNode| -> Result<(i64, i64)> {
+                if oval_drill {
+                    Ok((
+                        positive_um(drill.get_f64(2), "pad drill x")?,
+                        positive_um(drill.get_f64(3), "pad drill y")?,
+                    ))
+                } else {
+                    let diameter = positive_um(drill.get_f64(1), "pad drill")?;
+                    Ok((diameter, diameter))
                 }
-                (layers, None)
-            } else {
-                if !(layers == ["*.Cu".to_string()]
-                    || layers == ["F.Cu".to_string(), "B.Cu".to_string()])
-                {
-                    bail!(
-                        "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
-                        layers.join(", ")
-                    );
-                }
-                let drill = pad.find("drill").context("through-hole pad has no drill")?;
-                if drill.get(1).and_then(SexpNode::as_str) == Some("oval") {
-                    bail!("unsupported through-hole pad {reference}-{number}: oval drill");
-                }
-                let drill_um = positive_um(drill.get_f64(1), "pad drill")?;
-                if drill_um >= size_x_um.min(size_y_um) {
-                    bail!(
-                        "pad {reference}-{number} drill {drill_um} um is not smaller than its copper size"
-                    );
-                }
-                (vec!["F.Cu".to_string(), "B.Cu".to_string()], Some(drill_um))
             };
+
+            if pad_type == "np_thru_hole" {
+                let (drill_x, drill_y) =
+                    drill_size(drill.with_context(|| format!("NPTH {label} has no drill"))?)?;
+                keepouts.push(KeepoutModel {
+                    layers: copper_layers.to_vec(),
+                    diameter_um: drill_x.max(drill_y),
+                    x_um: pin_x_um,
+                    y_um: pin_y_um,
+                });
+                continue;
+            }
+            if !matches!(pad_type, "smd" | "connect" | "thru_hole") {
+                bail!("unsupported routing profile: pad {label} has type '{pad_type}'");
+            }
+            let size = pad.find("size").context("pad has no size")?;
+            let size_x_um = positive_um(size.get_f64(1), "pad width")?;
+            let size_y_um = positive_um(size.get_f64(2), "pad height")?;
+            let (layers, drill_um) = if pad_type == "thru_hole" {
+                let all = copper.iter().any(|layer| layer == "*.Cu")
+                    || (copper.iter().any(|layer| layer == "F.Cu")
+                        && copper.iter().any(|layer| layer == "B.Cu"));
+                if !all {
+                    bail!(
+                        "unsupported through-hole pad {label}: copper layers are [{}]",
+                        copper.join(", ")
+                    );
+                }
+                let (drill_x, drill_y) = drill_size(
+                    drill.with_context(|| format!("through-hole pad {label} has no drill"))?,
+                )?;
+                let fits = if oval_drill {
+                    drill_x < size_x_um && drill_y < size_y_um
+                } else {
+                    drill_x < size_x_um.min(size_y_um)
+                };
+                if !fits {
+                    bail!("pad {label} drill is not smaller than its copper");
+                }
+                (copper_layers.to_vec(), Some(drill_x.min(drill_y)))
+            } else {
+                match copper.as_slice() {
+                    [] => {
+                        // Paste or mask aperture without copper.
+                        skipped_pads += 1;
+                        continue;
+                    }
+                    [one] if one == "F.Cu" || one == "B.Cu" => (vec![one.clone()], None),
+                    _ => bail!(
+                        "unsupported SMD pad {label}: copper layers are [{}]",
+                        copper.join(", ")
+                    ),
+                }
+            };
+            let offset = match pad.find("offset") {
+                Some(offset) => (
+                    finite_um(offset.get_f64(1), "pad offset x")? as f64,
+                    -finite_um(offset.get_f64(2), "pad offset y")? as f64,
+                ),
+                None => (0.0, 0.0),
+            };
+            let (shape, geometry) = pad_geometry(pad, &label, size_x_um, size_y_um, offset)?;
+            let clearance_override = match pad.find("clearance") {
+                Some(clearance) => Some((
+                    non_negative_um(clearance.get_f64(1), "pad clearance")?,
+                    enclosing_diameter_um(&geometry),
+                )),
+                None => None,
+            };
+
+            let seen = occurrences.entry(number.clone()).or_insert(0);
+            let pin_id = match (number.is_empty(), *seen) {
+                (true, index) => format!("@{index}"),
+                (false, 0) => number.clone(),
+                (false, index) => format!("{number}@{index}"),
+            };
+            *seen += 1;
+            if !pin_ids.insert(pin_id.clone()) {
+                bail!("footprint '{reference}' has pads that collide on pin id '{pin_id}'");
+            }
             let net = pad
                 .find("net")
                 .and_then(|node| resolve_net(node, net_table));
             pads.push(PadModel {
                 number,
-                x_um,
-                y_um,
-                rotation_degrees,
+                pin_id,
+                x_um: pin_x_um,
+                y_um: pin_y_um,
+                rotation_degrees: pad_rotation,
                 net,
                 padstack: PadstackKey {
                     shape,
                     layers,
+                    geometry,
                     size_x_um,
                     size_y_um,
                     drill_um,
                 },
+                clearance_override,
             });
         }
-        if pads.is_empty() {
-            bail!("footprint '{reference}' has no pads");
+        if pads.is_empty() && keepouts.is_empty() {
+            continue;
         }
-        pads.sort_by(|left, right| left.number.cmp(&right.number));
+        pads.sort_by(|left, right| left.pin_id.cmp(&right.pin_id));
         output.push(FootprintModel {
             reference,
             kiid,
@@ -1147,11 +1619,265 @@ fn footprints(
             x_um,
             y_um,
             rotation_degrees,
+            side: side.to_string(),
             pads,
+            keepouts,
+            skipped_pads,
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
     Ok(output)
+}
+
+/// Geometry is quantised to the DSN resolution (0.1 um).
+fn tenths(value_um: f64) -> i64 {
+    (value_um * DSN_RESOLUTION as f64).round() as i64
+}
+
+fn pad_geometry(
+    pad: &SexpNode,
+    label: &str,
+    size_x_um: i64,
+    size_y_um: i64,
+    offset: (f64, f64),
+) -> Result<(PadShape, PadGeometry)> {
+    let (sx, sy) = (size_x_um as f64, size_y_um as f64);
+    let (ox, oy) = offset;
+    let rect = || PadGeometry::Rect {
+        x1: tenths(ox - sx / 2.0),
+        y1: tenths(oy - sy / 2.0),
+        x2: tenths(ox + sx / 2.0),
+        y2: tenths(oy + sy / 2.0),
+    };
+    let circle = |diameter: f64| PadGeometry::Circle {
+        diameter: tenths(diameter),
+        x: tenths(ox),
+        y: tenths(oy),
+    };
+    Ok(match pad.get(3).and_then(SexpNode::as_str) {
+        Some("circle") => {
+            if size_x_um != size_y_um {
+                bail!("circle pad {label} does not have equal X/Y size");
+            }
+            (PadShape::Circle, circle(sx))
+        }
+        Some("rect") => (PadShape::Rect, rect()),
+        Some("roundrect") => {
+            if pad.find_f64("chamfer_ratio").unwrap_or(0.0) > 0.0 && pad.find("chamfer").is_some() {
+                bail!("unsupported routing profile: pad {label} has chamfered corners");
+            }
+            let ratio = pad.find_f64("roundrect_rratio").unwrap_or(0.0);
+            if !(0.0..=0.5).contains(&ratio) {
+                bail!("pad {label} has an invalid corner ratio {ratio}");
+            }
+            let radius = ratio * sx.min(sy);
+            if radius < 1.0 {
+                (PadShape::Roundrect, rect())
+            } else {
+                (
+                    PadShape::Roundrect,
+                    PadGeometry::Polygon(rounded_rect(sx, sy, radius, offset)),
+                )
+            }
+        }
+        Some("oval") => {
+            let geometry = if size_x_um == size_y_um {
+                circle(sx)
+            } else {
+                let width = sx.min(sy);
+                let half = (sx.max(sy) - width) / 2.0;
+                let (dx, dy) = if sx > sy { (half, 0.0) } else { (0.0, half) };
+                PadGeometry::Path {
+                    width: tenths(width),
+                    coords: vec![
+                        (tenths(ox - dx), tenths(oy - dy)),
+                        (tenths(ox + dx), tenths(oy + dy)),
+                    ],
+                }
+            };
+            (PadShape::Oval, geometry)
+        }
+        Some("custom") => {
+            if ox != 0.0 || oy != 0.0 {
+                bail!("unsupported routing profile: custom pad {label} has a shape offset");
+            }
+            (PadShape::Custom, custom_pad_hull(pad, label, sx, sy)?)
+        }
+        Some(other) => bail!("unsupported routing profile: pad {label} has shape '{other}'"),
+        None => bail!("pad {label} has no shape"),
+    })
+}
+
+/// Circumscribed polygon of a rounded rectangle: every corner arc is
+/// replaced by tangent segments, so the polygon contains the pad.
+fn rounded_rect(sx: f64, sy: f64, radius: f64, offset: (f64, f64)) -> Vec<(i64, i64)> {
+    let (hx, hy) = (sx / 2.0 - radius, sy / 2.0 - radius);
+    let step = std::f64::consts::FRAC_PI_2 / ARC_SEGMENTS_PER_QUADRANT as f64;
+    let reach = radius / (step / 2.0).cos();
+    let mut ring = Vec::new();
+    for (quadrant, (cx, cy)) in [(hx, hy), (-hx, hy), (-hx, -hy), (hx, -hy)]
+        .into_iter()
+        .enumerate()
+    {
+        for segment in 0..ARC_SEGMENTS_PER_QUADRANT {
+            let angle =
+                quadrant as f64 * std::f64::consts::FRAC_PI_2 + (segment as f64 + 0.5) * step;
+            ring.push((
+                tenths(offset.0 + cx + reach * angle.cos()),
+                tenths(offset.1 + cy + reach * angle.sin()),
+            ));
+        }
+    }
+    let first = ring[0];
+    ring.push(first);
+    ring
+}
+
+/// Eight points whose octagon contains the circle.
+fn circle_points(points: &mut Vec<(f64, f64)>, center: (f64, f64), radius: f64) {
+    let step = std::f64::consts::FRAC_PI_4;
+    let reach = radius / (step / 2.0).cos();
+    for index in 0..8 {
+        let angle = (index as f64 + 0.5) * step;
+        points.push((
+            center.0 + reach * angle.cos(),
+            center.1 + reach * angle.sin(),
+        ));
+    }
+}
+
+/// Convex hull of a custom pad's anchor and primitives (pad frame, DSN axes).
+/// Freerouting treats pad shapes as convex, and the hull contains the copper.
+fn custom_pad_hull(pad: &SexpNode, label: &str, sx: f64, sy: f64) -> Result<PadGeometry> {
+    let mut points = Vec::new();
+    match pad
+        .find("options")
+        .and_then(|options| options.find_str("anchor"))
+        .unwrap_or("circle")
+    {
+        "circle" => circle_points(&mut points, (0.0, 0.0), sx / 2.0),
+        "rect" => points.extend([
+            (-sx / 2.0, -sy / 2.0),
+            (sx / 2.0, -sy / 2.0),
+            (sx / 2.0, sy / 2.0),
+            (-sx / 2.0, sy / 2.0),
+        ]),
+        other => bail!("custom pad {label} has unsupported anchor '{other}'"),
+    }
+    let primitives = pad
+        .find("primitives")
+        .with_context(|| format!("custom pad {label} has no primitives"))?;
+    let xy = |node: &SexpNode, tag: &str| -> Result<(f64, f64)> {
+        let point = node
+            .find(tag)
+            .with_context(|| format!("custom pad {label} primitive has no {tag}"))?;
+        Ok((
+            finite_um(point.get_f64(1), "primitive x")? as f64,
+            -finite_um(point.get_f64(2), "primitive y")? as f64,
+        ))
+    };
+    for primitive in primitives.children().unwrap_or(&[]).iter().skip(1) {
+        let width = match primitive.find("width") {
+            Some(width) => non_negative_um(width.get_f64(1), "primitive width")? as f64,
+            None => 0.0,
+        };
+        let mut outline = Vec::new();
+        match primitive.head() {
+            Some("gr_poly") => {
+                let pts = primitive
+                    .find("pts")
+                    .with_context(|| format!("custom pad {label} polygon has no points"))?;
+                for point in pts.children().unwrap_or(&[]).iter().skip(1) {
+                    if point.head() != Some("xy") {
+                        bail!("custom pad {label} polygon has a curved edge");
+                    }
+                    outline.push((
+                        finite_um(point.get_f64(1), "primitive x")? as f64,
+                        -finite_um(point.get_f64(2), "primitive y")? as f64,
+                    ));
+                }
+            }
+            Some("gr_rect") => {
+                let (start, end) = (xy(primitive, "start")?, xy(primitive, "end")?);
+                outline.extend([start, (end.0, start.1), end, (start.0, end.1)]);
+            }
+            Some("gr_line") => outline.extend([xy(primitive, "start")?, xy(primitive, "end")?]),
+            Some("gr_circle") => {
+                let (center, end) = (xy(primitive, "center")?, xy(primitive, "end")?);
+                let radius = (end.0 - center.0).hypot(end.1 - center.1);
+                circle_points(&mut outline, center, radius);
+            }
+            other => bail!("custom pad {label} has unsupported primitive {other:?}"),
+        }
+        if width > 0.0 {
+            for point in outline {
+                circle_points(&mut points, point, width / 2.0);
+            }
+        } else {
+            points.extend(outline);
+        }
+    }
+    let mut hull = convex_hull(
+        points
+            .into_iter()
+            .map(|(x, y)| (tenths(x), tenths(y)))
+            .collect(),
+    );
+    if hull.len() < 3 {
+        bail!("custom pad {label} has no area");
+    }
+    let first = hull[0];
+    hull.push(first);
+    Ok(PadGeometry::Polygon(hull))
+}
+
+/// Andrew's monotone chain; counter-clockwise, without the closing point.
+fn convex_hull(mut points: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    points.sort_unstable();
+    points.dedup();
+    if points.len() < 3 {
+        return points;
+    }
+    let cross = |o: (i64, i64), a: (i64, i64), b: (i64, i64)| -> i128 {
+        (a.0 - o.0) as i128 * (b.1 - o.1) as i128 - (a.1 - o.1) as i128 * (b.0 - o.0) as i128
+    };
+    let mut hull: Vec<(i64, i64)> = Vec::with_capacity(points.len() * 2);
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &(i64, i64)>> = if pass == 0 {
+            Box::new(points.iter())
+        } else {
+            Box::new(points.iter().rev())
+        };
+        for &point in iter {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0
+            {
+                hull.pop();
+            }
+            hull.push(point);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// Diameter (um, rounded up) of the circle about the pad origin that holds
+/// the pad copper.
+fn enclosing_diameter_um(geometry: &PadGeometry) -> i64 {
+    let reach = |x: i64, y: i64| (x as f64).hypot(y as f64);
+    let tenths_radius = match geometry {
+        PadGeometry::Circle { diameter, x, y } => reach(*x, *y) + *diameter as f64 / 2.0,
+        PadGeometry::Rect { x1, y1, x2, y2 } => [(*x1, *y1), (*x1, *y2), (*x2, *y1), (*x2, *y2)]
+            .into_iter()
+            .map(|(x, y)| reach(x, y))
+            .fold(0.0, f64::max),
+        PadGeometry::Polygon(ring) => ring.iter().map(|&(x, y)| reach(x, y)).fold(0.0, f64::max),
+        PadGeometry::Path { width, coords } => {
+            coords.iter().map(|&(x, y)| reach(x, y)).fold(0.0, f64::max) + *width as f64 / 2.0
+        }
+    };
+    (2.0 * tenths_radius / DSN_RESOLUTION as f64).ceil() as i64
 }
 
 fn normalize_rules(
@@ -1194,7 +1920,7 @@ fn normalize_rules(
 #[allow(clippy::too_many_arguments)]
 fn build_pcb(
     board_path: &Path,
-    copper_layers: &[String],
+    copper_layers: &[CopperLayer],
     outline: &[(i64, i64)],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
@@ -1202,31 +1928,40 @@ fn build_pcb(
     net_classes: &BTreeMap<String, String>,
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
+    fixed_via_names: &BTreeMap<(i64, i64), String>,
     locked_routing: &LockedRouting,
+    planes: &[PlaneModel],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
         .next()
         .context("routing model has no rule class")?;
+    let layer_names = copper_layers
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect::<Vec<_>>();
     let layers = copper_layers
         .iter()
         .enumerate()
-        .map(|(index, name)| dsn::Layer {
-            name: name.clone(),
-            r#type: "signal".to_string(),
+        .map(|(index, layer)| dsn::Layer {
+            name: layer.name.clone(),
+            r#type: layer.dsn_type.clone(),
             property: Some(dsn::Property { index }),
         })
         .collect();
+    let point = |(x, y): (i64, i64)| dsn::Point {
+        x: x as f64,
+        y: y as f64,
+    };
+    let fine = |value: i64| value as f64 / DSN_RESOLUTION as f64;
+    let fine_point = |(x, y): (i64, i64)| dsn::Point {
+        x: fine(x),
+        y: fine(y),
+    };
     let boundary = dsn::Boundary::Path(dsn::Path {
         layer: "pcb".to_string(),
         width: 0.0,
-        coords: outline
-            .iter()
-            .map(|(x, y)| dsn::Point {
-                x: *x as f64,
-                y: *y as f64,
-            })
-            .collect(),
+        coords: outline.iter().copied().map(point).collect(),
     });
 
     let components = footprints
@@ -1238,11 +1973,12 @@ fn build_pcb(
                 x: footprint.x_um as f64,
                 y: footprint.y_um as f64,
                 side: "front".to_string(),
-                rotation: footprint.rotation_degrees,
+                rotation: 0.0,
                 PN: None,
             }],
         })
         .collect();
+    let mut keepout_index = 0;
     let images = footprints
         .iter()
         .map(|footprint| dsn::Image {
@@ -1254,35 +1990,63 @@ fn build_pcb(
                 .map(|pad| dsn::Pin {
                     name: padstack_names[&pad.padstack].clone(),
                     rotate: (pad.rotation_degrees != 0.0).then_some(pad.rotation_degrees),
-                    id: pad.number.clone(),
+                    id: pad.pin_id.clone(),
                     x: pad.x_um as f64,
                     y: pad.y_um as f64,
                 })
                 .collect(),
-            keepouts: dsn::Keepouts(Vec::new()),
+            keepouts: dsn::Keepouts(
+                footprint
+                    .keepouts
+                    .iter()
+                    .flat_map(|keepout| keepout.layers.iter().map(move |layer| (keepout, layer)))
+                    .map(|(keepout, layer)| {
+                        keepout_index += 1;
+                        dsn::Keepout {
+                            kind: dsn::KeepoutKind::Normal,
+                            id_: format!("konnect_keepout_{keepout_index:05}"),
+                            sequence_number: None,
+                            shape: dsn::Shape::Circle(dsn::Circle {
+                                layer: layer.clone(),
+                                diameter: keepout.diameter_um as f64,
+                                offset: Some(point((keepout.x_um, keepout.y_um))),
+                            }),
+                            rule: None,
+                        }
+                    })
+                    .collect(),
+            ),
         })
         .collect();
 
+    let via_padstack = |name: &str, diameter_um: i64| dsn::Padstack {
+        name: name.to_string(),
+        shapes: layer_names
+            .iter()
+            .map(|layer| {
+                dsn::Shape::Circle(dsn::Circle {
+                    layer: layer.clone(),
+                    diameter: diameter_um as f64,
+                    offset: None,
+                })
+            })
+            .collect(),
+        attach: Some(false),
+    };
     let mut padstacks = padstack_names
         .iter()
-        .map(|(key, name)| padstack(name, key))
+        .map(|(key, name)| padstack(name, key, fine_point))
         .collect::<Vec<_>>();
-    padstacks.extend(via_names.iter().map(|(rule, name)| {
-        dsn::Padstack {
-            name: name.clone(),
-            shapes: copper_layers
-                .iter()
-                .map(|layer| {
-                    dsn::Shape::Circle(dsn::Circle {
-                        layer: layer.clone(),
-                        diameter: rule.via_diameter_um as f64,
-                        offset: None,
-                    })
-                })
-                .collect(),
-            attach: Some(false),
-        }
-    }));
+    padstacks.extend(
+        via_names
+            .iter()
+            .map(|(rule, name)| via_padstack(name, rule.via_diameter_um)),
+    );
+    padstacks.extend(
+        fixed_via_names
+            .iter()
+            .map(|((diameter, _), name)| via_padstack(name, *diameter)),
+    );
     padstacks.sort_by(|left, right| left.name.cmp(&right.name));
 
     let nets = net_pins
@@ -1330,14 +2094,8 @@ fn build_pcb(
                     layer: track.layer.clone(),
                     width: track.width_um as f64,
                     coords: vec![
-                        dsn::Point {
-                            x: track.start_x_um as f64,
-                            y: track.start_y_um as f64,
-                        },
-                        dsn::Point {
-                            x: track.end_x_um as f64,
-                            y: track.end_y_um as f64,
-                        },
+                        point((track.start_x_um, track.start_y_um)),
+                        point((track.end_x_um, track.end_y_um)),
                     ],
                 },
                 net: track.net.clone(),
@@ -1352,18 +2110,14 @@ fn build_pcb(
             let rule = net_rules
                 .get(&via.net)
                 .with_context(|| format!("locked via uses unknown routing net '{}'", via.net))?;
-            if via.diameter_um != rule.via_diameter_um || via.drill_um != rule.via_drill_um {
-                bail!(
-                    "locked via on net '{}' is {}:{} um, but its effective via rule is {}:{} um",
-                    via.net,
-                    via.diameter_um,
-                    via.drill_um,
-                    rule.via_diameter_um,
-                    rule.via_drill_um
-                );
-            }
+            let name =
+                if via.diameter_um == rule.via_diameter_um && via.drill_um == rule.via_drill_um {
+                    via_names[*rule].clone()
+                } else {
+                    fixed_via_names[&(via.diameter_um, via.drill_um)].clone()
+                };
             Ok(dsn::Via {
-                name: via_names[*rule].clone(),
+                name,
                 x: via.x_um as f64,
                 y: via.y_um as f64,
                 net: via.net.clone(),
@@ -1371,6 +2125,19 @@ fn build_pcb(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let planes = planes
+        .iter()
+        .flat_map(|plane| {
+            plane.pieces.iter().map(move |piece| dsn::Plane {
+                net: plane.net.clone(),
+                polygon: dsn::Polygon {
+                    layer: plane.layer.clone(),
+                    width: 0.0,
+                    coords: piece.iter().copied().map(point).collect(),
+                },
+            })
+        })
+        .collect();
 
     Ok(dsn::Pcb {
         name: board_path
@@ -1393,7 +2160,7 @@ fn build_pcb(
             layers,
             boundary,
             place_boundary: None,
-            planes: Vec::new(),
+            planes,
             keepouts: dsn::Keepouts(Vec::new()),
             via: dsn::ViaNames {
                 names: via_names.values().cloned().collect(),
@@ -1417,22 +2184,37 @@ fn build_pcb(
     })
 }
 
-fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
+fn padstack(
+    name: &str,
+    key: &PadstackKey,
+    fine_point: impl Fn((i64, i64)) -> dsn::Point,
+) -> dsn::Padstack {
+    let fine = |value: i64| value as f64 / DSN_RESOLUTION as f64;
     let shapes = key
         .layers
         .iter()
-        .map(|layer| match key.shape {
-            PadShape::Circle => dsn::Shape::Circle(dsn::Circle {
+        .map(|layer| match &key.geometry {
+            PadGeometry::Circle { diameter, x, y } => dsn::Shape::Circle(dsn::Circle {
                 layer: layer.clone(),
-                diameter: key.size_x_um as f64,
-                offset: None,
+                diameter: fine(*diameter),
+                offset: (*x != 0 || *y != 0).then(|| fine_point((*x, *y))),
             }),
-            PadShape::Rect => dsn::Shape::Rect(dsn::Rect {
+            PadGeometry::Rect { x1, y1, x2, y2 } => dsn::Shape::Rect(dsn::Rect {
                 layer: layer.clone(),
-                x1: -(key.size_x_um as f64) / 2.0,
-                y1: -(key.size_y_um as f64) / 2.0,
-                x2: key.size_x_um as f64 / 2.0,
-                y2: key.size_y_um as f64 / 2.0,
+                x1: fine(*x1),
+                y1: fine(*y1),
+                x2: fine(*x2),
+                y2: fine(*y2),
+            }),
+            PadGeometry::Polygon(ring) => dsn::Shape::Polygon(dsn::Polygon {
+                layer: layer.clone(),
+                width: 0.0,
+                coords: ring.iter().copied().map(&fine_point).collect(),
+            }),
+            PadGeometry::Path { width, coords } => dsn::Shape::Path(dsn::Path {
+                layer: layer.clone(),
+                width: fine(*width),
+                coords: coords.iter().copied().map(&fine_point).collect(),
             }),
         })
         .collect();
@@ -1468,14 +2250,21 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
 fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
-    copper_layers: &[String],
+    copper_layers: &[CopperLayer],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
     net_classes: &BTreeMap<String, String>,
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
+    fixed_via_names: &BTreeMap<(i64, i64), String>,
     locked_routing: &LockedRouting,
+    planes: &[PlaneModel],
+    options: &ExportOptions,
 ) -> Result<String> {
+    let layer_names = copper_layers
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect::<Vec<_>>();
     let components = footprints
         .iter()
         .map(|footprint| ManifestComponent {
@@ -1484,14 +2273,16 @@ fn build_manifest(
             image_name: footprint.image_name.clone(),
             x_um: footprint.x_um,
             y_um: footprint.y_um,
-            rotation_degrees: footprint.rotation_degrees,
+            rotation_degrees: 0.0,
             side: "front".to_string(),
+            kicad_side: footprint.side.clone(),
+            kicad_rotation_degrees: footprint.rotation_degrees,
             pads: footprint
                 .pads
                 .iter()
                 .map(|pad| ManifestPin {
                     pad_number: pad.number.clone(),
-                    dsn_pin: format!("{}-{}", footprint.reference, pad.number),
+                    dsn_pin: format!("{}-{}", footprint.reference, pad.pin_id),
                     net: pad.net.clone(),
                     padstack_name: padstack_names[&pad.padstack].clone(),
                 })
@@ -1518,41 +2309,71 @@ fn build_manifest(
             drill_um: key.drill_um,
         })
         .collect::<Vec<_>>();
-    padstacks.extend(via_names.iter().map(|(rule, name)| ManifestPadstack {
+    let via = |name: &String, diameter_um: i64, drill_um: i64| ManifestPadstack {
         name: name.clone(),
         purpose: "via".to_string(),
         shape: PadShape::Circle,
-        layers: copper_layers.to_vec(),
-        size_x_um: rule.via_diameter_um,
-        size_y_um: rule.via_diameter_um,
-        drill_um: Some(rule.via_drill_um),
-    }));
+        layers: layer_names.clone(),
+        size_x_um: diameter_um,
+        size_y_um: diameter_um,
+        drill_um: Some(drill_um),
+    };
+    padstacks.extend(
+        via_names
+            .iter()
+            .map(|(rule, name)| via(name, rule.via_diameter_um, rule.via_drill_um)),
+    );
+    padstacks.extend(
+        fixed_via_names
+            .iter()
+            .map(|((diameter, drill), name)| via(name, *diameter, *drill)),
+    );
     padstacks.sort_by(|left, right| left.name.cmp(&right.name));
 
+    let sides = footprints
+        .iter()
+        .map(|footprint| footprint.side.as_str())
+        .collect::<BTreeSet<_>>();
+    let component_side = match (sides.contains("front"), sides.contains("back")) {
+        (true, true) => "both",
+        (false, true) => "back",
+        _ => "front",
+    };
+    let pad_shapes = padstack_names
+        .keys()
+        .map(|key| key.shape.label().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     serde_json::to_string_pretty(&Manifest {
-        schema_version: 1,
+        schema_version: MANIFEST_SCHEMA,
         board_path: board_path.display().to_string(),
         source_sha256: source_sha256.to_string(),
         coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {
-            copper_layers: 2,
-            component_side: "front".to_string(),
-            pad_shapes: vec!["circle".to_string(), "rect".to_string()],
+            copper_layers: copper_layers.len() as u32,
+            component_side: component_side.to_string(),
+            pad_shapes,
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
-            copper_zones: false,
-            custom_rules: false,
+            copper_zones: !planes.is_empty(),
+            custom_rules: options.custom_rules_sha256.is_some(),
             outline: "one closed loop of straight Edge.Cuts lines".to_string(),
+            image_frame: "board_oriented".to_string(),
+            plane_count: planes.len(),
+            custom_rules_sha256: options.custom_rules_sha256.clone(),
         },
         layers: copper_layers
             .iter()
             .enumerate()
             .map(|(index, layer)| ManifestLayer {
-                kicad_name: layer.clone(),
-                dsn_name: layer.clone(),
+                kicad_name: layer.name.clone(),
+                dsn_name: layer.name.clone(),
                 index,
+                dsn_type: layer.dsn_type.clone(),
             })
             .collect(),
         components,
@@ -1898,15 +2719,459 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_pad_shape_offset_is_refused() {
+    fn pad_shape_offset_moves_the_padstack_copper() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb").replacen(
             "(size 0.6 0.5)",
             "(size 0.6 0.5)\n\t\t\t(offset 0.1 0)",
             1,
         );
-        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+        let export = export_dsn(Path::new("board.kicad_pcb"), &source, &rules()).unwrap();
+        assert!(
+            export.dsn.contains("(rect F.Cu -200 -250 400 250)"),
+            "{}",
+            export.dsn
+        );
+    }
+
+    const MULTILAYER: &str = include_str!("../tests/fixtures/specctra_multilayer.kicad_pcb");
+
+    fn multilayer_rules() -> IpcEffectiveRoutingRules {
+        let mut rules = rules();
+        let gnd = rules["GND"].clone();
+        rules.remove("VCC");
+        rules.insert("SIG".to_string(), gnd);
+        rules
+    }
+
+    fn parsed(dsn: &str) -> dsn::Pcb {
+        let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(dsn.as_bytes())));
+        dsn::DsnFile::read_dsn(&mut tokenizer).unwrap().pcb
+    }
+
+    fn image<'a>(pcb: &'a dsn::Pcb, reference: &str) -> &'a dsn::Image {
+        let name = format!("konnect_image_{reference}");
+        pcb.library
+            .images
+            .iter()
+            .find(|image| image.name == name)
+            .unwrap()
+    }
+
+    fn pin<'a>(image: &'a dsn::Image, id: &str) -> &'a dsn::Pin {
+        image.pins.iter().find(|pin| pin.id == id).unwrap()
+    }
+
+    fn padstack_of<'a>(pcb: &'a dsn::Pcb, name: &str) -> &'a dsn::Padstack {
+        pcb.library
+            .padstacks
+            .iter()
+            .find(|padstack| padstack.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn multilayer_stack_keeps_physical_order_and_plane_types() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        let layers = pcb
+            .structure
+            .layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.r#type.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            layers,
+            [
+                ("F.Cu", "signal"),
+                ("In1.Cu", "power"),
+                ("In2.Cu", "signal"),
+                ("B.Cu", "signal")
+            ]
+        );
+        assert_eq!(export.copper_layer_count, 4);
+    }
+
+    #[test]
+    fn rotated_and_back_side_pins_carry_their_board_offsets() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        for component in &pcb.placement.components {
+            let place = &component.places[0];
+            assert_eq!(
+                (place.side.as_str(), place.rotation),
+                ("front", 0.0),
+                "{}",
+                place.name
+            );
+        }
+        // U1 at (10, 10) rotated 90: pad 1 at local (-1, 0) lands at (10, 11).
+        let u1 = pin(image(&pcb, "U1"), "1");
+        assert_eq!((u1.x, u1.y, u1.rotate), (0.0, -1000.0, Some(90.0)));
+        // C1 on the back at (20, 10) rotated -90: pad 1 at local (-0.5, 0)
+        // lands at (20, 9.5), on B.Cu only.
+        let c1 = pin(image(&pcb, "C1"), "1");
+        assert_eq!((c1.x, c1.y, c1.rotate), (0.0, 500.0, Some(270.0)));
+        let layers = padstack_of(&pcb, &c1.name)
+            .shapes
+            .iter()
+            .map(|shape| match shape {
+                dsn::Shape::Rect(rect) => rect.layer.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(layers, ["B.Cu"]);
+        assert_eq!(export.back_component_count, 1);
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        let c1 = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "C1")
+            .unwrap();
+        assert_eq!(c1["kicad_side"], "back");
+        assert_eq!(c1["kicad_rotation_degrees"], -90.0);
+        assert_eq!(c1["rotation_degrees"], 0.0);
+    }
+
+    #[test]
+    fn rounded_oval_and_custom_pads_lower_to_enclosing_shapes() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        let roundrect = padstack_of(&pcb, &pin(image(&pcb, "U1"), "1").name);
+        let dsn::Shape::Polygon(polygon) = &roundrect.shapes[0] else {
+            panic!("{roundrect:?}")
+        };
+        assert_eq!(polygon.coords.len(), 4 * ARC_SEGMENTS_PER_QUADRANT + 1);
+        let max_x = polygon.coords.iter().map(|p| p.x).fold(f64::MIN, f64::max);
+        let max_y = polygon.coords.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+        assert_eq!(
+            (max_x, max_y),
+            (500.0, 250.0),
+            "flat sides lie on the pad edges"
+        );
+        // Corner radius 125 um: the corner vertex sits just outside the arc.
+        for p in polygon.coords.iter().filter(|p| p.x > 375.0 && p.y > 125.0) {
+            let reach = (p.x - 375.0).hypot(p.y - 125.0);
+            assert!((125.0..=128.0).contains(&reach), "{reach}");
+        }
+
+        let custom = padstack_of(&pcb, &pin(image(&pcb, "U1"), "2").name);
+        let dsn::Shape::Polygon(hull) = &custom.shapes[0] else {
+            panic!("{custom:?}")
+        };
+        assert_eq!(hull.coords.len(), 5, "the square contains the round anchor");
+
+        let slot = padstack_of(&pcb, &pin(image(&pcb, "J1"), "1").name);
+        assert_eq!(
+            slot.shapes.len(),
+            4,
+            "through pads cover every copper layer"
+        );
+        let dsn::Shape::Path(path) = &slot.shapes[0] else {
+            panic!("{slot:?}")
+        };
+        assert_eq!(path.width, 1000.0);
+        assert_eq!((path.coords[0].x, path.coords[1].x), (-500.0, 500.0));
+    }
+
+    #[test]
+    fn repeated_and_unnumbered_pads_get_distinct_pin_ids() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        let j1 = image(&pcb, "J1");
+        assert!(j1.pins.iter().any(|pin| pin.id == "1"));
+        assert!(j1.pins.iter().any(|pin| pin.id == "1@1"));
+        assert!(image(&pcb, "FID1").pins.iter().any(|pin| pin.id == "@0"));
+        let gnd = pcb
+            .network
+            .nets
+            .iter()
+            .find(|net| net.name == "GND")
+            .unwrap();
+        let pins = &gnd.pins.as_ref().unwrap().names;
+        assert!(pins.contains(&"J1-1".to_string()) && pins.contains(&"J1-1@1".to_string()));
+        assert_eq!(
+            export.skipped_pad_count, 1,
+            "the paste-only aperture has no copper"
+        );
+    }
+
+    #[test]
+    fn holes_and_enlarged_clearances_become_keepouts() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        let circles = |reference: &str| {
+            image(&pcb, reference)
+                .keepouts
+                .0
+                .iter()
+                .map(|keepout| match &keepout.shape {
+                    dsn::Shape::Circle(circle) => {
+                        let at = circle.offset.as_ref().unwrap();
+                        (circle.layer.clone(), circle.diameter, at.x, at.y)
+                    }
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let hole = circles("J1");
+        assert_eq!(hole.len(), 4);
+        assert!(hole
+            .iter()
+            .all(|(_, d, x, y)| (*d, *x, *y) == (1500.0, 0.0, -3000.0)));
+        // 1 mm pad, local clearance 0.6 against the 0.2 class clearance.
+        assert_eq!(circles("FID1"), [("F.Cu".to_string(), 1800.0, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn power_layer_zone_with_a_hole_becomes_exact_plane_pieces() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        assert_eq!(pcb.structure.planes.len(), 4);
+        let mut area = 0.0;
+        for plane in &pcb.structure.planes {
+            assert_eq!(
+                (plane.net.as_str(), plane.polygon.layer.as_str()),
+                ("GND", "In1.Cu")
+            );
+            let c = &plane.polygon.coords;
+            for pair in c.windows(2) {
+                area += pair[0].x * pair[1].y - pair[1].x * pair[0].y;
+            }
+            // The hole (15..25, 5..15 mm) is outside every piece.
+            let inside = |x: f64, y: f64| {
+                let (xs, ys): (Vec<f64>, Vec<f64>) = c.iter().map(|p| (p.x, p.y)).unzip();
+                let fold = |v: &[f64], f: fn(f64, f64) -> f64, s: f64| v.iter().copied().fold(s, f);
+                x > fold(&xs, f64::min, f64::MAX)
+                    && x < fold(&xs, f64::max, f64::MIN)
+                    && y > fold(&ys, f64::min, f64::MAX)
+                    && y < fold(&ys, f64::max, f64::MIN)
+            };
+            assert!(!inside(20_000.0, -10_000.0));
+        }
+        assert_eq!(
+            (area / 2.0).abs(),
+            1_100_000_000.0,
+            "40x30 mm minus the 10x10 mm hole"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["copper_zones"], true);
+        assert_eq!(manifest["supported_profile"]["plane_count"], 1);
+        assert_eq!(manifest["supported_profile"]["component_side"], "both");
+    }
+
+    #[test]
+    fn trapezoids_cut_a_sloped_outline_exactly() {
+        let triangle = vec![(0, 0), (100, 0), (0, 100)];
+        let notch = vec![(10, 10), (30, 10), (10, 30)];
+        let pieces = trapezoids(&[triangle, notch]);
+        let area: i64 = pieces
+            .iter()
+            .map(|ring| {
+                ring.windows(2)
+                    .map(|pair| pair[0].0 * pair[1].1 - pair[1].0 * pair[0].1)
+                    .sum::<i64>()
+            })
+            .sum::<i64>()
+            .abs();
+        assert_eq!(area, 2 * (5_000 - 200));
+    }
+
+    #[test]
+    fn off_rule_locked_vias_get_their_own_fixed_padstack() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            MULTILAYER,
+            &multilayer_rules(),
+        )
+        .unwrap();
+        let pcb = parsed(&export.dsn);
+        let via = &pcb.wiring.vias[0];
+        assert_eq!(via.name, "konnect_fixed_via_0001");
+        let padstack = padstack_of(&pcb, &via.name);
+        assert_eq!(padstack.shapes.len(), 4);
+        assert!(
+            !pcb.structure.via.names.contains(&via.name),
+            "the router may not place it"
+        );
+        assert_eq!(pcb.wiring.wires[0].path.layer, "In2.Cu");
+    }
+
+    #[test]
+    fn zone_on_a_routing_layer_is_refused() {
+        let source = MULTILAYER.replace(
+            "(layer \"In1.Cu\")\n\t\t(uuid \"f0000000",
+            "(layer \"In2.Cu\")\n\t\t(uuid \"f0000000",
+        );
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &multilayer_rules())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("shape offset"), "{error}");
+        assert!(error.contains("routing layer In2.Cu"), "{error}");
+    }
+
+    #[test]
+    fn blind_locked_via_is_refused() {
+        let source = MULTILAYER.replace(
+            "(layers \"F.Cu\" \"B.Cu\")\n\t\t(locked yes)",
+            "(layers \"F.Cu\" \"In2.Cu\")\n\t\t(locked yes)",
+        );
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &multilayer_rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("through via"), "{error}");
+    }
+
+    #[test]
+    fn multilayer_session_imports_inner_layer_wires_and_vias() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MULTILAYER).unwrap();
+        let export = export_dsn(&board, MULTILAYER, &multilayer_rules()).unwrap();
+        let pcb = parsed(&export.dsn);
+        let placement = pcb
+            .placement
+            .components
+            .iter()
+            .map(|component| {
+                let place = &component.places[0];
+                format!(
+                    "(component {} (place {} {} {} front 0))",
+                    component.name,
+                    place.name,
+                    place.x * 10.0,
+                    place.y * 10.0
+                )
+            })
+            .collect::<String>();
+        let ses = format!(
+            "(session board (base_design board) (placement (resolution um 10) {placement}) (was_is) \
+             (routes (resolution um 10) (library_out (padstack konnect_via_0001 \
+             (shape (circle F.Cu 6000 0 0)) (shape (circle In1.Cu 6000 0 0)) \
+             (shape (circle In2.Cu 6000 0 0)) (shape (circle B.Cu 6000 0 0)) (attach off))) \
+             (network_out (net SIG (wire (path In2.Cu 2500 100000 -110000 200000 -110000)) \
+             (via konnect_via_0001 200000 -110000)))))"
+        );
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, MULTILAYER, &export.manifest, &ses)
+                .unwrap();
+        assert_eq!(plan.tracks[0].layer, "In2.Cu");
+        assert_eq!((plan.vias[0].x_mm, plan.vias[0].y_mm), (20.0, 11.0));
+        assert_eq!((plan.locked_track_count, plan.locked_via_count), (1, 1));
+
+        let three_layer_via = ses.replace(" (shape (circle In1.Cu 6000 0 0))", "");
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            MULTILAYER,
+            &export.manifest,
+            &three_layer_via,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("every expected copper layer"), "{error}");
+    }
+
+    /// Real-engine check of the multi-layer profile: Freerouting must accept
+    /// the planes, inner layers, board-oriented images and fixed vias, and its
+    /// session must pass the strict planner.
+    #[test]
+    #[ignore = "requires Java and FREEROUTING_JAR"]
+    fn freerouting_routes_the_multilayer_fixture() {
+        let jar = std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let board_path = temp.path().join("board.kicad_pcb");
+        let dsn_path = temp.path().join("board.dsn");
+        let ses_path = temp.path().join("board.ses");
+        std::fs::write(&board_path, MULTILAYER).expect("write board fixture");
+        let export = export_dsn(&board_path, MULTILAYER, &multilayer_rules()).unwrap();
+        std::fs::write(&dsn_path, &export.dsn).expect("write DSN");
+        let output = std::process::Command::new("java")
+            .arg("-jar")
+            .arg(jar)
+            .arg("-de")
+            .arg(&dsn_path)
+            .arg("-do")
+            .arg(&ses_path)
+            .arg("-mp")
+            .arg("4")
+            .output()
+            .expect("run Freerouting");
+        assert!(
+            output.status.success(),
+            "Freerouting failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ses = std::fs::read_to_string(&ses_path).expect("read SES");
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board_path, MULTILAYER, &export.manifest, &ses)
+                .unwrap_or_else(|error| panic!("{error:#}\n{ses}"));
+        assert!(!plan.tracks.is_empty(), "{ses}");
+        assert!(
+            plan.tracks.iter().all(|track| track.layer != "In1.Cu"),
+            "no tracks on the power plane"
+        );
+        if let Ok(keep) = std::env::var("KONNECT_KEEP_FREEROUTING_OUTPUT") {
+            std::fs::copy(&dsn_path, Path::new(&keep).join("multilayer.dsn")).unwrap();
+            std::fs::copy(&ses_path, Path::new(&keep).join("multilayer.ses")).unwrap();
+        }
+    }
+
+    #[test]
+    fn acknowledged_custom_rules_are_recorded_and_imported() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, MULTILAYER).unwrap();
+        let options = ExportOptions {
+            custom_rules_sha256: Some("ab".repeat(32)),
+        };
+        let export = export_dsn_with(&board, MULTILAYER, &multilayer_rules(), &options).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["custom_rules"], true);
+        assert_eq!(
+            manifest["supported_profile"]["custom_rules_sha256"],
+            "ab".repeat(32)
+        );
+
+        let mut forged: serde_json::Value = manifest.clone();
+        forged["supported_profile"]["custom_rules_sha256"] = serde_json::Value::Null;
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            MULTILAYER,
+            &forged.to_string(),
+            "(session board)",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("supported routing profile"), "{error}");
     }
 }

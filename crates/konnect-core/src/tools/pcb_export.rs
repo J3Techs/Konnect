@@ -244,13 +244,17 @@ pub fn tools() -> Vec<ToolDef> {
              editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The first \
-             supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
-             custom DRC rules, or incomplete effective routing rules instead of approximating \
-             them, and writes a \
-             revision-bound reverse manifest beside the DSN for later SES import.",
+             is used. Supported: any F.Cu..B.Cu copper stack (KiCad 'power' layers become \
+             planes the router does not track on), footprints on either side, circle, rect, \
+             roundrect, oval and custom pads (rounded corners and custom shapes are lowered \
+             to enclosing polygons), NPTH holes and enlarged local pad clearances as keepouts, \
+             copper zones on power layers as planes (holes cut out exactly), locked tracks and \
+             locked through vias of any size as fixed wiring, and one straight-line closed \
+             outline. Refused: unlocked or arc routing, blind/buried vias, zones on routing \
+             layers, rule areas, chamfered pads and incomplete effective routing rules. A \
+             .kicad_dru file is refused unless acknowledge_custom_rules is set, because the \
+             router sees only net-class rules. Writes a revision-bound reverse manifest \
+             beside the DSN for later SES import.",
             json!({
                 "type": "object",
                 "properties": {
@@ -271,6 +275,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
                         "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
+                    },
+                    "acknowledge_custom_rules": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Export although the board has a .kicad_dru file. The router then sees only net-class rules; run KiCad DRC after import. The rules file hash is recorded in the manifest."
                     }
                 },
                 "required": ["board", "output"]
@@ -741,20 +750,31 @@ async fn handle_export_specctra_dsn(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board_path.display()))?;
     let custom_rules_path = board_path.with_extension("kicad_dru");
+    let mut options = crate::specctra::ExportOptions::default();
     if custom_rules_path.is_file() {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::HandlerError {
-                reason: format!(
-                    "custom DRC rules are outside the first supported routing profile: {}",
+        if args["acknowledge_custom_rules"].as_bool() != Some(true) {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: format!(
+                        "custom DRC rules are not visible to the router: {}",
+                        custom_rules_path.display()
+                    ),
+                },
+                format!(
+                    "Specctra export refused: custom DRC rules ({}) are not visible to the router. \
+                     Set acknowledge_custom_rules=true to route with net-class rules only and \
+                     leave the custom rules to KiCad DRC after import.",
                     custom_rules_path.display()
                 ),
-            },
-            format!(
-                "Specctra export refused: custom DRC rules are outside the first supported routing profile ({})",
-                custom_rules_path.display()
-            ),
-        ));
+            ));
+        }
+        let bytes = tokio::fs::read(&custom_rules_path)
+            .await
+            .with_context(|| format!("read {}", custom_rules_path.display()))?;
+        use sha2::Digest;
+        options.custom_rules_sha256 = Some(format!("{:x}", sha2::Sha256::digest(&bytes)));
     }
+    let custom_rules_acknowledged = options.custom_rules_sha256.is_some();
     let board_for_ipc = board_path.clone();
     let addr = ctx.config.ipc_address.clone();
     let export = with_ipc(addr, move |client| {
@@ -767,7 +787,7 @@ async fn handle_export_specctra_dsn(
                 "KiCad board changed while routing rules were captured; retry from a stable editor revision"
             );
         }
-        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
+        let export = crate::specctra::export_dsn_with(&board_for_ipc, &before, &rules, &options)?;
         Ok((export, before))
     })
     .await?;
@@ -880,12 +900,19 @@ async fn handle_export_specctra_dsn(
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
+            "copper_layer_count": export.copper_layer_count,
+            "back_component_count": export.back_component_count,
+            "skipped_copperless_pad_count": export.skipped_pad_count,
+            "keepout_count": export.keepout_count,
+            "plane_count": export.plane_count,
+            "plane_piece_count": export.plane_piece_count,
+            "custom_rules_acknowledged": custom_rules_acknowledged,
             "capabilities": {
                 "dsn_export_available": true,
-                "ses_import_available": false,
+                "ses_import_available": true,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+                "supported_profile": "multilayer_two_sided_board_oriented_images_power_planes_locked_through_vias"
             }
         })
         .to_string(),

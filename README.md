@@ -146,9 +146,15 @@ For end-to-end autorouting, run `check_freerouting`, then
 `plan_specctra_ses_import` / `apply_specctra_ses`. Readiness reports engine
 discovery, native-MCP compatibility, and complete bridge availability
 separately. The owned Java child is loopback-only and is reaped on success,
-failure, timeout, or cancellation. The first supported profile preserves fixed
-straight tracks and through vias; unlocked routing, arcs, zones, and unsupported
-geometry are rejected before mutation.
+failure, timeout, or cancellation. The exporter handles any F.Cu..B.Cu copper
+stack (KiCad `power` layers become planes the router does not track on),
+footprints on both sides, rounded, oval and custom pads (lowered to enclosing
+shapes), NPTH holes and enlarged pad clearances as keepouts, and copper zones on
+power layers as exact planes. Locked straight tracks and locked through vias of
+any size are kept as fixed wiring. Unlocked routing, arcs, blind or buried vias,
+zones on routing layers, rule areas and other unsupported geometry are rejected
+before mutation; a `.kicad_dru` file needs `acknowledge_custom_rules`, since
+the router sees only net-class rules and KiCad DRC remains the authority.
 
 ### Build from source
 

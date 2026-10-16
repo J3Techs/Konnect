@@ -88,6 +88,13 @@ struct SupportedProfile {
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
+    #[serde(default)]
+    image_frame: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    plane_count: usize,
+    #[serde(default)]
+    custom_rules_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +103,9 @@ struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dsn_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +118,11 @@ struct ManifestComponent {
     y_um: i64,
     rotation_degrees: f64,
     side: String,
+    #[serde(default)]
+    kicad_side: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    kicad_rotation_degrees: f64,
     pads: Vec<ManifestPin>,
 }
 
@@ -214,7 +229,7 @@ pub(crate) fn parse_import_plan(
 }
 
 fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest) -> Result<()> {
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         bail!(
             "unsupported Specctra manifest schema {}",
             manifest.schema_version
@@ -227,14 +242,24 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
-        || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.copper_zones
-        || manifest.supported_profile.custom_rules
-        || manifest.supported_profile.outline.is_empty()
-        || manifest.supported_profile.pad_shapes.is_empty()
+    let profile = &manifest.supported_profile;
+    // Schema 1 manifests predate multi-layer export and only ever described
+    // the two-layer, front-side, zone-free, rule-free profile.
+    let first_profile = profile.copper_layers == 2
+        && profile.component_side == "front"
+        && !profile.copper_zones
+        && !profile.custom_rules;
+    let widened = manifest.schema_version == 2
+        && profile.copper_layers >= 2
+        && matches!(profile.component_side.as_str(), "front" | "back" | "both")
+        && profile.image_frame == "board_oriented"
+        && profile.custom_rules == profile.custom_rules_sha256.is_some();
+    if !(first_profile || widened)
+        || profile.copper_layers as usize != manifest.layers.len()
+        || profile.outline.is_empty()
+        || profile.pad_shapes.is_empty()
     {
-        bail!("manifest does not describe the supported first routing profile");
+        bail!("manifest does not describe a supported routing profile");
     }
     let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
     let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
@@ -296,8 +321,8 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    if layer_names.len() != manifest.supported_profile.copper_layers as usize {
+        bail!("manifest copper layer mappings do not match its layer count");
     }
 
     let net_names = manifest
@@ -323,13 +348,23 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
             || component.side != "front"
+            || !matches!(component.kicad_side.as_str(), "" | "front" | "back")
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
         }
+        let prefix = format!("{}-", component.reference);
+        let mut dsn_pins = BTreeSet::new();
         for pin in &component.pads {
-            if pin.pad_number.is_empty()
-                || pin.dsn_pin != format!("{}-{}", component.reference, pin.pad_number)
+            // Unnumbered and repeated pad numbers get an `@n` pin id.
+            let pin_id = pin.dsn_pin.strip_prefix(&prefix).unwrap_or("");
+            let numbered = pin_id == pin.pad_number
+                || pin_id
+                    .strip_prefix(pin.pad_number.as_str())
+                    .and_then(|rest| rest.strip_prefix('@'))
+                    .is_some_and(|index| index.parse::<usize>().is_ok());
+            if !numbered
+                || !dsn_pins.insert(pin.dsn_pin.as_str())
                 || !padstack_names.contains(pin.padstack_name.as_str())
                 || pin
                     .net
