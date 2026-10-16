@@ -446,6 +446,130 @@ pub fn pad_bbox(pad: &SexpNode, fx: f64, fy: f64, footprint_rot: f64) -> Option<
     }
 }
 
+// ─── Parking extents ─────────────────────────────────────────────────────────
+
+/// A footprint-local box meant to *contain* the footprint, for keeping parked
+/// footprints apart.
+///
+/// [`footprint_bbox`] reproduces KiCad's own box, which leaves out text and
+/// annotation layers. This one is deliberately larger: every graphic on every
+/// layer, every pad (per-layer padstack shapes and chamfered rectangles bounded
+/// by their circumscribed circle), zones, points, and visible text estimated
+/// from its font size. Coordinates are footprint-local; the root `(at …)` is
+/// ignored. Clauses that do not change geometry, a pad's fabrication property
+/// among them, are not read at all.
+///
+/// Returns why when an item that has geometry cannot be read, rather than a
+/// box that might be too small.
+pub fn footprint_parking_extent(fp: &SexpNode) -> Result<Bbox, String> {
+    let mut acc = None;
+    for child in fp.children().unwrap_or(&[]) {
+        let Some(head) = child.head() else { continue };
+        let bb = match head {
+            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" | "fp_curve"
+            | "fp_text_box" => Some(
+                shape_bbox(child, None).ok_or_else(|| format!("a {head} cannot be measured"))?,
+            ),
+            "pad" => Some(pad_parking_bbox(child).ok_or_else(|| {
+                format!(
+                    "pad '{}' cannot be measured",
+                    child.get(1).and_then(SexpNode::as_str).unwrap_or("")
+                )
+            })?),
+            "zone" => Some(zone_bbox(child).ok_or("a footprint zone cannot be measured")?),
+            "point" => {
+                let (x, y) = point(child, "at").ok_or("a footprint point cannot be measured")?;
+                let size = child.find("size").and_then(|s| s.get_f64(1)).unwrap_or(1.0);
+                Some(inflate((x, y, x, y), size.abs() / 2.0))
+            }
+            "fp_text" | "property" => text_parking_bbox(child)?,
+            _ => None,
+        };
+        if let Some(bb) = bb {
+            acc = Some(merge(acc, bb));
+        }
+    }
+    acc.ok_or_else(|| "the footprint has no measurable geometry".to_string())
+}
+
+/// A pad's footprint-local box, extended to contain shapes [`pad_bbox`] does
+/// not reproduce.
+fn pad_parking_bbox(pad: &SexpNode) -> Option<Bbox> {
+    let at = pad.find("at")?;
+    let (px, py) = (finite(at.get_f64(1)?)?, finite(at.get_f64(2)?)?);
+    let size = pad.find("size")?;
+    let (w, h) = (finite(size.get_f64(1)?)?, finite(size.get_f64(2)?)?);
+    let offset = match pad.find("drill").and_then(|drill| drill.find("offset")) {
+        Some(offset) => pair(offset)?,
+        None => (0.0, 0.0),
+    };
+    let reach = |w: f64, h: f64, offset: (f64, f64)| w.hypot(h) / 2.0 + offset.0.hypot(offset.1);
+    let mut acc = match pad.get(3)?.as_str()? {
+        // Chamfering only removes copper, so the circumscribed circle holds.
+        "chamfered_rect" => inflate((px, py, px, py), reach(w, h, offset)),
+        _ => pad_bbox(pad, 0.0, 0.0, 0.0)?,
+    };
+    // Per-layer shapes: a circle around the pad centre that holds each layer
+    // at any pad angle.
+    if let Some(stack) = pad.find("padstack") {
+        for layer in stack.find_all("layer") {
+            if let Some(size) = layer.find("size") {
+                let layer_offset = match layer.find("offset") {
+                    Some(offset) => pair(offset)?,
+                    None => offset,
+                };
+                let (lw, lh) = pair(size)?;
+                acc = merge(
+                    Some(acc),
+                    inflate((px, py, px, py), reach(lw, lh, layer_offset)),
+                );
+            }
+            if let Some(primitives) = layer.find("primitives") {
+                for primitive in primitives.children()?.iter().skip(1) {
+                    let (x0, y0, x1, y1) = shape_bbox(primitive, None)?;
+                    let r = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                        .iter()
+                        .map(|(x, y)| (x + offset.0).hypot(y + offset.1))
+                        .fold(0.0, f64::max);
+                    acc = merge(Some(acc), inflate((px, py, px, py), r));
+                }
+            }
+        }
+    }
+    Some(acc)
+}
+
+/// A visible text item's box, estimated from its font size and length; `None`
+/// for hidden text and text without a position.
+fn text_parking_bbox(node: &SexpNode) -> Result<Option<Bbox>, String> {
+    let hidden_flag = |n: &SexpNode| {
+        n.find_str("hide") == Some("yes")
+            || n.children()
+                .unwrap_or(&[])
+                .iter()
+                .any(|child| child.as_str() == Some("hide"))
+    };
+    let effects = node.find("effects");
+    if hidden_flag(node) || effects.is_some_and(hidden_flag) {
+        return Ok(None);
+    }
+    let Some(at) = node.find("at") else {
+        return Ok(None);
+    };
+    let (x, y) = pair(at).ok_or("a text position cannot be read")?;
+    let (height, width) = effects
+        .and_then(|effects| effects.find("font"))
+        .and_then(|font| font.find("size"))
+        .map(|size| pair(size).ok_or("a text size cannot be read"))
+        .transpose()?
+        .unwrap_or((1.0, 1.0));
+    let text = node.get(2).and_then(SexpNode::as_str).unwrap_or("");
+    let characters = text.chars().count().max(1) as f64;
+    let half_length = characters * width.abs() * 0.6 / 2.0 + width.abs();
+    let r = half_length.hypot(height.abs());
+    Ok(Some(inflate((x, y, x, y), r)))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn finite(v: f64) -> Option<f64> {
@@ -486,4 +610,61 @@ fn hull<const N: usize>(points: [(f64, f64); N]) -> Bbox {
         .iter()
         .fold(None, |acc, &(x, y)| Some(merge(acc, (x, y, x, y))))
         .expect("at least one point")
+}
+
+#[cfg(test)]
+mod parking_extent_tests {
+    use super::*;
+
+    fn extent(source: &str) -> Result<Bbox, String> {
+        footprint_parking_extent(&crate::parse_sexp(source).unwrap())
+    }
+
+    /// KiCad's own box leaves out annotation layers and text; a parked
+    /// footprint still occupies them, so the parking box keeps both.
+    #[test]
+    fn parking_box_keeps_annotation_graphics_and_visible_text() {
+        let (x0, y0, x1, y1) = extent(
+            r#"(footprint "T" (layer "F.Cu") (at 50 60 90)
+                (property "Reference" "U1" (at 0 -4 0) (layer "F.SilkS")
+                    (effects (font (size 1 1) (thickness 0.15))))
+                (property "Hidden" "a long hidden value" (at 30 30 0) (layer "F.Fab") (hide yes)
+                    (effects (font (size 1 1))))
+                (fp_line (start -6 0) (end 6 0) (stroke (width 0.2) (type solid)) (layer "Dwgs.User"))
+                (pad "1" smd rect (at 0 1) (size 1 1) (layers "F.Cu")))"#,
+        )
+        .unwrap();
+        assert!(x0 <= -6.1 && x1 >= 6.1, "annotation line: {x0} {x1}");
+        assert!(y0 < -4.5, "visible reference text: {y0}");
+        assert!(
+            (1.5..30.0).contains(&y1),
+            "hidden text is not geometry: {y1}"
+        );
+    }
+
+    /// Shapes `pad_bbox` does not reproduce are bounded, never dropped: a
+    /// chamfered rectangle, a per-layer padstack size, and custom primitives.
+    #[test]
+    fn parking_box_contains_chamfered_padstack_and_custom_pads() {
+        let (x0, _, x1, _) = extent(
+            r#"(footprint "T" (layer "F.Cu")
+                (pad "1" smd chamfered_rect (at 10 0) (size 2 2) (chamfer_ratio 0.25) (chamfer top_left) (layers "F.Cu"))
+                (pad "2" thru_hole circle (at -10 0) (size 1 1) (drill 0.5) (layers "*.Cu")
+                    (padstack (mode custom) (layer "In1.Cu" (shape circle) (size 4 4))))
+                (pad "3" smd custom (at 0 0) (size 0.2 0.2) (layers "F.Cu") (property pad_prop_heatsink)
+                    (options (clearance outline) (anchor circle))
+                    (primitives (gr_poly (pts (xy 0 0) (xy 3 0) (xy 3 1)) (width 0) (fill yes)))))"#,
+        )
+        .unwrap();
+        assert!(x1 >= 10.0 + 2f64.sqrt() - 1e-9, "chamfered pad: {x1}");
+        assert!(x0 <= -10.0 - 2f64.hypot(2.0) + 1e-9, "padstack layer: {x0}");
+    }
+
+    #[test]
+    fn an_unreadable_pad_is_reported_not_shrunk() {
+        let error =
+            extent(r#"(footprint "T" (pad "7" smd rect (at 0 0) (layers "F.Cu")))"#).unwrap_err();
+        assert!(error.contains("pad '7'"), "{error}");
+        assert!(extent(r#"(footprint "T" (layer "F.Cu"))"#).is_err());
+    }
 }

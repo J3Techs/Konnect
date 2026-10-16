@@ -74,6 +74,7 @@ enum LiveResult {
     Snapshot(Result<IpcFootprint3DModelSnapshot, Error>),
     Conflict(IpcFootprint3DModelSnapshot),
     Edited(Result<IpcFootprint3DModelEditOutcome, Error>),
+    Refused(crate::tools::footprint_fabrication::RebuildRefusal),
 }
 
 async fn handle_set_placed_footprint_models(
@@ -125,6 +126,18 @@ async fn handle_set_placed_footprint_models(
         {
             return Ok(LiveResult::Conflict(snapshot));
         }
+        // The edit sends the whole footprint back, and KiCad re-creates its
+        // pads without any pad fabrication property.
+        if let Err(refusal) = crate::tools::footprint_fabrication::guard_live_rebuild_in(
+            client,
+            document.clone(),
+            &revision_board,
+            "set_placed_footprint_models",
+            &[&live_reference],
+            crate::tools::footprint_fabrication::Remedy::NoLosslessPath,
+        )? {
+            return Ok(LiveResult::Refused(refusal));
+        }
         Ok(LiveResult::Edited(client.edit_footprint_3d_models_in(
             document,
             &live_reference,
@@ -160,6 +173,7 @@ async fn handle_set_placed_footprint_models(
     };
 
     match live {
+        LiveResult::Refused(refusal) => Ok(refusal.into_result()),
         LiveResult::Snapshot(Ok(snapshot)) => {
             Ok(snapshot_result("inspected", false, &board, &snapshot))
         }

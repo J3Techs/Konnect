@@ -2,10 +2,13 @@
 
 `custom_pads_texas_rje0020a_kicad10.kicad_mod` and
 `custom_pads_vqfn20_kicad10.kicad_mod` are two stock KiCad footprints whose
-corner pads are `smd custom`. Konnect's typed placement path cannot carry a
-custom-shape pad, so `update_pcb_from_schematic` refuses a plan that needs one.
-These are the two footprints that refusal met on a real board, where it named
-neither of them (#657).
+corner pads are `smd custom`. Konnect's typed placement path once could not
+carry a custom-shape pad, so `update_pcb_from_schematic` refused a plan that
+needed one. These are the two footprints that refusal met on a real board,
+where it named neither of them (#657). They are now the success fixtures for
+custom-pad placement; the refusal tests derive unsupported variants from them
+in memory (`convexhull` clearance, an arc polygon edge) without editing these
+files.
 
 ## Provenance
 
@@ -31,6 +34,13 @@ Unnumbered `F.Paste`-only pads sit under the exposed pad: one in the Texas
 footprint, four in the generic one.
 
 The first is the footprint the schematic symbol names; the second is what a
-designer substitutes when the first is refused. Both are refused for the same
-reason, which is why a diagnostic that names nothing sends the designer round
-twice.
+designer substituted when the first was refused. Both were refused for the
+same reason, which is why a diagnostic that named nothing sent the designer
+round twice.
+
+The exposed pad 21 carries `(property pad_prop_heatsink)` and `(zone_connect 2)`.
+KiCad 10's API has a field for the zone connection
+(`PadStack.zone_settings`) but none for a pad's fabrication property, so the
+byte-exact files are refused for the heatsink property alone. The success
+tests strip that one line in memory (`test_support::without_heatsink_property`)
+and keep everything else, `zone_connect` included, exactly as KiCad wrote it.

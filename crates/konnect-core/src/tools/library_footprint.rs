@@ -11,6 +11,46 @@ use anyhow::{bail, Context, Result};
 use konnect_ipc::gen::kiapi;
 use konnect_sexp::SexpNode;
 
+/// Everything below, read once, for a caller that builds a new footprint from
+/// pads, drawings and fields and must give it the rest of its library data:
+/// `update_pcb_from_schematic`'s additions and `place_component`.
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryData {
+    pub(crate) attributes: kiapi::board::types::FootprintAttributes,
+    pub(crate) description_and_keywords: kiapi::board::types::FootprintAttributes,
+    pub(crate) models: Vec<kiapi::board::types::Footprint3DModel>,
+}
+
+impl LibraryData {
+    pub(crate) fn read(root: &SexpNode) -> Result<Self> {
+        Ok(Self {
+            attributes: attributes(root)?,
+            description_and_keywords: description_and_keywords(root),
+            models: models(root)?,
+        })
+    }
+
+    /// Give a footprint built from pads, drawings and fields the instance
+    /// attributes, the definition's description and keywords, and the 3D
+    /// models. Without them a placed SMD part had no `smd` attribute, so
+    /// KiCad treated it as unspecified, and its models were gone (#789).
+    pub(crate) fn apply(
+        &self,
+        footprint: &mut kiapi::board::types::FootprintInstance,
+    ) -> Result<()> {
+        footprint.attributes = Some(self.attributes.clone());
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("built footprint has no definition")?;
+        definition.attributes = Some(self.description_and_keywords.clone());
+        definition.items.extend(self.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }));
+        Ok(())
+    }
+}
+
 /// The instance attributes a library footprint's `(attr …)` declares.
 ///
 /// A footprint with no `(attr …)` gets KiCad's default: no mounting style,

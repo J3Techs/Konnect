@@ -83,6 +83,22 @@ impl Drop for MockIpcServer {
     }
 }
 
+/// A custom-pad fixture (`tests/fixtures/custom_pads_*_kicad10.kicad_mod`)
+/// without exposed pad 21's `(property pad_prop_heatsink)`, the one clause in
+/// it KiCad's API cannot carry, so the byte-exact files are refused for it.
+/// Everything else, the custom pads and `(zone_connect 2)` included, is left
+/// exactly as KiCad wrote it.
+pub(crate) fn without_heatsink_property(source: &str) -> String {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let heatsink = |line: &str| line.trim() == "(property pad_prop_heatsink)";
+    assert_eq!(
+        lines.iter().filter(|line| heatsink(line)).count(),
+        1,
+        "one heatsink pad"
+    );
+    lines.into_iter().filter(|line| !heatsink(line)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

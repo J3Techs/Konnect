@@ -185,7 +185,228 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_force_directed(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        tool!(
+            "set_reference_field_presentations",
+            "Set many placed footprints' Reference-field presentation in one atomic write to \
+             the saved .kicad_pcb of a board KiCad does not hold open: local position (or \
+             board position), text angle, character width/height and stroke. Only each \
+             field's (at …), (size …) and (thickness …) change; its UUID, text, layer, \
+             mirror and visibility, and every pad, fabrication property, net, model and \
+             schematic link stay byte for byte. Every member is validated before anything is \
+             written: an unknown or duplicate reference, a footprint with no single Reference \
+             field, a duplicated (at/effects/font/size/thickness) clause or an outline-font \
+             field with a saved render cache refuses the whole batch. Defaults to a dry run \
+             whose revision covers the saved bytes and the normalized request; apply requires \
+             that revision, re-proves the board closed and its KiCad lock absent, and reads \
+             the persisted bytes back. edit_component's reference_field inspects or edits one.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "fields": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5000,
+                        "items": reference_field_item_schema()
+                    },
+                    "report": {
+                        "type": "string",
+                        "enum": ["changed", "all"],
+                        "default": "changed",
+                        "description": "changed: list only fields the plan changes; all: every requested field. Counts are always complete."
+                    },
+                    "dry_run": { "type": "boolean", "default": true },
+                    "expected_revision": { "type": "string", "description": "The revision a current dry run returned; required to apply." }
+                },
+                "required": ["board", "fields"]
+            }),
+            |args, ctx| async move { handle_set_reference_field_presentations(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ]
+}
+
+fn reference_field_item_schema() -> serde_json::Value {
+    let mut item = crate::tools::pcb_components::reference_field_schema(
+        "One footprint's Reference field; omitted values are kept.",
+    );
+    item["properties"]["reference"] = json!({ "type": "string", "minLength": 1 });
+    item["required"] = json!(["reference"]);
+    item
+}
+
+const REFERENCE_FIELDS_DOMAIN: &str = "konnect.set_reference_field_presentations.v1";
+
+async fn handle_set_reference_field_presentations(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use crate::tools::pcb_components::reference_field::{self, FIELD_KEYS};
+    use crate::tools::{closed_board, invalid_arg};
+    const OPERATION: &str = "set_reference_field_presentations";
+
+    let board = get_path(args, "board")?;
+    let Some(fields) = args.get("fields").and_then(serde_json::Value::as_array) else {
+        return Ok(invalid_arg(
+            "fields",
+            "must be an array of Reference fields",
+        ));
+    };
+    if fields.is_empty() || fields.len() > reference_field::MAX_FIELDS {
+        return Ok(invalid_arg(
+            "fields",
+            &format!("must hold 1 to {} fields", reference_field::MAX_FIELDS),
+        ));
+    }
+    let mut requests = Vec::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        let at = format!("fields[{index}]");
+        let Some(object) = field.as_object() else {
+            return Ok(invalid_arg(&at, "must be an object"));
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| key.as_str() != "reference" && !FIELD_KEYS.contains(&key.as_str()))
+        {
+            return Ok(invalid_arg(
+                &format!("{at}.{key}"),
+                "is not a Reference-field presentation value",
+            ));
+        }
+        let Some(reference) = object
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reference| !reference.is_empty())
+        else {
+            return Ok(invalid_arg(&format!("{at}.reference"), "is required"));
+        };
+        match reference_field::field_request(reference, object, &at) {
+            Ok(request) => requests.push(request),
+            Err((field, reason)) => return Ok(invalid_arg(&field, &reason)),
+        }
+    }
+    let report_all = match args.get("report").and_then(serde_json::Value::as_str) {
+        None | Some("changed") => false,
+        Some("all") => true,
+        Some(other) => {
+            return Ok(invalid_arg(
+                "report",
+                &format!("must be 'changed' or 'all', got '{other}'"),
+            ))
+        }
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let expected_revision = args
+        .get("expected_revision")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if !dry_run && expected_revision.is_none() {
+        return Ok(invalid_arg(
+            "expected_revision",
+            "apply requires the revision a current dry run returned",
+        ));
+    }
+
+    let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {
+        Ok(closure) => closure,
+        Err(refusal) => return Ok(refusal),
+    };
+    let original = match read_saved_board(&board)? {
+        Ok(original) => original,
+        Err(refusal) => return Ok(refusal),
+    };
+    let prepared = match reference_field::prepare(&original, &requests) {
+        Ok(prepared) => prepared,
+        Err(reasons) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: OPERATION.to_string(),
+                    reasons: reasons.clone(),
+                },
+                format!(
+                    "No Reference field changed; {} member(s) cannot be planned: {}. The board \
+                     file was not modified.",
+                    reasons.len(),
+                    reasons.join("; ")
+                ),
+            ))
+        }
+    };
+    let normalized = serde_json::Value::Array(
+        requests
+            .iter()
+            .map(reference_field::FieldRequest::json)
+            .collect(),
+    );
+    let revision = closed_board::revision(REFERENCE_FIELDS_DOMAIN, &original, &normalized);
+    let changed = prepared.changed_references();
+    let listed: Vec<serde_json::Value> = prepared
+        .before
+        .iter()
+        .zip(&prepared.expected)
+        .filter(|((_, before), (_, after))| report_all || before != after)
+        .map(|((reference, before), (_, after))| {
+            json!({
+                "reference": reference,
+                "changed": before != after,
+                "before": before.json(reference),
+                "after": after.json(reference),
+            })
+        })
+        .collect();
+    let mut body = json!({
+        "board": board.display().to_string(),
+        "status": if prepared.edits.is_empty() { "noop" } else { "ready" },
+        "dry_run": dry_run,
+        "revision": revision,
+        "board_closure": closure,
+        "requested_count": requests.len(),
+        "changed_count": changed.len(),
+        "unchanged_count": requests.len() - changed.len(),
+        "changed_span_count": prepared.edits.len(),
+        "report": if report_all { "all" } else { "changed" },
+        "fields": listed,
+        "convention": reference_field::CONVENTION,
+        "write": serde_json::Value::Null,
+        "source": "saved",
+    });
+    if dry_run {
+        return Ok(CallToolResult::json(&body));
+    }
+    if expected_revision.as_deref() != Some(revision.as_str()) {
+        return Ok(closed_board::stale_revision(&board, OPERATION));
+    }
+    if prepared.edits.is_empty() {
+        return Ok(CallToolResult::json(&body));
+    }
+    let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {
+        Ok(closure) => closure,
+        Err(refusal) => return Ok(refusal),
+    };
+    let expected = prepared.expected.clone();
+    let edits = prepared.edits.clone();
+    match closed_board::write_and_read_back(
+        &board,
+        OPERATION,
+        &original,
+        &prepared.candidate,
+        |text| reference_field::verify(&original, text, &edits, &expected),
+    ) {
+        Ok(write) => {
+            body["status"] = json!("applied");
+            body["board_closure"] = closure;
+            body["write"] = write;
+            body["native_validation"] = json!(
+                "Konnect did not run KiCad. Reopen the board in KiCad 10, save it there, and run \
+                 DRC (silk_overlap, silk_over_copper, text height) before relying on the labels."
+            );
+            Ok(CallToolResult::json(&body))
+        }
+        Err(refusal) => Ok(refusal),
+    }
 }
 
 // ─── Scoring constants ───────────────────────────────────────────────────────

@@ -770,6 +770,9 @@ fn place_footprint_sends_graphics_children() {
         drill_oval: false,
         layers: vec!["F.Cu".to_string()],
         roundrect_ratio: 0.25,
+        zone_connection: None,
+        thermal: Default::default(),
+        custom: None,
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
@@ -1620,6 +1623,9 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             drill_oval: false,
             layers: vec!["F.Cu".to_string()],
             roundrect_ratio: 0.0,
+            zone_connection: None,
+            thermal: Default::default(),
+            custom: None,
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
@@ -3073,7 +3079,7 @@ mod board_stackup {
             .expect("KiCad answered");
 
         assert_eq!(*asked.lock().unwrap(), [Some(doc_for("stack.kicad_pcb"))]);
-        assert_eq!(stackup.finish, "None");
+        assert_eq!(stackup.finish.as_deref(), Some("None"));
         assert_eq!(stackup.layers.len(), 1);
         assert_eq!(stackup.layers[0].layer.as_deref(), Some("F.Cu"));
         assert_eq!(stackup.layers[0].thickness_nm, 35_000);
@@ -3119,10 +3125,10 @@ mod board_stackup {
             stackup.layers.iter().filter(|l| l.kind == "copper").count(),
             4
         );
-        assert_eq!(stackup.finish, "ENIG");
-        assert!(stackup.impedance_controlled);
-        assert_eq!(stackup.edge_connector, "beveled");
-        assert!(stackup.has_edge_plating);
+        assert_eq!(stackup.finish.as_deref(), Some("ENIG"));
+        assert_eq!(stackup.impedance_controlled, Some(true));
+        assert_eq!(stackup.edge_connector.as_deref(), Some("beveled"));
+        assert_eq!(stackup.has_edge_plating, Some(true));
     }
 
     #[test]

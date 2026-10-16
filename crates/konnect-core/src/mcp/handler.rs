@@ -2905,6 +2905,9 @@ mod component_properties_dispatch_tests {
     fn r1_row() -> Value {
         json!({
             "reference": "R1",
+            "in_bom": true,
+            "on_board": true,
+            "dnp": false,
             "value": "10k",
             "footprint": "",
             "lib_id": "Device:R",
@@ -2950,7 +2953,10 @@ mod component_properties_dispatch_tests {
             "rotation": 0.0,
             "mirror_x": false,
             "mirror_y": false,
-            "uuid": R1_UUID
+            "uuid": R1_UUID,
+            "in_bom": true,
+            "on_board": true,
+            "dnp": false
         }]);
         assert_eq!(r1, expected);
 

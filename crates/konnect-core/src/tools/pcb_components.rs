@@ -6,6 +6,10 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::footprint_fabrication::{
+    guard_live_rebuild,
+    Remedy::{ClosedBoardPath, NoLosslessPath},
+};
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{
@@ -24,6 +28,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+
+mod attributes;
+pub(crate) mod reference_field;
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
@@ -168,12 +175,94 @@ fn replace_quoted_after(source: &mut String, marker: &str, value: &str) -> anyho
 }
 
 fn replace_reference(source: &mut String, reference: &str) -> anyhow::Result<()> {
-    for marker in ["(property \"Reference\" \"", "(fp_text reference \""] {
-        if source.contains(marker) {
-            return replace_quoted_after(source, marker, reference);
+    replace_footprint_field(source, "Reference", reference)
+}
+
+/// Byte spans of the top-level tokens inside one balanced `(…)` block,
+/// relative to the block, head first. Strings keep their quotes, nested lists
+/// are one token each.
+pub(crate) fn sexp_block_tokens(block: &str) -> Vec<(usize, usize)> {
+    let bytes = block.as_bytes();
+    let mut out = Vec::new();
+    let end = block.len().saturating_sub(1);
+    let mut i = 1;
+    while i < end {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < end {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i = (i + 1).min(end);
+                out.push((start, i));
+            }
+            b'(' => match find_balanced_block(block, i) {
+                Some((start, stop)) => {
+                    out.push((start, stop));
+                    i = stop;
+                }
+                None => break,
+            },
+            _ => {
+                let start = i;
+                while i < end && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')') {
+                    i += 1;
+                }
+                out.push((start, i));
+            }
         }
     }
-    anyhow::bail!("footprint library data has no Reference property or fp_text")
+    out
+}
+
+/// A token's value: a quoted string unescaped as KiCad's reader does, or an
+/// atom as written.
+pub(crate) fn sexp_token_value(token: &str) -> String {
+    match konnect_sexp::parse_sexp(token) {
+        Ok(node) => node.as_str().map(str::to_string).unwrap_or_default(),
+        Err(_) => token.to_string(),
+    }
+}
+
+/// Byte span, quotes included, of a footprint field's value: the root's own
+/// `(property "Name" "value" …)`, or — for Reference and Value, in files
+/// older than KiCad 8 — `(fp_text reference|value "value" …)`. Nested
+/// properties (a pad's, a group's) are never matched.
+pub(crate) fn footprint_field_value_span(source: &str, name: &str) -> Option<(usize, usize)> {
+    let fp_text = match name {
+        "Reference" => Some("reference"),
+        "Value" => Some("value"),
+        _ => None,
+    };
+    let children = find_direct_child_blocks(source, "footprint");
+    let find = |head: &str, key: &str| {
+        children.iter().find_map(|&(start, end)| {
+            let block = &source[start..end];
+            let spans = sexp_block_tokens(block);
+            let (head_start, head_end) = *spans.first()?;
+            let (key_start, key_end) = *spans.get(1)?;
+            let (value_start, value_end) = *spans.get(2)?;
+            (&block[head_start..head_end] == head
+                && sexp_token_value(&block[key_start..key_end]) == key)
+                .then_some((start + value_start, start + value_end))
+        })
+    };
+    find("property", name).or_else(|| fp_text.and_then(|kind| find("fp_text", kind)))
+}
+
+/// Set a footprint field's value through [`footprint_field_value_span`].
+fn replace_footprint_field(source: &mut String, name: &str, value: &str) -> anyhow::Result<()> {
+    let (start, end) = footprint_field_value_span(source, name).ok_or_else(|| {
+        anyhow::anyhow!("footprint library data has no {name} property or fp_text")
+    })?;
+    source.replace_range(start..end, &format!("\"{}\"", escape_sexp_string(value)));
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -201,7 +290,7 @@ fn prepare_footprint_source(
     replace_quoted_after(&mut prepared, "(footprint \"", lib_id)?;
     replace_reference(&mut prepared, reference)?;
     if let Some(value) = value {
-        replace_quoted_after(&mut prepared, "(property \"Value\" \"", value)?;
+        replace_footprint_field(&mut prepared, "Value", value)?;
     }
     replace_quoted_after(&mut prepared, "(layer \"", layer)?;
     let layer_start = prepared
@@ -220,6 +309,7 @@ pub(crate) fn extract_pad_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcPadDefinition>> {
     let footprint = konnect_sexp::parse_sexp(source)?;
+    let format_version = sexp_format_version(&footprint);
     footprint
         .find_all("pad")
         .into_iter()
@@ -230,11 +320,25 @@ pub(crate) fn extract_pad_definitions(
                     .ok_or_else(|| anyhow::anyhow!("footprint pad is missing {label}"))
             };
             let shape = required(3, "shape")?.to_string();
-            if shape == "custom" {
-                anyhow::bail!(
-                    "custom-shape pads are not supported by KiCad 10's typed placement path"
-                );
-            }
+            let number = pad
+                .get(1)
+                .and_then(konnect_sexp::SexpNode::as_str)
+                .unwrap_or_default();
+            refuse_uncarried_pad_clauses(pad, &shape).with_context(|| {
+                format!("pad '{number}' cannot be carried by KiCad 10's typed placement path")
+            })?;
+            let custom = if shape == "custom" {
+                Some(parse_custom_pad(pad).with_context(|| {
+                    format!("custom pad '{number}' cannot be carried by KiCad 10's typed placement path")
+                })?)
+            } else {
+                None
+            };
+            let zone_connection = pad_zone_connection(pad)
+                .with_context(|| format!("pad '{number}' has an unreadable zone connection"))?;
+            let (thermal, _) = pad_thermal(pad, format_version).with_context(|| {
+                format!("pad '{number}' cannot be carried by KiCad 10's typed placement path")
+            })?;
             let at = pad
                 .find("at")
                 .context("footprint pad is missing its position")?;
@@ -290,9 +394,395 @@ pub(crate) fn extract_pad_definitions(
                 drill_oval,
                 layers,
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.0),
+                custom,
+                zone_connection,
+                thermal,
             })
         })
         .collect()
+}
+
+/// A pad's `(zone_connect N)`: `None` when the pad leaves it out and so
+/// inherits, the named connection otherwise. A repeated clause, a value that
+/// is not one integer, or an integer KiCad does not define is refused rather
+/// than read as inherited.
+pub(crate) fn pad_zone_connection(
+    pad: &konnect_sexp::SexpNode,
+) -> anyhow::Result<Option<konnect_ipc::IpcPadZoneConnection>> {
+    let clauses = pad.find_all("zone_connect");
+    let clause = match clauses.as_slice() {
+        [] => return Ok(None),
+        [clause] => clause,
+        _ => anyhow::bail!("the pad has {} (zone_connect …) clauses", clauses.len()),
+    };
+    let values = clause.children().unwrap_or_default();
+    anyhow::ensure!(
+        values.len() == 2,
+        "(zone_connect …) must hold exactly one value"
+    );
+    let text = values[1]
+        .as_str()
+        .filter(|_| matches!(values[1], konnect_sexp::SexpNode::Atom(_)))
+        .context("(zone_connect …) must hold a bare integer")?;
+    let value: i64 = text
+        .parse()
+        .with_context(|| format!("zone_connect '{text}' is not an integer"))?;
+    konnect_ipc::IpcPadZoneConnection::from_file_value(value)
+        .map(Some)
+        .with_context(|| {
+            format!("zone_connect {value} is not a KiCad zone connection (-1, 0, 1, 2 or 3)")
+        })
+}
+
+/// A file's `(version N)`, read from the root's own children. KiCad's parser
+/// treats a missing one as 0, which callers pass on as `None`.
+pub(crate) fn sexp_format_version(root: &konnect_sexp::SexpNode) -> Option<i64> {
+    root.children()
+        .unwrap_or_default()
+        .iter()
+        .find(|child| child.head() == Some("version"))
+        .and_then(|version| version.get(1))
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|text| text.parse().ok())
+}
+
+/// A pad's thermal-relief clauses as KiCad 10's footprint parser reads them
+/// (`PCB_IO_KICAD_SEXPR_PARSER::parsePAD`): `(thermal_bridge_width mm)` or
+/// its legacy spelling `(thermal_width mm)`, `(thermal_gap mm)` and
+/// `(thermal_bridge_angle degrees)`.
+///
+/// The width and gap stay `None` unless written, and an explicit zero stays
+/// zero. The angle is always filled in, because the parser always sets one:
+/// the written value, or its shape default (see
+/// [`konnect_ipc::file_default_thermal_spoke_angle`]); the flag says whether
+/// the file wrote it. A repeated clause, one that is not a single bare
+/// number, and a value KiCad could not hold as written are refused.
+pub(crate) fn pad_thermal(
+    pad: &konnect_sexp::SexpNode,
+    format_version: Option<i64>,
+) -> anyhow::Result<(konnect_ipc::IpcPadThermal, bool)> {
+    let value = |tags: &[&str], unit: &str| -> anyhow::Result<Option<f64>> {
+        let clauses = pad
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|child| child.head().is_some_and(|tag| tags.contains(&tag)))
+            .collect::<Vec<_>>();
+        let clause = match clauses.as_slice() {
+            [] => return Ok(None),
+            [clause] => clause,
+            _ => anyhow::bail!(
+                "the pad has {} ({} …) clauses",
+                clauses.len(),
+                tags.join(" …)/(")
+            ),
+        };
+        let tag = clause.head().unwrap_or_default();
+        let values = clause.children().unwrap_or_default();
+        anyhow::ensure!(
+            values.len() == 2 && matches!(values[1], konnect_sexp::SexpNode::Atom(_)),
+            "({tag} …) must hold exactly one bare number of {unit}"
+        );
+        let text = values[1].as_str().unwrap_or_default();
+        let number: f64 = text
+            .parse()
+            .with_context(|| format!("{tag} '{text}' is not a number"))?;
+        anyhow::ensure!(number.is_finite(), "{tag} '{text}' is not finite");
+        Ok(Some(number))
+    };
+    let shape = pad
+        .get(3)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .unwrap_or_default();
+    let anchor = pad
+        .find("options")
+        .and_then(|options| options.find("anchor"))
+        .and_then(|anchor| anchor.get(1))
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .and_then(|anchor| match anchor {
+            "circle" => Some(konnect_ipc::IpcCustomPadAnchor::Circle),
+            "rect" => Some(konnect_ipc::IpcCustomPadAnchor::Rect),
+            _ => None,
+        });
+    let written_angle = value(&["thermal_bridge_angle"], "degrees")?;
+    let thermal = konnect_ipc::IpcPadThermal {
+        spoke_width: value(&["thermal_bridge_width", "thermal_width"], "mm")?,
+        gap: value(&["thermal_gap"], "mm")?,
+        spoke_angle: Some(written_angle.unwrap_or_else(|| {
+            konnect_ipc::file_default_thermal_spoke_angle(shape, anchor, format_version)
+        })),
+    };
+    thermal.validate()?;
+    Ok((thermal, written_angle.is_some()))
+}
+
+/// Refuse a pad clause the typed placement path would drop. A pad is built
+/// from its position, size, layers, drill, corner ratio, custom shape, zone
+/// connection and thermal settings; anything else that changes the pad (a
+/// fabrication property, mask or paste margins, clearance overrides, chamfers, a
+/// trapezoid delta, a drill offset, removed unused layers, a padstack, …) has
+/// no field it could travel in, so placing the pad without it would put a
+/// different pad on the board than the library holds.
+///
+/// `uuid`/`tstamp` are identity KiCad assigns afresh, and `pinfunction`/
+/// `pintype` are schematic data, not pad geometry.
+fn refuse_uncarried_pad_clauses(pad: &konnect_sexp::SexpNode, shape: &str) -> anyhow::Result<()> {
+    for child in pad.children().unwrap_or_default().iter().skip(4) {
+        let Some(tag) = child.head() else {
+            anyhow::bail!(
+                "pad flag '{}' is not supported",
+                child.as_str().unwrap_or("<list>")
+            );
+        };
+        match tag {
+            "at" | "size" | "layers" | "roundrect_rratio" | "zone_connect" | "uuid" | "tstamp"
+            | "pinfunction" | "pintype" => {}
+            // Read and validated by `pad_thermal`.
+            "thermal_bridge_width" | "thermal_width" | "thermal_gap" | "thermal_bridge_angle" => {}
+            "options" | "primitives" if shape == "custom" => {}
+            "drill" => {
+                if let Some(nested) = child
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .find_map(konnect_sexp::SexpNode::head)
+                {
+                    anyhow::bail!("drill clause '{nested}' is not supported");
+                }
+            }
+            // The typed pad stack always keeps unused layers.
+            "remove_unused_layers" => {
+                let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+                anyhow::ensure!(
+                    value == Some("no"),
+                    "'(remove_unused_layers {})' is not supported",
+                    value.unwrap_or("")
+                );
+            }
+            "property" => anyhow::bail!(
+                "pad property '{}' is not supported: KiCad's API has no field for a pad's \
+                 fabrication property",
+                child
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .unwrap_or("")
+            ),
+            other => anyhow::bail!("pad clause '{other}' is not supported"),
+        }
+    }
+    Ok(())
+}
+
+/// Read a custom pad's `(options …)` and `(primitives …)` into the typed form
+/// KiCad's API carries (`PadStackLayer::custom_anchor_shape` and
+/// `custom_shapes`), keeping every coordinate pad-local.
+///
+/// Only what that form reproduces exactly is accepted. Everything else is
+/// refused by name rather than dropped or guessed: a `convexhull` clearance
+/// (the API has no field for it, and KiCad's default is `outline`), bezier,
+/// annotation and vector primitives, polygon arc edges, rounded rectangles,
+/// a primitive missing its width or fill, and any clause not listed here.
+fn parse_custom_pad(pad: &konnect_sexp::SexpNode) -> anyhow::Result<konnect_ipc::IpcCustomPad> {
+    use konnect_ipc::{IpcCustomPadAnchor, IpcPadPrimitive};
+    use konnect_sexp::SexpNode;
+
+    let options = pad.find("options").context(
+        "it has no (options …), so its anchor shape is unknown; save the footprint \
+         in KiCad 10 to write it",
+    )?;
+    let mut anchor = None;
+    for option in options.children().unwrap_or_default().iter().skip(1) {
+        let value = option.get(1).and_then(SexpNode::as_str);
+        match (option.head(), value) {
+            (Some("anchor"), Some("circle")) => anchor = Some(IpcCustomPadAnchor::Circle),
+            (Some("anchor"), Some("rect")) => anchor = Some(IpcCustomPadAnchor::Rect),
+            (Some("anchor"), other) => anyhow::bail!(
+                "anchor '{}' is not one KiCad supports (circle or rect)",
+                other.unwrap_or("")
+            ),
+            (Some("clearance"), Some("outline")) => {}
+            (Some("clearance"), Some("convexhull")) => anyhow::bail!(
+                "'(clearance convexhull)' cannot be sent: KiCad's API has no field for a \
+                 custom pad's zone clearance shape, so the pad would arrive with the \
+                 'outline' default. Change the pad to 'outline' clearance in the \
+                 footprint editor if that is acceptable"
+            ),
+            (Some("clearance"), other) => anyhow::bail!(
+                "clearance '{}' is not one KiCad supports (outline or convexhull)",
+                other.unwrap_or("")
+            ),
+            (head, _) => anyhow::bail!(
+                "custom pad option '{}' is not supported",
+                head.unwrap_or("<atom>")
+            ),
+        }
+    }
+    let anchor = anchor.context("its (options …) names no anchor shape")?;
+
+    let primitives_node = pad.find("primitives").context("it has no (primitives …)")?;
+    let mut primitives = Vec::new();
+    for (index, node) in primitives_node
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .enumerate()
+    {
+        let primitive = parse_pad_primitive(node)
+            .with_context(|| format!("primitive {index} ({})", node.head().unwrap_or("<atom>")))?;
+        primitive
+            .validate()
+            .with_context(|| format!("primitive {index} ({})", primitive.kind()))?;
+        primitives.push(primitive);
+    }
+    let custom = konnect_ipc::IpcCustomPad { anchor, primitives };
+    custom.validate()?;
+    return Ok(custom);
+
+    fn parse_pad_primitive(node: &SexpNode) -> anyhow::Result<IpcPadPrimitive> {
+        let kind = node.head().context("a primitive must be a list")?;
+        let geometry: &[&str] = match kind {
+            "gr_poly" => &["pts"],
+            "gr_rect" => &["start", "end"],
+            "gr_circle" => &["center", "end"],
+            "gr_line" => &["start", "end"],
+            "gr_arc" => &["start", "mid", "end"],
+            "gr_curve" | "bezier" => anyhow::bail!("bezier primitives are not supported"),
+            "gr_bbox" | "gr_vector" => anyhow::bail!(
+                "'{kind}' annotation primitives are not supported: KiCad's API cannot \
+                 mark them as annotation, so they would arrive as copper"
+            ),
+            // KiCad writes width and fill on each primitive; a list-level
+            // default would have to be guessed onto them.
+            "width" | "fill" => anyhow::bail!(
+                "a list-level ({kind} …) in (primitives …) is not supported; save the \
+                 footprint in KiCad 10 to write it on each primitive"
+            ),
+            other => anyhow::bail!("primitive type '{other}' is not supported"),
+        };
+        let closed = matches!(kind, "gr_poly" | "gr_rect" | "gr_circle");
+        let mut width = None;
+        let mut filled = None;
+        let mut seen = HashSet::new();
+        for child in node.children().unwrap_or_default().iter().skip(1) {
+            let tag = child
+                .head()
+                .with_context(|| format!("unexpected bare token in {kind}"))?;
+            anyhow::ensure!(seen.insert(tag), "{kind} has more than one ({tag} …)");
+            match tag {
+                _ if geometry.contains(&tag) => {}
+                "width" => width = Some(number(child, 1, "width")?),
+                "stroke" => {
+                    for part in child.children().unwrap_or_default().iter().skip(1) {
+                        match (part.head(), part.get(1).and_then(SexpNode::as_str)) {
+                            (Some("width"), _) => width = Some(number(part, 1, "stroke width")?),
+                            (Some("type"), Some("solid" | "default")) => {}
+                            (Some("type"), other) => anyhow::bail!(
+                                "stroke type '{}' is not supported",
+                                other.unwrap_or("")
+                            ),
+                            (head, _) => anyhow::bail!(
+                                "stroke clause '{}' is not supported",
+                                head.unwrap_or("<atom>")
+                            ),
+                        }
+                    }
+                }
+                "fill" => {
+                    filled = Some(match child.get(1).and_then(SexpNode::as_str) {
+                        Some("yes" | "solid") => true,
+                        Some("no" | "none") => false,
+                        other => anyhow::bail!(
+                            "fill '{}' is not supported (yes or no)",
+                            other.unwrap_or("")
+                        ),
+                    })
+                }
+                other => anyhow::bail!("{kind} clause '{other}' is not supported"),
+            }
+        }
+        let width = width.with_context(|| format!("{kind} has no width"))?;
+        let filled = if closed {
+            filled.with_context(|| format!("{kind} has no (fill …), so its copper is ambiguous"))?
+        } else {
+            anyhow::ensure!(filled != Some(true), "a filled {kind} is not supported");
+            false
+        };
+        let point = |tag: &str| -> anyhow::Result<(f64, f64)> {
+            let node = node
+                .find(tag)
+                .with_context(|| format!("{kind} has no ({tag} …)"))?;
+            anyhow::ensure!(
+                node.children().map_or(0, <[SexpNode]>::len) == 3,
+                "{kind} ({tag} …) must hold exactly X and Y"
+            );
+            Ok((number(node, 1, tag)?, number(node, 2, tag)?))
+        };
+        Ok(match kind {
+            "gr_poly" => {
+                let pts = node.find("pts").context("gr_poly has no (pts …)")?;
+                let points = pts
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .map(|vertex| match vertex.head() {
+                        Some("xy") => {
+                            anyhow::ensure!(
+                                vertex.children().map_or(0, <[SexpNode]>::len) == 3,
+                                "gr_poly (xy …) must hold exactly X and Y"
+                            );
+                            Ok((number(vertex, 1, "xy")?, number(vertex, 2, "xy")?))
+                        }
+                        Some("arc") => anyhow::bail!(
+                            "gr_poly has a curved (arc …) edge, which is not supported"
+                        ),
+                        other => anyhow::bail!(
+                            "gr_poly point '{}' is not supported",
+                            other.unwrap_or("<atom>")
+                        ),
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                IpcPadPrimitive::Polygon {
+                    points,
+                    width,
+                    filled,
+                }
+            }
+            "gr_rect" => IpcPadPrimitive::Rect {
+                start: point("start")?,
+                end: point("end")?,
+                width,
+                filled,
+            },
+            "gr_circle" => IpcPadPrimitive::Circle {
+                center: point("center")?,
+                end: point("end")?,
+                width,
+                filled,
+            },
+            "gr_line" => IpcPadPrimitive::Segment {
+                start: point("start")?,
+                end: point("end")?,
+                width,
+            },
+            _ => IpcPadPrimitive::Arc {
+                start: point("start")?,
+                mid: point("mid")?,
+                end: point("end")?,
+                width,
+            },
+        })
+    }
+
+    fn number(node: &SexpNode, index: usize, label: &str) -> anyhow::Result<f64> {
+        let value = node
+            .get_f64(index)
+            .with_context(|| format!("{label} is missing a number"))?;
+        anyhow::ensure!(value.is_finite(), "{label} value {value} is not finite");
+        Ok(value)
+    }
 }
 
 // ─── Footprint graphics extraction ───────────────────────────────────────────
@@ -891,6 +1381,9 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    /// The library's attributes, description, keywords and 3D models; `None`
+    /// for inline geometry, which has no library to carry them.
+    library: Option<super::library_footprint::LibraryData>,
     board_sexp: String,
 }
 
@@ -912,6 +1405,11 @@ impl PreparedFootprintPlacement {
         let pads = extract_pad_definitions(&prepared)?;
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
+        let library =
+            super::library_footprint::LibraryData::read(&konnect_sexp::parse_sexp(&prepared)?)
+                .map_err(|error| {
+                    anyhow::anyhow!("footprint '{lib_id}' library data cannot be placed: {error:#}")
+                })?;
         let board_sexp =
             board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
                 .map_err(anyhow::Error::msg)?;
@@ -926,6 +1424,7 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            library: Some(library),
             board_sexp,
         })
     }
@@ -942,8 +1441,46 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            library: None,
             board_sexp,
         }
+    }
+
+    /// The typed item the IPC path creates: built from the pads, drawings and
+    /// fields, then given the library's attributes, description, keywords and
+    /// 3D models when there is a library. The library source is only read.
+    pub(crate) fn build_item(
+        &self,
+        lib_id: &str,
+        reference: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+    ) -> anyhow::Result<prost_types::Any> {
+        let item = KiCadIpcClient::build_footprint_item(
+            lib_id,
+            reference,
+            &self.value,
+            &self.pads,
+            &self.graphics,
+            &self.fields,
+            x,
+            y,
+            rotation,
+            layer,
+        )?;
+        let Some(library) = &self.library else {
+            return Ok(item);
+        };
+        let mut footprint =
+            konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .context("typed footprint builder returned an invalid item")?;
+        library.apply(&mut footprint)?;
+        Ok(konnect_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
     }
 
     /// Insert exactly this footprint through the same atomic, duplicate-safe
@@ -981,7 +1518,7 @@ fn board_contains_reference(board_path: &Path, reference: &str) -> anyhow::Resul
     Ok(footprint_references(&content)?.contains(reference))
 }
 
-fn footprint_reference(footprint: &konnect_sexp::SexpNode) -> Option<String> {
+pub(crate) fn footprint_reference(footprint: &konnect_sexp::SexpNode) -> Option<String> {
     footprint
         .find_all("property")
         .into_iter()
@@ -1088,10 +1625,38 @@ pub(crate) fn update_closed_board_footprints(
     board_path: &Path,
     placements: &[konnect_ipc::types::IpcFootprintPlacement],
 ) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
+    update_closed_board_footprints_on_sides(board_path, placements, &vec![None; placements.len()])
+        .map(|(applied, _)| applied)
+}
+
+/// As [`update_closed_board_footprints`], first moving each footprint given
+/// a side to it with the closed-board flip (which mirrors its geometry and
+/// refuses anything it cannot mirror), then setting the requested position and
+/// absolute rotation. One write for the whole batch, or none.
+fn update_closed_board_footprints_on_sides(
+    board_path: &Path,
+    placements: &[konnect_ipc::types::IpcFootprintPlacement],
+    sides: &[Option<String>],
+) -> Result<
+    (
+        Vec<konnect_ipc::types::IpcFootprintPlacement>,
+        Vec<serde_json::Value>,
+    ),
+    ClosedBoardError,
+> {
     let content =
         read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
     let mut updated = content.clone();
-    for placement in placements {
+    let mut layers = Vec::with_capacity(placements.len());
+    for (placement, side) in placements.iter().zip(sides) {
+        let mut flipped = false;
+        if let Some(layer) = side {
+            let (next, changed) =
+                prepare_closed_board_footprint_side(&updated, &placement.reference, layer)?;
+            updated = next;
+            flipped = changed;
+        }
+        layers.push(json!({ "reference": placement.reference, "flipped": flipped }));
         updated = prepare_closed_board_footprint_update(
             &updated,
             &placement.reference,
@@ -1108,7 +1673,7 @@ pub(crate) fn update_closed_board_footprints(
     // the root angle to KiCad's (-180, 180] (a requested 270 is stored as
     // -90), and the response has to say the number the file now holds.
     let mut applied = Vec::with_capacity(placements.len());
-    for placement in placements {
+    for (index, placement) in placements.iter().enumerate() {
         let root_at = find_direct_child_blocks(&updated, "kicad_pcb")
             .into_iter()
             .filter_map(|(start, end)| konnect_sexp::parse_sexp(&updated[start..end]).ok())
@@ -1116,6 +1681,7 @@ pub(crate) fn update_closed_board_footprints(
             .find(|node| footprint_reference(node).as_deref() == Some(&placement.reference))
             .and_then(|node| {
                 let at = node.find("at")?;
+                layers[index]["layer"] = json!(node.find_str("layer"));
                 Some((at.get_f64(1)?, at.get_f64(2)?, at.get_f64(3).unwrap_or(0.0)))
             })
             .ok_or_else(|| {
@@ -1131,7 +1697,7 @@ pub(crate) fn update_closed_board_footprints(
             rotation: root_at.2,
         });
     }
-    Ok(applied)
+    Ok((applied, layers))
 }
 
 fn prepare_closed_board_footprint_update(
@@ -1791,7 +2357,7 @@ fn set_closed_board_footprint_side(
 /// above: `find_balanced_block` skips whatever precedes the first paren, so
 /// leading garbage would pass, as would a well-formed form that is not a board
 /// at all.
-fn check_single_board_form(content: &str) -> Result<(), String> {
+pub(crate) fn check_single_board_form(content: &str) -> Result<(), String> {
     let trimmed = content.trim();
     let (start, end) = find_balanced_block(trimmed, 0)
         .ok_or_else(|| "the result is not a balanced S-expression".to_string())?;
@@ -1815,7 +2381,7 @@ fn check_single_board_form(content: &str) -> Result<(), String> {
 }
 
 /// Prefix every non-empty line with `indent`, joining them with `eol`.
-fn indent_block(block: &str, indent: &str, eol: &str) -> String {
+pub(crate) fn indent_block(block: &str, indent: &str, eol: &str) -> String {
     // `lines()` strips a trailing \r along with the \n, so rejoining with `eol`
     // re-imposes one convention on a block that may have arrived with another —
     // a CRLF library footprint going into an LF board, or the reverse.
@@ -1830,6 +2396,26 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(eol)
+}
+
+/// The Reference-field presentation values `edit_component.reference_field`
+/// and `set_reference_field_presentations` share; see `reference_field`.
+pub(crate) fn reference_field_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": format!("{description} {}", reference_field::CONVENTION),
+        "properties": {
+            "local_x": { "type": "number", "description": "Saved (at …) X offset from the footprint anchor, footprint frame, mm" },
+            "local_y": { "type": "number", "description": "Saved (at …) Y offset from the footprint anchor, footprint frame, mm" },
+            "board_x": { "type": "number", "description": "Board-space X, mm; with board_y, instead of local_x/local_y" },
+            "board_y": { "type": "number", "description": "Board-space Y, mm; with board_x" },
+            "angle_deg": { "type": "number", "description": "Text board angle as KiCad saves it" },
+            "relative_angle_deg": { "type": "number", "description": "Text angle relative to the footprint angle; instead of angle_deg" },
+            "width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+            "height_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+            "stroke_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 25 }
+        }
+    })
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -1891,7 +2477,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "set_component_placements",
-            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
+            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks. A placement may name a target layer (F.Cu or B.Cu) on a closed board only: that footprint is mirrored first, then placed; any unsupported footprint refuses the whole batch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1905,7 +2491,8 @@ pub fn tools() -> Vec<ToolDef> {
                                 "reference": { "type": "string" },
                                 "x": { "type": "number", "description": "Target X coordinate in millimetres" },
                                 "y": { "type": "number", "description": "Target Y coordinate in millimetres" },
-                                "rotation": { "type": "number", "description": "Target absolute rotation in degrees" }
+                                "rotation": { "type": "number", "description": "Target absolute rotation in degrees" },
+                                "layer": { "type": "string", "enum": ["F.Cu", "B.Cu"], "description": "Optional target side, closed board only: a footprint on the other side is first mirrored by the closed-board flip (which refuses custom pads, pad offsets/primitives, moving 3D models and unsupported children), then set to x/y/rotation. Any layer in the batch refuses the whole batch while KiCad holds the board." }
                             },
                             "required": ["reference", "x", "y", "rotation"]
                         }
@@ -1954,19 +2541,31 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
-            "Update the value or other properties of a placed footprint via KiCAD IPC.",
+            "Update a footprint value through live KiCad IPC, or inspect/edit its assembly attributes or its Reference field's presentation in the saved board while KiCad does not hold it. Attribute and reference_field edits preserve every other footprint clause and use an atomic revision-checked write. Give only one of value, attributes and reference_field per call. For many Reference fields in one write use set_reference_field_presentations.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
-                    "value":     { "type": "string", "description": "New value string (optional)" }
+                    "value":     { "type": "string", "description": "New value string (optional)" },
+                    "attributes": {
+                        "type": "object", "additionalProperties": false,
+                        "description": "Requires the exact board closed. Set only named flags; omitted flags and unknown existing attributes are preserved. Empty object inspects saved attributes without a write.",
+                        "properties": {
+                            "board_only": { "type": "boolean" },
+                            "exclude_from_bom": { "type": "boolean" },
+                            "exclude_from_pos_files": { "type": "boolean" }
+                        }
+                    },
+                    "reference_field": reference_field_schema(
+                        "Requires the exact board closed. Set the saved Reference field's local position, text angle, character width/height and stroke; omitted values are kept, and an empty object inspects the saved values without a write."
+                    )
                 },
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_edit_component(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "repair_corrupted_footprints",
             "Repair the exact legacy corruption from Konnect issue #244: footprint drawing \
@@ -2065,12 +2664,40 @@ pub fn tools() -> Vec<ToolDef> {
              'source' says which, so unsaved placements are visible without a save. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
-             but unreadable; treat null as an error, not as an unconnected pad.",
+             but unreadable; treat null as an error, not as an unconnected pad. \
+             Pad fabrication properties (pad_prop_bga, pad_prop_heatsink, …) are reported \
+             only from the saved file, as each pad's 'fabrication_property' (\"none\" when the \
+             saved pad has none); KiCad 10's live typed API cannot observe them, so a live read \
+             says 'unobservable_via_live_typed_api' rather than reporting them absent. \
+             source 'saved' reads the saved file even while KiCad holds the board: it shows the \
+             last save, not unsaved edits.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
-                    "reference": { "type": "string" }
+                    "reference": { "type": "string" },
+                    "source": {
+                        "type": "string",
+                        "enum": ["auto", "saved"],
+                        "default": "auto",
+                        "description": "auto: live board when KiCad holds it, else the saved file. saved: always the saved file, with pad fabrication properties."
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["full", "fabrication", "connectivity"],
+                        "default": "full",
+                        "description": "fabrication returns each pad number and fabrication property plus the source/observability facts, omitting geometry. connectivity returns each physical pad's number, net, board-space x/y, rotation, pad type, UUID and fabrication property, plus the footprint's own pose, UUID, layer and library ID; no shape, polygon, paste or 3D data. Use either for large parts; full retains the existing response."
+                    },
+                    "pad_numbers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Only pads whose number is exactly one of these. Every physical pad with a matching number is returned, duplicates included; numbers that match none are listed in unmatched_pad_numbers."
+                    },
+                    "nets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Only pads whose net name is exactly one of these (\"\" for unconnected); nets that match none are listed in unmatched_nets."
+                    }
                 },
                 "required": ["board", "reference"]
             }),
@@ -2095,17 +2722,34 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_component_list",
-            "List all footprints on the board with their positions, layers, and values.",
+            "List footprints on the board with their positions, rotations, layers, values, \
+             library IDs and UUIDs. source 'live' (default) reads the board KiCad holds open, \
+             with no file fallback; source 'saved' reads the saved file even while KiCad holds \
+             the board and says it excludes unsaved editor state. 'references' limits the \
+             answer to those exact references: a reference no footprint carries is listed in \
+             unknown_references, and one several footprints carry is listed in \
+             duplicate_references with every footprint kept.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string" }
+                    "board": { "type": "string" },
+                    "references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Only these exact references; omit for every footprint."
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["live", "saved"],
+                        "default": "live",
+                        "description": "live: the exact board open in KiCad. saved: the saved file only."
+                    }
                 },
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_component_list(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "place_component_array",
             "Place multiple copies of a footprint in a grid or line array via KiCAD IPC.",
@@ -2224,7 +2868,7 @@ async fn handle_place_component(
         board.parent(),
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+        Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
     };
 
     // Try IPC first. The fallback gate is the typed transport classification:
@@ -2237,19 +2881,9 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        c.place_footprint(
-            &requested_board,
-            &footprint_ipc,
-            &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
-            x,
-            y,
-            rotation,
-            &layer_ipc,
-        )
+        let item =
+            prepared_ipc.build_item(&footprint_ipc, &reference_ipc, x, y, rotation, &layer_ipc)?;
+        c.place_footprint_item(&requested_board, &reference_ipc, item)
     })
     .await?;
 
@@ -2308,14 +2942,25 @@ async fn handle_move_component(
     };
 
     let ref_ipc = reference.clone();
+    let guard_board = board.clone();
     match attempt_ipc_write(ctx, &board, "move", move |c| {
-        c.move_footprint(&ref_ipc, x, y)
+        if let Err(refusal) = guard_live_rebuild(
+            c,
+            &guard_board,
+            "move_component",
+            &[&ref_ipc],
+            ClosedBoardPath,
+        )? {
+            return Ok(Err(refusal));
+        }
+        c.move_footprint(&ref_ipc, x, y).map(Ok)
     })
     .await?
     {
-        BoardWrite::Ipc(()) => Ok(CallToolResult::json(
+        BoardWrite::Ipc(Ok(())) => Ok(CallToolResult::json(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
+        BoardWrite::Ipc(Err(refusal)) => Ok(refusal.into_result()),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
@@ -2385,8 +3030,24 @@ async fn handle_edit_board_footprint_graphic(
     };
 
     let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
-    let kind: String = ipc!(ctx, args, |c| c
-        .set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts));
+    let guard_board = get_path(args, "board")?;
+    let kind: Result<String, _> = ipc!(ctx, args, |c| {
+        if let Err(refusal) = guard_live_rebuild(
+            c,
+            &guard_board,
+            "edit_board_footprint_graphic",
+            &[&ref_ipc],
+            NoLosslessPath,
+        )? {
+            return Ok(Err(refusal));
+        }
+        c.set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts)
+            .map(Ok)
+    });
+    let kind = match kind {
+        Ok(kind) => kind,
+        Err(refusal) => return Ok(refusal.into_result()),
+    };
 
     Ok(CallToolResult::json(&json!({
         "edited": reference,
@@ -2411,16 +3072,27 @@ async fn handle_rotate_component(
     };
 
     let ref_ipc = reference.clone();
+    let guard_board = board.clone();
     match attempt_ipc_write(ctx, &board, "rotation", move |c| {
-        c.rotate_footprint(&ref_ipc, rotation)
+        if let Err(refusal) = guard_live_rebuild(
+            c,
+            &guard_board,
+            "rotate_component",
+            &[&ref_ipc],
+            ClosedBoardPath,
+        )? {
+            return Ok(Err(refusal));
+        }
+        c.rotate_footprint(&ref_ipc, rotation).map(Ok)
     })
     .await?
     {
-        BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Ok(())) => Ok(CallToolResult::json(&json!({
             "rotated": reference,
             "rotation": rotation,
             "source": "ipc"
         }))),
+        BoardWrite::Ipc(Err(refusal)) => Ok(refusal.into_result()),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
             match update_closed_board_footprint(
@@ -2452,9 +3124,15 @@ fn invalid_placement(field: String, reason: impl Into<String>) -> CallToolResult
     )
 }
 
+/// The placements, and each one's requested side (`None` keeps its side).
+type ParsedPlacements = (
+    Vec<konnect_ipc::types::IpcFootprintPlacement>,
+    Vec<Option<String>>,
+);
+
 fn parse_component_placements(
     args: &serde_json::Value,
-) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, CallToolResult> {
+) -> Result<ParsedPlacements, CallToolResult> {
     let values = require_array(args, "placements")?;
     if values.is_empty() {
         return Err(invalid_placement(
@@ -2465,6 +3143,7 @@ fn parse_component_placements(
 
     let mut references = HashSet::new();
     let mut placements = Vec::with_capacity(values.len());
+    let mut sides = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let field = |name: &str| format!("placements[{index}].{name}");
         let Some(object) = value.as_object() else {
@@ -2491,6 +3170,13 @@ fn parse_component_placements(
                 .and_then(serde_json::Value::as_f64)
                 .ok_or_else(|| invalid_placement(field(name), "missing or not a number"))
         };
+        sides.push(match object.get("layer") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(layer)) if layer == "F.Cu" || layer == "B.Cu" => {
+                Some(layer.clone())
+            }
+            Some(_) => return Err(invalid_placement(field("layer"), "must be F.Cu or B.Cu")),
+        });
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
             reference,
             x: number("x")?,
@@ -2498,7 +3184,7 @@ fn parse_component_placements(
             rotation: number("rotation")?,
         });
     }
-    Ok(placements)
+    Ok((placements, sides))
 }
 
 async fn handle_set_component_placements(
@@ -2506,34 +3192,91 @@ async fn handle_set_component_placements(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let placements = match parse_component_placements(args) {
-        Ok(placements) => placements,
+    let (placements, sides) = match parse_component_placements(args) {
+        Ok(parsed) => parsed,
         Err(error) => return Ok(error),
     };
+    let changes_sides = sides.iter().any(Option::is_some);
 
     let placements_ipc = placements.clone();
+    let guard_board = board.clone();
     match attempt_ipc_write(ctx, &board, "component placement batch", move |client| {
-        client.set_footprint_placements(&placements_ipc)
+        // A side change is a closed-board edit only: refuse before anything
+        // live is touched.
+        if changes_sides {
+            return Ok(Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::PlanBlocked {
+                    operation: "set_component_placements".to_string(),
+                    reasons: vec!["side_change_requires_closed_board".to_string()],
+                },
+                "A placement batch that sets 'layer' edits the saved board and requires it \
+                 closed in KiCad; use flip_component for an open board. Nothing was changed.",
+            )));
+        }
+        // The whole batch or nothing: one unsupported footprint refuses all.
+        let references = placements_ipc
+            .iter()
+            .map(|placement| placement.reference.as_str())
+            .collect::<Vec<_>>();
+        if let Err(refusal) = guard_live_rebuild(
+            client,
+            &guard_board,
+            "set_component_placements",
+            &references,
+            ClosedBoardPath,
+        )? {
+            return Ok(Err(refusal.into_result()));
+        }
+        client.set_footprint_placements(&placements_ipc).map(Ok)
     })
     .await?
     {
-        BoardWrite::Ipc(applied) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Err(refusal)) => Ok(refusal),
+        BoardWrite::Ipc(Ok(applied)) => Ok(CallToolResult::json(&json!({
             "count": applied.len(),
             "placements": applied,
             "source": "ipc",
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
-            Ok(applied) => Ok(CallToolResult::json(&json!({
-                "count": applied.len(),
-                "placements": applied,
-                "source": "file",
-                "fallback_reason": reason.evidence(),
-                "warning": reason.warning()
-            }))),
-            Err(error) => Ok(error.into_result()),
-        },
+        BoardWrite::File(_)
+            if changes_sides
+                && !matches!(
+                    crate::tools::live_board::editor_lock(&board),
+                    crate::tools::live_board::EditorLock::Absent
+                ) =>
+        {
+            Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::UnsafeFileFallback {
+                    path: board.display().to_string(),
+                    reason: "kicad_lock_present".to_string(),
+                },
+                "The exact board's KiCad lock is present or unreadable; no side-changing \
+                 placement was written.",
+            ))
+        }
+        BoardWrite::File(reason) => {
+            match update_closed_board_footprints_on_sides(&board, &placements, &sides) {
+                Ok((applied, layers)) => {
+                    let mut body = json!({
+                        "count": applied.len(),
+                        "placements": applied,
+                        "source": "file",
+                        "fallback_reason": reason.evidence(),
+                        "warning": reason.warning()
+                    });
+                    if changes_sides {
+                        body["sides"] = json!(layers);
+                        body["side_change"] = json!(
+                            "Each footprint given a layer was mirrored by the closed-board flip \
+                             first, then set to the requested position and absolute rotation."
+                        );
+                    }
+                    Ok(CallToolResult::json(&body))
+                }
+                Err(error) => Ok(error.into_result()),
+            }
+        }
     }
 }
 
@@ -2670,6 +3413,24 @@ async fn handle_edit_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let given = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
+    if given("reference_field") {
+        if given("value") || given("attributes") {
+            return Ok(CallToolResult::error(
+                "Edit value, closed-board attributes and the Reference field in separate calls."
+                    .to_string(),
+            ));
+        }
+        return reference_field::handle(args, ctx).await;
+    }
+    if given("attributes") {
+        if given("value") {
+            return Ok(CallToolResult::error(
+                "Edit value and closed-board attributes in separate calls.".to_string(),
+            ));
+        }
+        return attributes::handle(args, ctx).await;
+    }
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -2677,8 +3438,23 @@ async fn handle_edit_component(
     if let Some(value) = args["value"].as_str() {
         let reference_for_ipc = reference.clone();
         let value_for_ipc = value.to_string();
-        ipc!(ctx, args, |c| c
-            .set_footprint_value(&reference_for_ipc, &value_for_ipc));
+        let guard_board = get_path(args, "board")?;
+        let guarded = ipc!(ctx, args, |c| {
+            if let Err(refusal) = guard_live_rebuild(
+                c,
+                &guard_board,
+                "edit_component",
+                &[&reference_for_ipc],
+                NoLosslessPath,
+            )? {
+                return Ok(Err(refusal));
+            }
+            c.set_footprint_value(&reference_for_ipc, &value_for_ipc)
+                .map(Ok)
+        });
+        if let Err(refusal) = guarded {
+            return Ok(refusal.into_result());
+        }
     }
     let lookup_reference = reference.clone();
     let fp = ipc!(ctx, args, |c| {
@@ -3295,6 +4071,7 @@ pub(crate) fn pad_info_from_sexp(
     y: f64,
     rotation_deg: f64,
     net: String,
+    format_version: Option<i64>,
 ) -> anyhow::Result<konnect_ipc::IpcPad> {
     let number = pad
         .get(1)
@@ -3355,6 +4132,18 @@ pub(crate) fn pad_info_from_sexp(
         .find("roundrect_rratio")
         .and_then(|node| node.get_f64(1));
     let chamfer_ratio = pad.find("chamfer_ratio").and_then(|node| node.get_f64(1));
+    // The same reader placement uses, so the file and the live board describe
+    // a custom pad alike; what it cannot read is said, not left empty.
+    let custom = (shape.as_deref() == Some("custom")).then(|| parse_custom_pad(pad));
+    let (custom_anchor_shape, custom_primitives, custom_primitives_unreadable) = match custom {
+        Some(Ok(custom)) => (
+            Some(custom.anchor.token().to_string()),
+            Some(custom.primitives),
+            None,
+        ),
+        Some(Err(error)) => (None, None, Some(format!("{error:#}"))),
+        None => (None, None, None),
+    };
     let copper_layers = layers
         .iter()
         .filter(|layer| layer.as_str() == "*.Cu" || layer.ends_with(".Cu"))
@@ -3365,12 +4154,22 @@ pub(crate) fn pad_info_from_sexp(
             offset: offset.clone(),
             corner_rounding_ratio,
             chamfer_ratio,
+            custom_anchor_shape: custom_anchor_shape.clone(),
+            custom_primitives: custom_primitives.clone(),
+            custom_primitives_unreadable: custom_primitives_unreadable.clone(),
         })
         .collect();
     let uuid = pad
         .find_str("uuid")
         .filter(|uuid| !uuid.is_empty())
         .map(str::to_string);
+    // The reader placement uses; a file pad without the clause inherits.
+    let zone_connection = pad_zone_connection(pad)
+        .with_context(|| format!("pad '{number}' has an unreadable zone connection"))?
+        .unwrap_or(konnect_ipc::IpcPadZoneConnection::Inherited);
+    // As KiCad's parser leaves the pad, so it compares with the live readback.
+    let (thermal, thermal_spoke_angle_explicit) = pad_thermal(pad, format_version)
+        .with_context(|| format!("pad '{number}' has unreadable thermal settings"))?;
 
     Ok(konnect_ipc::IpcPad {
         uuid,
@@ -3385,41 +4184,225 @@ pub(crate) fn pad_info_from_sexp(
         size,
         drill: file_pad_drill(pad),
         copper_layers,
+        corner_rounding_ratio,
+        zone_connection: Some(zone_connection),
+        thermal: Some(thermal),
+        thermal_spoke_angle_explicit: Some(thermal_spoke_angle_explicit),
     })
 }
+
+/// An optional array of exact strings, for the pad filters.
+fn exact_strings(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, CallToolResult> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or_else(|| crate::tools::invalid_arg(key, "must be an array of strings")),
+        Some(_) => Err(crate::tools::invalid_arg(
+            key,
+            "must be an array of strings",
+        )),
+    }
+}
+
+/// The pad keys `detail: "connectivity"` keeps.
+const CONNECTIVITY_PAD_KEYS: [&str; 8] = [
+    "number",
+    "net",
+    "x",
+    "y",
+    "rotation_deg",
+    "pad_type",
+    "uuid",
+    "fabrication_property",
+];
 
 async fn handle_get_component_pads(
     args: &serde_json::Value,
     ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let detail = match args["detail"].as_str().unwrap_or("full") {
+        detail @ ("full" | "fabrication" | "connectivity") => detail,
+        other => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "detail".to_string(),
+                    reason: format!(
+                        "expected 'full', 'fabrication' or 'connectivity', got '{other}'"
+                    ),
+                },
+                "detail must be 'full', 'fabrication' or 'connectivity'.",
+            ))
+        }
+    };
+    let pad_numbers = match exact_strings(args, "pad_numbers") {
+        Ok(filter) => filter,
+        Err(refusal) => return Ok(refusal),
+    };
+    let nets = match exact_strings(args, "nets") {
+        Ok(filter) => filter,
+        Err(refusal) => return Ok(refusal),
+    };
+    let connectivity = detail == "connectivity";
+    let mut result = read_component_pads(args, ctx, connectivity).await?;
+    if result.is_error || (detail == "full" && pad_numbers.is_none() && nets.is_none()) {
+        return Ok(result);
+    }
+    for content in &mut result.content {
+        let crate::mcp::protocol::ToolContent::Text { text } = content else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let Some(pads) = value
+            .get_mut("pads")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let total = pads.len();
+        // The filters read the reported values, so they select exactly what
+        // the unfiltered answer would have said.
+        pads.retain(|pad| {
+            pad_numbers.as_ref().is_none_or(|numbers| {
+                pad["number"]
+                    .as_str()
+                    .is_some_and(|n| numbers.iter().any(|w| w == n))
+            }) && nets.as_ref().is_none_or(|nets| {
+                pad["net"]
+                    .as_str()
+                    .is_some_and(|n| nets.iter().any(|w| w == n))
+            })
+        });
+        let unmatched = |wanted: &Option<Vec<String>>, key: &str, pads: &[serde_json::Value]| {
+            wanted.as_ref().map(|wanted| {
+                wanted
+                    .iter()
+                    .filter(|w| !pads.iter().any(|p| p[key].as_str() == Some(w.as_str())))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let unmatched_numbers = unmatched(&pad_numbers, "number", pads);
+        let unmatched_nets = unmatched(&nets, "net", pads);
+        for pad in pads.iter_mut() {
+            if let Some(fields) = pad.as_object_mut() {
+                match detail {
+                    "fabrication" => {
+                        fields.retain(|name, _| name == "number" || name == "fabrication_property")
+                    }
+                    "connectivity" => {
+                        fields.retain(|name, _| CONNECTIVITY_PAD_KEYS.contains(&name.as_str()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let matched = pads.len();
+        if detail != "full" {
+            value["detail"] = json!(detail);
+            value["geometry_omitted"] = json!(true);
+        }
+        if pad_numbers.is_some() || nets.is_some() {
+            value["total_pad_count"] = json!(total);
+            value["matched_pad_count"] = json!(matched);
+            value["pad_count"] = json!(matched);
+            value["filters"] = json!({ "pad_numbers": pad_numbers, "nets": nets });
+            value["unmatched_pad_numbers"] = json!(unmatched_numbers);
+            value["unmatched_nets"] = json!(unmatched_nets);
+        }
+        *text = value.to_string();
+    }
+    Ok(result)
+}
+
+/// `context` adds the footprint's own pose, UUID, layer and library ID, and
+/// refuses a reference more than one saved footprint carries.
+async fn read_component_pads(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    context: bool,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let saved_only = match args["source"].as_str().unwrap_or("auto") {
+        "auto" => false,
+        "saved" => true,
+        other => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "source".to_string(),
+                    reason: format!("must be 'auto' or 'saved', got '{other}'"),
+                },
+                format!("Unknown source '{other}'. Expected 'auto' or 'saved'."),
+            ))
+        }
+    };
+    // What a live typed read can say about pad fabrication properties:
+    // nothing, which is not the same as "none".
+    let live_fabrication = json!({
+        "observable": false,
+        "status": crate::tools::footprint_fabrication::LIVE_TYPED_UNOBSERVABLE,
+        "note": "KiCad 10's Pad protobuf has no fabrication-property field. Save the board and \
+                 call again with source 'saved' to read them."
+    });
 
     // The board open in KiCad first: a part placed but not yet saved has no
     // pads in the file at all, so reading the file would either error or
     // answer about a stale board while the writers in this toolset act on the
     // live one. The file stays the fallback for an offline session.
     let ipc_reference = reference.clone();
-    let live = with_board_ipc_classified(ctx, &board_path, move |c, document| {
-        c.get_footprint_pads_in(document, &ipc_reference)
-    })
-    .await?;
+    let live = if saved_only {
+        // Asked for the saved file: no live read, whatever KiCad holds.
+        Err(konnect_ipc::IpcFailure::Unreachable(String::new()))
+    } else {
+        with_board_ipc_classified(ctx, &board_path, move |c, document| {
+            let pads = c.get_footprint_pads_in(document.clone(), &ipc_reference)?;
+            let poses = if context && pads.is_some() {
+                c.list_footprints_in(document)?
+                    .into_iter()
+                    .filter(|fp| fp.reference == ipc_reference)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(pads.map(|pads| (pads, poses)))
+        })
+        .await?
+    };
     match live {
         // KiCad has the part and reports pads for it.
-        Ok(Some(pads)) if !pads.is_empty() => {
+        Ok(Some((pads, poses))) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
                 .iter()
-                .map(|pad| serde_json::to_value(pad).expect("IpcPad is serializable"))
+                .map(|pad| {
+                    let mut value = serde_json::to_value(pad).expect("IpcPad is serializable");
+                    // Unknown, never "none": the live API cannot carry it.
+                    value["fabrication_property"] = serde_json::Value::Null;
+                    value
+                })
                 .collect();
-            return Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "reference": reference,
                 "pad_count": items.len(),
                 "pads": items,
-                "source": "ipc"
-            })));
+                "source": "ipc",
+                "pad_fabrication_properties": live_fabrication
+            });
+            if context {
+                body["footprint"] = live_footprint_context(&poses);
+            }
+            return Ok(CallToolResult::json(&body));
         }
         // KiCad has the part and reports no pads. A pad-less footprint is
         // legal — a logo, a mounting graphic — so this is not wrong by
@@ -3432,7 +4415,7 @@ async fn handle_get_component_pads(
         // "no pads" is refused until the next save. Preferring that to
         // silently reporting an unread response as an empty pad list is the
         // whole point — and the message says which key to press.
-        Ok(Some(_)) => {
+        Ok(Some((_, poses))) => {
             if saved_pad_count(&board_path, &reference).is_some_and(|count| count > 0) {
                 return Ok(CallToolResult::error(format!(
                     "KiCad reports no pads for footprint '{reference}' while the saved file \
@@ -3440,12 +4423,17 @@ async fn handle_get_component_pads(
                      retry, and report this if it persists."
                 )));
             }
-            return Ok(CallToolResult::json(&json!({
+            let mut body = json!({
                 "reference": reference,
                 "pad_count": 0,
                 "pads": [],
-                "source": "ipc"
-            })));
+                "source": "ipc",
+                "pad_fabrication_properties": live_fabrication
+            });
+            if context {
+                body["footprint"] = live_footprint_context(&poses);
+            }
+            return Ok(CallToolResult::json(&body));
         }
         // KiCad holds this board and does not have the part: the file may
         // still carry a footprint the user has deleted, so answering from it
@@ -3476,13 +4464,34 @@ async fn handle_get_component_pads(
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
 
-    // Find the footprint with matching reference
-    let fp_node = tree.find_all("footprint").into_iter().find(|fp| {
-        fp.find_all("property").iter().any(|p| {
-            p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                && p.get(2).and_then(|n| n.as_str()) == Some(reference.as_str())
-        })
-    });
+    // Find the footprint with matching reference, as a property or the
+    // older fp_text.
+    let matching: Vec<&konnect_sexp::SexpNode> = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|fp| footprint_reference(fp).as_deref() == Some(reference.as_str()))
+        .collect();
+    if context && matching.len() > 1 {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                target: reference.clone(),
+                candidates: matching
+                    .iter()
+                    .map(|fp| {
+                        crate::tools::footprint_fabrication::footprint_identity(fp)
+                            .unwrap_or("<no uuid>")
+                            .to_string()
+                    })
+                    .collect(),
+            },
+            format!(
+                "{} saved footprints carry reference '{reference}'; their pads cannot be told \
+                 apart by reference.",
+                matching.len()
+            ),
+        ));
+    }
+    let fp_node = matching.first().copied();
 
     let fp_node = match fp_node {
         Some(n) => n,
@@ -3498,6 +4507,8 @@ async fn handle_get_component_pads(
     let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
     let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
     let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
+    // KiCad parses the board's footprints under the greater of the two.
+    let format_version = sexp_format_version(&tree).max(sexp_format_version(fp_node));
 
     let mut pads = Vec::new();
     for pad in fp_node.find_all("pad") {
@@ -3542,6 +4553,7 @@ async fn handle_get_component_pads(
             board_y,
             rotation_deg,
             net.as_str().unwrap_or_default().to_string(),
+            format_version,
         ) {
             Ok(info) => info,
             Err(error) => {
@@ -3555,15 +4567,85 @@ async fn handle_get_component_pads(
         // typed pad uses a string for known/unconnected values; malformed
         // saved net nodes remain an explicit JSON null here.
         value["net"] = net;
+        // The saved pad's fabrication property, or "none" when the saved pad
+        // has none: KiCad writes the clause only for a property other than
+        // none, so its absence is the fact, not a gap in the read.
+        value["fabrication_property"] = json!(
+            crate::tools::footprint_fabrication::pad_fabrication_property(pad).unwrap_or("none")
+        );
         pads.push(value);
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "reference": reference,
         "pad_count": pads.len(),
         "pads": pads,
-        "source": "file"
-    })))
+        "source": "file",
+        "requested_source": if saved_only { "saved" } else { "auto" },
+        "pad_fabrication_properties": {
+            "observable": true,
+            "status": "read_from_saved_file",
+            "uuid": crate::tools::footprint_fabrication::footprint_identity(fp_node),
+            "note": "The saved board as last written; unsaved edits in an open KiCad are not \
+                     part of this read."
+        }
+    });
+    if context {
+        let mut pose = saved_footprint_json(fp_node);
+        pose["source"] = json!("file");
+        body["footprint"] = pose;
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+/// A live footprint's pose and identity, as the compact readers report it.
+fn live_footprint_context(poses: &[konnect_ipc::IpcFootprint]) -> serde_json::Value {
+    match poses {
+        [fp] => json!({
+            "reference": fp.reference,
+            "footprint": fp.footprint,
+            "uuid": fp.uuid,
+            "x": fp.position.x,
+            "y": fp.position.y,
+            "rotation": fp.rotation,
+            "layer": fp.layer,
+            "source": "ipc",
+        }),
+        _ => json!({
+            "unavailable": format!(
+                "KiCad's footprint list names {} footprints with this reference",
+                poses.len()
+            ),
+            "source": "ipc",
+        }),
+    }
+}
+
+/// A saved footprint's pose, identity and value, as `get_component_list` and
+/// the compact pad reader report it. Angles are the saved (at …) angle.
+fn saved_footprint_json(fp: &konnect_sexp::SexpNode) -> serde_json::Value {
+    let at = fp.find("at");
+    let value = fp
+        .find_all("property")
+        .into_iter()
+        .find(|p| p.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Value"))
+        .or_else(|| {
+            fp.find_all("fp_text")
+                .into_iter()
+                .find(|t| t.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("value"))
+        })
+        .and_then(|p| p.get(2))
+        .and_then(konnect_sexp::SexpNode::as_str);
+    json!({
+        "reference": footprint_reference(fp),
+        "value": value,
+        "footprint": fp.get(1).and_then(konnect_sexp::SexpNode::as_str),
+        "uuid": crate::tools::footprint_fabrication::footprint_identity(fp),
+        "x": at.and_then(|a| a.get_f64(1)),
+        "y": at.and_then(|a| a.get_f64(2)),
+        "rotation": at.map(|a| a.get_f64(3).unwrap_or(0.0)),
+        "layer": fp.find_str("layer"),
+    })
 }
 
 async fn handle_get_pad_position(
@@ -3606,25 +4688,101 @@ async fn handle_get_pad_position(
 }
 
 async fn handle_get_component_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fps = ipc!(ctx, _args, |c| c.list_footprints());
-    let items: Vec<serde_json::Value> = fps
-        .iter()
-        .map(|fp| {
-            json!({
-                "reference": fp.reference,
-                "value": fp.value,
-                "footprint": fp.footprint,
-                "x": fp.position.x, "y": fp.position.y,
-                "rotation": fp.rotation, "layer": fp.layer
+    let references = match exact_strings(args, "references") {
+        Ok(filter) => filter,
+        Err(refusal) => return Ok(refusal),
+    };
+    let saved = match args.get("source").and_then(serde_json::Value::as_str) {
+        None | Some("live") => false,
+        Some("saved") => true,
+        Some(other) => {
+            return Ok(crate::tools::invalid_arg(
+                "source",
+                &format!("must be 'live' or 'saved', got '{other}'"),
+            ))
+        }
+    };
+    let items: Vec<serde_json::Value> = if saved {
+        let board = get_path(args, "board")?;
+        let content = match read_consistent(&board) {
+            Ok(content) => content,
+            Err(error) => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::FileNotFound {
+                        path: board.display().to_string(),
+                    },
+                    format!("The saved board could not be read: {error}"),
+                ))
+            }
+        };
+        let tree = konnect_sexp::parser::parse_sexp(&content)?;
+        tree.find_all("footprint")
+            .into_iter()
+            .map(saved_footprint_json)
+            .collect()
+    } else {
+        let fps = ipc!(ctx, args, |c| c.list_footprints());
+        fps.iter()
+            .map(|fp| {
+                json!({
+                    "reference": fp.reference,
+                    "value": fp.value,
+                    "footprint": fp.footprint,
+                    "x": fp.position.x, "y": fp.position.y,
+                    "rotation": fp.rotation, "layer": fp.layer,
+                    "uuid": fp.uuid
+                })
             })
-        })
-        .collect();
-    Ok(CallToolResult::json(
-        &json!({ "count": items.len(), "components": items }),
-    ))
+            .collect()
+    };
+    let mut body = match &references {
+        None => json!({ "count": items.len(), "components": items }),
+        Some(wanted) => {
+            let kept: Vec<serde_json::Value> = items
+                .into_iter()
+                .filter(|item| {
+                    item["reference"]
+                        .as_str()
+                        .is_some_and(|r| wanted.iter().any(|w| w == r))
+                })
+                .collect();
+            let count_of = |reference: &str| {
+                kept.iter()
+                    .filter(|item| item["reference"].as_str() == Some(reference))
+                    .count()
+            };
+            let unknown: Vec<&String> = wanted.iter().filter(|w| count_of(w) == 0).collect();
+            let duplicate: Vec<&String> = wanted.iter().filter(|w| count_of(w) > 1).collect();
+            json!({
+                "count": kept.len(),
+                "components": kept,
+                "requested_count": wanted.len(),
+                "unknown_references": unknown,
+                "duplicate_references": duplicate,
+            })
+        }
+    };
+    if saved {
+        let board = get_path(args, "board")?;
+        body["source"] = json!("saved");
+        body["source_evidence"] = json!({
+            "board_state": crate::tools::board_source::FROM_SAVED_BOARD,
+            "excludes_unsaved_editor_state": true,
+            "reason": if ctx.board_session.was_observed_live(&board) {
+                "explicitly_requested_after_live_observation"
+            } else {
+                "explicitly_requested"
+            },
+            "detail": "source 'saved' was requested; KiCad was not consulted. Angles are the \
+                       saved (at …) angle.",
+        });
+    } else if references.is_some() {
+        body["source"] = json!("ipc");
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_place_array(
@@ -3809,7 +4967,14 @@ async fn handle_align_components(
         Err(e) => return Ok(e),
     };
 
+    let guard_board = board.clone();
     let aligned = match with_board_ipc_classified(ctx, &board, move |c, _| {
+        let names = references.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Err(refusal) =
+            guard_live_rebuild(c, &guard_board, "align_components", &names, NoLosslessPath)?
+        {
+            return Ok(Err(refusal));
+        }
         c.run_commit("Align footprints", |c| {
             references
                 .iter()
@@ -3827,10 +4992,12 @@ async fn handle_align_components(
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
         })
+        .map(Ok)
     })
     .await?
     {
-        Ok(aligned) => aligned,
+        Ok(Ok(aligned)) => aligned,
+        Ok(Err(refusal)) => return Ok(refusal.into_result()),
         Err(error) => return Ok(CallToolResult::error(format!("IPC align error: {error}"))),
     };
     Ok(CallToolResult::json(
@@ -6325,6 +7492,21 @@ mod tests {
                     angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
                         value_degrees: 105.0,
                     }),
+                    // KiCad reports zone settings on every pad, inherited
+                    // ones included, and always the spoke angle.
+                    zone_settings: Some(konnect_ipc::gen::kiapi::board::types::ZoneConnectionSettings {
+                        zone_connection:
+                            konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle::ZcsInherited
+                                as i32,
+                        thermal_spokes: Some(
+                            konnect_ipc::gen::kiapi::board::types::ThermalSpokeSettings {
+                                angle: Some(konnect_ipc::gen::kiapi::common::types::Angle {
+                                    value_degrees: 90.0,
+                                }),
+                                ..Default::default()
+                            },
+                        ),
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -6486,6 +7668,78 @@ mod tests {
 
     fn parsed(res: &CallToolResult) -> serde_json::Value {
         serde_json::from_str(&result_text(res)).expect("json result")
+    }
+
+    /// The compact live answers: every physical pad with a requested number
+    /// (two share "1" here), the footprint's live pose, fabrication properties
+    /// unknown rather than "none", and the list filter's unknown/duplicate split.
+    #[tokio::test]
+    async fn compact_live_pads_and_filtered_list_report_what_kicad_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![
+                live_footprint(
+                    "R1",
+                    vec![
+                        live_pad("1", 101.0, 66.0, "/VBUS"),
+                        live_pad("1", 102.0, 66.0, "/VBUS"),
+                        live_pad("2", 103.0, 66.0, "GND"),
+                    ],
+                ),
+                live_footprint("R2", vec![live_pad("1", 1.0, 1.0, "GND")]),
+                live_footprint("R2", vec![live_pad("1", 2.0, 2.0, "GND")]),
+            ],
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1",
+                     "detail": "connectivity", "pad_numbers": ["1", "9"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{}", result_text(&res));
+        let body = parsed(&res);
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["total_pad_count"], 3);
+        assert_eq!(body["matched_pad_count"], 2);
+        assert_eq!(body["unmatched_pad_numbers"], json!(["9"]));
+        assert_eq!(body["pads"][1]["x"], 102.0);
+        assert!(body["pads"][0]["fabrication_property"].is_null());
+        assert_eq!(body["pad_fabrication_properties"]["observable"], false);
+        assert!(body["pads"][0].get("copper_layers").is_none());
+        assert_eq!(body["footprint"]["x"], 100.0);
+        assert_eq!(body["footprint"]["source"], "ipc");
+
+        // An explicit saved read answers from the file even while KiCad holds it.
+        let saved = parsed(
+            &handle_get_component_pads(
+                &json!({ "board": board.to_string_lossy(), "reference": "R1",
+                         "detail": "connectivity", "source": "saved" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(saved["source"], "file");
+        assert_eq!(saved["pads"][0]["net"], "SAVED");
+        assert_eq!(saved["footprint"]["rotation"], 90.0);
+
+        let list = parsed(
+            &handle_get_component_list(
+                &json!({ "board": board.to_string_lossy(), "references": ["R1", "R2", "R9"] }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(list["source"], "ipc");
+        assert_eq!(list["count"], 3);
+        assert_eq!(list["unknown_references"], json!(["R9"]));
+        assert_eq!(list["duplicate_references"], json!(["R2"]));
     }
 
     #[tokio::test]
@@ -6687,6 +7941,863 @@ mod tests {
         assert_eq!(body["pads"][0]["copper_layers"][1]["shape"], "circle");
         assert_eq!(body["pads"][0]["copper_layers"][2]["layer"], "B.Cu");
         assert_eq!(body["pads"][0]["copper_layers"][2]["shape"], "rect");
+    }
+
+    // ─── Custom-shape pads through the typed placement path ────────────────
+
+    const TEXAS_CUSTOM_PADS: &str =
+        include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod");
+    const GENERIC_CUSTOM_PADS: &str =
+        include_str!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod");
+
+    use crate::test_support::without_heatsink_property as carried;
+
+    /// The exposed pad's fabrication property has no field in KiCad 10's pad
+    /// message, so placing the stock footprints would put a pad on the board
+    /// that is not the library's. The shared parser refuses it by name before
+    /// anything is built.
+    #[test]
+    fn byte_exact_custom_pad_fixtures_refuse_the_heatsink_property_by_name() {
+        for source in [TEXAS_CUSTOM_PADS, GENERIC_CUSTOM_PADS] {
+            let error = format!("{:#}", extract_pad_definitions(source).unwrap_err());
+            assert!(
+                error.contains("pad '21'") && error.contains("pad_prop_heatsink"),
+                "{error}"
+            );
+        }
+    }
+
+    /// `(zone_connect 2)` on the fixtures' exposed pad is read, built into the
+    /// pad stack's own zone settings (not the per-layer field the protocol
+    /// reserves) and every other pad, which leaves it out, stays inherited:
+    /// no zone settings are sent for it.
+    #[test]
+    fn fixture_zone_connect_reaches_the_pad_stack_and_absence_stays_inherited() {
+        use konnect_ipc::gen::kiapi::board::types::{PadStackShape, ZoneConnectionStyle};
+        for source in [TEXAS_CUSTOM_PADS, GENERIC_CUSTOM_PADS] {
+            let pads = extract_pad_definitions(&carried(source)).unwrap();
+            for pad in &pads {
+                let want = (pad.number == "21").then_some(konnect_ipc::IpcPadZoneConnection::Solid);
+                assert_eq!(pad.zone_connection, want, "pad '{}'", pad.number);
+            }
+            let built = built_pads(&build_at(&pads, 10.0, 20.0, 37.0).unwrap());
+            for pad in &built {
+                let stack = pad.pad_stack.as_ref().unwrap();
+                assert!(stack
+                    .copper_layers
+                    .iter()
+                    .all(|layer| layer.zone_settings.is_none()));
+                // Every file pad goes out with the spoke angle KiCad's parser
+                // gives it (none of these write one): 45° for a custom pad
+                // on a circle anchor in a 20260206 file, 90° for a rounded
+                // or plain rectangle. No width or gap override is invented.
+                let settings = stack.zone_settings.as_ref().unwrap();
+                assert_eq!(
+                    settings.zone_connection,
+                    if pad.number == "21" {
+                        ZoneConnectionStyle::ZcsFull
+                    } else {
+                        ZoneConnectionStyle::ZcsInherited
+                    } as i32,
+                    "pad '{}'",
+                    pad.number
+                );
+                let spokes = settings.thermal_spokes.unwrap();
+                assert_eq!((spokes.width, spokes.gap), (None, None));
+                let copper = &stack.copper_layers[0];
+                let want_angle = if copper.shape == PadStackShape::PssCustom as i32 {
+                    assert_eq!(copper.custom_anchor_shape, PadStackShape::PssCircle as i32);
+                    45.0
+                } else {
+                    assert!(
+                        [PadStackShape::PssRoundrect, PadStackShape::PssRectangle]
+                            .map(|shape| shape as i32)
+                            .contains(&copper.shape),
+                        "pad '{}'",
+                        pad.number
+                    );
+                    90.0
+                };
+                assert_eq!(
+                    spokes.angle.map(|angle| angle.value_degrees),
+                    Some(want_angle),
+                    "pad '{}'",
+                    pad.number
+                );
+            }
+        }
+    }
+
+    fn thermal_footprint(version: &str, pad: &str) -> String {
+        format!("(footprint \"X\" {version} (layer \"F.Cu\") {pad})")
+    }
+
+    fn thermal_roundrect(clauses: &str) -> String {
+        format!(
+            "(pad \"1\" smd roundrect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") \
+             (roundrect_rratio 0.25) {clauses} (uuid \"u\"))"
+        )
+    }
+
+    fn thermal_custom(anchor: &str, clauses: &str) -> String {
+        format!(
+            "(pad \"2\" smd custom (at 0 0) (size 0.5 0.5) (layers \"F.Cu\" \"F.Mask\") \
+             {clauses} (options (clearance outline) (anchor {anchor})) (primitives (gr_poly \
+             (pts (xy -1 -1) (xy 1 -1) (xy 1 1)) (width 0) (fill yes))) (uuid \"v\"))"
+        )
+    }
+
+    const KICAD10_FORMAT: &str = "(version 20260206)";
+
+    /// The spokes one built pad carries.
+    fn built_spokes(
+        pads: &[konnect_ipc::IpcPadDefinition],
+    ) -> konnect_ipc::gen::kiapi::board::types::ZoneConnectionSettings {
+        built_pads(&build_at(pads, 10.0, 20.0, 37.0).unwrap())[0]
+            .pad_stack
+            .as_ref()
+            .unwrap()
+            .zone_settings
+            .unwrap()
+    }
+
+    /// A pad's thermal clauses travel exactly as KiCad's parser holds them:
+    /// an explicit zero stays zero, an unwritten width or gap stays unset,
+    /// and the angle is the written one or the parser's shape default
+    /// (`PCB_IO_KICAD_SEXPR_PARSER::parsePAD`), which also depends on the
+    /// file format for a circle-anchored custom pad.
+    #[test]
+    fn pad_thermal_clauses_travel_exactly_and_absence_stays_unset() {
+        use konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle;
+        use konnect_ipc::gen::kiapi::common::types::Distance;
+
+        let source = thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_roundrect(
+                "(thermal_bridge_width 0) (thermal_gap 0.3) (thermal_bridge_angle 30)",
+            ),
+        );
+        let pads = extract_pad_definitions(&source).unwrap();
+        assert_eq!(
+            pads[0].thermal,
+            konnect_ipc::IpcPadThermal {
+                spoke_width: Some(0.0),
+                gap: Some(0.3),
+                spoke_angle: Some(30.0),
+            }
+        );
+        let settings = built_spokes(&pads);
+        assert_eq!(
+            settings.zone_connection,
+            ZoneConnectionStyle::ZcsInherited as i32
+        );
+        let spokes = settings.thermal_spokes.unwrap();
+        assert_eq!(spokes.width, Some(Distance { value_nm: 0 }));
+        assert_eq!(spokes.gap, Some(Distance { value_nm: 300_000 }));
+        assert_eq!(spokes.angle.map(|angle| angle.value_degrees), Some(30.0));
+
+        // KiCad's legacy spelling of the width.
+        let legacy = thermal_footprint(KICAD10_FORMAT, &thermal_roundrect("(thermal_width 0.25)"));
+        assert_eq!(
+            extract_pad_definitions(&legacy).unwrap()[0]
+                .thermal
+                .spoke_width,
+            Some(0.25)
+        );
+
+        let circle = "(pad \"3\" thru_hole circle (at 0 0) (size 2 2) (drill 1) \
+                      (layers \"*.Cu\" \"*.Mask\") (uuid \"w\"))";
+        for (pad, version, angle) in [
+            (thermal_roundrect(""), KICAD10_FORMAT, 90.0),
+            (circle.to_string(), KICAD10_FORMAT, 45.0),
+            (thermal_custom("circle", ""), KICAD10_FORMAT, 45.0),
+            (thermal_custom("rect", ""), KICAD10_FORMAT, 90.0),
+            (thermal_custom("circle", ""), "(version 20211014)", 90.0),
+            (thermal_custom("circle", ""), "(version 20211015)", 45.0),
+            (thermal_custom("circle", ""), "", 90.0),
+        ] {
+            let pads = extract_pad_definitions(&thermal_footprint(version, &pad)).unwrap();
+            let thermal = pads[0].thermal;
+            assert_eq!(
+                (thermal.spoke_width, thermal.gap, thermal.spoke_angle),
+                (None, None, Some(angle)),
+                "{version} {pad}"
+            );
+            let spokes = built_spokes(&pads).thermal_spokes.unwrap();
+            assert_eq!((spokes.width, spokes.gap), (None, None), "{pad}");
+            assert_eq!(
+                spokes.angle.map(|angle| angle.value_degrees),
+                Some(angle),
+                "{version} {pad}"
+            );
+        }
+
+        // An explicit angle equal to the default is still the written one.
+        let written = thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_custom("rect", "(thermal_bridge_angle 45)"),
+        );
+        assert_eq!(
+            extract_pad_definitions(&written).unwrap()[0]
+                .thermal
+                .spoke_angle,
+            Some(45.0)
+        );
+    }
+
+    /// The file readback reports the thermal settings KiCad's parser holds,
+    /// and says whether the angle was written or defaulted.
+    #[test]
+    fn file_pad_readback_reports_thermal_settings_and_their_source() {
+        let readback = |source: &str| {
+            let root = konnect_sexp::parse_sexp(source).unwrap();
+            let pad = root.find("pad").unwrap();
+            serde_json::to_value(
+                pad_info_from_sexp(
+                    pad,
+                    0.0,
+                    0.0,
+                    0.0,
+                    String::new(),
+                    sexp_format_version(&root),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let written = readback(&thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_roundrect(
+                "(thermal_bridge_width 0) (thermal_gap 0.3) (thermal_bridge_angle 30)",
+            ),
+        ));
+        assert_eq!(
+            written["thermal"],
+            json!({ "spoke_width": 0.0, "gap": 0.3, "spoke_angle": 30.0 })
+        );
+        assert_eq!(written["thermal_spoke_angle_explicit"], json!(true));
+
+        let defaulted = readback(&thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_custom("rect", ""),
+        ));
+        assert_eq!(defaulted["thermal"], json!({ "spoke_angle": 90.0 }));
+        assert_eq!(defaulted["thermal_spoke_angle_explicit"], json!(false));
+    }
+
+    /// Every malformed, repeated, non-finite or uncarriable thermal clause is
+    /// refused by name before anything is built.
+    #[test]
+    fn malformed_or_uncarriable_thermal_clauses_are_refused_by_name() {
+        for (clauses, named) in [
+            (
+                "(thermal_gap 0.3) (thermal_gap 0.3)",
+                "2 (thermal_gap …) clauses",
+            ),
+            (
+                "(thermal_width 0.2) (thermal_bridge_width 0.2)",
+                "thermal_bridge_width",
+            ),
+            (
+                "(thermal_bridge_angle 30) (thermal_bridge_angle 30)",
+                "thermal_bridge_angle",
+            ),
+            ("(thermal_gap 0.3 0.4)", "exactly one bare number"),
+            ("(thermal_gap (x 1))", "exactly one bare number"),
+            ("(thermal_gap \"0.3\")", "exactly one bare number"),
+            ("(thermal_gap)", "exactly one bare number"),
+            ("(thermal_gap abc)", "not a number"),
+            ("(thermal_bridge_angle nan)", "not finite"),
+            ("(thermal_bridge_angle inf)", "not finite"),
+            ("(thermal_bridge_width -0.1)", "negative"),
+            ("(thermal_gap 5000)", "board-unit range"),
+        ] {
+            let source = thermal_footprint(KICAD10_FORMAT, &thermal_roundrect(clauses));
+            let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+            assert!(
+                error.contains(named) && error.contains("pad '1'"),
+                "{clauses}: {error}"
+            );
+        }
+        // The other uncarried clauses are still refused beside them.
+        let source = thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_roundrect("(thermal_gap 0.3) (property pad_prop_heatsink)"),
+        );
+        let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+        assert!(error.contains("pad_prop_heatsink"), "{error}");
+        let source = thermal_footprint(
+            KICAD10_FORMAT,
+            &thermal_custom("circle", "(thermal_bridge_angle 45)")
+                .replace("(clearance outline)", "(clearance convexhull)"),
+        );
+        let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+        assert!(error.contains("convexhull"), "{error}");
+    }
+
+    /// Each value KiCad writes, from the KiCad-written zone-connect fixtures,
+    /// maps to its protocol style; malformed and undefined values are refused,
+    /// not read as inherited.
+    #[test]
+    fn pad_zone_connect_maps_every_kicad_value_and_refuses_the_rest() {
+        use konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle as Style;
+        use konnect_ipc::IpcPadZoneConnection as Zone;
+        let fixtures = [
+            (
+                include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod"),
+                [Some(Zone::Solid); 3],
+            ),
+            (
+                include_str!("../../tests/fixtures/pad_zone_connect_thermal_kicad10.kicad_mod"),
+                [Some(Zone::Thermal); 3],
+            ),
+            (
+                include_str!("../../tests/fixtures/pad_zone_connect_inherited_kicad10.kicad_mod"),
+                [None; 3],
+            ),
+            (
+                include_str!("../../tests/fixtures/pad_zone_connect_first_none_kicad10.kicad_mod"),
+                [Some(Zone::None), None, None],
+            ),
+        ];
+        for (source, want) in fixtures {
+            let pads = extract_pad_definitions(source).unwrap();
+            assert_eq!(
+                pads.iter()
+                    .map(|pad| pad.zone_connection)
+                    .collect::<Vec<_>>(),
+                want
+            );
+            // The file reader inspection shares reports the same, with
+            // absence spelled out as inherited.
+            let root = konnect_sexp::parse_sexp(source).unwrap();
+            for (pad, want) in root.find_all("pad").into_iter().zip(want) {
+                let info = pad_info_from_sexp(pad, 0.0, 0.0, 0.0, String::new(), None).unwrap();
+                assert_eq!(info.zone_connection, Some(want.unwrap_or(Zone::Inherited)));
+            }
+        }
+
+        for (value, zone, style) in [
+            (-1, Zone::Inherited, Style::ZcsInherited),
+            (0, Zone::None, Style::ZcsNone),
+            (1, Zone::Thermal, Style::ZcsThermal),
+            (2, Zone::Solid, Style::ZcsFull),
+            (3, Zone::PthThermal, Style::ZcsPthThermal),
+        ] {
+            assert_eq!(Zone::from_file_value(value), Some(zone));
+            assert_eq!(zone.file_value(), value);
+            assert_eq!(zone.to_proto(), style);
+            assert_eq!(Zone::from_proto(style as i32), Some(zone));
+        }
+        assert_eq!(Zone::from_proto(Style::ZcsUnknown as i32), None);
+
+        let base = include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+        for bad in [
+            "(zone_connect 4)",
+            "(zone_connect -2)",
+            "(zone_connect solid)",
+            "(zone_connect \"2\")",
+            "(zone_connect 2.0)",
+            "(zone_connect)",
+            "(zone_connect 2 2)",
+            "(zone_connect 2) (zone_connect 2)",
+        ] {
+            let source = base.replacen("(zone_connect 2)", bad, 1);
+            let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+            assert!(error.contains("zone connection"), "{bad}: {error}");
+            let root = konnect_sexp::parse_sexp(&source).unwrap();
+            let pad = root.find("pad").unwrap();
+            assert!(
+                pad_info_from_sexp(pad, 0.0, 0.0, 0.0, String::new(), None).is_err(),
+                "{bad} must not be inspected as a connection"
+            );
+        }
+    }
+
+    /// Pad clauses the typed path has no field for are refused by name, while
+    /// the ones it carries or that are not pad semantics are accepted.
+    #[test]
+    fn pad_clauses_the_typed_path_cannot_carry_are_refused() {
+        let pad = |clauses: &str| {
+            format!(
+                "(footprint \"X\" (layer \"F.Cu\") (pad \"1\" smd roundrect (at 0 0) \
+                 (size 1 1) (layers \"F.Cu\" \"F.Mask\") (roundrect_rratio 0.25) {clauses} \
+                 (uuid \"u\")))"
+            )
+        };
+        assert!(extract_pad_definitions(&pad("(zone_connect 1) (pinfunction \"A\")")).is_ok());
+        assert!(extract_pad_definitions(&pad("(remove_unused_layers no)")).is_ok());
+        for (clause, named) in [
+            ("(property pad_prop_bga)", "pad_prop_bga"),
+            ("(solder_mask_margin 0.05)", "solder_mask_margin"),
+            ("(solder_paste_margin -0.02)", "solder_paste_margin"),
+            ("(clearance 0.2)", "clearance"),
+            ("(chamfer_ratio 0.2)", "chamfer_ratio"),
+            ("(remove_unused_layers yes)", "remove_unused_layers yes"),
+            ("(options (anchor rect))", "options"),
+            ("locked", "locked"),
+        ] {
+            let error = format!("{:#}", extract_pad_definitions(&pad(clause)).unwrap_err());
+            assert!(error.contains(named), "{clause}: {error}");
+        }
+        let offset = "(footprint \"X\" (pad \"1\" thru_hole circle (at 0 0) (size 2 2) \
+                      (drill 1 (offset 0.1 0)) (layers \"*.Cu\")))";
+        let error = format!("{:#}", extract_pad_definitions(offset).unwrap_err());
+        assert!(error.contains("drill clause 'offset'"), "{error}");
+    }
+
+    /// The pads of a built `FootprintInstance`, decoded.
+    fn built_pads(item: &prost_types::Any) -> Vec<konnect_ipc::gen::kiapi::board::types::Pad> {
+        use konnect_ipc::gen::kiapi;
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("a FootprintInstance");
+        footprint
+            .definition
+            .expect("a definition")
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .map(|child| kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap())
+            .collect()
+    }
+
+    fn build_at(
+        pads: &[konnect_ipc::IpcPadDefinition],
+        x: f64,
+        y: f64,
+        rotation: f64,
+    ) -> anyhow::Result<prost_types::Any> {
+        KiCadIpcClient::build_footprint_item(
+            "Lib:Part",
+            "U1",
+            "part",
+            pads,
+            &[],
+            &Default::default(),
+            x,
+            y,
+            rotation,
+            "F.Cu",
+        )
+    }
+
+    /// The polygon of a pad's single primitive, in nm, as sent.
+    fn polygon_nm(
+        shape: &konnect_ipc::gen::kiapi::board::types::BoardGraphicShape,
+    ) -> Vec<(i64, i64)> {
+        use konnect_ipc::gen::kiapi::common::types::{graphic_shape::Geometry, poly_line_node};
+        let Some(Geometry::Polygon(set)) = shape.shape.as_ref().unwrap().geometry.as_ref() else {
+            panic!("expected a polygon primitive, got {shape:?}");
+        };
+        assert_eq!(set.polygons.len(), 1);
+        assert!(set.polygons[0].holes.is_empty());
+        set.polygons[0]
+            .outline
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|node| match node.geometry.as_ref().unwrap() {
+                poly_line_node::Geometry::Point(p) => (p.x_nm, p.y_nm),
+                other => panic!("unexpected arc node {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Both stock KiCad 10 fixtures, which #657 refused, now parse with every
+    /// pad kept: eight custom corner pads each, their primitives exact.
+    #[test]
+    fn stock_custom_pad_footprints_parse_with_every_pad_and_primitive() {
+        for (source, paste_only) in [(TEXAS_CUSTOM_PADS, 1), (GENERIC_CUSTOM_PADS, 4)] {
+            let pads = extract_pad_definitions(&carried(source)).unwrap();
+            assert_eq!(pads.len(), 21 + paste_only, "every pad, numbered or not");
+            let custom: Vec<_> = pads.iter().filter(|pad| pad.shape == "custom").collect();
+            assert_eq!(
+                custom
+                    .iter()
+                    .map(|pad| pad.number.as_str())
+                    .collect::<Vec<_>>(),
+                ["1", "5", "6", "10", "11", "15", "16", "20"]
+            );
+            for pad in &custom {
+                let shape = pad.custom.as_ref().expect("custom pads carry primitives");
+                assert_eq!(shape.anchor, konnect_ipc::IpcCustomPadAnchor::Circle);
+                assert_eq!(shape.primitives.len(), 1);
+                assert!(matches!(
+                    &shape.primitives[0],
+                    konnect_ipc::IpcPadPrimitive::Polygon { points, filled: true, .. }
+                        if points.len() == 5
+                ));
+                assert_eq!(pad.layers, ["F.Cu", "F.Mask", "F.Paste"]);
+            }
+            assert!(pads
+                .iter()
+                .filter(|pad| pad.shape != "custom")
+                .all(|pad| pad.custom.is_none()));
+            let paste: Vec<_> = pads.iter().filter(|pad| pad.number.is_empty()).collect();
+            assert_eq!(paste.len(), paste_only);
+            assert!(paste.iter().all(|pad| pad.layers == ["F.Paste"]));
+        }
+
+        let texas = extract_pad_definitions(&carried(TEXAS_CUSTOM_PADS)).unwrap();
+        let pad1 = texas.iter().find(|pad| pad.number == "1").unwrap();
+        assert_eq!(
+            pad1.custom.as_ref().unwrap().primitives[0],
+            konnect_ipc::IpcPadPrimitive::Polygon {
+                points: vec![
+                    (-0.4275, -0.09),
+                    (0.253358, -0.09),
+                    (0.4275, 0.084142),
+                    (0.4275, 0.09),
+                    (-0.4275, 0.09),
+                ],
+                width: 0.02,
+                filled: true,
+            }
+        );
+    }
+
+    /// The real fixture through the actual `FootprintInstance` builder, placed
+    /// translated and rotated: the pad moves and turns with the footprint, the
+    /// primitive stays exactly pad-local (KiCad applies the pad transform to
+    /// it, so applying it here too would move the copper twice), and the
+    /// paste-only pads keep their single layer.
+    #[test]
+    fn stock_custom_pads_survive_the_typed_builder_pad_local() {
+        use konnect_ipc::gen::kiapi::board::types::{BoardLayer, PadStackShape};
+        let pads = extract_pad_definitions(&carried(TEXAS_CUSTOM_PADS)).unwrap();
+        let item = build_at(&pads, 100.0, 50.0, 90.0).unwrap();
+        let built = built_pads(&item);
+        assert_eq!(built.len(), pads.len(), "no pad is dropped");
+
+        let pad1 = built.iter().find(|pad| pad.number == "1").unwrap();
+        let (bx, by) = konnect_sexp::geometry::transform_pad(-1.4375, -0.9, 100.0, 50.0, 90.0);
+        let position = pad1.position.unwrap();
+        assert_eq!(
+            (position.x_nm, position.y_nm),
+            (
+                konnect_ipc::builders::mm_to_nm(bx),
+                konnect_ipc::builders::mm_to_nm(by)
+            )
+        );
+        let stack = pad1.pad_stack.as_ref().unwrap();
+        assert_eq!(stack.angle.as_ref().unwrap().value_degrees, 90.0);
+        assert_eq!(
+            stack.layers,
+            [
+                BoardLayer::BlFCu as i32,
+                BoardLayer::BlFMask as i32,
+                BoardLayer::BlFPaste as i32
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+        let [copper] = stack.copper_layers.as_slice() else {
+            panic!("one copper entry for a normal stack");
+        };
+        assert_eq!(copper.layer, BoardLayer::BlFCu as i32);
+        assert_eq!(copper.shape, PadStackShape::PssCustom as i32);
+        assert_eq!(copper.custom_anchor_shape, PadStackShape::PssCircle as i32);
+        assert_eq!(copper.size.unwrap().x_nm, 72_721);
+        assert_eq!(copper.custom_shapes.len(), 1);
+        assert_eq!(
+            polygon_nm(&copper.custom_shapes[0]),
+            [
+                (-427_500, -90_000),
+                (253_358, -90_000),
+                (427_500, 84_142),
+                (427_500, 90_000),
+                (-427_500, 90_000)
+            ],
+            "pad-local and exact to the nanometre"
+        );
+        let attributes = copper.custom_shapes[0]
+            .shape
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            attributes.stroke.as_ref().unwrap().width.unwrap().value_nm,
+            20_000
+        );
+        assert_eq!(
+            attributes.fill.as_ref().unwrap().fill_type,
+            konnect_ipc::gen::kiapi::common::types::GraphicFillType::GftFilled as i32
+        );
+
+        // Another placement changes the pad, never its primitives.
+        let elsewhere = built_pads(&build_at(&pads, -7.0, 3.0, 215.0).unwrap());
+        let moved = elsewhere.iter().find(|pad| pad.number == "1").unwrap();
+        assert_ne!(moved.position, pad1.position);
+        assert_eq!(
+            moved.pad_stack.as_ref().unwrap().copper_layers[0].custom_shapes,
+            copper.custom_shapes
+        );
+
+        let paste: Vec<_> = built.iter().filter(|pad| pad.number.is_empty()).collect();
+        assert_eq!(paste.len(), 1);
+        assert_eq!(
+            paste[0].pad_stack.as_ref().unwrap().layers,
+            [BoardLayer::BlFPaste as i32]
+        );
+
+        // Ordinary pads are built as before: no primitives, anchor = shape.
+        let pad2 = built.iter().find(|pad| pad.number == "2").unwrap();
+        let ordinary = &pad2.pad_stack.as_ref().unwrap().copper_layers[0];
+        assert_eq!(ordinary.shape, PadStackShape::PssRoundrect as i32);
+        assert_eq!(
+            ordinary.custom_anchor_shape,
+            PadStackShape::PssRoundrect as i32
+        );
+        assert!(ordinary.custom_shapes.is_empty());
+    }
+
+    /// One custom pad of every supported primitive type, on a rect anchor, a
+    /// rotated pad and a rotated, translated footprint.
+    const MIXED_CUSTOM_PAD: &str = r#"(footprint "Mixed"
+	(layer "F.Cu")
+	(pad "7" smd custom
+		(at 1.5 -2 30)
+		(size 0.4 0.3)
+		(layers "F.Cu" "F.Mask")
+		(options
+			(clearance outline)
+			(anchor rect)
+		)
+		(primitives
+			(gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 0.5)) (width 0) (fill yes))
+			(gr_rect (start -0.5 -0.25) (end 0.25 0.5) (stroke (width 0.05) (type solid)) (fill no))
+			(gr_circle (center 0.1 0.2) (end 0.4 0.2) (width 0.03) (fill yes))
+			(gr_line (start -1 0) (end -0.2 0.3) (width 0.1))
+			(gr_arc (start 0 -0.6) (mid 0.3 -0.3) (end 0 0) (width 0.08))
+		)
+	)
+	(pad "" smd custom
+		(at 0 0)
+		(size 0.2 0.2)
+		(layers "F.Paste")
+		(options (anchor circle))
+		(primitives (gr_poly (pts (xy -0.3 -0.3) (xy 0.3 -0.3) (xy 0.3 0.3) (xy -0.3 0.3)) (width 0) (fill yes)))
+	)
+)"#;
+
+    #[test]
+    fn every_supported_primitive_is_carried_pad_local_on_a_rotated_pad() {
+        use konnect_ipc::gen::kiapi::board::types::{BoardLayer, PadStackShape};
+        use konnect_ipc::IpcPadPrimitive as P;
+
+        let pads = extract_pad_definitions(MIXED_CUSTOM_PAD).unwrap();
+        let expected = vec![
+            P::Polygon {
+                points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 0.5)],
+                width: 0.0,
+                filled: true,
+            },
+            P::Rect {
+                start: (-0.5, -0.25),
+                end: (0.25, 0.5),
+                width: 0.05,
+                filled: false,
+            },
+            P::Circle {
+                center: (0.1, 0.2),
+                end: (0.4, 0.2),
+                width: 0.03,
+                filled: true,
+            },
+            P::Segment {
+                start: (-1.0, 0.0),
+                end: (-0.2, 0.3),
+                width: 0.1,
+            },
+            P::Arc {
+                start: (0.0, -0.6),
+                mid: (0.3, -0.3),
+                end: (0.0, 0.0),
+                width: 0.08,
+            },
+        ];
+        let custom = pads[0].custom.as_ref().unwrap();
+        assert_eq!(custom.anchor, konnect_ipc::IpcCustomPadAnchor::Rect);
+        assert_eq!(custom.primitives, expected);
+
+        let built = built_pads(&build_at(&pads, 10.0, 20.0, -45.0).unwrap());
+        let stack = built[0].pad_stack.as_ref().unwrap();
+        assert_eq!(stack.angle.as_ref().unwrap().value_degrees, -15.0);
+        let (bx, by) = konnect_sexp::geometry::transform_pad(1.5, -2.0, 10.0, 20.0, -45.0);
+        assert_eq!(
+            built[0].position.unwrap(),
+            konnect_ipc::builders::vec2(bx, by)
+        );
+        let copper = &stack.copper_layers[0];
+        assert_eq!(
+            copper.custom_anchor_shape,
+            PadStackShape::PssRectangle as i32
+        );
+        // Read back with the inverse reader: every primitive unchanged.
+        let round_trip = copper
+            .custom_shapes
+            .iter()
+            .map(|shape| konnect_ipc::builders::pad_primitive_from_proto(shape).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(round_trip, expected);
+
+        // A paste-only custom pad keeps exactly its one layer and its copper.
+        let paste = built[1].pad_stack.as_ref().unwrap();
+        assert_eq!(paste.layers, [BoardLayer::BlFPaste as i32]);
+        assert_eq!(paste.copper_layers[0].custom_shapes.len(), 1);
+    }
+
+    /// Everything the typed path cannot carry exactly is refused with a
+    /// reason naming the pad and what to change, never approximated.
+    #[test]
+    fn unrepresentable_custom_pads_are_refused_by_name() {
+        let pad = |options: &str, primitives: &str| {
+            format!(
+                "(footprint \"X\" (layer \"F.Cu\") (pad \"3\" smd custom (at 0 0) (size 0.2 0.2) \
+                 (layers \"F.Cu\" \"F.Mask\") {options} (primitives {primitives})))"
+            )
+        };
+        let ok_options = "(options (clearance outline) (anchor circle))";
+        let square = "(gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1) (xy 0 1)) (width 0) (fill yes))";
+        let cases = [
+            (
+                pad("(options (clearance convexhull) (anchor circle))", square),
+                "clearance convexhull",
+            ),
+            (pad("", square), "no (options"),
+            (pad("(options (clearance outline))", square), "no anchor"),
+            (pad("(options (anchor oval))", square), "anchor 'oval'"),
+            (pad("(options (anchor rect) (thermal 1))", square), "option 'thermal'"),
+            (
+                pad(
+                    ok_options,
+                    "(gr_poly (pts (xy 0 0) (arc (start 1 0) (mid 1.2 0.5) (end 1 1)) (xy 0 1)) (width 0) (fill yes))",
+                ),
+                "curved (arc",
+            ),
+            (
+                pad(ok_options, "(gr_curve (pts (xy 0 0) (xy 1 0) (xy 1 1) (xy 0 1)) (width 0.1))"),
+                "bezier",
+            ),
+            (
+                pad(ok_options, "(gr_bbox (start 0 0) (end 1 1))"),
+                "annotation",
+            ),
+            (pad(ok_options, "(gr_blob (start 0 0))"), "primitive type 'gr_blob'"),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (fill yes))"),
+                "no width",
+            ),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (width 0))"),
+                "no (fill",
+            ),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0) (xy NaN 1)) (width 0) (fill yes))"),
+                "not finite",
+            ),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0) (xy 2 0)) (width 0) (fill yes))"),
+                "no area",
+            ),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0)) (width 0) (fill yes))"),
+                "at least 3",
+            ),
+            (
+                pad(ok_options, "(gr_circle (center 0 0) (end 0 0) (width 0) (fill yes))"),
+                "zero radius",
+            ),
+            (
+                pad(ok_options, "(gr_line (start 0 0) (end 0 0) (width 0.1))"),
+                "zero length",
+            ),
+            (
+                pad(ok_options, "(gr_arc (start 0 0) (mid 1 0) (end 2 0) (width 0.1))"),
+                "collinear",
+            ),
+            (
+                pad(ok_options, "(gr_rect (start 0 0) (end 1 1) (radius 0.1) (width 0) (fill yes))"),
+                "clause 'radius'",
+            ),
+            (
+                pad(ok_options, "(gr_line (start 0 0) (end 1 0) (stroke (width 0.1) (type dash)))"),
+                "stroke type 'dash'",
+            ),
+            (pad(ok_options, &format!("{square} (width 0.1)")), "list-level (width"),
+            (pad(ok_options, ""), "at least one primitive"),
+            (
+                pad(ok_options, "(gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (width -0.1) (fill yes))"),
+                "non-negative",
+            ),
+        ];
+        for (source, expected) in cases {
+            let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+            assert!(
+                error.contains("custom pad '3'") && error.contains(expected),
+                "expected '{expected}' in: {error}"
+            );
+        }
+        // The control: the same pad with ordinary options is accepted.
+        assert!(extract_pad_definitions(&pad(ok_options, square)).is_ok());
+        // `(clearance outline)` is KiCad's default, so it may be omitted.
+        assert!(extract_pad_definitions(&pad("(options (anchor rect))", square)).is_ok());
+    }
+
+    /// The live readback reports a custom pad's anchor and pad-local
+    /// primitives, so Konnect can verify what KiCad holds; ordinary pads gain
+    /// no new fields.
+    #[tokio::test]
+    async fn live_custom_pad_readback_reports_anchor_and_primitives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let pads = extract_pad_definitions(&carried(TEXAS_CUSTOM_PADS)).unwrap();
+        let built = build_at(&pads, 100.0, 100.0, 90.0).unwrap();
+        let children = konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            built.value.as_slice(),
+        )
+        .unwrap()
+        .definition
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+        .collect();
+        let server = spawn_kicad_holding(&board, vec![live_footprint("R1", children)]);
+
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = parsed(&result);
+        let pads = body["pads"].as_array().unwrap();
+        let pad1 = pads.iter().find(|pad| pad["number"] == "1").unwrap();
+        let copper = &pad1["copper_layers"][0];
+        assert_eq!(copper["shape"], "custom");
+        assert_eq!(copper["custom_anchor_shape"], "circle");
+        assert_eq!(
+            copper["custom_primitives"],
+            json!([{
+                "kind": "polygon",
+                "points": [[-0.4275, -0.09], [0.253358, -0.09], [0.4275, 0.084142], [0.4275, 0.09], [-0.4275, 0.09]],
+                "width": 0.02,
+                "filled": true
+            }])
+        );
+        let pad2 = pads.iter().find(|pad| pad["number"] == "2").unwrap();
+        let ordinary = pad2["copper_layers"][0].as_object().unwrap();
+        assert!(!ordinary.contains_key("custom_primitives"));
+        assert!(!ordinary.contains_key("custom_anchor_shape"));
     }
 
     #[tokio::test]
@@ -7020,6 +9131,347 @@ mod tests {
             "board file must be left untouched"
         );
     }
+
+    /// A saved read reports each pad's fabrication property, "none" where the
+    /// saved pad has none; a live read reports it as unknown, never as none.
+    #[tokio::test]
+    async fn saved_pads_report_fabrication_properties_and_live_pads_say_unobservable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(
+            &board,
+            SAVED_BOARD_WITH_R1.replace(
+                "(net \"SAVED\")",
+                "(property pad_prop_heatsink) (net \"SAVED\")",
+            ),
+        )
+        .unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint("R1", vec![live_pad("1", 5.0, 5.9, "SAVED")])],
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let saved = parsed(
+            &handle_get_component_pads(
+                &json!({ "board": board.to_string_lossy(), "reference": "R1", "source": "saved" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            saved["source"], "file",
+            "saved is read even while KiCad holds the board"
+        );
+        assert_eq!(
+            saved["pads"][0]["fabrication_property"],
+            "pad_prop_heatsink"
+        );
+        assert_eq!(saved["pad_fabrication_properties"]["observable"], true);
+
+        let live = parsed(
+            &handle_get_component_pads(
+                &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(live["source"], "ipc");
+        assert_eq!(
+            live["pads"][0]["fabrication_property"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            live["pad_fabrication_properties"]["status"],
+            "unobservable_via_live_typed_api"
+        );
+
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let plain = parsed(
+            &handle_get_component_pads(
+                &json!({ "board": board.to_string_lossy(), "reference": "R1", "source": "saved" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(plain["pads"][0]["fabrication_property"], "none");
+    }
+
+    #[tokio::test]
+    async fn fabrication_detail_preserves_pad_numbers_properties_and_observability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("pads.kicad_pcb");
+        std::fs::write(
+            &board,
+            SAVED_BOARD_WITH_R1.replace(
+                "(net \"SAVED\")",
+                "(property pad_prop_heatsink) (net \"SAVED\")",
+            ),
+        )
+        .unwrap();
+        let server = spawn_kicad_holding(
+            &board,
+            vec![live_footprint("R1", vec![live_pad("1", 5.0, 5.9, "SAVED")])],
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+        for source in ["saved", "auto"] {
+            let mut args =
+                json!({"board":board.to_string_lossy(),"reference":"R1","source":source});
+            let full = parsed(&handle_get_component_pads(&args, &ctx).await.unwrap());
+            args["detail"] = json!("fabrication");
+            let result = handle_get_component_pads(&args, &ctx).await.unwrap();
+            assert!(!result.is_error);
+            let compact = parsed(&result);
+            for key in [
+                "reference",
+                "pad_count",
+                "source",
+                "pad_fabrication_properties",
+            ] {
+                assert_eq!(compact[key], full[key], "{source} {key}");
+            }
+            let pads = compact["pads"].as_array().unwrap();
+            assert_eq!(pads.len(), full["pads"].as_array().unwrap().len());
+            for (pad, original) in pads.iter().zip(full["pads"].as_array().unwrap()) {
+                assert_eq!(pad["number"], original["number"]);
+                assert_eq!(
+                    pad["fabrication_property"],
+                    original["fabrication_property"]
+                );
+                assert_eq!(pad.as_object().unwrap().len(), 2);
+            }
+            assert_eq!(compact["geometry_omitted"], true);
+        }
+    }
+}
+
+/// The fabrication-property guard on the live whole-footprint tools: it
+/// refuses before anything is sent, all or nothing, lets an ordinary
+/// footprint through, and leaves the closed-board file path available.
+#[cfg(test)]
+mod fabrication_guard_tests {
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const BGA: &str = "(footprint \"Bga\" (version 20260206) (layer \"F.Cu\")\n\t(property \"Reference\" \"REF**\" (at 0 -2 0) (layer \"F.SilkS\"))\n\t(property \"Value\" \"Bga\" (at 0 2 0) (layer \"F.Fab\"))\n\t(attr smd)\n\t(pad \"A1\" smd circle (at 0 0) (size 0.3 0.3) (layers \"F.Cu\" \"F.Mask\") (property pad_prop_bga))\n)\n";
+
+    fn saved_board() -> String {
+        String::from(
+            "(kicad_pcb (version 20260206)\n\t(footprint \"Parts:Bga\" (layer \"F.Cu\") (uuid \"aaaaaaaa-0000-4000-8000-000000000001\") (at 10 10)\n\t\t(property \"Reference\" \"U1\" (at 0 -2 0) (layer \"F.SilkS\"))\n\t\t(property \"Value\" \"Bga\" (at 0 2 0) (layer \"F.Fab\"))\n\t\t(attr smd)\n\t\t(pad \"A1\" smd circle (at 0 0) (size 0.3 0.3) (layers \"F.Cu\" \"F.Mask\") (property pad_prop_bga) (net \"GND\"))\n\t)\n\t(footprint \"Parts:Plain\" (layer \"F.Cu\") (uuid \"aaaaaaaa-0000-4000-8000-000000000002\") (at 20 10)\n\t\t(property \"Reference\" \"R1\" (at 0 -2 0) (layer \"F.SilkS\"))\n\t\t(property \"Value\" \"Plain\" (at 0 2 0) (layer \"F.Fab\"))\n\t\t(attr smd)\n\t\t(pad \"A1\" smd circle (at 0 0) (size 0.3 0.3) (layers \"F.Cu\" \"F.Mask\") (net \"GND\"))\n\t)\n)\n"
+        )
+    }
+
+    fn project() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let pretty = temp.path().join("Parts.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("Bga.kicad_mod"), BGA).unwrap();
+        std::fs::write(
+            pretty.join("Plain.kicad_mod"),
+            BGA.replace(" (property pad_prop_bga)", ""),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/Parts.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, saved_board()).unwrap();
+        (temp, board)
+    }
+
+    fn live(reference: &str, kiid: &str, entry: &str, x: f64) -> prost_types::Any {
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: kiid.to_string(),
+                }),
+                position: Some(konnect_ipc::builders::vec2(x, 10.0)),
+                reference_field: Some(kiapi::board::types::Field {
+                    name: "Reference".to_string(),
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: reference.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint {
+                    id: Some(kiapi::common::types::LibraryIdentifier {
+                        library_nickname: "Parts".to_string(),
+                        entry_name: entry.to_string(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    /// A KiCad holding `board` with U1 (BGA) and R1 (plain), counting every
+    /// `UpdateItems` it receives.
+    fn kicad(board: &Path, updates: Arc<AtomicUsize>) -> crate::test_support::MockIpcServer {
+        let footprints = vec![
+            live("U1", "aaaaaaaa-0000-4000-8000-000000000001", "Bga", 10.0),
+            live("R1", "aaaaaaaa-0000-4000-8000-000000000002", "Plain", 20.0),
+        ];
+        crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
+            let url = command.type_url.as_str();
+            if url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: footprints.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if url.ends_with("BeginCommit") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ));
+            }
+            if url.ends_with("EndCommit") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ));
+            }
+            if url.ends_with("UpdateItems") {
+                updates.fetch_add(1, Ordering::SeqCst);
+                let request =
+                    kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
+                        .expect("UpdateItems request");
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: request
+                            .items
+                            .into_iter()
+                            .map(|item| kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: Some(item),
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ));
+            }
+            None
+        })
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_property_carrying_live_footprint_refuses_the_whole_batch_before_sending() {
+        let (_temp, board) = project();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let server = kicad(&board, updates.clone());
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+        let path = board.to_string_lossy().to_string();
+
+        let batch = handle_set_component_placements(
+            &json!({ "board": path, "placements": [
+                {"reference": "R1", "x": 30.0, "y": 30.0, "rotation": 0.0},
+                {"reference": "U1", "x": 40.0, "y": 40.0, "rotation": 90.0}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(batch.is_error);
+        let refusal = text(&batch);
+        assert!(
+            refusal.contains("plan_blocked")
+                && refusal.contains("U1")
+                && refusal.contains("pad_prop_bga")
+                && !refusal.contains("R1 ("),
+            "{refusal}"
+        );
+        for result in [
+            handle_move_component(
+                &json!({ "board": path, "reference": "U1", "x": 1.0, "y": 2.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+            handle_rotate_component(
+                &json!({ "board": path, "reference": "U1", "rotation": 45.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+            handle_edit_component(
+                &json!({ "board": path, "reference": "U1", "value": "New" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        ] {
+            assert!(result.is_error, "{}", text(&result));
+            assert!(text(&result).contains("plan_blocked"), "{}", text(&result));
+        }
+        assert_eq!(updates.load(Ordering::SeqCst), 0, "nothing reached KiCad");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), saved_board());
+
+        // An ordinary footprint is not blocked.
+        let plain = handle_set_component_placements(
+            &json!({ "board": path, "placements": [
+                {"reference": "R1", "x": 30.0, "y": 30.0, "rotation": 0.0}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!plain.is_error, "{}", text(&plain));
+        assert_eq!(updates.load(Ordering::SeqCst), 1);
+    }
+
+    /// With the board closed the file path moves and rotates the same
+    /// footprint in place and keeps its fabrication property.
+    #[tokio::test]
+    async fn the_closed_board_path_still_moves_property_carrying_footprints() {
+        let (_temp, board) = project();
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+        let result = handle_set_component_placements(
+            &json!({ "board": board.to_string_lossy(), "placements": [
+                {"reference": "U1", "x": 40.0, "y": 40.0, "rotation": 90.0},
+                {"reference": "R1", "x": 50.0, "y": 40.0, "rotation": 0.0}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert!(written.contains("(at 40 40 90)"), "{written}");
+        assert_eq!(written.matches("(property pad_prop_bga)").count(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -7342,5 +9794,833 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+#[cfg(test)]
+mod placement_library_data_tests {
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    /// A library footprint carrying everything `place_component` used to drop:
+    /// mounting style and exclusion flags, description and keywords, and two
+    /// 3D models with distinct offset, scale, rotation, opacity and visibility.
+    /// Its exposed pad also carries `(zone_connect 2)`.
+    const LIBRARY: &str = "(footprint \"QFN_Test\"\r\n\
+        \t(version 20260206)\r\n\
+        \t(generator \"pcbnew\")\r\n\
+        \t(layer \"F.Cu\")\r\n\
+        \t(descr \"Test QFN with an exposed pad\")\r\n\
+        \t(tags \"qfn exposed-pad test\")\r\n\
+        \t(property \"Reference\" \"REF**\" (at 0 -2 0) (layer \"F.SilkS\"))\r\n\
+        \t(property \"Value\" \"QFN_Test\" (at 0 2 0) (layer \"F.Fab\"))\r\n\
+        \t(attr smd exclude_from_pos_files exclude_from_bom allow_missing_courtyard)\r\n\
+        \t(pad \"1\" smd roundrect (at -1 0) (size 0.6 0.24) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (roundrect_rratio 0.25))\r\n\
+        \t(pad \"2\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (zone_connect 2))\r\n\
+        \t(model \"${KICAD10_3DMODEL_DIR}/Test.3dshapes/QFN_Test.step\"\r\n\
+        \t\t(offset (xyz 0.1 -0.2 0.3))\r\n\
+        \t\t(scale (xyz 1 1.5 2))\r\n\
+        \t\t(rotate (xyz -90 0 45))\r\n\
+        \t)\r\n\
+        \t(model \"extra.wrl\"\r\n\
+        \t\t(hide yes)\r\n\
+        \t\t(opacity 0.4)\r\n\
+        \t\t(offset (xyz 0 0 1))\r\n\
+        \t\t(scale (xyz 2 2 2))\r\n\
+        \t\t(rotate (xyz 0 180 0))\r\n\
+        \t)\r\n\
+        )\r\n";
+
+    fn project(dir: &Path) -> (PathBuf, PathBuf) {
+        let pretty = dir.join("Test.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let library = pretty.join("QFN_Test.kicad_mod");
+        std::fs::write(&library, LIBRARY).unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\r\n\t(version 7)\r\n\t(lib (name \"Test\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\r\n)\r\n",
+                pretty.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let board = dir.join("b.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n)\n",
+        )
+        .unwrap();
+        (board, library)
+    }
+
+    type Created = Arc<Mutex<Vec<prost_types::Any>>>;
+
+    /// A KiCad holding `board` that keeps what it is asked to create, lists it
+    /// back, and records every created item exactly as received.
+    fn spawn_creating_kicad(board: &Path) -> (crate::test_support::MockIpcServer, Created) {
+        let board = board.to_string_lossy().to_string();
+        let created: Created = Arc::default();
+        let held = created.clone();
+        let server = crate::test_support::MockIpcServer::spawn(
+            "place-library-data",
+            move |request| {
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetItems") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: held.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("CreateItems") {
+                    let request =
+                        kiapi::common::commands::CreateItems::decode(command.value.as_slice())
+                            .expect("CreateItems request");
+                    held.lock().unwrap().extend(request.items.iter().cloned());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::CreateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            created_items: request
+                                .items
+                                .into_iter()
+                                .map(|item| kiapi::common::commands::ItemCreationResult {
+                                    status: Some(kiapi::common::commands::ItemStatus {
+                                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    ))
+                } else {
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                }
+            },
+        );
+        (server, created)
+    }
+
+    fn ctx_talking_to(address: String) -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn vector(v: &Option<kiapi::common::types::Vector3D>) -> (f64, f64, f64) {
+        let v = v.as_ref().expect("a vector");
+        (v.x_nm, v.y_nm, v.z_nm)
+    }
+
+    /// The live path sends the library's mounting style, flags, description,
+    /// keywords and every model with its transforms on the very message
+    /// KiCad receives, and leaves the library file byte for byte as it was.
+    #[tokio::test]
+    async fn place_component_sends_the_library_data_on_the_created_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        let (server, created) = spawn_creating_kicad(&board);
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "reference": "U1",
+                "x": 30.0, "y": 40.0, "rotation": 37.0,
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let items = created.lock().unwrap().clone();
+        let [item] = items.as_slice() else {
+            panic!("exactly one created item, got {}", items.len());
+        };
+        assert!(konnect_ipc::builders::any_is(
+            item,
+            "kiapi.board.types.FootprintInstance"
+        ));
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("a footprint instance");
+
+        let attributes = footprint.attributes.as_ref().expect("instance attributes");
+        assert_eq!(
+            attributes.mounting_style(),
+            kiapi::board::types::FootprintMountingStyle::FmsSmd
+        );
+        assert!(attributes.exclude_from_position_files);
+        assert!(attributes.exclude_from_bill_of_materials);
+        assert!(attributes.exempt_from_courtyard_requirement);
+        assert!(!attributes.not_in_schematic);
+        assert!(!attributes.do_not_populate);
+        assert!(!attributes.allow_soldermask_bridges);
+
+        let definition = footprint.definition.as_ref().expect("a definition");
+        let text = definition
+            .attributes
+            .as_ref()
+            .expect("definition attributes");
+        assert_eq!(text.description, "Test QFN with an exposed pad");
+        assert_eq!(text.keywords, "qfn exposed-pad test");
+        let id = definition.id.as_ref().unwrap();
+        assert_eq!(
+            (id.library_nickname.as_str(), id.entry_name.as_str()),
+            ("Test", "QFN_Test")
+        );
+
+        let models: Vec<_> = definition
+            .items
+            .iter()
+            .filter(|child| {
+                konnect_ipc::builders::any_is(child, "kiapi.board.types.Footprint3DModel")
+            })
+            .map(|child| {
+                kiapi::board::types::Footprint3DModel::decode(child.value.as_slice()).unwrap()
+            })
+            .collect();
+        assert_eq!(models.len(), 2, "every library model is sent");
+        assert_eq!(
+            models[0].filename,
+            "${KICAD10_3DMODEL_DIR}/Test.3dshapes/QFN_Test.step"
+        );
+        assert_eq!(vector(&models[0].offset), (0.1, -0.2, 0.3));
+        assert_eq!(vector(&models[0].scale), (1.0, 1.5, 2.0));
+        assert_eq!(vector(&models[0].rotation), (-90.0, 0.0, 45.0));
+        assert!(models[0].visible);
+        assert_eq!(models[0].opacity, 1.0);
+        assert_eq!(models[1].filename, "extra.wrl");
+        assert_eq!(vector(&models[1].offset), (0.0, 0.0, 1.0));
+        assert_eq!(vector(&models[1].scale), (2.0, 2.0, 2.0));
+        assert_eq!(vector(&models[1].rotation), (0.0, 180.0, 0.0));
+        assert!(!models[1].visible);
+        assert_eq!(models[1].opacity, 0.4);
+
+        // The pads are still the library's, the exposed pad's zone connection
+        // included, and the reference is the requested one.
+        let pads: Vec<_> = definition
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .map(|child| kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(pads.len(), 2);
+        let zone = |number: &str| {
+            pads.iter()
+                .find(|pad| pad.number == number)
+                .unwrap()
+                .pad_stack
+                .as_ref()
+                .unwrap()
+                .zone_settings
+                .as_ref()
+                .map(|settings| settings.zone_connection)
+        };
+        // Pad 1 has no `(zone_connect …)`: it goes out inherited, with the
+        // thermal spoke angle the library pad holds.
+        assert_eq!(
+            zone("1"),
+            Some(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32)
+        );
+        assert_eq!(
+            zone("2"),
+            Some(kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32)
+        );
+        let reference = footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.as_str());
+        assert_eq!(reference, Some("U1"));
+
+        assert_eq!(
+            std::fs::read_to_string(&library).unwrap(),
+            LIBRARY,
+            "the library source is only read"
+        );
+
+        // The extracted placement method still refuses a duplicate reference
+        // before creating anything.
+        let duplicate = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "reference": "U1", "x": 0.0, "y": 0.0,
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(duplicate.is_error, "{:?}", duplicate.content);
+        assert_eq!(created.lock().unwrap().len(), 1, "nothing more was created");
+    }
+
+    /// A library footprint whose attributes cannot be read is refused before
+    /// anything is created, rather than placed without them.
+    #[tokio::test]
+    async fn unreadable_library_data_refuses_the_placement_before_creating_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        std::fs::write(
+            &library,
+            LIBRARY.replace("allow_missing_courtyard", "mystery_flag"),
+        )
+        .unwrap();
+        let (server, created) = spawn_creating_kicad(&board);
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "reference": "U1", "x": 1.0, "y": 2.0,
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("mystery_flag"), "{text}");
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    /// The item carries the reference the placement checks and reads back;
+    /// a mismatch is refused before KiCad is asked to create anything.
+    #[test]
+    fn a_footprint_item_must_carry_the_reference_it_is_placed_under() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, _library) = project(tmp.path());
+        let (server, created) = spawn_creating_kicad(&board);
+        let prepared = PreparedFootprintPlacement::from_library(
+            LIBRARY,
+            "Test:QFN_Test",
+            "U7",
+            None,
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+            board.parent(),
+        )
+        .unwrap();
+        let item = prepared
+            .build_item("Test:QFN_Test", "U7", 0.0, 0.0, 0.0, "F.Cu")
+            .unwrap();
+        let client = KiCadIpcClient::new(server.address());
+        let error = client
+            .place_footprint_item(&board, "U8", item)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("carries reference 'U7'"), "{error}");
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    /// Inline geometry has no library, so its item is exactly the plain
+    /// builder's: no attributes, description or models are invented.
+    #[test]
+    fn inline_placement_builds_the_plain_item() {
+        let pads = vec![konnect_ipc::IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "np_thru_hole".into(),
+            shape: "circle".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 3.2,
+            size_y: 3.2,
+            drill_x: Some(3.2),
+            drill_y: Some(3.2),
+            drill_oval: false,
+            layers: vec!["*.Cu".into(), "*.Mask".into()],
+            roundrect_ratio: 0.0,
+            custom: None,
+            zone_connection: None,
+            thermal: Default::default(),
+        }];
+        let prepared = PreparedFootprintPlacement::from_inline(
+            "MountingHole".into(),
+            pads.clone(),
+            Vec::new(),
+            Default::default(),
+            String::new(),
+        );
+        let built = prepared
+            .build_item(
+                "MountingHole:MountingHole_3.2mm_M3",
+                "H1",
+                5.0,
+                6.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap();
+        let plain = KiCadIpcClient::build_footprint_item(
+            "MountingHole:MountingHole_3.2mm_M3",
+            "H1",
+            "MountingHole",
+            &pads,
+            &[],
+            &Default::default(),
+            5.0,
+            6.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        assert_eq!(built, plain);
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(built.value.as_slice()).unwrap();
+        assert!(footprint.attributes.is_none());
+    }
+
+    /// The byte-exact stock footprint's exposed pad carries a fabrication
+    /// property KiCad's API cannot send. Placement names it and creates
+    /// nothing, rather than placing a pad that differs from the library.
+    #[tokio::test]
+    async fn an_uncarried_pad_property_refuses_the_placement_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        std::fs::write(
+            &library,
+            include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        let (server, created) = spawn_creating_kicad(&board);
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "reference": "U1", "x": 1.0, "y": 2.0,
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("pad '21'") && text.contains("pad_prop_heatsink"),
+            "{text}"
+        );
+        assert!(created.lock().unwrap().is_empty());
+    }
+}
+
+/// The compact saved readers: exact filters over the values the full answer
+/// reports, duplicate pad numbers kept, empty matches told apart from unknown
+/// references, and board-space pad positions for rotated and back-side parts.
+#[cfg(test)]
+mod compact_reader_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    const BOARD: &str = r#"(kicad_pcb (version 20260206)
+	(footprint "Test:Qfn" (layer "F.Cu") (uuid "11111111-1111-4111-8111-111111111111") (at 20 30 37)
+		(property "Reference" "U1" (at 0 -2 37) (layer "F.SilkS"))
+		(property "Value" "QFN" (at 0 2 37) (layer "F.Fab"))
+		(pad "A1" smd custom (at 1 2 37) (size 0.3 0.3) (layers "F.Cu") (property pad_prop_bga) (net 1 "GND")
+			(primitives (gr_poly (pts (xy -1 -1) (xy 1 -1) (xy 1 1)) (width 0) (fill yes)))
+			(uuid "41111111-1111-4111-8111-111111111111"))
+		(pad "EP" smd rect (at -0.5 0 37) (size 1 1) (layers "F.Cu" "F.Paste") (net 1 "GND") (uuid "42222222-2222-4222-8222-222222222222"))
+		(pad "EP" smd rect (at 0.5 0 37) (size 1 1) (layers "F.Cu" "F.Paste") (net 1 "GND") (uuid "43333333-3333-4333-8333-333333333333"))
+		(pad "2" smd rect (at 0 1 37) (size 0.3 0.3) (layers "F.Cu"))
+		(model "keep.step" (offset (xyz 1 2 3))))
+	(footprint "Resistor_SMD:R_0402" (layer "B.Cu") (uuid "12222222-2222-4222-8222-222222222222") (at 50 60 90)
+		(property "Reference" "R4001" (at 0 1.5 90) (layer "B.SilkS"))
+		(property "Value" "10k" (at 0 -1.5 90) (layer "B.Fab"))
+		(pad "1" smd roundrect (at -0.5 0 90) (size 0.6 0.5) (layers "B.Cu" "B.Paste" "B.Mask") (net 2 "VCC") (uuid "44444444-4444-4444-8444-444444444444"))
+		(pad "2" smd roundrect (at 0.5 0 180) (size 0.6 0.5) (layers "B.Cu" "B.Paste" "B.Mask") (net 1 "GND") (uuid "45555555-5555-4555-8555-555555555555")))
+	(footprint "Test:Dup" (layer "F.Cu") (uuid "13333333-3333-4333-8333-333333333333") (at 1 1) (property "Reference" "DUP" (at 0 0 0)) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))
+	(footprint "Test:Dup" (layer "F.Cu") (uuid "14444444-4444-4444-8444-444444444444") (at 2 2) (property "Reference" "DUP" (at 0 0 0)) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))
+)
+"#;
+
+    fn board() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.kicad_pcb");
+        std::fs::write(&path, BOARD).unwrap();
+        (dir, path)
+    }
+
+    async fn pads(args: serde_json::Value) -> (bool, serde_json::Value) {
+        let result = handle_get_component_pads(&args, &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        (
+            result.is_error,
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })),
+        )
+    }
+
+    #[tokio::test]
+    async fn connectivity_is_compact_board_space_and_carries_the_footprint_pose() {
+        let (_dir, path) = board();
+        let (error, body) =
+            pads(json!({ "board": path, "reference": "U1", "detail": "connectivity" })).await;
+        assert!(!error, "{body}");
+        assert_eq!(body["detail"], "connectivity");
+        assert_eq!(body["pad_count"], 4);
+        let a1 = &body["pads"][0];
+        let mut keys: Vec<&str> = a1.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "fabrication_property",
+                "net",
+                "number",
+                "pad_type",
+                "rotation_deg",
+                "uuid",
+                "x",
+                "y"
+            ]
+        );
+        // (1, 2) turned by 37° about (20, 30): x' = x·cos θ + y·sin θ, y' = −x·sin θ + y·cos θ.
+        let theta = 37f64.to_radians();
+        let x = 20.0 + theta.cos() + 2.0 * theta.sin();
+        let y = 30.0 - theta.sin() + 2.0 * theta.cos();
+        assert!((a1["x"].as_f64().unwrap() - x).abs() < 1e-9, "{a1}");
+        assert!((a1["y"].as_f64().unwrap() - y).abs() < 1e-9, "{a1}");
+        assert_eq!(
+            a1["rotation_deg"], 37.0,
+            "the saved pad angle is already board-space"
+        );
+        assert_eq!(a1["fabrication_property"], "pad_prop_bga");
+        assert_eq!(body["pads"][3]["fabrication_property"], "none");
+        assert_eq!(body["pads"][3]["net"], "", "an unconnected pad is \"\"");
+        assert_eq!(body["pad_fabrication_properties"]["observable"], true);
+        let fp = &body["footprint"];
+        assert_eq!(fp["uuid"], "11111111-1111-4111-8111-111111111111");
+        assert_eq!(fp["footprint"], "Test:Qfn");
+        assert_eq!(fp["rotation"], 37.0);
+        assert_eq!(fp["layer"], "F.Cu");
+        assert_eq!(fp["value"], "QFN");
+
+        // A back-side part: its saved local frame is already the flipped one,
+        // so board space is the same turn about the anchor.
+        let (_, r) =
+            pads(json!({ "board": path, "reference": "R4001", "detail": "connectivity" })).await;
+        assert_eq!(r["footprint"]["layer"], "B.Cu");
+        assert!((r["pads"][0]["x"].as_f64().unwrap() - 50.0).abs() < 1e-9);
+        assert!((r["pads"][0]["y"].as_f64().unwrap() - 60.5).abs() < 1e-9);
+        assert!((r["pads"][1]["y"].as_f64().unwrap() - 59.5).abs() < 1e-9);
+        assert_eq!(r["pads"][1]["rotation_deg"], 180.0);
+        assert_eq!(r["pads"][0]["net"], "VCC");
+    }
+
+    #[tokio::test]
+    async fn filters_select_actual_values_and_keep_duplicate_pad_numbers() {
+        let (_dir, path) = board();
+        let (_, ep) = pads(json!({ "board": path, "reference": "U1", "detail": "connectivity", "pad_numbers": ["EP"] })).await;
+        assert_eq!(ep["matched_pad_count"], 2, "{ep}");
+        assert_eq!(ep["total_pad_count"], 4);
+        assert_ne!(ep["pads"][0]["uuid"], ep["pads"][1]["uuid"]);
+        assert_eq!(ep["unmatched_pad_numbers"], json!([]));
+
+        let (_, gnd) = pads(json!({ "board": path, "reference": "U1", "nets": ["GND"], "pad_numbers": ["A1", "2"] })).await;
+        assert_eq!(gnd["matched_pad_count"], 1, "{gnd}");
+        assert_eq!(gnd["pads"][0]["number"], "A1");
+        assert!(
+            gnd["pads"][0].get("copper_layers").is_some(),
+            "full detail keeps geometry"
+        );
+
+        let (_, unconnected) =
+            pads(json!({ "board": path, "reference": "U1", "nets": [""] })).await;
+        assert_eq!(unconnected["pads"][0]["number"], "2");
+
+        // A real footprint with no match is an empty answer, not an error.
+        let (error, none) = pads(
+            json!({ "board": path, "reference": "U1", "detail": "connectivity", "nets": ["NOPE"] }),
+        )
+        .await;
+        assert!(!error);
+        assert_eq!(none["matched_pad_count"], 0);
+        assert_eq!(none["unmatched_nets"], json!(["NOPE"]));
+        assert_eq!(
+            none["footprint"]["uuid"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+
+        // An unknown reference is an error; an ambiguous one is refused.
+        let (error, _) =
+            pads(json!({ "board": path, "reference": "U9", "detail": "connectivity" })).await;
+        assert!(error);
+        let (error, dup) =
+            pads(json!({ "board": path, "reference": "DUP", "detail": "connectivity" })).await;
+        assert!(error);
+        assert_eq!(dup["error"]["kind"], "ambiguous_target", "{dup}");
+        assert_eq!(dup["error"]["candidates"].as_array().unwrap().len(), 2);
+
+        // Without a filter or compact detail the existing answer is unchanged.
+        let (_, full) = pads(json!({ "board": path, "reference": "U1" })).await;
+        assert!(full.get("footprint").is_none());
+        assert!(full.get("matched_pad_count").is_none());
+        assert_eq!(full["pad_count"], 4);
+    }
+
+    #[tokio::test]
+    async fn the_saved_component_list_filters_exact_references_and_names_its_source() {
+        let (_dir, path) = board();
+        let result = handle_get_component_list(
+            &json!({ "board": path, "source": "saved", "references": ["R4001", "DUP", "NOPE"] }),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["source"], "saved");
+        assert_eq!(
+            body["source_evidence"]["excludes_unsaved_editor_state"],
+            true
+        );
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["unknown_references"], json!(["NOPE"]));
+        assert_eq!(body["duplicate_references"], json!(["DUP"]));
+        let r = &body["components"][0];
+        assert_eq!(r["reference"], "R4001");
+        assert_eq!(r["uuid"], "12222222-2222-4222-8222-222222222222");
+        assert_eq!(r["layer"], "B.Cu");
+        assert_eq!(r["rotation"], 90.0);
+        assert_eq!(r["value"], "10k");
+        assert_eq!(r["x"], 50.0);
+
+        // No KiCad and no source: the live default refuses rather than read the file.
+        let live =
+            handle_get_component_list(&json!({ "board": path }), &ctx_talking_to(String::new()))
+                .await
+                .unwrap();
+        assert!(live.is_error);
+    }
+}
+
+/// `set_component_placements` with a target side: mirror first, then place,
+/// in one closed-board write or none.
+#[cfg(test)]
+mod side_batch_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    const BOARD: &str = "(kicad_pcb (version 20260206)
+\t(footprint \"Resistor_SMD:R_0402\" (layer \"F.Cu\") (uuid \"aaaaaaaa-1111-4111-8111-111111111111\") (at 10 20 0)
+\t\t(property \"Reference\" \"R4001\" (at 0 -1.2 0) (layer \"F.SilkS\") (uuid \"aaaaaaaa-2222-4222-8222-222222222222\") (effects (font (size 1 1) (thickness 0.15))))
+\t\t(fp_line (start -0.5 -0.3) (end 0.5 -0.3) (stroke (width 0.1) (type solid)) (layer \"F.SilkS\") (uuid \"aaaaaaaa-3333-4333-8333-333333333333\"))
+\t\t(pad \"1\" smd roundrect (at -0.5 0.1 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25) (net 2 \"VCC\") (uuid \"aaaaaaaa-4444-4444-8444-444444444444\"))
+\t\t(pad \"2\" smd roundrect (at 0.5 0.1 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25) (net 1 \"GND\") (uuid \"aaaaaaaa-5555-4555-8555-555555555555\"))
+\t\t(model \"${KICAD9_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0402_1005Metric.step\" (offset (xyz 0 0 0)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 0))))
+\t(footprint \"Capacitor_SMD:C_0402\" (layer \"F.Cu\") (uuid \"bbbbbbbb-1111-4111-8111-111111111111\") (at 30 20 0)
+\t\t(property \"Reference\" \"C1\" (at 0 -1.2 0) (layer \"F.SilkS\") (uuid \"bbbbbbbb-2222-4222-8222-222222222222\") (effects (font (size 1 1) (thickness 0.15))))
+\t\t(pad \"1\" smd roundrect (at -0.5 0 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25) (net 1 \"GND\") (uuid \"bbbbbbbb-4444-4444-8444-444444444444\")))
+\t(footprint \"Custom:Odd\" (layer \"F.Cu\") (uuid \"cccccccc-1111-4111-8111-111111111111\") (at 50 20 0)
+\t\t(property \"Reference\" \"U9\" (at 0 -1.2 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))
+\t\t(pad \"1\" smd custom (at 0 0 0) (size 0.5 0.5) (layers \"F.Cu\") (primitives (gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (width 0) (fill yes)))))
+)
+";
+
+    fn result_body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mixed_batch_mirrors_then_places_in_one_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("sides.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        let args = json!({ "board": board, "placements": [
+            { "reference": "R4001", "x": 12, "y": 25, "rotation": 90, "layer": "B.Cu" },
+            { "reference": "C1", "x": 31, "y": 21, "rotation": 0 }
+        ] });
+        let result = handle_set_component_placements(&args, &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_body(&result);
+        assert_eq!(body["sides"][0]["flipped"], true);
+        assert_eq!(body["sides"][0]["layer"], "B.Cu");
+        assert_eq!(body["sides"][1]["flipped"], false);
+        assert_eq!(body["sides"][1]["layer"], "F.Cu");
+
+        // Exactly the existing single-footprint flip followed by the existing
+        // closed-board set, composed.
+        let (flipped, changed) =
+            prepare_closed_board_footprint_side(BOARD, "R4001", "B.Cu").unwrap();
+        assert!(changed);
+        let placed = prepare_closed_board_footprint_update(
+            &flipped,
+            "R4001",
+            FootprintPlacementUpdate::Set {
+                x: 12.0,
+                y: 25.0,
+                rotation: 90.0,
+            },
+        )
+        .unwrap();
+        let expected = prepare_closed_board_footprint_update(
+            &placed,
+            "C1",
+            FootprintPlacementUpdate::Set {
+                x: 31.0,
+                y: 21.0,
+                rotation: 0.0,
+            },
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(written, expected);
+
+        // The mirrored geometry: root on B.Cu at the requested pose, pads
+        // mirrored in Y and moved to the back layers, text mirrored onto
+        // B.SilkS, every identity, net and model kept.
+        let tree = konnect_sexp::parse_sexp(&written).unwrap();
+        let r = tree
+            .find_all("footprint")
+            .into_iter()
+            .find(|fp| footprint_reference(fp).as_deref() == Some("R4001"))
+            .unwrap();
+        assert_eq!(r.find_str("layer"), Some("B.Cu"));
+        let at = r.find("at").unwrap();
+        assert_eq!(
+            (at.get_f64(1), at.get_f64(2), at.get_f64(3)),
+            (Some(12.0), Some(25.0), Some(90.0))
+        );
+        let pad = r.find_all("pad")[0];
+        assert_eq!(pad.find("at").unwrap().get_f64(2), Some(-0.1));
+        let layers: Vec<&str> = pad.find("layers").unwrap().children().unwrap()[1..]
+            .iter()
+            .filter_map(konnect_sexp::SexpNode::as_str)
+            .collect();
+        assert_eq!(layers, ["B.Cu", "B.Paste", "B.Mask"]);
+        assert_eq!(
+            konnect_sexp::net::net_name(pad.find("net").unwrap()),
+            Some("VCC")
+        );
+        assert!(written.contains("(uuid \"aaaaaaaa-4444-4444-8444-444444444444\")"));
+        assert!(written.contains("(uuid \"aaaaaaaa-2222-4222-8222-222222222222\")"));
+        assert!(written.contains("R_0402_1005Metric.step\" (offset (xyz 0 0 0))"));
+        let reference = r.find_all("property")[0];
+        assert_eq!(reference.find_str("layer"), Some("B.SilkS"));
+        assert!(reference.find("effects").unwrap().find("justify").is_some());
+        assert!(
+            written.contains("(layer \"B.SilkS\") (uuid \"aaaaaaaa-3333-4333-8333-333333333333\")")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unsupported_member_or_an_open_board_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("sides.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        let args = json!({ "board": board, "placements": [
+            { "reference": "R4001", "x": 12, "y": 25, "rotation": 90, "layer": "B.Cu" },
+            { "reference": "U9", "x": 50, "y": 21, "rotation": 0, "layer": "B.Cu" }
+        ] });
+        let refused = handle_set_component_placements(&args, &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        assert!(refused.is_error);
+        assert!(format!("{:?}", refused.content).contains("custom pads"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+
+        let bad = json!({ "board": board, "placements": [
+            { "reference": "R4001", "x": 12, "y": 25, "rotation": 90, "layer": "F.SilkS" }
+        ] });
+        assert!(
+            handle_set_component_placements(&bad, &ctx_talking_to(String::new()))
+                .await
+                .unwrap()
+                .is_error
+        );
+
+        // KiCad holds the board: refused before any live command but the
+        // open-document query.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            log.lock().unwrap().push(command.type_url.clone());
+            None
+        });
+        let ok = json!({ "board": board, "placements": [
+            { "reference": "R4001", "x": 12, "y": 25, "rotation": 90, "layer": "B.Cu" }
+        ] });
+        let refused =
+            handle_set_component_placements(&ok, &ctx_talking_to(server.address().to_string()))
+                .await
+                .unwrap();
+        assert!(refused.is_error);
+        assert_eq!(
+            result_body(&refused)["error"]["reasons"][0],
+            "side_change_requires_closed_board"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        drop(server);
+
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "own-test-lock").unwrap();
+        assert!(
+            handle_set_component_placements(&ok, &ctx_talking_to(String::new()))
+                .await
+                .unwrap()
+                .is_error
+        );
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
     }
 }

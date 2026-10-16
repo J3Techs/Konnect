@@ -100,10 +100,26 @@ Follow this sequence for a clean PCB workflow:
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A diagnostic about a library
    footprint names that footprint and every part that needs it: when the footprint
-   cannot be placed (custom-shape pads are not supported), assign those parts a
-   footprint without them; when the schematic connects a pad the footprint does not
+   cannot be placed (for example a custom pad with `convexhull` clearance or
+   curved polygon edges, or a pad fabrication property such as heatsink, which
+   the typed API cannot carry), the message names the
+   pad and clause: change that pad in the footprint editor or assign another
+   footprint; when the schematic connects a pad the footprint does not
    have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   undo entry, so Ctrl-Z reverses the whole update. Added footprints are parked
+   in a bounded shelf region beside the board (`parking`), never placed.
+   For a first import whose footprints carry pad fabrication properties (BGA,
+   heatsink) the live path cannot send, use `backend: "closed_initial"` with the
+   board saved and closed in KiCad, for the dry run and the apply alike. It copies
+   each library footprint's complete text into the saved board in one atomic,
+   revision-checked write, keeps existing board-only footprints, and refuses a
+   board that already has circuit footprints, netted pads or routing. It has no
+   KiCad undo step; reopen the board and run native DRC afterwards.
+   Afterwards, a live move, rotation, value or model edit of a footprint whose
+   saved or library pads carry a fabrication property is refused before anything
+   is sent (KiCad 10's typed API would drop it): close the board and use the same
+   placement tool, whose closed-board file path keeps every pad clause. Read the
+   properties back with `get_component_pads` and `source: "saved"`.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
@@ -113,7 +129,11 @@ Follow this sequence for a clean PCB workflow:
    `dry_run: true`; apply only with `dry_run: false` and the exact returned
    `expected_plan_revision`. The requested board must be open in live KiCad, one
    apply is one undo entry, and unsupported or stale content returns a non-mutating
-   conflict instead of silently dropping it.
+   conflict instead of silently dropping it. A planned pads change lists its pad
+   differences (pad, typed field, library expected value, board observed value);
+   read them before applying, and read the response's pad parity notes when
+   native DRC reports a library footprint mismatch on a footprint the plan calls
+   unchanged.
 4. **Place components** — position all footprints
 5. **Route traces** — connect all nets
 6. **Copper pour** — add ground/power zones last
@@ -243,6 +263,37 @@ participating footprints. Use its returned board-space position, effective
 rotation, shape, size, drill, and per-copper-layer geometry; do not estimate
 copper extent from package family or a different pad in the footprint. A null
 geometry field is unavailable evidence, not a zero-size pad.
+
+To check pad nets and positions on a large part without a geometry dump, use
+`get_component_pads` with `detail: "connectivity"` and, where useful, exact
+`pad_numbers` or `nets`: it returns every physical pad that matches (duplicate
+pad numbers included), the footprint's pose and UUID, and lists requested
+values that matched nothing. To verify a placement batch on a closed board, call
+`get_component_list` with `references` and `source: "saved"`; unknown and
+duplicated references are reported separately. A saved answer excludes unsaved
+editor state and must not be presented as live readback.
+
+## Physical stackup
+
+KiCad 10 cannot change a stackup over IPC, and KiCad 10.0.4's live
+`get_board_stackup` answer omits finish, impedance, edge settings, layer enabled
+flags and dielectric sub-layers: those read as `null` or as not reported, never as
+zero or false. Read the saved values with `get_board_stackup` and
+`source: "saved"`. To set a stackup, save and close the board, then call
+`set_closed_board_stackup` with the complete ordered stack (copper in physical
+order F.Cu, In1.Cu …, B.Cu) as a dry run, review its differences, and apply with
+`dry_run: false` and the returned `expected_revision`. Give
+`nominal_board_thickness_mm` only to change the nominal thickness; never alter a
+dielectric to make the stack sum match it. Reopen the board in KiCad, check
+Board Setup's stackup, save, and run DRC before relying on it.
+
+## Reference labels
+
+To resize or reposition Reference fields on a closed board, use
+`set_reference_field_presentations` for a batch (dry run, then apply with its
+`expected_revision`) or `edit_component` with `reference_field` for one; an
+empty `reference_field` inspects the saved values. Keep the board's text rules:
+fix labels, do not hide them or lower the minimum height. Re-run DRC afterwards.
 
 ### Routing Tools
 

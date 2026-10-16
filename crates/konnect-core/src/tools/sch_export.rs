@@ -191,16 +191,35 @@ pub fn tools() -> Vec<ToolDef> {
              and the sync proceeds for every other component. A library footprint that \
              cannot be placed, or a connected pad its footprint does not have, makes the dry \
              run a conflict whose diagnostics name the footprint and every part that needs it. \
-             Added footprints are staged beside the board as KiCad measured it; `staging` \
+             Added footprints are parked in a bounded, non-overlapping shelf region beside \
+             the board (parking, not placement), inside KiCad's coordinate range; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty.",
+             is never reported as complete or empty. backend 'live' (default) needs the board \
+             open in KiCad. backend 'closed_initial' is an initial import only, into a board \
+             KiCad provably does not hold (even for a dry run): it copies each library \
+             footprint's complete text — pad fabrication properties, padstacks, custom pads, \
+             groups, models — into the saved file in one atomic, revision-checked write, and \
+             refuses a board that already has circuit footprints, netted pads or routing. \
+             Reopen the board and run native DRC afterwards.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
-                    "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
+                    "board": { "type": "string", "description": "Matching .kicad_pcb path: open in KiCad for backend 'live', closed for 'closed_initial'" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
-                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run of the same backend" },
+                    "backend": {
+                        "type": "string",
+                        "enum": ["live", "closed_initial"],
+                        "default": "live",
+                        "description": "live: KiCad IPC on the open board. closed_initial: one-time verbatim library import into the saved, closed board"
+                    },
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["full", "summary"],
+                        "default": "full",
+                        "description": "summary keeps all diagnostics, counts, revision and preservation facts but omits per-instance changes and input-file inventories, so large-board plans fit an agent response. It does not change the plan or its revision."
+                    }
                 },
                 "required": ["schematic", "board"]
             }),
@@ -208,7 +227,8 @@ pub fn tools() -> Vec<ToolDef> {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        // Live for the default backend, closed for closed_initial.
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ]
 }
 

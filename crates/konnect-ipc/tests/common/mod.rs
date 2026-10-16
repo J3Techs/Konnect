@@ -63,16 +63,19 @@ pub fn assert_matches_file(stackup: &IpcBoardStackup, board: &Path) {
     // KiCad writes the finish only when one is set, `dielectric_constraints`
     // always, and the edge settings only when they are on.
     if let Some(finish) = declared.find_str("copper_finish") {
-        assert_eq!(stackup.finish, finish);
+        assert_eq!(stackup.finish.as_deref(), Some(finish));
     }
     let yes = |key: &str| declared.find_str(key) == Some("yes");
-    assert_eq!(stackup.impedance_controlled, yes("dielectric_constraints"));
-    assert_eq!(stackup.has_edge_plating, yes("edge_plating"));
+    assert_eq!(
+        stackup.impedance_controlled,
+        Some(yes("dielectric_constraints"))
+    );
+    assert_eq!(stackup.has_edge_plating, Some(yes("edge_plating")));
     let connector = match declared.find_str("edge_connector") {
         None => "none",
         Some("yes") => "plain",
         Some("bevelled") => "beveled",
         Some(other) => panic!("an edge connector of {other:?}"),
     };
-    assert_eq!(stackup.edge_connector, connector);
+    assert_eq!(stackup.edge_connector.as_deref(), Some(connector));
 }

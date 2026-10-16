@@ -912,6 +912,9 @@ fn mounting_hole_pad(drill_diameter_mm: f64) -> konnect_ipc::IpcPadDefinition {
         drill_oval: false,
         layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
         roundrect_ratio: 0.0,
+        zone_connection: None,
+        thermal: Default::default(),
+        custom: None,
     }
 }
 
@@ -1293,6 +1296,7 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
+        super::board_stackup::setter_tool(),
     ]
 }
 
@@ -2385,7 +2389,7 @@ async fn handle_add_mounting_hole(
                 board_path.parent(),
             ) {
                 Ok(prepared) => prepared,
-                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+                Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
             }
         }
         None => super::pcb_components::PreparedFootprintPlacement::from_inline(
@@ -2417,19 +2421,8 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
-        c.place_footprint(
-            &requested_board,
-            &lib_id_ipc,
-            &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
-            x,
-            y,
-            0.0,
-            "F.Cu",
-        )
+        let item = prepared_ipc.build_item(&lib_id_ipc, &reference_ipc, x, y, 0.0, "F.Cu")?;
+        c.place_footprint_item(&requested_board, &reference_ipc, item)
     })
     .await?;
 

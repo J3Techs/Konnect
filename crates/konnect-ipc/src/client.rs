@@ -87,6 +87,9 @@ struct PadGeometry {
     size: Option<IpcVector2>,
     drill: Option<IpcPadDrill>,
     copper_layers: Vec<IpcPadLayerGeometry>,
+    corner_rounding_ratio: Option<f64>,
+    zone_connection: Option<IpcPadZoneConnection>,
+    thermal: Option<IpcPadThermal>,
 }
 
 fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
@@ -97,19 +100,46 @@ fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
             size: None,
             drill: None,
             copper_layers: Vec::new(),
+            corner_rounding_ratio: None,
+            zone_connection: None,
+            thermal: None,
         };
     };
     let copper_layers: Vec<_> = stack
         .copper_layers
         .iter()
-        .map(|layer| IpcPadLayerGeometry {
-            layer: layer_enum_to_name(layer.layer).to_string(),
-            shape: pad_shape_name(layer.shape),
-            size: optional_point_in_mm(layer.size),
-            offset: optional_point_in_mm(layer.offset),
-            corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
-                .then_some(layer.corner_rounding_ratio),
-            chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+        .map(|layer| {
+            let custom = layer.shape == kiapi::board::types::PadStackShape::PssCustom as i32;
+            let primitives = custom.then(|| {
+                layer
+                    .custom_shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, shape)| {
+                        crate::builders::pad_primitive_from_proto(shape)
+                            .map_err(|error| format!("primitive {index}: {error}"))
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()
+            });
+            let (custom_primitives, custom_primitives_unreadable) = match primitives {
+                Some(Ok(primitives)) => (Some(primitives), None),
+                Some(Err(reason)) => (None, Some(reason)),
+                None => (None, None),
+            };
+            IpcPadLayerGeometry {
+                layer: layer_enum_to_name(layer.layer).to_string(),
+                shape: pad_shape_name(layer.shape),
+                size: optional_point_in_mm(layer.size),
+                offset: optional_point_in_mm(layer.offset),
+                corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
+                    .then_some(layer.corner_rounding_ratio),
+                chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+                custom_anchor_shape: custom
+                    .then(|| pad_shape_name(layer.custom_anchor_shape))
+                    .flatten(),
+                custom_primitives,
+                custom_primitives_unreadable,
+            }
         })
         .collect();
     let shape = copper_layers.first().and_then(|layer| layer.shape.clone());
@@ -121,12 +151,25 @@ fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
             .then(|| layer_enum_to_name(drill.start_layer).to_string()),
         end_layer: (drill.end_layer != 0).then(|| layer_enum_to_name(drill.end_layer).to_string()),
     });
+    let corner_rounding_ratio = copper_layers
+        .first()
+        .and_then(|layer| layer.corner_rounding_ratio);
     PadGeometry {
         rotation_deg: stack.angle.as_ref().map(|angle| angle.value_degrees),
         shape,
         size,
         drill,
         copper_layers,
+        corner_rounding_ratio,
+        zone_connection: stack
+            .zone_settings
+            .as_ref()
+            .and_then(|settings| IpcPadZoneConnection::from_proto(settings.zone_connection)),
+        thermal: stack
+            .zone_settings
+            .as_ref()
+            .and_then(|settings| settings.thermal_spokes.as_ref())
+            .map(IpcPadThermal::from_proto),
     }
 }
 
@@ -331,6 +374,11 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
 /// copper layer's material is always "copper"; a dielectric's materials, εr and
 /// loss tangents are per sub-layer; a solder mask carries its own εr and loss
 /// tangent; a color is present only when the board specifies one.
+///
+/// KiCad 10.0.4 fills less: no finish, impedance or edge message, no layer
+/// `enabled` flag, no dielectric type, and an empty dielectric detail (its
+/// sub-layers go to a detached message). What it did not send stays `None` or
+/// empty here rather than reading as a protobuf default.
 fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
     use kiapi::board::board_stackup_layer::Details;
     use kiapi::board::{BoardEdgeConnectorType, BoardStackupDielectricType, BoardStackupLayerType};
@@ -346,6 +394,13 @@ fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
             byte(c.a)
         )
     };
+    // A proto3 bool has no presence. 10.0.6 sets `enabled` alongside the
+    // board settings it added; 10.0.4 sets neither, so its all-false layers
+    // are no evidence of disabled layers.
+    let enabled_reported = stackup.finish.is_some()
+        || stackup.impedance.is_some()
+        || stackup.edge.is_some()
+        || stackup.layers.iter().any(|layer| layer.enabled);
 
     let layers = stackup
         .layers
@@ -368,7 +423,7 @@ fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
                 layer: board_layer,
                 user_name: Some(layer.user_name.clone()).filter(|n| !n.is_empty()),
                 kind: kind.to_string(),
-                enabled: layer.enabled,
+                enabled: enabled_reported.then_some(layer.enabled),
                 thickness_nm: nm(&layer.thickness),
                 material: layer.material_name.clone(),
                 color: layer.color.as_ref().map(hex),
@@ -379,15 +434,16 @@ fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
             };
             match &layer.details {
                 Some(Details::Dielectric(dielectric)) => {
-                    out.dielectric_type = Some(
+                    out.dielectric_type =
                         match BoardStackupDielectricType::try_from(dielectric.r#type) {
-                            Ok(BoardStackupDielectricType::BsdtCore) => "core",
-                            Ok(BoardStackupDielectricType::BsdtPrepreg) => "prepreg",
-                            Ok(BoardStackupDielectricType::BsdtNone) => "none",
-                            _ => "unknown",
+                            // The proto default: KiCad set no type.
+                            Ok(BoardStackupDielectricType::BsdtUnknown) => None,
+                            Ok(BoardStackupDielectricType::BsdtCore) => Some("core"),
+                            Ok(BoardStackupDielectricType::BsdtPrepreg) => Some("prepreg"),
+                            Ok(BoardStackupDielectricType::BsdtNone) => Some("none"),
+                            Err(_) => Some("unknown"),
                         }
-                        .to_string(),
-                    );
+                        .map(str::to_string);
                     out.dielectric = dielectric
                         .layer
                         .iter()
@@ -415,25 +471,20 @@ fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
 
     let edge = stackup.edge.as_ref();
     IpcBoardStackup {
-        finish: stackup
-            .finish
-            .as_ref()
-            .map(|f| f.type_name.clone())
-            .unwrap_or_default(),
-        impedance_controlled: stackup.impedance.as_ref().is_some_and(|i| i.is_controlled),
-        edge_connector: match edge
+        finish: stackup.finish.as_ref().map(|f| f.type_name.clone()),
+        impedance_controlled: stackup.impedance.as_ref().map(|i| i.is_controlled),
+        edge_connector: edge
             .and_then(|e| e.connector.as_ref())
-            .map(|c| BoardEdgeConnectorType::try_from(c.r#type))
-        {
-            Some(Ok(BoardEdgeConnectorType::BectNone)) => "none",
-            Some(Ok(BoardEdgeConnectorType::BectPlain)) => "plain",
-            Some(Ok(BoardEdgeConnectorType::BectBeveled)) => "beveled",
-            _ => "unknown",
-        }
-        .to_string(),
+            .map(|c| match BoardEdgeConnectorType::try_from(c.r#type) {
+                Ok(BoardEdgeConnectorType::BectNone) => "none",
+                Ok(BoardEdgeConnectorType::BectPlain) => "plain",
+                Ok(BoardEdgeConnectorType::BectBeveled) => "beveled",
+                _ => "unknown",
+            })
+            .map(str::to_string),
         has_edge_plating: edge
             .and_then(|e| e.plating.as_ref())
-            .is_some_and(|p| p.has_edge_plating),
+            .map(|p| p.has_edge_plating),
         layers,
     }
 }
@@ -2188,6 +2239,11 @@ impl KiCadIpcClient {
                         .map(|a| a.value_degrees)
                         .unwrap_or(0.0),
                     layer: layer_enum_to_name(fp.layer).to_string(),
+                    uuid: fp
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .filter(|id| !id.is_empty()),
                 });
             }
         }
@@ -2699,6 +2755,10 @@ impl KiCadIpcClient {
                     size: geometry.size,
                     drill: geometry.drill,
                     copper_layers: geometry.copper_layers,
+                    corner_rounding_ratio: geometry.corner_rounding_ratio,
+                    zone_connection: geometry.zone_connection,
+                    thermal: geometry.thermal,
+                    thermal_spoke_angle_explicit: None,
                 });
             }
             found = Some(pads);
@@ -3982,6 +4042,10 @@ impl KiCadIpcClient {
         let (library_nickname, entry_name) = lib_id
             .split_once(':')
             .context("footprint identifier must use Library:Footprint syntax")?;
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite() && rotation.is_finite(),
+            "footprint '{lib_id}' has a non-finite placement or rotation"
+        );
 
         // Refuse an unrepresentable layer here, before a single child is built.
         //
@@ -4004,6 +4068,49 @@ impl KiCadIpcClient {
                     format!("footprint '{lib_id}' pad '{}' cannot be placed", pad.number)
                 })?;
             }
+            // Refuse a shape this builder cannot reproduce instead of sending
+            // a rectangle in its place, and hold a custom pad to having its
+            // primitives (and only a custom pad to having them).
+            pad_stack_shape(&pad.shape).with_context(|| {
+                format!("footprint '{lib_id}' pad '{}' cannot be placed", pad.number)
+            })?;
+            match (&pad.custom, pad.shape.as_str()) {
+                (Some(custom), "custom") => {
+                    anyhow::ensure!(pad.x.is_finite() && pad.y.is_finite() && pad.rotation.is_finite(),
+                        "footprint '{lib_id}' custom pad '{}' has a non-finite position or rotation", pad.number);
+                    anyhow::ensure!(
+                        pad.size_x.is_finite()
+                            && pad.size_y.is_finite()
+                            && pad.size_x > 0.0
+                            && pad.size_y > 0.0,
+                        "footprint '{lib_id}' custom pad '{}' has an invalid anchor size {} x {}",
+                        pad.number,
+                        pad.size_x,
+                        pad.size_y
+                    );
+                    custom.validate().with_context(|| {
+                        format!(
+                            "footprint '{lib_id}' custom pad '{}' cannot be placed",
+                            pad.number
+                        )
+                    })?;
+                }
+                (None, "custom") => anyhow::bail!(
+                    "footprint '{lib_id}' custom pad '{}' has no primitives to place",
+                    pad.number
+                ),
+                (Some(_), shape) => anyhow::bail!(
+                    "footprint '{lib_id}' pad '{}' is '{shape}' but carries custom primitives",
+                    pad.number
+                ),
+                (None, _) => {}
+            }
+            pad.thermal.to_proto().with_context(|| {
+                format!(
+                    "footprint '{lib_id}' pad '{}' has thermal settings that cannot be placed",
+                    pad.number
+                )
+            })?;
         }
         for graphic in graphics {
             crate::builders::try_layer_from_name(graphic.layer()).with_context(|| {
@@ -4090,14 +4197,30 @@ impl KiCadIpcClient {
                 layers.sort_unstable();
                 layers.dedup();
 
-                let shape = match pad.shape.as_str() {
-                    "circle" => kiapi::board::types::PadStackShape::PssCircle,
-                    "rect" => kiapi::board::types::PadStackShape::PssRectangle,
-                    "oval" => kiapi::board::types::PadStackShape::PssOval,
-                    "trapezoid" => kiapi::board::types::PadStackShape::PssTrapezoid,
-                    "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
-                    "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
-                    _ => kiapi::board::types::PadStackShape::PssRectangle,
+                // Validated above, before any child was built.
+                let shape = pad_stack_shape(&pad.shape)
+                    .expect("pad shapes are validated before children are built");
+                // A custom pad's anchor is its own ordinary shape, and its
+                // primitives go out pad-local: KiCad applies the pad position
+                // and angle to them, so transforming them here as well would
+                // move and rotate the copper twice.
+                let (custom_anchor_shape, custom_shapes) = match &pad.custom {
+                    Some(custom) => (
+                        match custom.anchor {
+                            crate::IpcCustomPadAnchor::Circle => {
+                                kiapi::board::types::PadStackShape::PssCircle
+                            }
+                            crate::IpcCustomPadAnchor::Rect => {
+                                kiapi::board::types::PadStackShape::PssRectangle
+                            }
+                        },
+                        custom
+                            .primitives
+                            .iter()
+                            .map(crate::builders::pad_primitive)
+                            .collect(),
+                    ),
+                    None => (shape, Vec::new()),
                 };
                 // Always F_Cu: it is KiCad's ALL_LAYERS sentinel for a
                 // PST_NORMAL stack, not a statement about which side the pad
@@ -4109,7 +4232,8 @@ impl KiCadIpcClient {
                     shape: shape as i32,
                     size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
                     corner_rounding_ratio: pad.roundrect_ratio,
-                    custom_anchor_shape: shape as i32,
+                    custom_shapes,
+                    custom_anchor_shape: custom_anchor_shape as i32,
                     offset: Some(crate::builders::vec2(0.0, 0.0)),
                     ..Default::default()
                 };
@@ -4139,6 +4263,29 @@ impl KiCadIpcClient {
                     angle: Some(kiapi::common::types::Angle {
                         value_degrees: rotation + pad.rotation,
                     }),
+                    // The pad-stack field, not `PadStackLayer.zone_settings`,
+                    // which the protocol reserves for future per-layer use.
+                    // Thermal spokes go with it whenever the definition has
+                    // any, the angle always among them (validated above): a
+                    // footprint file's pad always holds one, while a stack
+                    // sent without spokes would get KiCad's API default for
+                    // the shape, which differs for a rect-anchored custom pad.
+                    zone_settings: {
+                        let thermal_spokes = pad
+                            .thermal
+                            .to_proto()
+                            .expect("thermal settings are validated before children are built");
+                        (pad.zone_connection.is_some() || thermal_spokes.is_some()).then(|| {
+                            kiapi::board::types::ZoneConnectionSettings {
+                                zone_connection: pad
+                                    .zone_connection
+                                    .unwrap_or(crate::IpcPadZoneConnection::Inherited)
+                                    .to_proto()
+                                    as i32,
+                                thermal_spokes,
+                            }
+                        })
+                    },
                     ..Default::default()
                 };
                 let pad_type = match pad.pad_type.as_str() {
@@ -4207,6 +4354,40 @@ impl KiCadIpcClient {
         rotation: f64,
         layer: &str,
     ) -> Result<IpcFootprint> {
+        let item = Self::build_footprint_item(
+            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
+        )?;
+        self.place_footprint_item(board, reference, item)
+    }
+
+    /// Place one fully built `FootprintInstance` (normally from
+    /// [`Self::build_footprint_item`], possibly given more of its library's
+    /// data by the caller) and read it back by reference.
+    ///
+    /// `reference` must be the reference the item carries: it is what the
+    /// duplicate check refuses and the readback finds.
+    pub fn place_footprint_item(
+        &self,
+        board: &Path,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
+        anyhow::ensure!(
+            crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance"),
+            "only a footprint instance can be placed, not a {}",
+            item.type_url
+        );
+        let carried = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("the footprint item to place is unreadable")?
+            .reference_field
+            .and_then(|field| field.text)
+            .and_then(|text| text.text)
+            .map(|text| text.text)
+            .unwrap_or_default();
+        anyhow::ensure!(
+            carried == reference,
+            "the footprint item carries reference '{carried}', not '{reference}'"
+        );
         // Target the document matching `board`, not whichever board is first
         // in KiCad's open list — with several boards open, first-document
         // targeting mutates the wrong one (caught in live verification).
@@ -4218,9 +4399,6 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = Self::build_footprint_item(
-            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
-        )?;
         self.create_items_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints
@@ -4679,6 +4857,23 @@ fn readable_text_angle(deg: f64) -> f64 {
 
 /// Transform one footprint-local graphic into an absolute-board-space child
 /// item for a `FootprintInstance` (see [`KiCadIpcClient::build_footprint_item`]).
+/// The pad-stack shape for a footprint-file pad shape token. An unknown token
+/// is refused: it used to become a rectangle, which is copper the library
+/// never drew.
+fn pad_stack_shape(shape: &str) -> Result<kiapi::board::types::PadStackShape> {
+    use kiapi::board::types::PadStackShape;
+    Ok(match shape {
+        "circle" => PadStackShape::PssCircle,
+        "rect" => PadStackShape::PssRectangle,
+        "oval" => PadStackShape::PssOval,
+        "trapezoid" => PadStackShape::PssTrapezoid,
+        "roundrect" => PadStackShape::PssRoundrect,
+        "chamfered_rect" => PadStackShape::PssChamferedrect,
+        "custom" => PadStackShape::PssCustom,
+        other => anyhow::bail!("pad shape '{other}' is not a KiCad pad shape"),
+    })
+}
+
 fn build_graphic_child(
     graphic: &IpcGraphicDefinition,
     x: f64,
@@ -6337,6 +6532,9 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            zone_connection: None,
+            thermal: Default::default(),
+            custom: None,
             rotation: 0.0,
         };
 
@@ -6483,6 +6681,9 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            zone_connection: None,
+            thermal: Default::default(),
+            custom: None,
             rotation: 0.0,
         }];
         let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));
@@ -6501,6 +6702,116 @@ mod footprint_graphics_tests {
             ..pad[0].clone()
         }];
         assert!(build(&through_hole, &[], "F.Cu").is_ok());
+
+        // An unknown pad shape used to go out as a rectangle.
+        let hexagon = vec![IpcPadDefinition {
+            shape: "hexagon".to_string(),
+            layers: vec!["F.Cu".to_string()],
+            ..pad[0].clone()
+        }];
+        let error = format!(
+            "{:#}",
+            build(&hexagon, &[], "F.Cu").expect_err("unknown shape")
+        );
+        assert!(error.contains("pad shape 'hexagon'"), "{error}");
+
+        // `custom` and its primitives travel together or not at all.
+        let custom = crate::IpcCustomPad {
+            anchor: crate::IpcCustomPadAnchor::Rect,
+            primitives: vec![crate::IpcPadPrimitive::Polygon {
+                points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                width: 0.0,
+                filled: true,
+            }],
+        };
+        let bare = vec![IpcPadDefinition {
+            shape: "custom".to_string(),
+            layers: vec!["F.Cu".to_string()],
+            ..pad[0].clone()
+        }];
+        let error = format!(
+            "{:#}",
+            build(&bare, &[], "F.Cu").expect_err("no primitives")
+        );
+        assert!(error.contains("has no primitives"), "{error}");
+        let mislabelled = vec![IpcPadDefinition {
+            shape: "rect".to_string(),
+            layers: vec!["F.Cu".to_string()],
+            custom: Some(custom.clone()),
+            ..pad[0].clone()
+        }];
+        let error = format!(
+            "{:#}",
+            build(&mislabelled, &[], "F.Cu").expect_err("mislabelled")
+        );
+        assert!(error.contains("carries custom primitives"), "{error}");
+        let degenerate = vec![IpcPadDefinition {
+            custom: Some(crate::IpcCustomPad {
+                primitives: vec![crate::IpcPadPrimitive::Segment {
+                    start: (0.0, 0.0),
+                    end: (f64::NAN, 0.0),
+                    width: 0.1,
+                }],
+                ..custom.clone()
+            }),
+            ..bare[0].clone()
+        }];
+        let error = format!("{:#}", build(&degenerate, &[], "F.Cu").expect_err("NaN"));
+        assert!(error.contains("not a finite coordinate"), "{error}");
+        let zero_anchor = vec![IpcPadDefinition {
+            size_x: 0.0,
+            custom: Some(custom.clone()),
+            ..bare[0].clone()
+        }];
+        let error = format!(
+            "{:#}",
+            build(&zero_anchor, &[], "F.Cu").expect_err("anchor")
+        );
+        assert!(error.contains("invalid anchor size"), "{error}");
+        let good = vec![IpcPadDefinition {
+            custom: Some(custom),
+            ..bare[0].clone()
+        }];
+        assert!(build(&good, &[], "F.Cu").is_ok());
+    }
+
+    /// A primitive KiCad reports that the builder could not have sent is
+    /// named, not approximated, by the readback converter.
+    #[test]
+    fn pad_primitive_readback_refuses_what_it_cannot_describe() {
+        use crate::builders;
+        use kiapi::common::types::{graphic_shape::Geometry, GraphicBezierAttributes};
+        let mut bezier = builders::pad_primitive(&crate::IpcPadPrimitive::Segment {
+            start: (0.0, 0.0),
+            end: (1.0, 0.0),
+            width: 0.1,
+        });
+        bezier.shape.as_mut().unwrap().geometry =
+            Some(Geometry::Bezier(GraphicBezierAttributes::default()));
+        let error = builders::pad_primitive_from_proto(&bezier).unwrap_err();
+        assert!(error.to_string().contains("bezier"), "{error}");
+
+        let mut rounded = builders::pad_primitive(&crate::IpcPadPrimitive::Rect {
+            start: (0.0, 0.0),
+            end: (1.0, 1.0),
+            width: 0.0,
+            filled: true,
+        });
+        if let Some(Geometry::Rectangle(rect)) = rounded.shape.as_mut().unwrap().geometry.as_mut() {
+            rect.corner_radius = Some(builders::distance(0.1));
+        }
+        let error = builders::pad_primitive_from_proto(&rounded).unwrap_err();
+        assert!(error.to_string().contains("rounded-rectangle"), "{error}");
+    }
+
+    /// `mm_to_nm` rounds as KiCad's parser does; truncation lost a nanometre
+    /// on ordinary library values.
+    #[test]
+    fn millimetres_round_to_the_nearest_nanometre() {
+        use crate::builders;
+        assert_eq!(builders::mm_to_nm(0.254289), 254_289);
+        assert_eq!(builders::mm_to_nm(-0.254289), -254_289);
+        assert_eq!(builders::mm_to_nm(0.1), 100_000);
     }
 }
 
@@ -6887,6 +7198,312 @@ mod footprint_graphic_tests {
 }
 
 #[cfg(test)]
+mod pad_readback_tests {
+    use super::*;
+
+    /// A live pad reports its corner ratio at pad level, so a paste-only
+    /// aperture's ratio is visible, and its pad-stack zone connection; a stack
+    /// with no zone settings reports none rather than a guess.
+    #[test]
+    fn live_pad_reports_corner_ratio_and_zone_connection() {
+        use kiapi::board::types::{
+            BoardLayer, Pad, PadStack, PadStackLayer, PadStackShape, ZoneConnectionSettings,
+            ZoneConnectionStyle,
+        };
+        let pad = |zone: Option<ZoneConnectionStyle>| Pad {
+            pad_stack: Some(PadStack {
+                layers: vec![BoardLayer::BlFPaste as i32],
+                copper_layers: vec![PadStackLayer {
+                    layer: BoardLayer::BlFCu as i32,
+                    shape: PadStackShape::PssRoundrect as i32,
+                    corner_rounding_ratio: 0.1,
+                    ..Default::default()
+                }],
+                zone_settings: zone.map(|style| ZoneConnectionSettings {
+                    zone_connection: style as i32,
+                    thermal_spokes: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let geometry = pad_geometry(&pad(Some(ZoneConnectionStyle::ZcsFull)));
+        assert_eq!(geometry.corner_rounding_ratio, Some(0.1));
+        assert_eq!(geometry.zone_connection, Some(IpcPadZoneConnection::Solid));
+        assert_eq!(
+            pad_geometry(&pad(Some(ZoneConnectionStyle::ZcsInherited))).zone_connection,
+            Some(IpcPadZoneConnection::Inherited)
+        );
+        assert_eq!(pad_geometry(&pad(None)).zone_connection, None);
+        assert_eq!(
+            pad_geometry(&pad(Some(ZoneConnectionStyle::ZcsUnknown))).zone_connection,
+            None
+        );
+    }
+
+    /// A live pad reports exactly the thermal spokes its stack carries: an
+    /// unset width or gap stays absent, an explicit zero stays zero, and a
+    /// stack without spokes reports none.
+    #[test]
+    fn live_pad_reports_thermal_spokes_exactly() {
+        use kiapi::board::types::{
+            Pad, PadStack, ThermalSpokeSettings, ZoneConnectionSettings, ZoneConnectionStyle,
+        };
+        let pad = |spokes: Option<ThermalSpokeSettings>| Pad {
+            pad_stack: Some(PadStack {
+                zone_settings: Some(ZoneConnectionSettings {
+                    zone_connection: ZoneConnectionStyle::ZcsInherited as i32,
+                    thermal_spokes: spokes,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reported = pad_geometry(&pad(Some(ThermalSpokeSettings {
+            width: Some(kiapi::common::types::Distance { value_nm: 0 }),
+            angle: Some(kiapi::common::types::Angle {
+                value_degrees: 45.0,
+            }),
+            gap: None,
+        })));
+        assert_eq!(
+            reported.thermal,
+            Some(IpcPadThermal {
+                spoke_width: Some(0.0),
+                gap: None,
+                spoke_angle: Some(45.0),
+            })
+        );
+        assert_eq!(pad_geometry(&pad(None)).thermal, None);
+    }
+}
+
+#[cfg(test)]
+mod pad_thermal_tests {
+    use super::*;
+
+    fn pad(thermal: IpcPadThermal) -> IpcPadDefinition {
+        IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "smd".into(),
+            shape: "rect".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".into()],
+            roundrect_ratio: 0.0,
+            custom: None,
+            zone_connection: None,
+            thermal,
+        }
+    }
+
+    fn sent_zone_settings(
+        thermal: IpcPadThermal,
+    ) -> anyhow::Result<Option<kiapi::board::types::ZoneConnectionSettings>> {
+        let item = KiCadIpcClient::build_footprint_item(
+            "Lib:Part",
+            "U1",
+            "part",
+            &[pad(thermal)],
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )?;
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let child = footprint
+            .definition
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|child| crate::builders::any_is(child, "kiapi.board.types.Pad"))
+            .unwrap();
+        Ok(kiapi::board::types::Pad::decode(child.value.as_slice())?
+            .pad_stack
+            .unwrap()
+            .zone_settings)
+    }
+
+    /// KiCad 10's `PADSTACK::Deserialize` reads the spoke angle whenever
+    /// spokes are present, as 0° when it is missing, so the builder refuses a
+    /// width or gap without one; invalid values are refused as well. A
+    /// definition with no thermal settings sends no zone settings, as before.
+    #[test]
+    fn thermal_spokes_need_an_angle_and_valid_values() {
+        let error = format!(
+            "{:#}",
+            sent_zone_settings(IpcPadThermal {
+                gap: Some(0.2),
+                ..Default::default()
+            })
+            .unwrap_err()
+        );
+        assert!(error.contains("need an angle"), "{error}");
+        for invalid in [
+            IpcPadThermal {
+                spoke_width: Some(f64::NAN),
+                spoke_angle: Some(45.0),
+                ..Default::default()
+            },
+            IpcPadThermal {
+                gap: Some(-0.1),
+                spoke_angle: Some(45.0),
+                ..Default::default()
+            },
+            IpcPadThermal {
+                spoke_angle: Some(f64::INFINITY),
+                ..Default::default()
+            },
+        ] {
+            assert!(sent_zone_settings(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(sent_zone_settings(IpcPadThermal::default()).unwrap(), None);
+
+        let sent = sent_zone_settings(IpcPadThermal {
+            spoke_width: Some(0.0),
+            gap: None,
+            spoke_angle: Some(90.0),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sent.zone_connection,
+            kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
+        );
+        let spokes = sent.thermal_spokes.unwrap();
+        assert_eq!(
+            spokes.width,
+            Some(kiapi::common::types::Distance { value_nm: 0 })
+        );
+        assert_eq!(spokes.gap, None);
+        assert_eq!(spokes.angle.map(|angle| angle.value_degrees), Some(90.0));
+    }
+
+    /// A stack sent without zone settings is what KiCad holds as inherited
+    /// with `DefaultThermalSpokeAngleForShape`: 90° for oval and the
+    /// rectangles, 45° otherwise, custom pads included. Present settings are
+    /// returned untouched.
+    #[test]
+    fn canonical_zone_settings_follow_kicads_deserialize_defaults() {
+        use kiapi::board::types::{PadStack, PadStackLayer, PadStackShape};
+        let stack = |shape: PadStackShape| PadStack {
+            copper_layers: vec![PadStackLayer {
+                shape: shape as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (shape, angle) in [
+            (PadStackShape::PssCircle, 45.0),
+            (PadStackShape::PssCustom, 45.0),
+            (PadStackShape::PssTrapezoid, 45.0),
+            (PadStackShape::PssRectangle, 90.0),
+            (PadStackShape::PssOval, 90.0),
+            (PadStackShape::PssRoundrect, 90.0),
+            (PadStackShape::PssChamferedrect, 90.0),
+        ] {
+            let settings = crate::builders::canonical_pad_zone_settings(&stack(shape));
+            assert_eq!(
+                settings.zone_connection,
+                kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
+            );
+            let spokes = settings.thermal_spokes.unwrap();
+            assert_eq!((spokes.width, spokes.gap), (None, None));
+            assert_eq!(
+                spokes.angle.map(|angle| angle.value_degrees),
+                Some(angle),
+                "{shape:?}"
+            );
+        }
+        let mut explicit = stack(PadStackShape::PssCustom);
+        explicit.zone_settings = Some(kiapi::board::types::ZoneConnectionSettings {
+            zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32,
+            thermal_spokes: None,
+        });
+        assert_eq!(
+            crate::builders::canonical_pad_zone_settings(&explicit),
+            explicit.zone_settings.unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod footprint_input_validation_tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_custom_pad_or_footprint_transforms_are_refused_before_serialization() {
+        let pad = IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "smd".into(),
+            shape: "custom".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 0.16,
+            size_y: 0.16,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".into(), "F.Mask".into(), "F.Paste".into()],
+            roundrect_ratio: 0.0,
+            zone_connection: None,
+            thermal: Default::default(),
+            custom: Some(crate::IpcCustomPad {
+                anchor: crate::IpcCustomPadAnchor::Circle,
+                primitives: vec![crate::IpcPadPrimitive::Rect {
+                    start: (-0.1, -0.1),
+                    end: (0.1, 0.1),
+                    width: 0.0,
+                    filled: true,
+                }],
+            }),
+        };
+        let build = |pad: &IpcPadDefinition, x, y, rotation| {
+            KiCadIpcClient::build_footprint_item(
+                "Test:Custom",
+                "U1",
+                "",
+                std::slice::from_ref(pad),
+                &[],
+                &IpcFieldPlacement::default(),
+                x,
+                y,
+                rotation,
+                "F.Cu",
+            )
+        };
+        assert!(build(&pad, 1.0, 2.0, 37.0).is_ok());
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for [x, y, rotation] in [
+                [invalid, 0.0, 0.0],
+                [0.0, invalid, 0.0],
+                [0.0, 0.0, invalid],
+            ] {
+                assert!(build(&pad, x, y, rotation).is_err());
+            }
+            for field in 0..3 {
+                let mut invalid_pad = pad.clone();
+                match field {
+                    0 => invalid_pad.x = invalid,
+                    1 => invalid_pad.y = invalid,
+                    _ => invalid_pad.rotation = invalid,
+                }
+                assert!(build(&invalid_pad, 1.0, 2.0, 37.0).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod stackup_tests {
     use super::*;
     use kiapi::board::board_stackup_layer::Details;
@@ -7004,10 +7621,10 @@ mod stackup_tests {
     fn every_serialized_field_reaches_the_crate_type() {
         let stackup = stackup_from_proto(&sample());
 
-        assert_eq!(stackup.finish, "ENIG");
-        assert!(stackup.impedance_controlled);
-        assert_eq!(stackup.edge_connector, "beveled");
-        assert!(stackup.has_edge_plating);
+        assert_eq!(stackup.finish.as_deref(), Some("ENIG"));
+        assert_eq!(stackup.impedance_controlled, Some(true));
+        assert_eq!(stackup.edge_connector.as_deref(), Some("beveled"));
+        assert_eq!(stackup.has_edge_plating, Some(true));
 
         let [silk, mask, copper, core, inner] = stackup.layers.as_slice() else {
             panic!("five entries, in order: {:?}", stackup.layers);
@@ -7039,16 +7656,61 @@ mod stackup_tests {
         assert!(core.dielectric[0].thickness_locked);
 
         assert_eq!(inner.layer.as_deref(), Some("In1.Cu"));
-        assert!(!inner.enabled);
+        assert_eq!(inner.enabled, Some(false));
+        assert_eq!(copper.enabled, Some(true));
     }
 
     #[test]
-    fn a_stackup_with_no_finish_or_edge_settings_reads_as_unset() {
+    fn a_stackup_with_no_finish_or_edge_settings_reads_as_not_reported() {
         let stackup = stackup_from_proto(&BoardStackup::default());
-        assert_eq!(stackup.finish, "");
-        assert!(!stackup.impedance_controlled);
-        assert_eq!(stackup.edge_connector, "unknown");
-        assert!(!stackup.has_edge_plating);
+        assert_eq!(stackup.finish, None);
+        assert_eq!(stackup.impedance_controlled, None);
+        assert_eq!(stackup.edge_connector, None);
+        assert_eq!(stackup.has_edge_plating, None);
         assert!(stackup.layers.is_empty());
+    }
+
+    /// The shape KiCad 10.0.4's `BOARD_STACKUP::Serialize` puts on the wire:
+    /// each entry's thickness, layer and type only, `enabled` never set, and a
+    /// dielectric whose detail is present but empty because its sub-layers
+    /// went to a detached `New()` message. None of the missing values may read
+    /// as a fact — not zero copper, not "disabled", not "no finish".
+    #[test]
+    fn kicad_10_0_4s_partial_answer_reports_nothing_it_did_not_send() {
+        let bare =
+            |layer: BoardLayer, kind: BoardStackupLayerType, thickness: i64| BoardStackupLayer {
+                enabled: false,
+                ..entry(layer, kind, thickness)
+            };
+        let mut copper = bare(BoardLayer::BlFCu, BoardStackupLayerType::BsltCopper, 35_000);
+        copper.material_name = "copper".into();
+        let mut core = bare(
+            BoardLayer::BlUndefined,
+            BoardStackupLayerType::BsltDielectric,
+            1_510_000,
+        );
+        core.details = Some(Details::Dielectric(BoardStackupDielectricLayer::default()));
+        let mask = bare(
+            BoardLayer::BlFMask,
+            BoardStackupLayerType::BsltSoldermask,
+            10_000,
+        );
+        let stackup = stackup_from_proto(&BoardStackup {
+            layers: vec![mask, copper, core],
+            ..Default::default()
+        });
+
+        assert_eq!(stackup.finish, None);
+        assert_eq!(stackup.impedance_controlled, None);
+        assert_eq!(stackup.edge_connector, None);
+        assert_eq!(stackup.has_edge_plating, None);
+        for layer in &stackup.layers {
+            assert_eq!(layer.enabled, None, "{layer:?}");
+        }
+        let core = &stackup.layers[2];
+        assert_eq!(core.dielectric_type, None, "BSDT_UNKNOWN is no type");
+        assert!(core.dielectric.is_empty());
+        assert_eq!(core.thickness_nm, 1_510_000);
+        assert_eq!(stackup.layers[0].epsilon_r, None);
     }
 }

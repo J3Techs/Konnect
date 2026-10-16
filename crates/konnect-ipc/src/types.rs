@@ -264,6 +264,17 @@ pub struct IpcPadLayerGeometry {
     pub offset: Option<IpcVector2>,
     pub corner_rounding_ratio: Option<f64>,
     pub chamfer_ratio: Option<f64>,
+    /// For a `custom` entry, the anchor shape KiCad reports; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_anchor_shape: Option<String>,
+    /// For a `custom` entry, its primitives in pad-local mm, exactly as KiCad
+    /// reports them; absent for ordinary shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_primitives: Option<Vec<IpcPadPrimitive>>,
+    /// Why `custom_primitives` is absent from a `custom` entry: KiCad sent a
+    /// primitive this build cannot describe. Never left silently empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_primitives_unreadable: Option<String>,
 }
 
 /// Native drill information for a pad, when it has a drilled hole.
@@ -283,6 +294,9 @@ pub struct IpcFootprint {
     pub position: IpcVector2,
     pub rotation: f64,
     pub layer: String,
+    /// The footprint instance KIID KiCad reported, `None` when it sent none.
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
 /// A pad of a footprint placed on the board, read back from KiCad.
@@ -316,6 +330,212 @@ pub struct IpcPad {
     /// Every copper geometry entry KiCad supplied.  This prevents custom and
     /// front/inner/back pad stacks from being flattened into a guessed shape.
     pub copper_layers: Vec<IpcPadLayerGeometry>,
+    /// The pad's corner-rounding ratio, read from the pad itself rather than
+    /// a copper entry, so a pad with no copper (a paste-only aperture) still
+    /// reports it. Mirrors the first copper entry on the live board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_rounding_ratio: Option<f64>,
+    /// How copper zones connect to the pad. A footprint file without a
+    /// `(zone_connect …)` reads as `inherited`; a live pad whose stack reports
+    /// no zone settings leaves this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_connection: Option<IpcPadZoneConnection>,
+    /// Thermal-relief settings as KiCad holds them: what the live pad stack
+    /// reports, or for a footprint file the explicit clauses with the angle
+    /// KiCad's parser gives the pad. Absent when the live stack reports none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<IpcPadThermal>,
+    /// Whether a footprint file wrote `(thermal_bridge_angle …)` itself
+    /// (`false`: `thermal.spoke_angle` is the parser's shape default). Always
+    /// `null` for a live pad, whose stack cannot say.
+    #[serde(default)]
+    pub thermal_spoke_angle_explicit: Option<bool>,
+}
+
+/// A pad's own zone-connection override: KiCad's `ZONE_CONNECTION`, written
+/// in a footprint file as `(zone_connect N)` and carried by the API as
+/// `PadStack.zone_settings.zone_connection`.
+///
+/// `PadStackLayer.zone_settings` also exists, but the protocol reserves it
+/// for future per-layer use; the pad-stack field is the one KiCad applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPadZoneConnection {
+    /// `-1`: follow the footprint, zone and board rules. KiCad writes it by
+    /// leaving the token out.
+    Inherited,
+    /// `0`
+    None,
+    /// `1`: thermal reliefs.
+    Thermal,
+    /// `2`: solid copper.
+    Solid,
+    /// `3`: thermal reliefs for plated through holes only, solid otherwise.
+    PthThermal,
+}
+
+impl IpcPadZoneConnection {
+    /// The connection a footprint file's `(zone_connect N)` names, or `None`
+    /// for a number KiCad does not define.
+    pub fn from_file_value(value: i64) -> Option<Self> {
+        Some(match value {
+            -1 => Self::Inherited,
+            0 => Self::None,
+            1 => Self::Thermal,
+            2 => Self::Solid,
+            3 => Self::PthThermal,
+            _ => return None,
+        })
+    }
+
+    /// The number a footprint file writes for this connection.
+    pub fn file_value(self) -> i64 {
+        match self {
+            Self::Inherited => -1,
+            Self::None => 0,
+            Self::Thermal => 1,
+            Self::Solid => 2,
+            Self::PthThermal => 3,
+        }
+    }
+
+    pub fn to_proto(self) -> crate::gen::kiapi::board::types::ZoneConnectionStyle {
+        use crate::gen::kiapi::board::types::ZoneConnectionStyle as Style;
+        match self {
+            Self::Inherited => Style::ZcsInherited,
+            Self::None => Style::ZcsNone,
+            Self::Thermal => Style::ZcsThermal,
+            Self::Solid => Style::ZcsFull,
+            Self::PthThermal => Style::ZcsPthThermal,
+        }
+    }
+
+    /// The connection a protocol value names, or `None` for `ZCS_UNKNOWN`
+    /// and values this build does not know.
+    pub fn from_proto(value: i32) -> Option<Self> {
+        use crate::gen::kiapi::board::types::ZoneConnectionStyle as Style;
+        Some(match Style::try_from(value).ok()? {
+            Style::ZcsInherited => Self::Inherited,
+            Style::ZcsNone => Self::None,
+            Style::ZcsThermal => Self::Thermal,
+            Style::ZcsFull => Self::Solid,
+            Style::ZcsPthThermal => Self::PthThermal,
+            Style::ZcsUnknown => return None,
+        })
+    }
+}
+
+/// A pad's thermal-relief settings: `(thermal_bridge_width …)`,
+/// `(thermal_gap …)` and `(thermal_bridge_angle …)` in a footprint file, and
+/// `PadStack.zone_settings.thermal_spokes` in the API.
+///
+/// `None` means "not set": the width and gap then inherit from the zone, and
+/// an absent angle means the shape default. An explicit zero is `Some(0.0)`,
+/// never folded into `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpcPadThermal {
+    /// Spoke width override, in mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoke_width: Option<f64>,
+    /// Relief gap override, in mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<f64>,
+    /// Spoke angle, in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoke_angle: Option<f64>,
+}
+
+impl IpcPadThermal {
+    pub fn is_empty(&self) -> bool {
+        self.spoke_width.is_none() && self.gap.is_none() && self.spoke_angle.is_none()
+    }
+
+    /// The `ThermalSpokeSettings` to send, or `None` when nothing is set.
+    ///
+    /// KiCad 10's `PADSTACK::Deserialize` reads the angle unconditionally once
+    /// `thermal_spokes` is present (an absent angle arrives as 0°), so a width
+    /// or gap without an angle is refused rather than sent.
+    pub fn to_proto(
+        &self,
+    ) -> anyhow::Result<Option<crate::gen::kiapi::board::types::ThermalSpokeSettings>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        self.validate()?;
+        let angle = self.spoke_angle.ok_or_else(|| {
+            anyhow::anyhow!(
+                "thermal spoke settings need an angle: KiCad reads a missing one as 0 degrees"
+            )
+        })?;
+        Ok(Some(
+            crate::gen::kiapi::board::types::ThermalSpokeSettings {
+                width: self.spoke_width.map(crate::builders::distance),
+                angle: Some(crate::gen::kiapi::common::types::Angle {
+                    value_degrees: angle,
+                }),
+                gap: self.gap.map(crate::builders::distance),
+            },
+        ))
+    }
+
+    /// Exactly the settings a protocol message carries; absent fields stay
+    /// absent.
+    pub fn from_proto(settings: &crate::gen::kiapi::board::types::ThermalSpokeSettings) -> Self {
+        Self {
+            spoke_width: settings
+                .width
+                .map(|width| crate::builders::nm_to_mm(width.value_nm)),
+            gap: settings
+                .gap
+                .map(|gap| crate::builders::nm_to_mm(gap.value_nm)),
+            spoke_angle: settings.angle.as_ref().map(|angle| angle.value_degrees),
+        }
+    }
+
+    /// Refuse what KiCad could not hold as given: non-finite numbers, and a
+    /// negative or out-of-range (KiCad clamps board units to 32 bits) width
+    /// or gap.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (label, value) in [
+            ("thermal spoke width", self.spoke_width),
+            ("thermal gap", self.gap),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(value.is_finite(), "{label} {value} is not finite");
+                anyhow::ensure!(value >= 0.0, "{label} {value} mm is negative");
+                anyhow::ensure!(
+                    crate::builders::mm_to_nm(value) <= i64::from(i32::MAX),
+                    "{label} {value} mm exceeds KiCad's board-unit range"
+                );
+            }
+        }
+        if let Some(angle) = self.spoke_angle {
+            anyhow::ensure!(
+                angle.is_finite(),
+                "thermal spoke angle {angle} is not finite"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The spoke angle KiCad 10's footprint-file parser gives a pad without a
+/// `(thermal_bridge_angle …)`: 45° for a circle, and for a custom pad on a
+/// circle anchor (90° in files of format 20211014 or older), 90° otherwise.
+/// `format_version` is the file's `(version …)`; KiCad reads a missing one as
+/// 0, the oldest format.
+pub fn file_default_thermal_spoke_angle(
+    shape: &str,
+    custom_anchor: Option<IpcCustomPadAnchor>,
+    format_version: Option<i64>,
+) -> f64 {
+    match (shape, custom_anchor) {
+        ("circle", _) => 45.0,
+        ("custom", Some(IpcCustomPadAnchor::Circle)) if format_version.unwrap_or(0) > 20211014 => {
+            45.0
+        }
+        _ => 90.0,
+    }
 }
 
 /// The document's title block, which the board file also carries.
@@ -355,6 +575,282 @@ pub struct IpcPadDefinition {
     pub drill_oval: bool,
     pub layers: Vec<String>,
     pub roundrect_ratio: f64,
+    /// The anchor and primitives of a `custom` pad; `None` for every other
+    /// shape. `build_footprint_item` refuses a `custom` pad without it, and
+    /// any other shape with it, so the two can never disagree silently.
+    pub custom: Option<IpcCustomPad>,
+    /// The pad's `(zone_connect …)`, or `None` when the library leaves it out
+    /// and the pad inherits. An explicit `-1` is kept as `Inherited`.
+    pub zone_connection: Option<IpcPadZoneConnection>,
+    /// The pad's thermal-relief settings. A footprint-file reader fills the
+    /// angle in even when the file leaves it out (see
+    /// [`file_default_thermal_spoke_angle`]), because KiCad's parser always
+    /// sets one; empty sends no thermal settings at all.
+    pub thermal: IpcPadThermal,
+}
+
+/// The anchor of a custom pad: the ordinary pad shape, sized by the pad's
+/// `(size …)`, that the primitives are unioned with. KiCad supports only these
+/// two (`PadStackLayer::custom_anchor_shape`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcCustomPadAnchor {
+    Circle,
+    Rect,
+}
+
+impl IpcCustomPadAnchor {
+    /// The token a footprint file uses in `(options (anchor …))`.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Circle => "circle",
+            Self::Rect => "rect",
+        }
+    }
+}
+
+/// The custom-shape part of a `custom` pad.
+///
+/// Primitive coordinates are PAD-LOCAL: relative to the pad position, before
+/// the pad's rotation. KiCad keeps them that way (`PADSTACK` primitives) and
+/// rotates them with the pad, so they must never be passed through the
+/// footprint placement transform.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcCustomPad {
+    pub anchor: IpcCustomPadAnchor,
+    pub primitives: Vec<IpcPadPrimitive>,
+}
+
+impl IpcCustomPad {
+    /// Distance from the pad origin to the farthest copper any primitive
+    /// draws, stroke included, in mm. A rotation-invariant extent.
+    pub fn primitive_reach(&self) -> f64 {
+        self.primitives
+            .iter()
+            .map(IpcPadPrimitive::reach)
+            .fold(0.0, f64::max)
+    }
+
+    /// Refuse anything KiCad would not draw exactly as described: non-finite
+    /// numbers, an empty primitive list and degenerate primitives.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.primitives.is_empty(),
+            "a custom pad needs at least one primitive"
+        );
+        for (index, primitive) in self.primitives.iter().enumerate() {
+            primitive.validate().map_err(|error| {
+                anyhow::anyhow!("primitive {index} ({}): {error}", primitive.kind())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// One custom-pad primitive in pad-local mm (see [`IpcCustomPad`]).
+///
+/// `width` is the stroke width, which KiCad adds to the copper outline of a
+/// filled shape as well as an outlined one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IpcPadPrimitive {
+    /// `gr_poly` — one closed outline of straight edges.
+    Polygon {
+        points: Vec<(f64, f64)>,
+        width: f64,
+        filled: bool,
+    },
+    /// `gr_rect` — axis-aligned (in the pad frame) between two corners.
+    Rect {
+        start: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+        filled: bool,
+    },
+    /// `gr_circle` — centre plus a point on the circumference.
+    Circle {
+        center: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+        filled: bool,
+    },
+    /// `gr_line` — a stroked segment.
+    Segment {
+        start: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+    },
+    /// `gr_arc` — a stroked arc through start, mid and end.
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+        width: f64,
+    },
+}
+
+fn finite_point(label: &str, (x, y): (f64, f64)) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        x.is_finite() && y.is_finite(),
+        "{label} ({x}, {y}) is not a finite coordinate"
+    );
+    Ok(())
+}
+
+impl IpcPadPrimitive {
+    /// The footprint-file token this primitive is written with.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Polygon { .. } => "gr_poly",
+            Self::Rect { .. } => "gr_rect",
+            Self::Circle { .. } => "gr_circle",
+            Self::Segment { .. } => "gr_line",
+            Self::Arc { .. } => "gr_arc",
+        }
+    }
+
+    pub fn width(&self) -> f64 {
+        match self {
+            Self::Polygon { width, .. }
+            | Self::Rect { width, .. }
+            | Self::Circle { width, .. }
+            | Self::Segment { width, .. }
+            | Self::Arc { width, .. } => *width,
+        }
+    }
+
+    pub fn filled(&self) -> bool {
+        match self {
+            Self::Polygon { filled, .. }
+            | Self::Rect { filled, .. }
+            | Self::Circle { filled, .. } => *filled,
+            Self::Segment { .. } | Self::Arc { .. } => false,
+        }
+    }
+
+    /// See [`IpcCustomPad::primitive_reach`].
+    pub fn reach(&self) -> f64 {
+        let distance = |(x, y): (f64, f64)| x.hypot(y);
+        let farthest = match self {
+            Self::Polygon { points, .. } => {
+                points.iter().copied().map(distance).fold(0.0, f64::max)
+            }
+            Self::Rect { start, end, .. } => [*start, *end, (start.0, end.1), (end.0, start.1)]
+                .into_iter()
+                .map(distance)
+                .fold(0.0, f64::max),
+            Self::Circle { center, end, .. } => {
+                distance(*center) + (end.0 - center.0).hypot(end.1 - center.1)
+            }
+            Self::Segment { start, end, .. } => distance(*start).max(distance(*end)),
+            // The chord points bound the arc only loosely; the circle through
+            // them bounds it for certain.
+            Self::Arc {
+                start, mid, end, ..
+            } => match circle_through(*start, *mid, *end) {
+                Some((center, radius)) => distance(center) + radius,
+                None => distance(*start).max(distance(*mid)).max(distance(*end)),
+            },
+        };
+        farthest + self.width() / 2.0
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let width = self.width();
+        anyhow::ensure!(
+            width.is_finite() && width >= 0.0,
+            "stroke width {width} is not a finite, non-negative length"
+        );
+        match self {
+            Self::Polygon { points, filled, .. } => {
+                for (index, point) in points.iter().enumerate() {
+                    finite_point(&format!("point {index}"), *point)?;
+                }
+                let mut distinct = points.clone();
+                if distinct.len() > 1 && distinct.first() == distinct.last() {
+                    distinct.pop();
+                }
+                anyhow::ensure!(
+                    distinct.len() >= 3,
+                    "a polygon needs at least 3 distinct points, got {}",
+                    distinct.len()
+                );
+                let twice_area: f64 = distinct
+                    .iter()
+                    .zip(distinct.iter().cycle().skip(1))
+                    .map(|(a, b)| a.0 * b.1 - b.0 * a.1)
+                    .sum();
+                anyhow::ensure!(
+                    twice_area.abs() > 1e-12,
+                    "the polygon encloses no area (its points are collinear)"
+                );
+                anyhow::ensure!(
+                    *filled || width > 0.0,
+                    "an unfilled polygon with zero stroke width draws no copper"
+                );
+            }
+            Self::Rect {
+                start, end, filled, ..
+            } => {
+                finite_point("start", *start)?;
+                finite_point("end", *end)?;
+                anyhow::ensure!(
+                    start.0 != end.0 && start.1 != end.1,
+                    "the rectangle from {start:?} to {end:?} has no area"
+                );
+                anyhow::ensure!(
+                    *filled || width > 0.0,
+                    "an unfilled rectangle with zero stroke width draws no copper"
+                );
+            }
+            Self::Circle {
+                center,
+                end,
+                filled,
+                ..
+            } => {
+                finite_point("center", *center)?;
+                finite_point("end", *end)?;
+                anyhow::ensure!(center != end, "the circle has zero radius");
+                anyhow::ensure!(
+                    *filled || width > 0.0,
+                    "an unfilled circle with zero stroke width draws no copper"
+                );
+            }
+            Self::Segment { start, end, .. } => {
+                finite_point("start", *start)?;
+                finite_point("end", *end)?;
+                anyhow::ensure!(start != end, "the line has zero length");
+                anyhow::ensure!(width > 0.0, "a line with zero stroke width draws no copper");
+            }
+            Self::Arc {
+                start, mid, end, ..
+            } => {
+                finite_point("start", *start)?;
+                finite_point("mid", *mid)?;
+                finite_point("end", *end)?;
+                anyhow::ensure!(
+                    circle_through(*start, *mid, *end).is_some(),
+                    "the arc's start, mid and end points are collinear or coincide"
+                );
+                anyhow::ensure!(width > 0.0, "an arc with zero stroke width draws no copper");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Centre and radius of the circle through three points, or `None` when they
+/// are collinear (or two coincide).
+fn circle_through(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> Option<((f64, f64), f64)> {
+    let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let sq = |p: (f64, f64)| p.0 * p.0 + p.1 * p.1;
+    let ux = (sq(a) * (b.1 - c.1) + sq(b) * (c.1 - a.1) + sq(c) * (a.1 - b.1)) / d;
+    let uy = (sq(a) * (c.0 - b.0) + sq(b) * (a.0 - c.0) + sq(c) * (b.0 - a.0)) / d;
+    Some(((ux, uy), (a.0 - ux).hypot(a.1 - uy)))
 }
 
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from
@@ -549,15 +1045,24 @@ pub struct IpcEnabledLayers {
 /// KiCad answers with the board's own stackup, or with its default one when
 /// the board defines none (`BOARD::GetStackupOrDefault`), and the message does
 /// not say which. Values KiCad marks "Not specified" are kept as it sends them.
+///
+/// `None` is a value KiCad did not serialize, never a default standing in for
+/// one. KiCad 10.0.4's `BOARD_STACKUP::Serialize` writes no finish, impedance
+/// or edge settings, no layer `enabled` flag, and attaches each dielectric's
+/// sub-layers to a detached message, so none of those reach the wire; 10.0.6
+/// fills them all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcBoardStackup {
     /// The copper finish KiCad names, e.g. "ENIG"; empty or "Not specified"
-    /// when the board names none.
-    pub finish: String,
-    pub impedance_controlled: bool,
-    /// "none", "plain", "beveled" or "unknown".
-    pub edge_connector: String,
-    pub has_edge_plating: bool,
+    /// when the board names none. `None` when KiCad sent no finish message.
+    pub finish: Option<String>,
+    /// `None` when KiCad sent no impedance message.
+    pub impedance_controlled: Option<bool>,
+    /// "none", "plain", "beveled" or "unknown"; `None` when KiCad sent no
+    /// edge-connector message.
+    pub edge_connector: Option<String>,
+    /// `None` when KiCad sent no edge-plating message.
+    pub has_edge_plating: Option<bool>,
     /// Top to bottom, in KiCad's order.
     pub layers: Vec<IpcStackupLayer>,
 }
@@ -573,7 +1078,11 @@ pub struct IpcStackupLayer {
     /// "copper", "dielectric", "soldermask", "silkscreen", "solderpaste" or
     /// "undefined".
     pub kind: String,
-    pub enabled: bool,
+    /// `None` when the answer carries no evidence that KiCad set the flag: a
+    /// proto3 bool has no presence, and KiCad 10.0.4 never sets it, so a
+    /// `false` is only believed from an answer that also carries 10.0.6's
+    /// board settings or some layer marked enabled.
+    pub enabled: Option<bool>,
     /// The entry's thickness in nanometres. A dielectric's own value is its
     /// first sub-layer's; `dielectric` carries every sub-layer.
     pub thickness_nm: i64,
@@ -583,9 +1092,10 @@ pub struct IpcStackupLayer {
     /// `#RRGGBBAA`, only when the board specifies a color.
     pub color: Option<String>,
     /// "core", "prepreg", "none", or "unknown" for a value this crate does not
-    /// know, for a dielectric.
+    /// know, for a dielectric. `None` when KiCad left the type unset.
     pub dielectric_type: Option<String>,
-    /// A dielectric's physical sub-layers, top to bottom.
+    /// A dielectric's physical sub-layers, top to bottom. Empty for a
+    /// dielectric whose sub-layers KiCad did not serialize.
     pub dielectric: Vec<IpcStackupDielectric>,
     /// A solder mask's relative permittivity.
     pub epsilon_r: Option<f64>,

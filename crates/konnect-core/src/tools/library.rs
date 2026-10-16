@@ -151,7 +151,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, position, drill, or zone connection of a pad in an existing .kicad_mod footprint file.",
+            "Edit a pad in an existing .kicad_mod file, or normalize redundant custom-polygon closing points without changing its closed copper geometry.",
             json!({
                 "type": "object",
                 "properties": {
@@ -159,6 +159,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "pad_number": { "type": "string", "description": "Pad number to edit" },
                     "new_number": { "type": "string", "description": "New pad number (optional; duplicate destination numbers are allowed)" },
                     "match_all": { "type": "boolean", "description": "Edit every direct-child pad with pad_number instead of only the first match", "default": false },
+                    "normalize_polygon_closures": {
+                        "type": "boolean",
+                        "description": "Remove only trailing polygon points that exactly repeat the first point, on the selected custom pad. Retains all other coordinates and clauses. Cannot be combined with other pad edits.",
+                        "default": false
+                    },
                     "x": { "type": "number", "description": "New X position in mm (optional)" },
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
                     "width": { "type": "number", "description": "New pad width in mm (optional)" },
@@ -909,6 +914,37 @@ async fn handle_edit_footprint_pad(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let normalize_polygon_closures = match args.get("normalize_polygon_closures") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "normalize_polygon_closures",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
+    if normalize_polygon_closures
+        && [
+            "new_number",
+            "shape",
+            "x",
+            "y",
+            "width",
+            "height",
+            "drill",
+            "zone_connect",
+        ]
+        .iter()
+        .any(|field| args.get(*field).is_some())
+    {
+        return Ok(invalid_library_argument(
+            "normalize_polygon_closures",
+            "cannot be combined with other pad edits",
+        ));
+    }
     let new_number = match args.get("new_number") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => match value.as_str() {
@@ -998,6 +1034,7 @@ async fn handle_edit_footprint_pad(
 
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
+    let mut normalized_closing_points = 0usize;
     let mut observed_zone_connects = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
@@ -1017,6 +1054,20 @@ async fn handle_edit_footprint_pad(
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
         };
+        if normalize_polygon_closures {
+            match normalize_custom_pad_polygon_closures(&edited) {
+                Ok((replacement, removed)) => {
+                    edited = replacement;
+                    normalized_closing_points += removed;
+                }
+                Err(reason) => {
+                    return Ok(invalid_library_argument(
+                        "normalize_polygon_closures",
+                        reason,
+                    ))
+                }
+            }
+        }
         if let Some(zone_connect) = zone_connect {
             edited = set_pad_zone_connect(edited, zone_connect);
             observed_zone_connects.push(
@@ -1046,6 +1097,9 @@ async fn handle_edit_footprint_pad(
         "matched_count": matched_count,
         "updated_count": matched_count
     });
+    if normalize_polygon_closures {
+        response["normalized_closing_points"] = json!(normalized_closing_points);
+    }
     // Read off the pads as written, not echoed from the request.
     observed_zone_connects.dedup();
     match observed_zone_connects.as_slice() {
@@ -1057,6 +1111,91 @@ async fn handle_edit_footprint_pad(
     Ok(CallToolResult::text(
         serde_json::to_string(&response).unwrap(),
     ))
+}
+
+/// Remove zero-length closing edges only. Every retained byte, including pad
+/// properties, anchors, stencil/mask settings and other primitives, is unchanged.
+/// The revision-aware caller applies all selected pad edits atomically.
+fn normalize_custom_pad_polygon_closures(pad: &str) -> Result<(String, usize), String> {
+    let root = parse_sexp(pad).map_err(|error| error.to_string())?;
+    if root.head() != Some("pad") || root.get(3).and_then(SexpNode::as_str) != Some("custom") {
+        return Err("only custom pads can normalize polygon closures".to_string());
+    }
+    let mut edits = Vec::new();
+    for (primitive_start, primitive_end) in find_direct_child_blocks(pad, "pad") {
+        let primitives = &pad[primitive_start..primitive_end];
+        if parse_sexp(primitives)
+            .map_err(|error| error.to_string())?
+            .head()
+            != Some("primitives")
+        {
+            continue;
+        }
+        for (poly_start, poly_end) in find_direct_child_blocks(primitives, "primitives") {
+            let polygon = &primitives[poly_start..poly_end];
+            if parse_sexp(polygon)
+                .map_err(|error| error.to_string())?
+                .head()
+                != Some("gr_poly")
+            {
+                continue;
+            }
+            let mut pts_count = 0;
+            for (pts_start, pts_end) in find_direct_child_blocks(polygon, "gr_poly") {
+                let pts = &polygon[pts_start..pts_end];
+                if parse_sexp(pts).map_err(|error| error.to_string())?.head() != Some("pts") {
+                    continue;
+                }
+                pts_count += 1;
+                if pts_count > 1 {
+                    return Err("polygon has multiple point lists".to_string());
+                }
+                let pts_node = parse_sexp(pts).map_err(|error| error.to_string())?;
+                let nodes = pts_node.children().unwrap_or_default();
+                let ranges = find_direct_child_blocks(pts, "pts");
+                if nodes.len().saturating_sub(1) != ranges.len() {
+                    return Err("polygon point list contains unsupported atoms".to_string());
+                }
+                let mut points = Vec::new();
+                for node in nodes.iter().skip(1) {
+                    if node.head() != Some("xy")
+                        || node.children().map_or(0, <[SexpNode]>::len) != 3
+                    {
+                        return Err(
+                            "only straight-edge xy polygons can normalize closures".to_string()
+                        );
+                    }
+                    let x = node.get_f64(1).filter(|value| value.is_finite());
+                    let y = node.get_f64(2).filter(|value| value.is_finite());
+                    points.push(x.zip(y).ok_or("polygon has invalid coordinates")?);
+                }
+                let mut retained = points.len();
+                while retained > 3 && points.first() == points.get(retained - 1) {
+                    retained -= 1;
+                }
+                if retained < points.len() {
+                    let mut distinct = Vec::new();
+                    for point in &points[..retained] {
+                        if !distinct.contains(point) {
+                            distinct.push(*point);
+                        }
+                    }
+                    if distinct.len() < 3 {
+                        return Err("polygon has fewer than three distinct points".to_string());
+                    }
+                    let offset = primitive_start + poly_start + pts_start;
+                    for &(start, end) in &ranges[retained..] {
+                        edits.push(SexpEdit::delete(offset + start, offset + end));
+                    }
+                }
+            }
+            if pts_count != 1 {
+                return Err("polygon must have exactly one point list".to_string());
+            }
+        }
+    }
+    let removed = edits.len();
+    Ok((apply_edits(pad.to_string(), edits), removed))
 }
 
 /// A pad's `(zone_connect N)` override. The numbers are KiCad's
@@ -4932,6 +5071,7 @@ async fn handle_get_footprint_info(
                 y,
                 rotation_deg,
                 String::new(),
+                super::pcb_components::sexp_format_version(&footprint),
             ) {
                 Ok(info) => info,
                 Err(error) => {
@@ -6316,6 +6456,95 @@ mod tests {
         assert!(taller.contains("(size 2 4.5)"), "{taller}");
     }
 
+    const EXPLICIT_CLOSURE_PAD: &str = r#"(pad "1" smd custom
+  (at 0.25 -0.5 90) (size 0.16 0.16) (layers "F.Cu" "F.Paste" "F.Mask")
+  (property pad_prop_heatsink) (zone_connect 2) (thermal_bridge_angle 45)
+  (options (clearance outline) (anchor circle))
+  (primitives
+    (gr_poly (pts (xy 0 0) (xy 1 0) (xy 0 1) (xy 0.0 -0.0)) (width 0) (fill yes))
+    (gr_poly (pts (xy 2 2) (xy 3 2) (xy 2 3)) (width 0.1) (fill no))
+    (gr_circle (center 0 0) (end 0.1 0) (width 0) (fill yes))))"#;
+
+    #[test]
+    fn polygon_closure_normalization_preserves_every_other_byte_and_is_idempotent() {
+        let expected = EXPLICIT_CLOSURE_PAD.replace("(xy 0.0 -0.0)", "");
+        let (actual, removed) =
+            normalize_custom_pad_polygon_closures(EXPLICIT_CLOSURE_PAD).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(actual, expected);
+        parse_sexp(&actual).unwrap();
+        let (again, removed) = normalize_custom_pad_polygon_closures(&actual).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(again, actual);
+    }
+
+    #[test]
+    fn polygon_closure_normalization_refuses_curves_invalid_points_and_noncustom_pads() {
+        for invalid in [
+            EXPLICIT_CLOSURE_PAD.replace("(xy 1 0)", "(arc (start 0 0) (mid 1 1) (end 2 0))"),
+            EXPLICIT_CLOSURE_PAD.replace("(xy 1 0)", "(xy nan 0)"),
+            EXPLICIT_CLOSURE_PAD.replace("(xy 0 1)", "(xy 1 0)"),
+            EXPLICIT_CLOSURE_PAD.replace("smd custom", "smd rect"),
+            EXPLICIT_CLOSURE_PAD.replace("(xy 1 0)", "(xy 1 0 5)"),
+        ] {
+            assert!(
+                normalize_custom_pad_polygon_closures(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn polygon_closure_handler_changes_only_the_selected_pad() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Exact.kicad_mod");
+        let second = EXPLICIT_CLOSURE_PAD.replacen("(pad \"1\"", "(pad \"2\"", 1);
+        let source = format!("(footprint \"Exact\" (version 20241229)\n{EXPLICIT_CLOSURE_PAD}\n{second}\n(model \"unchanged.step\"))");
+        std::fs::write(&path, &source).unwrap();
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path, "pad_number": "1", "normalize_polygon_closures": true,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["normalized_closing_points"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            source.replacen("(xy 0.0 -0.0)", "", 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches(" (xy 0.0 -0.0)")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn polygon_closure_handler_refuses_invalid_or_mixed_edits_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Exact.kicad_mod");
+        let source = format!("(footprint \"Exact\" {EXPLICIT_CLOSURE_PAD})");
+        std::fs::write(&path, &source).unwrap();
+        for extra in [
+            json!({"normalize_polygon_closures": "yes"}),
+            json!({"normalize_polygon_closures": true, "width": 2.0}),
+        ] {
+            let mut args = json!({"footprint_path": path, "pad_number": "1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_edit_footprint_pad(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
     #[tokio::test]
     async fn unsupported_pad_shape_is_rejected_before_reading_or_writing() {
         let result = handle_edit_footprint_pad(
@@ -7045,6 +7274,64 @@ mod tests {
         assert_eq!(schema["properties"]["include_graphics"]["type"], "boolean");
         assert_eq!(schema["properties"]["include_pads"]["type"], "boolean");
         assert_eq!(schema["properties"]["graphics_layer"]["type"], "string");
+    }
+
+    /// Library inspection reports what a source/native comparison needs from
+    /// the shared pad reader: a paste-only pad's corner ratio although it has
+    /// no copper entry, each pad's zone connection (absence as `inherited`),
+    /// and the custom pads' anchor and primitives.
+    #[tokio::test]
+    async fn get_footprint_info_reports_paste_ratio_zone_connection_and_custom_pads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Texas_RJE0020A.kicad_mod");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
+        )
+        .unwrap();
+
+        let result = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "include_pads": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let pads = body["pads"].as_array().unwrap();
+        let pad = |number: &str| {
+            pads.iter()
+                .find(|pad| pad["number"] == number)
+                .unwrap_or_else(|| panic!("pad '{number}'"))
+        };
+
+        let paste = pad("");
+        assert_eq!(paste["layers"], json!(["F.Paste"]));
+        assert_eq!(paste["copper_layers"], json!([]));
+        assert_eq!(paste["corner_rounding_ratio"], 0.25);
+        assert_eq!(paste["zone_connection"], "inherited");
+
+        assert_eq!(pad("21")["zone_connection"], "solid");
+        assert_eq!(pad("2")["zone_connection"], "inherited");
+        assert_eq!(pad("2")["corner_rounding_ratio"], 0.25);
+
+        let custom = &pad("1")["copper_layers"][0];
+        assert_eq!(custom["shape"], "custom");
+        assert_eq!(custom["custom_anchor_shape"], "circle");
+        assert_eq!(custom["custom_primitives"][0]["kind"], "polygon");
+        assert_eq!(
+            custom["custom_primitives"][0]["points"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
     }
 
     #[tokio::test]

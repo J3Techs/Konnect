@@ -1,16 +1,29 @@
-//! The board's physical stackup, read from the board KiCad holds open (#716).
+//! The board's physical stackup: read from the board KiCad holds open (#716),
+//! or from the saved file when asked, and set in the saved file of a board
+//! KiCad provably does not hold.
 //!
-//! Read-only by design. KiCad 10 declares `UpdateBoardStackup` but does not
-//! implement it, and #716 settled that Konnect will not write a stackup into a
-//! board file meanwhile: the answer names KiCad's Board Setup as the place to
-//! change one. There is no saved-file fallback either — reading the file's
-//! `(stackup …)` block would be a second parser of KiCad's format — so a board
-//! KiCad does not hold open is refused.
+//! KiCad 10 declares `UpdateBoardStackup` but does not implement it, so a live
+//! board's stackup cannot be changed through Konnect; the closed-board setter
+//! edits the saved `(setup (stackup …))` span instead, under the same closure,
+//! lock, revision and atomic-write guards as the other saved-board edits.
+//!
+//! The live read reports only what KiCad serialized. KiCad 10.0.4's
+//! `BOARD_STACKUP::Serialize` sends no finish, impedance or edge settings, no
+//! layer `enabled` flag and no dielectric sub-layers (it attaches them to a
+//! detached message); those are `null` or `not_reported` here, never the
+//! protobuf defaults that would read as zero copper, zero thickness, no finish
+//! or no impedance control. A live read never falls back to the file: the
+//! saved file is read only when `source: "saved"` asks for it, and that answer
+//! says it excludes unsaved editor state.
+
+mod saved;
+mod setter;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::board_source::{self, FROM_DERIVED, FROM_IPC};
+use crate::tools::board_source::{self, FROM_DERIVED, FROM_IPC, FROM_SAVED_BOARD};
+use crate::tools::closed_board;
 use crate::tools::{
     get_path, invalid_arg, ipc_target_error_result, with_bound_board_ipc_classified, BoardAccess,
     BoardBinding, ToolContext, ToolDef,
@@ -29,9 +42,10 @@ const THICKNESS_TOLERANCE_MM: f64 = 0.001;
 /// εr and loss tangent are compared to within this.
 const PROPERTY_TOLERANCE: f64 = 1e-6;
 
-const BOARD_SETUP_HINT: &str = "Konnect cannot change a stackup: KiCad 10 declares \
-     UpdateBoardStackup but does not implement it (#716). Change it in KiCad's Board Setup, \
-     under Board Stackup, then read it again.";
+const SETTER_HINT: &str = "KiCad 10 declares UpdateBoardStackup but does not implement it \
+     (#716), so an open board's stackup cannot be changed over IPC. Save and close the board, \
+     then use set_closed_board_stackup, which edits the saved file under revision and lock \
+     guards; reopen the board in KiCad afterwards.";
 
 /// KiCad's own default finish is "None" (`BOARD_STACKUP::BOARD_STACKUP`), and
 /// "None" is also a finish its list offers, so the answer cannot tell a board
@@ -41,49 +55,139 @@ const DEFAULT_NOTE: &str = "KiCad serves its default stackup for a board that de
      a finish a board can name, so it is not reported as missing: give expected.finish to \
      check it.";
 
+const PARTIAL_NOTE: &str = "This KiCad's GetBoardStackup answer omits fields (KiCad 10.0.4's \
+     BOARD_STACKUP::Serialize sends no finish, impedance or edge settings, no layer enabled \
+     flag and no dielectric sub-layers). Each is null or not_reported rather than a default; \
+     read source 'saved' for the saved file's values.";
+
+const SAVED_NOTE: &str = "Read from the saved .kicad_pcb as last written. Unsaved changes in an \
+     open KiCad editor are not part of this answer. board_thickness_mm is KiCad's sum of the \
+     copper, dielectric and mask plies; nominal_board_thickness_mm is the separate (general \
+     (thickness …)) value.";
+
+const REVISION_DOMAIN: &str = "konnect.set_closed_board_stackup.v1";
+const OPERATION: &str = "set_closed_board_stackup";
+
+fn expected_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "The stackup the fabricator will build, to compare against. Only the fields given are compared.",
+        "properties": {
+            "board_thickness_mm": { "type": "number", "exclusiveMinimum": 0 },
+            "copper_layer_count": { "type": "integer", "minimum": 1 },
+            "finish": { "type": "string", "description": "KiCad's finish name, e.g. 'ENIG' or 'HAL lead-free'; compared ignoring case" },
+            "impedance_controlled": { "type": "boolean" },
+            "layers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "A layer name as this tool reports it: 'F.Cu', 'F.Mask', 'dielectric 1'" },
+                        "thickness_mm": { "type": "number", "exclusiveMinimum": 0, "description": "A dielectric's is the slot's total over its sub-layers" },
+                        "material": { "type": "string", "description": "Compared ignoring case; for a dielectric, against every sub-layer" },
+                        "epsilon_r": { "type": "number", "exclusiveMinimum": 0 },
+                        "loss_tangent": { "type": "number", "minimum": 0 }
+                    },
+                    "required": ["name"]
+                }
+            }
+        }
+    })
+}
+
 pub(crate) fn tool() -> ToolDef {
     tool!(
         "get_board_stackup",
-        "Read the physical stackup of the board KiCad holds open: each layer's type, \
-         thickness and material, dielectric εr and loss tangent, the copper finish, impedance \
-         control, edge settings, and the board thickness KiCad computes from the stack. \
-         'findings' lists unspecified fabrication values and, given 'expected', every value \
-         that differs from it. Live only, with no file fallback; read-only, so changes are \
-         made in Board Setup.",
+        "Read the physical stackup: each layer's type, thickness and material, dielectric εr, \
+         loss tangent and sub-layers, the copper finish, impedance control, edge settings, and \
+         the board thickness KiCad computes from the stack. 'findings' lists unspecified \
+         fabrication values and, given 'expected', every value that differs from it. source \
+         'live' (default) reads the board KiCad holds open, with no file fallback; a value \
+         that KiCad's answer does not carry (KiCad 10.0.4 omits finish, impedance, edge, layer \
+         enabled and dielectric sub-layers) is null or not_reported, never a default. source \
+         'saved' reads the saved file's (setup (stackup …)) and (general (thickness …)) even \
+         while KiCad holds the board, and says it excludes unsaved editor state. Read-only; \
+         set_closed_board_stackup changes the saved stackup of a closed board.",
         json!({
             "type": "object",
             "properties": {
                 "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                "expected": {
-                    "type": "object",
-                    "description": "The stackup the fabricator will build, to compare against. Only the fields given are compared.",
-                    "properties": {
-                        "board_thickness_mm": { "type": "number", "exclusiveMinimum": 0 },
-                        "copper_layer_count": { "type": "integer", "minimum": 1 },
-                        "finish": { "type": "string", "description": "KiCad's finish name, e.g. 'ENIG' or 'HAL lead-free'; compared ignoring case" },
-                        "impedance_controlled": { "type": "boolean" },
-                        "layers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": { "type": "string", "description": "A layer name as this tool reports it: 'F.Cu', 'F.Mask', 'dielectric 1'" },
-                                    "thickness_mm": { "type": "number", "exclusiveMinimum": 0, "description": "A dielectric's is the slot's total over its sub-layers" },
-                                    "material": { "type": "string", "description": "Compared ignoring case; for a dielectric, against every sub-layer" },
-                                    "epsilon_r": { "type": "number", "exclusiveMinimum": 0 },
-                                    "loss_tangent": { "type": "number", "minimum": 0 }
-                                },
-                                "required": ["name"]
-                            }
-                        }
-                    }
-                }
+                "source": {
+                    "type": "string",
+                    "enum": ["live", "saved"],
+                    "default": "live",
+                    "description": "live: the exact board open in KiCad, refused when it is not open. saved: the saved file only, marked as excluding unsaved editor state."
+                },
+                "expected": expected_schema()
             },
             "required": ["board"]
         }),
         |args, ctx| async move { handle_get_board_stackup(args, ctx).await }
     )
-    .with_board_access(BoardAccess::LiveOnly)
+    .with_board_access(BoardAccess::LivePreferredWithFallback)
+}
+
+fn ply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "thickness_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+            "material": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "epsilon_r": { "type": "number", "minimum": 1, "maximum": 100 },
+            "loss_tangent": { "type": "number", "minimum": 0, "maximum": 1 },
+            "thickness_locked": { "type": "boolean", "description": "Dielectric only: KiCad's impedance thickness lock" },
+            "color": { "type": "string", "minLength": 1, "maxLength": 64 }
+        }
+    })
+}
+
+pub(crate) fn setter_tool() -> ToolDef {
+    let mut layer = ply_schema();
+    layer["properties"]["name"] = json!({
+        "type": "string",
+        "description": "'F.SilkS', 'F.Paste', 'F.Mask', a copper layer, 'dielectric N' (N in stack order), 'B.Mask', 'B.Paste' or 'B.SilkS'"
+    });
+    layer["properties"]["type"] = json!({ "type": "string", "enum": ["core", "prepreg"], "description": "Dielectric only; required for a new dielectric" });
+    layer["properties"]["sublayers"] = json!({
+        "type": "array", "minItems": 1, "maxItems": 16, "items": ply_schema(),
+        "description": "Dielectric only: every ply of the slot, top to bottom. Replaces the saved plies; each ply's omitted values come from the saved ply at the same index."
+    });
+    layer["required"] = json!(["name"]);
+    tool!(
+        "set_closed_board_stackup",
+        "Set the physical stackup in the saved .kicad_pcb of a board KiCad does not hold open \
+         (KiCad 10 cannot change a stackup over IPC). 'layers' is the complete ordered stack, \
+         top to bottom: optional F.SilkS/F.Paste/F.Mask, then F.Cu, one dielectric between \
+         each pair of copper layers, B.Cu, then optional B.Mask/B.Paste/B.SilkS. The copper \
+         must be exactly the board's enabled copper layers in physical order (F.Cu, In1.Cu …, \
+         B.Cu — not KiCad's layer-ID order). Values omitted for an entry already saved are \
+         kept (thickness locks, materials, colors, sub-layers); a new entry must give its \
+         thickness, and a new dielectric its type, material, εr and loss tangent. The nominal \
+         board thickness ((general (thickness …))) changes only when \
+         nominal_board_thickness_mm is given, and no ply is ever adjusted to meet it. Refuses \
+         duplicate or malformed setup/stackup/general clauses and any saved clause KiCad does \
+         not know. Defaults to a dry run that returns a revision covering the saved bytes and \
+         the normalized request; apply requires that revision, re-proves the board closed and \
+         its KiCad lock absent, writes once atomically, and reads the persisted bytes back. \
+         Only the stackup span and, when requested, the nominal-thickness span change.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                "layers": { "type": "array", "minItems": 1, "maxItems": 128, "items": layer },
+                "finish": { "type": "string", "minLength": 1, "maxLength": 64, "description": "KiCad's finish name, e.g. 'ENIG', 'HAL lead-free', 'None'. 'Not specified' removes it. Omit to keep the saved finish." },
+                "impedance_controlled": { "type": "boolean", "description": "KiCad's (dielectric_constraints …). Omit to keep." },
+                "edge_connector": { "type": "string", "enum": ["none", "plain", "beveled"], "description": "Omit to keep." },
+                "edge_plating": { "type": "boolean", "description": "Omit to keep." },
+                "nominal_board_thickness_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Set (general (thickness …)). Omit to keep the saved nominal thickness." },
+                "dry_run": { "type": "boolean", "default": true },
+                "expected_revision": { "type": "string", "description": "The revision a current dry run returned; required to apply." }
+            },
+            "required": ["board", "layers"]
+        }),
+        |args, ctx| async move { handle_set_closed_board_stackup(args, ctx).await }
+    )
+    .with_board_access(BoardAccess::ApplyModeDependent)
 }
 
 async fn handle_get_board_stackup(
@@ -95,6 +199,16 @@ async fn handle_get_board_stackup(
         Ok(expected) => expected,
         Err(refusal) => return Ok(refusal),
     };
+    match args.get("source").and_then(Value::as_str).unwrap_or("live") {
+        "live" => {}
+        "saved" => return Ok(saved_read(ctx, &board, &expected)),
+        other => {
+            return Ok(invalid_arg(
+                "source",
+                &format!("must be 'live' or 'saved', got '{other}'"),
+            ))
+        }
+    }
 
     // The read's own failure is carried back as data, so an answer Konnect
     // could not decode is reported as that, never as KiCad refusing (#658).
@@ -121,7 +235,8 @@ async fn handle_get_board_stackup(
                 },
                 format!(
                     "KiCad must be running with the requested board open: {message}. The \
-                     stackup is read from the live board only; there is no file fallback."
+                     live stackup has no file fallback; ask for source 'saved' to read the \
+                     saved file."
                 ),
             ))
         }
@@ -136,7 +251,8 @@ async fn handle_get_board_stackup(
                 },
                 format!(
                     "KiCad could not serve the stackup read for this board: {error}. The \
-                     stackup is read from the live board only; there is no file fallback."
+                     live stackup has no file fallback; ask for source 'saved' to read the \
+                     saved file."
                 ),
             ))
         }
@@ -146,10 +262,439 @@ async fn handle_get_board_stackup(
         &board.display().to_string(),
         &stackup,
         &expected,
+        Basis::Live,
     )))
 }
 
+/// Provenance for an explicitly requested saved read: whether an editor may
+/// hold newer state, as far as Konnect can tell without asking KiCad.
+fn saved_evidence(ctx: &ToolContext, board: &std::path::Path) -> Value {
+    let observed = ctx.board_session.was_observed_live(board);
+    let lock = match crate::tools::live_board::editor_lock(board) {
+        crate::tools::live_board::EditorLock::Absent => "absent",
+        crate::tools::live_board::EditorLock::Present(_) => "present",
+        crate::tools::live_board::EditorLock::Unreadable(..) => "unreadable",
+    };
+    json!({
+        "board_state": FROM_SAVED_BOARD,
+        "excludes_unsaved_editor_state": true,
+        "reason": if observed { "explicitly_requested_after_live_observation" } else { "explicitly_requested" },
+        "kicad_sibling_lock": lock,
+        "may_be_stale_relative_to_open_editor": observed || lock != "absent",
+        "detail": "source 'saved' was requested, so KiCad was not consulted; the answer is the \
+                   saved file and excludes any unsaved editor changes.",
+    })
+}
+
+fn saved_read(ctx: &ToolContext, board: &std::path::Path, expected: &Expected) -> CallToolResult {
+    let source = match konnect_sexp::read_consistent(board) {
+        Ok(source) => source,
+        Err(error) => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: board.display().to_string(),
+                },
+                format!("The saved board could not be read: {error}"),
+            )
+        }
+    };
+    let file = match saved::read(&source) {
+        Ok(file) => file,
+        Err(reason) => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: "get_board_stackup".to_string(),
+                    reasons: vec![reason.clone()],
+                },
+                format!("The saved board's stackup cannot be read unambiguously: {reason}"),
+            )
+        }
+    };
+    let mut body = match &file.stackup {
+        Some(stackup) => {
+            let mut body = stackup_body(
+                &board.display().to_string(),
+                &saved::to_ipc(stackup),
+                expected,
+                Basis::Saved,
+            );
+            body["layers"] = json!(stackup
+                .entries
+                .iter()
+                .map(saved::entry_json)
+                .collect::<Vec<_>>());
+            body
+        }
+        None => json!({
+            "board": board.display().to_string(),
+            "copper_layer_count": Value::Null,
+            "board_thickness_mm": Value::Null,
+            "finish": Value::Null,
+            "impedance_controlled": Value::Null,
+            "edge_connector": Value::Null,
+            "has_edge_plating": Value::Null,
+            "count": 0,
+            "layers": [],
+            "finding_count": 1,
+            "findings": [finding(
+                "board", "stackup", "missing",
+                "The saved board defines no (setup (stackup …)); KiCad would build and serve \
+                 its default stackup, which this read does not invent.".to_string(),
+            )],
+            "expected_not_compared": !expected.is_empty(),
+            "hint": SETTER_HINT,
+        }),
+    };
+    body["source"] = json!("saved");
+    body["stackup_defined"] = json!(file.stackup.is_some());
+    body["nominal_board_thickness_mm"] = json!(file.nominal_thickness_mm);
+    body["layer_table_copper_count"] =
+        json!(file.layer_table.iter().filter(|l| l.is_copper()).count());
+    body["unrecognized_clauses"] = json!(file.unrecognized);
+    body["note"] = json!(SAVED_NOTE);
+    board_source::provenance(
+        &mut body,
+        json!({
+            "stackup": FROM_SAVED_BOARD,
+            "nominal_board_thickness_mm": FROM_SAVED_BOARD,
+            "copper_layer_count": FROM_DERIVED,
+            "board_thickness_mm": FROM_DERIVED,
+            "findings": FROM_DERIVED,
+        }),
+        saved_evidence(ctx, board),
+    );
+    CallToolResult::json(&body)
+}
+
+// ─── The setter ──────────────────────────────────────────────────────────────
+
+async fn handle_set_closed_board_stackup(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let request = match request::request_from_args(args) {
+        Ok(request) => request,
+        Err((field, reason)) => return Ok(invalid_arg(&field, &reason)),
+    };
+    let dry_run = match args.get("dry_run") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Ok(invalid_arg("dry_run", "must be a boolean")),
+    };
+    let expected_revision = match args.get("expected_revision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(revision)) => Some(revision.clone()),
+        Some(_) => return Ok(invalid_arg("expected_revision", "must be a string")),
+    };
+    if !dry_run && expected_revision.is_none() {
+        return Ok(invalid_arg(
+            "expected_revision",
+            "apply requires the revision a current dry run returned",
+        ));
+    }
+
+    let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {
+        Ok(closure) => closure,
+        Err(refusal) => return Ok(refusal),
+    };
+    let original = match konnect_sexp::read_consistent(&board) {
+        Ok(original) => original,
+        Err(error) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: board.display().to_string(),
+                },
+                format!("The saved board could not be read: {error}"),
+            ))
+        }
+    };
+    let plan = match setter::plan(&original, &request) {
+        Ok(plan) => plan,
+        Err(reasons) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: OPERATION.to_string(),
+                    reasons: reasons.clone(),
+                },
+                format!(
+                    "The stackup was not planned; the board file was not modified: {}",
+                    reasons.join("; ")
+                ),
+            ))
+        }
+    };
+    let revision = closed_board::revision(REVISION_DOMAIN, &original, &request.normalized());
+    let mut body = json!({
+        "board": board.display().to_string(),
+        "status": if plan.changed() { "ready" } else { "noop" },
+        "dry_run": dry_run,
+        "revision": revision,
+        "board_closure": closure,
+        "before": setter::summary(plan.before.as_ref(), plan.nominal_before_mm),
+        "after": setter::summary(Some(&plan.target), plan.nominal_after_mm),
+        "difference_count": plan.differences.len(),
+        "differences": plan.differences,
+        "warnings": plan.warnings,
+        "changed_spans": plan.edits.len(),
+        "write": Value::Null,
+        "source": "saved",
+    });
+    if dry_run {
+        return Ok(CallToolResult::json(&body));
+    }
+    if expected_revision.as_deref() != Some(revision.as_str()) {
+        return Ok(closed_board::stale_revision(&board, OPERATION));
+    }
+    if !plan.changed() {
+        body["status"] = json!("noop");
+        body["readback"] = json!({ "persisted_bytes_unchanged": true });
+        return Ok(CallToolResult::json(&body));
+    }
+    // Closure and lock again, immediately before the write; the atomic
+    // writer itself refuses a file that changed since it was read.
+    let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {
+        Ok(closure) => closure,
+        Err(refusal) => return Ok(refusal),
+    };
+    let target = plan.target.clone();
+    let nominal = plan.nominal_after_mm;
+    let edits = plan.edits.clone();
+    match closed_board::write_and_read_back(&board, OPERATION, &original, &plan.candidate, |text| {
+        setter::verify(&original, text, &edits, &target, nominal)
+    }) {
+        Ok(write) => {
+            body["status"] = json!("applied");
+            body["board_closure"] = closure;
+            body["write"] = write;
+            body["native_validation"] = json!(
+                "Konnect did not run KiCad. Reopen the board in KiCad 10, confirm Board Setup › \
+                 Board Stackup shows this stack, save it there, and run DRC before relying on it."
+            );
+            body["undo"] = json!(
+                "A closed-board write has no KiCad undo step: restore the previous file \
+                 (write.original_sha256 identifies it) to reverse it."
+            );
+            Ok(CallToolResult::json(&body))
+        }
+        Err(refusal) => Ok(refusal),
+    }
+}
+
+// ─── Reading the setter request ─────────────────────────────────────────────
+
+/// The setter's arguments, read where the handler that declares them lives.
+mod request {
+    use super::saved::{mm_to_nm, EdgeConnector};
+    use super::setter::{EntryRequest, PlyRequest, Request};
+    use serde_json::{Map, Value};
+
+    const MAX_ENTRIES: usize = 128;
+    const MAX_PLIES: usize = 16;
+    const MAX_TEXT: usize = 64;
+    const MAX_THICKNESS_MM: f64 = 10.0;
+
+    pub(crate) type ArgError = (String, String);
+
+    fn bad(field: impl Into<String>, reason: impl Into<String>) -> ArgError {
+        (field.into(), reason.into())
+    }
+
+    fn text(value: Option<&Value>, field: &str) -> Result<Option<String>, ArgError> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => {
+                if text.trim().is_empty() || text.chars().count() > MAX_TEXT {
+                    return Err(bad(field, format!("must be 1 to {MAX_TEXT} characters")));
+                }
+                if text.chars().any(char::is_control) {
+                    return Err(bad(field, "must not contain control characters"));
+                }
+                Ok(Some(text.clone()))
+            }
+            Some(_) => Err(bad(field, "must be a string")),
+        }
+    }
+
+    fn number(
+        value: Option<&Value>,
+        field: &str,
+        valid: impl Fn(f64) -> bool,
+        range: &str,
+    ) -> Result<Option<f64>, ArgError> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => match value.as_f64() {
+                Some(number) if number.is_finite() && valid(number) => Ok(Some(number)),
+                _ => Err(bad(field, format!("must be a finite number {range}"))),
+            },
+        }
+    }
+
+    fn thickness(value: Option<&Value>, field: &str) -> Result<Option<i64>, ArgError> {
+        let mm = number(
+            value,
+            field,
+            |mm| mm > 0.0 && mm <= MAX_THICKNESS_MM,
+            "greater than 0 and at most 10 mm",
+        )?;
+        match mm.map(mm_to_nm) {
+            Some(nm) if nm < 1 => Err(bad(field, "rounds to less than one nanometre")),
+            other => Ok(other),
+        }
+    }
+
+    fn boolean(value: Option<&Value>, field: &str) -> Result<Option<bool>, ArgError> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(flag)) => Ok(Some(*flag)),
+            Some(_) => Err(bad(field, "must be a boolean")),
+        }
+    }
+
+    fn ply_request(object: &Map<String, Value>, at: &str) -> Result<PlyRequest, ArgError> {
+        Ok(PlyRequest {
+            thickness_nm: thickness(object.get("thickness_mm"), &format!("{at}.thickness_mm"))?,
+            material: text(object.get("material"), &format!("{at}.material"))?,
+            epsilon_r: number(
+                object.get("epsilon_r"),
+                &format!("{at}.epsilon_r"),
+                |er| (1.0..=100.0).contains(&er),
+                "from 1 to 100",
+            )?,
+            loss_tangent: number(
+                object.get("loss_tangent"),
+                &format!("{at}.loss_tangent"),
+                |tan| (0.0..=1.0).contains(&tan),
+                "from 0 to 1",
+            )?,
+            thickness_locked: boolean(
+                object.get("thickness_locked"),
+                &format!("{at}.thickness_locked"),
+            )?,
+            color: text(object.get("color"), &format!("{at}.color"))?,
+        })
+    }
+
+    const PLY_FIELDS: [&str; 6] = [
+        "thickness_mm",
+        "material",
+        "epsilon_r",
+        "loss_tangent",
+        "thickness_locked",
+        "color",
+    ];
+
+    /// Read the request. The served schema refuses most of this before dispatch;
+    /// this keeps the same refusals for direct handler calls.
+    pub(crate) fn request_from_args(args: &Value) -> Result<Request, ArgError> {
+        let Some(layers) = args.get("layers").and_then(Value::as_array) else {
+            return Err(bad(
+                "layers",
+                "must be the complete ordered array of stackup entries",
+            ));
+        };
+        if layers.is_empty() || layers.len() > MAX_ENTRIES {
+            return Err(bad(
+                "layers",
+                format!("must hold 1 to {MAX_ENTRIES} entries"),
+            ));
+        }
+        let mut entries = Vec::with_capacity(layers.len());
+        for (index, layer) in layers.iter().enumerate() {
+            let at = format!("layers[{index}]");
+            let Some(object) = layer.as_object() else {
+                return Err(bad(at, "must be an object"));
+            };
+            for key in object.keys() {
+                if !PLY_FIELDS.contains(&key.as_str())
+                    && !["name", "type", "sublayers"].contains(&key.as_str())
+                {
+                    return Err(bad(format!("{at}.{key}"), "is not a stackup field"));
+                }
+            }
+            let name = text(object.get("name"), &format!("{at}.name"))?
+                .ok_or_else(|| bad(format!("{at}.name"), "is required"))?;
+            let dielectric_type = match text(object.get("type"), &format!("{at}.type"))? {
+                None => None,
+                Some(kind) if kind == "core" || kind == "prepreg" => Some(kind),
+                Some(_) => return Err(bad(format!("{at}.type"), "must be 'core' or 'prepreg'")),
+            };
+            let sublayers = match object.get("sublayers") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(plies)) => {
+                    if plies.is_empty() || plies.len() > MAX_PLIES {
+                        return Err(bad(
+                            format!("{at}.sublayers"),
+                            format!("must hold 1 to {MAX_PLIES} sub-layers"),
+                        ));
+                    }
+                    let mut out = Vec::with_capacity(plies.len());
+                    for (ply_index, ply) in plies.iter().enumerate() {
+                        let ply_at = format!("{at}.sublayers[{ply_index}]");
+                        let Some(ply) = ply.as_object() else {
+                            return Err(bad(ply_at, "must be an object"));
+                        };
+                        if let Some(key) =
+                            ply.keys().find(|key| !PLY_FIELDS.contains(&key.as_str()))
+                        {
+                            return Err(bad(format!("{ply_at}.{key}"), "is not a sub-layer field"));
+                        }
+                        out.push(ply_request(ply, &ply_at)?);
+                    }
+                    Some(out)
+                }
+                Some(_) => return Err(bad(format!("{at}.sublayers"), "must be an array")),
+            };
+            entries.push(EntryRequest {
+                name,
+                dielectric_type,
+                ply: ply_request(object, &at)?,
+                sublayers,
+            });
+        }
+        let finish = text(args.get("finish"), "finish")?;
+        let edge_connector = match args.get("edge_connector") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(match value.as_str() {
+                "none" => EdgeConnector::None,
+                "plain" => EdgeConnector::Plain,
+                "beveled" => EdgeConnector::Bevelled,
+                _ => {
+                    return Err(bad(
+                        "edge_connector",
+                        "must be 'none', 'plain' or 'beveled'",
+                    ))
+                }
+            }),
+            Some(_) => return Err(bad("edge_connector", "must be a string")),
+        };
+        Ok(Request {
+            layers: entries,
+            finish,
+            impedance_controlled: boolean(
+                args.get("impedance_controlled"),
+                "impedance_controlled",
+            )?,
+            edge_connector,
+            edge_plating: boolean(args.get("edge_plating"), "edge_plating")?,
+            nominal_board_thickness_nm: thickness(
+                args.get("nominal_board_thickness_mm"),
+                "nominal_board_thickness_mm",
+            )?,
+        })
+    }
+}
+
 // ─── The answer ───────────────────────────────────────────────────────────────
+
+/// Which board the answer is about, which decides what an absent value means:
+/// on the live wire it was not sent, in the saved file it is not specified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Basis {
+    Live,
+    Saved,
+}
 
 fn mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
@@ -179,37 +724,55 @@ fn layer_names(stackup: &IpcBoardStackup) -> Vec<String> {
         .collect()
 }
 
+/// A dielectric whose sub-layers the answer does not carry (KiCad 10.0.4).
+fn plies_unreported(layer: &IpcStackupLayer) -> bool {
+    layer.kind == "dielectric" && layer.dielectric.is_empty()
+}
+
 /// A dielectric slot's thickness: all its sub-layers, as KiCad adds them.
-fn slot_thickness_nm(layer: &IpcStackupLayer) -> i64 {
-    if layer.dielectric.is_empty() {
-        layer.thickness_nm
+/// `None` when the sub-layers were not sent: the entry's own thickness is only
+/// its first ply's.
+fn slot_thickness_nm(layer: &IpcStackupLayer) -> Option<i64> {
+    if plies_unreported(layer) {
+        None
+    } else if layer.dielectric.is_empty() {
+        Some(layer.thickness_nm)
     } else {
-        layer.dielectric.iter().map(|sub| sub.thickness_nm).sum()
+        Some(layer.dielectric.iter().map(|sub| sub.thickness_nm).sum())
     }
+}
+
+/// An entry is built unless KiCad said it is not.
+fn built(layer: &IpcStackupLayer) -> bool {
+    layer.enabled != Some(false)
 }
 
 /// The board thickness KiCad derives from a stackup: every enabled copper,
 /// dielectric and solder-mask entry, a dielectric with all its sub-layers
-/// (`BOARD_STACKUP::BuildBoardThicknessFromStackup`).
-fn board_thickness_nm(stackup: &IpcBoardStackup) -> i64 {
+/// (`BOARD_STACKUP::BuildBoardThicknessFromStackup`). `None` when an entry's
+/// enabled flag or a dielectric's sub-layers were not reported.
+fn board_thickness_nm(stackup: &IpcBoardStackup) -> Option<i64> {
     stackup
         .layers
         .iter()
-        .filter(|layer| layer.enabled)
-        .map(|layer| match layer.kind.as_str() {
-            "dielectric" => slot_thickness_nm(layer),
-            "copper" | "soldermask" => layer.thickness_nm,
-            _ => 0,
+        .filter(|layer| layer.enabled != Some(false))
+        .map(|layer| {
+            layer.enabled?;
+            match layer.kind.as_str() {
+                "dielectric" => slot_thickness_nm(layer),
+                "copper" | "soldermask" => Some(layer.thickness_nm),
+                _ => Some(0),
+            }
         })
         .sum()
 }
 
-fn copper_layer_count(stackup: &IpcBoardStackup) -> usize {
-    stackup
-        .layers
-        .iter()
-        .filter(|layer| layer.enabled && layer.kind == "copper")
-        .count()
+/// Enabled copper entries; `None` when KiCad did not report enabled flags.
+fn copper_layer_count(stackup: &IpcBoardStackup) -> Option<usize> {
+    let copper = stackup.layers.iter().filter(|layer| layer.kind == "copper");
+    copper
+        .map(|layer| layer.enabled.map(usize::from))
+        .sum::<Option<usize>>()
 }
 
 fn layer_json(id: &str, layer: &IpcStackupLayer) -> Value {
@@ -233,18 +796,24 @@ fn layer_json(id: &str, layer: &IpcStackupLayer) -> Value {
     match layer.kind.as_str() {
         "dielectric" => {
             out["dielectric_type"] = json!(layer.dielectric_type);
-            out["thickness_mm"] = json!(mm(slot_thickness_nm(layer)));
-            out["sublayers"] = json!(layer
-                .dielectric
-                .iter()
-                .map(|sub| json!({
-                    "thickness_mm": mm(sub.thickness_nm),
-                    "material": text(&sub.material),
-                    "epsilon_r": sub.epsilon_r,
-                    "loss_tangent": sub.loss_tangent,
-                    "thickness_locked": sub.thickness_locked,
-                }))
-                .collect::<Vec<_>>());
+            out["thickness_mm"] = json!(slot_thickness_nm(layer).map(mm));
+            if plies_unreported(layer) {
+                out["sublayers"] = Value::Null;
+                out["sublayers_reported"] = json!(false);
+                out["first_sublayer_thickness_mm"] = json!(mm(layer.thickness_nm));
+            } else {
+                out["sublayers"] = json!(layer
+                    .dielectric
+                    .iter()
+                    .map(|sub| json!({
+                        "thickness_mm": mm(sub.thickness_nm),
+                        "material": text(&sub.material),
+                        "epsilon_r": sub.epsilon_r,
+                        "loss_tangent": sub.loss_tangent,
+                        "thickness_locked": sub.thickness_locked,
+                    }))
+                    .collect::<Vec<_>>());
+            }
         }
         "copper" => {
             out["thickness_mm"] = json!(mm(layer.thickness_nm));
@@ -264,20 +833,52 @@ fn layer_json(id: &str, layer: &IpcStackupLayer) -> Value {
     out
 }
 
-fn stackup_body(board: &str, stackup: &IpcBoardStackup, expected: &Expected) -> Value {
+/// The fields of this answer that KiCad's message did not carry.
+fn unobserved_fields(stackup: &IpcBoardStackup) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if stackup.finish.is_none() {
+        out.push("finish");
+    }
+    if stackup.impedance_controlled.is_none() {
+        out.push("impedance_controlled");
+    }
+    if stackup.edge_connector.is_none() {
+        out.push("edge_connector");
+    }
+    if stackup.has_edge_plating.is_none() {
+        out.push("has_edge_plating");
+    }
+    if stackup.layers.iter().any(|layer| layer.enabled.is_none()) {
+        out.push("layers.enabled");
+    }
+    if stackup.layers.iter().any(plies_unreported) {
+        out.push("dielectric sublayers (thickness per ply, material, epsilon_r, loss_tangent, thickness_locked)");
+    }
+    out
+}
+
+fn stackup_body(
+    board: &str,
+    stackup: &IpcBoardStackup,
+    expected: &Expected,
+    basis: Basis,
+) -> Value {
     let names = layer_names(stackup);
     let layers: Vec<Value> = names
         .iter()
         .zip(&stackup.layers)
         .map(|(id, layer)| layer_json(id, layer))
         .collect();
-    let mut findings = missing_values(stackup, &names);
-    findings.extend(expected.mismatches(stackup, &names));
+    let mut findings = missing_values(stackup, &names, basis);
+    findings.extend(expected.mismatches(stackup, &names, basis));
+    let unobserved = unobserved_fields(stackup);
 
     let mut body = json!({
         "board": board,
+        "source": if basis == Basis::Live { "ipc" } else { "saved" },
         "copper_layer_count": copper_layer_count(stackup),
-        "board_thickness_mm": mm(board_thickness_nm(stackup)),
+        "copper_entry_count": stackup.layers.iter().filter(|l| l.kind == "copper").count(),
+        "board_thickness_mm": board_thickness_nm(stackup).map(mm),
         "finish": stackup.finish,
         "impedance_controlled": stackup.impedance_controlled,
         "edge_connector": stackup.edge_connector,
@@ -287,18 +888,25 @@ fn stackup_body(board: &str, stackup: &IpcBoardStackup, expected: &Expected) -> 
         "finding_count": findings.len(),
         "findings": findings,
         "note": DEFAULT_NOTE,
-        "hint": BOARD_SETUP_HINT,
+        "hint": SETTER_HINT,
     });
-    board_source::provenance(
-        &mut body,
-        json!({
-            "stackup": FROM_IPC,
-            "copper_layer_count": FROM_DERIVED,
-            "board_thickness_mm": FROM_DERIVED,
-            "findings": FROM_DERIVED,
-        }),
-        board_source::live_evidence(),
-    );
+    if basis == Basis::Live {
+        body["unobserved_fields"] = json!(unobserved);
+        body["live_answer_complete"] = json!(unobserved.is_empty());
+        if !unobserved.is_empty() {
+            body["partial_answer_note"] = json!(PARTIAL_NOTE);
+        }
+        board_source::provenance(
+            &mut body,
+            json!({
+                "stackup": FROM_IPC,
+                "copper_layer_count": FROM_DERIVED,
+                "board_thickness_mm": FROM_DERIVED,
+                "findings": FROM_DERIVED,
+            }),
+            board_source::live_evidence(),
+        );
+    }
     body
 }
 
@@ -308,20 +916,35 @@ fn finding(id: &str, field: &str, kind: &str, detail: String) -> Value {
     json!({ "name": id, "field": field, "kind": kind, "detail": detail })
 }
 
+fn unreported(id: &str, field: &str) -> Value {
+    finding(
+        id,
+        field,
+        "not_reported",
+        format!(
+            "KiCad's live answer does not carry {id} {field}; read source 'saved' for the \
+             saved value."
+        ),
+    )
+}
+
 /// Fabrication values the board leaves unset: what a fabricator or an
-/// impedance calculation needs and KiCad reports as missing.
-fn missing_values(stackup: &IpcBoardStackup, names: &[String]) -> Vec<Value> {
+/// impedance calculation needs and KiCad reports as missing. A value the live
+/// answer did not carry is `not_reported`, not missing.
+fn missing_values(stackup: &IpcBoardStackup, names: &[String], basis: Basis) -> Vec<Value> {
     let mut out = Vec::new();
-    if unspecified(&stackup.finish) {
-        out.push(finding(
+    match &stackup.finish {
+        Some(finish) if !unspecified(finish) => {}
+        None if basis == Basis::Live => out.push(unreported("board", "finish")),
+        _ => out.push(finding(
             "board",
             "finish",
             "missing",
             "The board names no copper finish.".to_string(),
-        ));
+        )),
     }
     for (id, layer) in names.iter().zip(&stackup.layers) {
-        if !layer.enabled {
+        if !built(layer) {
             continue;
         }
         match layer.kind.as_str() {
@@ -331,8 +954,11 @@ fn missing_values(stackup: &IpcBoardStackup, names: &[String]) -> Vec<Value> {
                 "missing",
                 format!("{id} has no thickness."),
             )),
+            "dielectric" if plies_unreported(layer) => {
+                out.push(unreported(id, "sublayers"));
+            }
             "dielectric" => {
-                if slot_thickness_nm(layer) <= 0 {
+                if slot_thickness_nm(layer).unwrap_or(0) <= 0 {
                     out.push(finding(
                         id,
                         "thickness_mm",
@@ -396,6 +1022,14 @@ struct Expected {
 }
 
 impl Expected {
+    fn is_empty(&self) -> bool {
+        self.board_thickness_mm.is_none()
+            && self.copper_layer_count.is_none()
+            && self.finish.is_none()
+            && self.impedance_controlled.is_none()
+            && self.layers.is_empty()
+    }
+
     /// Read `expected`. The served schema refuses a malformed one before
     /// dispatch; this keeps the same refusals for direct handler calls.
     fn from_args(args: &Value) -> Result<Self, CallToolResult> {
@@ -484,8 +1118,9 @@ impl Expected {
         Ok(expected)
     }
 
-    /// Every expected value the stackup does not carry.
-    fn mismatches(&self, stackup: &IpcBoardStackup, names: &[String]) -> Vec<Value> {
+    /// Every expected value the stackup does not carry. A value the answer
+    /// does not report is `not_reported`, never compared against a default.
+    fn mismatches(&self, stackup: &IpcBoardStackup, names: &[String], basis: Basis) -> Vec<Value> {
         let mut out = Vec::new();
         let differs = |id: &str, field: &str, expected: Value, actual: Value| {
             json!({
@@ -495,47 +1130,53 @@ impl Expected {
             })
         };
         let same_text = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+        // NaN is a value the saved file does not state: always a difference,
+        // reported as null.
+        let far = |have: f64, want: f64, tolerance: f64| {
+            !have.is_finite() || (have - want).abs() > tolerance
+        };
 
         if let Some(want) = self.board_thickness_mm {
-            let have = mm(board_thickness_nm(stackup));
-            if (have - want).abs() > THICKNESS_TOLERANCE_MM {
-                out.push(differs(
+            match board_thickness_nm(stackup).map(mm) {
+                Some(have) if far(have, want, THICKNESS_TOLERANCE_MM) => out.push(differs(
                     "board",
                     "board_thickness_mm",
                     json!(want),
                     json!(have),
-                ));
+                )),
+                Some(_) => {}
+                None => out.push(unreported("board", "board_thickness_mm")),
             }
         }
         if let Some(want) = self.copper_layer_count {
-            let have = copper_layer_count(stackup) as u64;
-            if have != want {
-                out.push(differs(
+            match copper_layer_count(stackup) {
+                Some(have) if have as u64 != want => out.push(differs(
                     "board",
                     "copper_layer_count",
                     json!(want),
                     json!(have),
-                ));
+                )),
+                Some(_) => {}
+                None => out.push(unreported("board", "copper_layer_count")),
             }
         }
         if let Some(want) = &self.finish {
-            if !same_text(want, &stackup.finish) {
-                out.push(differs(
-                    "board",
-                    "finish",
-                    json!(want),
-                    json!(stackup.finish),
-                ));
+            match &stackup.finish {
+                Some(have) if same_text(want, have) => {}
+                None if basis == Basis::Live => out.push(unreported("board", "finish")),
+                have => out.push(differs("board", "finish", json!(want), json!(have))),
             }
         }
         if let Some(want) = self.impedance_controlled {
-            if want != stackup.impedance_controlled {
-                out.push(differs(
+            match stackup.impedance_controlled {
+                Some(have) if have == want => {}
+                Some(have) => out.push(differs(
                     "board",
                     "impedance_controlled",
                     json!(want),
-                    json!(stackup.impedance_controlled),
-                ));
+                    json!(have),
+                )),
+                None => out.push(unreported("board", "impedance_controlled")),
             }
         }
 
@@ -558,22 +1199,35 @@ impl Expected {
 
             if let Some(thickness) = want.thickness_mm {
                 let have = match layer.kind.as_str() {
-                    "dielectric" => Some(mm(slot_thickness_nm(layer))),
-                    "copper" | "soldermask" => Some(mm(layer.thickness_nm)),
-                    _ => None,
+                    "dielectric" => slot_thickness_nm(layer).map(mm).ok_or(true),
+                    "copper" | "soldermask" => Ok(mm(layer.thickness_nm)),
+                    _ => Err(false),
                 };
                 match have {
-                    Some(have) if (have - thickness).abs() > THICKNESS_TOLERANCE_MM => {
+                    Ok(have) if far(have, thickness, THICKNESS_TOLERANCE_MM) => {
                         out.push(differs(id, "thickness_mm", json!(thickness), json!(have)))
                     }
-                    Some(_) => {}
-                    None => out.push(not_reported(id, "thickness_mm", &layer.kind)),
+                    Ok(_) => {}
+                    Err(true) => out.push(unreported(id, "thickness_mm")),
+                    Err(false) => out.push(not_reported(id, "thickness_mm", &layer.kind)),
                 }
             }
 
             // A dielectric's material, εr and loss tangent are per sub-layer;
             // every sub-layer is held to the expected value.
             if layer.kind == "dielectric" {
+                if plies_unreported(layer) {
+                    for (field, asked) in [
+                        ("material", want.material.is_some()),
+                        ("epsilon_r", want.epsilon_r.is_some()),
+                        ("loss_tangent", want.loss_tangent.is_some()),
+                    ] {
+                        if asked {
+                            out.push(unreported(id, field));
+                        }
+                    }
+                    continue;
+                }
                 let plies = layer.dielectric.len();
                 for (index, sub) in layer.dielectric.iter().enumerate() {
                     // A slot of several sub-layers gives one finding each, so
@@ -595,12 +1249,12 @@ impl Expected {
                         }
                     }
                     if let Some(er) = want.epsilon_r {
-                        if (sub.epsilon_r - er).abs() > PROPERTY_TOLERANCE {
+                        if far(sub.epsilon_r, er, PROPERTY_TOLERANCE) {
                             out.push(at("epsilon_r", json!(er), json!(sub.epsilon_r)));
                         }
                     }
                     if let Some(tan) = want.loss_tangent {
-                        if (sub.loss_tangent - tan).abs() > PROPERTY_TOLERANCE {
+                        if far(sub.loss_tangent, tan, PROPERTY_TOLERANCE) {
                             out.push(at("loss_tangent", json!(tan), json!(sub.loss_tangent)));
                         }
                     }
@@ -664,7 +1318,7 @@ mod tests {
             layer: Some(name.to_string()),
             user_name: Some(name.to_string()),
             kind: kind.to_string(),
-            enabled: true,
+            enabled: Some(true),
             thickness_nm,
             material: String::new(),
             color: None,
@@ -680,7 +1334,7 @@ mod tests {
             layer: None,
             user_name: None,
             kind: "dielectric".to_string(),
-            enabled: true,
+            enabled: Some(true),
             thickness_nm: sublayers.first().map_or(0, |s| s.0),
             material: String::new(),
             color: None,
@@ -718,10 +1372,10 @@ mod tests {
             ..layer(name, "copper", nm)
         };
         IpcBoardStackup {
-            finish: "None".to_string(),
-            impedance_controlled: false,
-            edge_connector: "none".to_string(),
-            has_edge_plating: false,
+            finish: Some("None".to_string()),
+            impedance_controlled: Some(false),
+            edge_connector: Some("none".to_string()),
+            has_edge_plating: Some(false),
             layers: vec![
                 layer("F.SilkS", "silkscreen", 0),
                 layer("F.Paste", "solderpaste", 0),
@@ -742,7 +1396,7 @@ mod tests {
 
     fn body_for(stackup: &IpcBoardStackup, expected: Value) -> Value {
         let expected = Expected::from_args(&json!({ "expected": expected })).unwrap();
-        stackup_body("board.kicad_pcb", stackup, &expected)
+        stackup_body("board.kicad_pcb", stackup, &expected, Basis::Live)
     }
 
     fn fields(body: &Value) -> Vec<(String, String, String)> {
@@ -778,7 +1432,7 @@ mod tests {
         let mut stackup = four_layer();
         stackup.layers[0].thickness_nm = 1_000_000;
         stackup.layers[1].thickness_nm = 1_000_000;
-        stackup.layers[5].enabled = false;
+        stackup.layers[5].enabled = Some(false);
         stackup.layers[6] = dielectric(
             "core",
             &[(200_000, "FR4", 4.5, 0.02), (50_000, "FR4", 4.4, 0.02)],
@@ -834,18 +1488,22 @@ mod tests {
         assert_eq!(body["finding_count"], 0, "{body}");
         assert_eq!(body["sources"]["stackup"], "ipc");
         assert_eq!(body["source_evidence"]["board_state"], "ipc");
-        assert!(body["hint"].as_str().unwrap().contains("Board Setup"));
+        assert!(body["hint"]
+            .as_str()
+            .unwrap()
+            .contains("set_closed_board_stackup"));
+        assert_eq!(body["live_answer_complete"], true, "{body}");
         assert!(body["note"].as_str().unwrap().contains("default stackup"));
     }
 
     #[test]
     fn unspecified_fabrication_values_are_reported_missing() {
         let mut stackup = four_layer();
-        stackup.finish = NOT_SPECIFIED.to_string();
+        stackup.finish = Some(NOT_SPECIFIED.to_string());
         stackup.layers[4] = dielectric("prepreg", &[(210_400, NOT_SPECIFIED, 0.0, 0.02)]);
         stackup.layers[3].thickness_nm = 0;
         // A disabled layer is not built, so nothing is missing from it.
-        stackup.layers[7].enabled = false;
+        stackup.layers[7].enabled = Some(false);
         stackup.layers[7].thickness_nm = 0;
 
         let body = body_for(&stackup, Value::Null);
@@ -1327,5 +1985,767 @@ mod tests {
                 .contains("the double is busy"),
             "{body}"
         );
+    }
+}
+
+/// The closed-board setter and the saved read, against synthetic boards and
+/// KiCad 10.0.6's own four-layer board and captured answer. No KiCad runs:
+/// an empty IPC address is the unreachable transport, and every live answer
+/// comes from an in-process double.
+#[cfg(test)]
+mod closed_setter_tests {
+    use super::*;
+    use crate::tools::closed_board::only_spans_changed;
+    use crate::tools::pcb_board::board_mock::{
+        board_document, ctx_talking_to, spawn_kicad_holding_board, spawn_kicad_reporting_documents,
+    };
+    use konnect_ipc::gen::kiapi;
+
+    /// Everything a stackup edit must leave byte for byte: fabrication pad
+    /// properties, custom primitives, UUIDs, nets, models, zones, the rest of
+    /// (setup …) and board-level fields. The layer table is in KiCad's ID
+    /// order (F.Cu 0, B.Cu 2, In1.Cu 4 …), not the physical order.
+    const SIX_LAYER: &str =
+        include_str!("../../tests/fixtures/stackup_six_layer_synthetic.kicad_pcb");
+
+    const NAMES: [&str; 17] = [
+        "F.SilkS",
+        "F.Paste",
+        "F.Mask",
+        "F.Cu",
+        "dielectric 1",
+        "In1.Cu",
+        "dielectric 2",
+        "In2.Cu",
+        "dielectric 3",
+        "In3.Cu",
+        "dielectric 4",
+        "In4.Cu",
+        "dielectric 5",
+        "B.Cu",
+        "B.Mask",
+        "B.Paste",
+        "B.SilkS",
+    ];
+
+    /// Every entry named, nothing else: the saved values all stand.
+    fn names_only() -> Vec<Value> {
+        NAMES.iter().map(|n| json!({ "name": n })).collect()
+    }
+
+    fn board_with(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("six.kicad_pcb");
+        std::fs::write(&board, text).unwrap();
+        (dir, board)
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }))
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    async fn call(ctx: &ToolContext, args: Value) -> (bool, Value) {
+        let result = handle_set_closed_board_stackup(&args, ctx).await.unwrap();
+        (result.is_error, body(&result))
+    }
+
+    fn plan_of(text: &str, args: Value) -> Result<setter::Plan, Vec<String>> {
+        let request = request::request_from_args(&args).map_err(|e| vec![format!("{e:?}")])?;
+        setter::plan(text, &request)
+    }
+
+    fn reasons(result: Result<setter::Plan, Vec<String>>) -> String {
+        match result {
+            Ok(_) => panic!("expected a refusal"),
+            Err(reasons) => reasons.join(" | "),
+        }
+    }
+
+    fn without_stackup() -> String {
+        let start = SIX_LAYER.find("\t\t(stackup").unwrap();
+        let end = SIX_LAYER.find("\t\t(pad_to_mask_clearance").unwrap();
+        format!("{}{}", &SIX_LAYER[..start], &SIX_LAYER[end..])
+    }
+
+    #[test]
+    fn naming_every_saved_entry_preserves_everything_and_is_a_noop() {
+        let plan = plan_of(SIX_LAYER, json!({ "layers": names_only() })).unwrap();
+        assert!(!plan.changed());
+        assert_eq!(plan.candidate, SIX_LAYER);
+        assert!(plan.differences.is_empty(), "{:?}", plan.differences);
+        // Locks, plies, colors and materials survive in the target model.
+        let d1 = &plan.target.entries[4];
+        assert_eq!(d1.plies.len(), 2);
+        assert!(d1.plies[0].locked && !d1.plies[1].locked);
+        assert_eq!(d1.plies[1].color.as_deref(), Some("FR4 natural"));
+        assert_eq!(
+            plan.target.entries[2].plies[0].color.as_deref(),
+            Some("Green")
+        );
+    }
+
+    #[test]
+    fn six_copper_layers_follow_physical_order_not_kicad_layer_ids() {
+        // KiCad's ID order F.Cu, B.Cu, In1.Cu … is refused.
+        let mut by_id = names_only();
+        let b = by_id.remove(13);
+        by_id.insert(5, b);
+        let refused = reasons(plan_of(SIX_LAYER, json!({ "layers": by_id })));
+        assert!(refused.contains("physical order"), "{refused}");
+
+        // An enabled copper layer left out.
+        let mut missing = names_only();
+        missing.drain(11..13);
+        let refused = reasons(plan_of(SIX_LAYER, json!({ "layers": missing })));
+        assert!(
+            refused.contains("F.Cu, In1.Cu, In2.Cu, In3.Cu, In4.Cu, B.Cu"),
+            "{refused}"
+        );
+
+        // Two dielectrics in one gap, or one named out of sequence.
+        let mut doubled = names_only();
+        doubled.insert(
+            5,
+            json!({ "name": "dielectric 2", "type": "core", "thickness_mm": 0.1,
+                    "material": "FR4", "epsilon_r": 4.5, "loss_tangent": 0.02 }),
+        );
+        assert!(plan_of(SIX_LAYER, json!({ "layers": doubled })).is_err());
+        let mut misnamed = names_only();
+        misnamed[6] = json!({ "name": "dielectric 9" });
+        assert!(reasons(plan_of(SIX_LAYER, json!({ "layers": misnamed }))).contains("dielectric 2"));
+
+        // Paste below mask is out of KiCad's order.
+        let mut swapped = names_only();
+        swapped.swap(1, 2);
+        assert!(reasons(plan_of(SIX_LAYER, json!({ "layers": swapped })))
+            .contains("F.SilkS, F.Paste and F.Mask"));
+
+        // A technical layer the board does not enable.
+        let disabled = SIX_LAYER.replace("\t\t(15 \"B.Paste\" user)\n", "");
+        assert!(
+            reasons(plan_of(&disabled, json!({ "layers": names_only() })))
+                .contains("'B.Paste' is not an enabled layer")
+        );
+    }
+
+    #[test]
+    fn a_requested_change_touches_only_the_stackup_span_and_reads_back() {
+        let mut layers = names_only();
+        layers[8] = json!({ "name": "dielectric 3", "thickness_mm": 0.21, "epsilon_r": 4.2 });
+        layers[3] = json!({ "name": "F.Cu", "thickness_mm": 0.07 });
+        let plan = plan_of(
+            SIX_LAYER,
+            json!({ "layers": layers, "finish": "ENIG", "impedance_controlled": true,
+                    "edge_connector": "beveled", "edge_plating": true }),
+        )
+        .unwrap();
+        assert!(plan.changed());
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "the nominal thickness was not requested"
+        );
+        assert!(only_spans_changed(SIX_LAYER, &plan.candidate, &plan.edits));
+        for kept in [
+            "(property pad_prop_bga)",
+            "(primitives (gr_poly (pts (xy -1 -1) (xy 1 -1) (xy 1 1)) (width 0) (fill yes)))",
+            "(model \"keep.step\" (offset (xyz 1 2 3)) (rotate (xyz 0 0 37)))",
+            "(uuid \"55555555-5555-4555-8555-555555555555\")",
+            "(outputdirectory \"fab/\")",
+            "\t\t(thickness 1.6)\n",
+            "(thickness 0.1 locked)",
+            "\t\t\t\taddsublayer\n",
+            "(color \"FR4 natural\")",
+        ] {
+            assert!(plan.candidate.contains(kept), "{kept} was lost");
+        }
+        let after = saved::read(&plan.candidate).unwrap();
+        let stackup = after.stackup.unwrap();
+        assert_eq!(stackup.finish.as_deref(), Some("ENIG"));
+        assert!(stackup.dielectric_constraints && stackup.edge_plating);
+        assert_eq!(stackup.edge_connector, saved::EdgeConnector::Bevelled);
+        let d3 = &stackup.entries[8];
+        assert_eq!(d3.plies[0].thickness_nm, Some(210_000));
+        assert_eq!(d3.plies[0].epsilon_r, Some(4.2));
+        assert_eq!(
+            d3.plies[0].material.as_deref(),
+            Some("FR4"),
+            "unrequested values stay"
+        );
+        // The nominal thickness is not the stack sum and was not touched.
+        assert_eq!(after.nominal_thickness_mm, Some(1.6));
+        let fields: Vec<String> = plan
+            .differences
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}.{}",
+                    d["name"].as_str().unwrap(),
+                    d["field"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "F.Cu.thickness_mm",
+                "dielectric 3.sublayers",
+                "dielectric 3.thickness_mm",
+                "board.edge_connector",
+                "board.edge_plating",
+                "board.finish",
+                "board.impedance_controlled",
+            ]
+        );
+        // The same request against its own result changes nothing.
+        let again = plan_of(
+            &plan.candidate,
+            json!({ "layers": names_only(), "finish": "ENIG", "impedance_controlled": true,
+                    "edge_connector": "beveled", "edge_plating": true }),
+        )
+        .unwrap();
+        assert!(!again.changed());
+    }
+
+    #[test]
+    fn the_nominal_thickness_changes_only_when_asked_and_no_ply_is_forced() {
+        let plan = plan_of(
+            SIX_LAYER,
+            json!({ "layers": names_only(), "nominal_board_thickness_mm": 1.2 }),
+        )
+        .unwrap();
+        assert_eq!(plan.edits.len(), 1);
+        assert!(plan
+            .candidate
+            .contains("\t\t(thickness 1.2)\n\t\t(legacy_teardrops no)"));
+        assert_eq!(plan.target, plan.before.clone().unwrap(), "no ply moved");
+        let summary = setter::summary(Some(&plan.target), plan.nominal_after_mm);
+        assert_eq!(summary["nominal_board_thickness_mm"], 1.2);
+        assert!((summary["stack_thickness_mm"].as_f64().unwrap() - 1.26).abs() < 1e-9);
+        assert!((summary["nominal_minus_stack_mm"].as_f64().unwrap() + 0.06).abs() < 1e-9);
+        // The same nominal again is no edit.
+        let same = plan_of(
+            SIX_LAYER,
+            json!({ "layers": names_only(), "nominal_board_thickness_mm": 1.6 }),
+        )
+        .unwrap();
+        assert!(!same.changed());
+    }
+
+    #[test]
+    fn a_multi_ply_dielectric_needs_per_ply_values_and_keeps_its_locks() {
+        let mut slot = names_only();
+        slot[4] = json!({ "name": "dielectric 1", "thickness_mm": 0.2 });
+        assert!(
+            reasons(plan_of(SIX_LAYER, json!({ "layers": slot }))).contains("2 saved sub-layers")
+        );
+
+        let mut plies = names_only();
+        plies[4] = json!({ "name": "dielectric 1", "sublayers": [
+            { "thickness_mm": 0.12 },
+            { "material": "FR4-HTG" },
+            { "thickness_mm": 0.03, "material": "FR4", "epsilon_r": 4.3, "loss_tangent": 0.02,
+              "thickness_locked": true }
+        ] });
+        let plan = plan_of(SIX_LAYER, json!({ "layers": plies })).unwrap();
+        let d1 = &saved::read(&plan.candidate)
+            .unwrap()
+            .stackup
+            .unwrap()
+            .entries[4];
+        assert_eq!(d1.plies.len(), 3);
+        assert_eq!(d1.plies[0].thickness_nm, Some(120_000));
+        assert!(d1.plies[0].locked, "the saved lock is kept");
+        assert_eq!(d1.plies[0].material.as_deref(), Some("FR408HR"));
+        assert_eq!(d1.plies[1].material.as_deref(), Some("FR4-HTG"));
+        assert_eq!(d1.plies[1].color.as_deref(), Some("FR4 natural"));
+        assert!(d1.plies[2].locked);
+
+        // A new ply must say what it is made of.
+        let mut bare = names_only();
+        bare[4] =
+            json!({ "name": "dielectric 1", "sublayers": [{}, {}, { "thickness_mm": 0.03 }] });
+        assert!(
+            reasons(plan_of(SIX_LAYER, json!({ "layers": bare }))).contains("sub-layer 3 is new")
+        );
+        // Slot values and per-ply values together are ambiguous.
+        let mut both = names_only();
+        both[4] = json!({ "name": "dielectric 1", "thickness_mm": 0.1, "sublayers": [{}] });
+        assert!(plan_of(SIX_LAYER, json!({ "layers": both })).is_err());
+    }
+
+    #[test]
+    fn values_kicad_cannot_hold_for_an_entry_are_refused() {
+        for (index, entry) in [
+            (3, json!({ "name": "F.Cu", "material": "copper" })),
+            (0, json!({ "name": "F.SilkS", "thickness_mm": 0.01 })),
+            (1, json!({ "name": "F.Paste", "material": "SAC305" })),
+            (14, json!({ "name": "B.Mask", "epsilon_r": 3.3 })),
+            (14, json!({ "name": "B.Mask", "thickness_locked": true })),
+            (3, json!({ "name": "F.Cu", "type": "core" })),
+        ] {
+            let mut layers = names_only();
+            layers[index] = entry.clone();
+            assert!(
+                plan_of(SIX_LAYER, json!({ "layers": layers })).is_err(),
+                "{entry}"
+            );
+        }
+        for args in [
+            json!({ "layers": names_only(), "finish": "" }),
+            json!({ "layers": [{ "name": "F.Cu", "thickness_mm": -1 }] }),
+            json!({ "layers": [{ "name": "F.Cu", "thickness_mm": 11 }] }),
+            json!({ "layers": [{ "name": "dielectric 1", "epsilon_r": 0.5 }] }),
+            json!({ "layers": [{ "name": "dielectric 1", "loss_tangent": 2 }] }),
+            json!({ "layers": [{ "name": "dielectric 1", "material": "x".repeat(65) }] }),
+            json!({ "layers": [{ "name": "dielectric 1", "material": "a\nb" }] }),
+            json!({ "layers": [{ "name": "dielectric 1", "type": "laminate" }] }),
+            json!({ "layers": [{ "name": "F.Cu", "thicknes_mm": 0.035 }] }),
+            json!({ "layers": [] }),
+        ] {
+            assert!(request::request_from_args(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn unknown_duplicate_or_malformed_saved_clauses_refuse_before_planning() {
+        let unknown = SIX_LAYER.replace(
+            "\t\t\t(dielectric_constraints no)\n",
+            "\t\t\t(dielectric_constraints no)\n\t\t\t(castellated_pads yes)\n",
+        );
+        assert!(
+            reasons(plan_of(&unknown, json!({ "layers": names_only() })))
+                .contains("castellated_pads")
+        );
+        let nested = SIX_LAYER.replace(
+            "(epsilon_r 3.68)",
+            "(epsilon_r 3.68)\n\t\t\t\t(dk_model djordjevic)",
+        );
+        assert!(reasons(plan_of(&nested, json!({ "layers": names_only() }))).contains("dk_model"));
+        let dup = SIX_LAYER.replace(
+            "\t\t(pad_to_mask_clearance 0)\n",
+            "\t\t(stackup)\n\t\t(pad_to_mask_clearance 0)\n",
+        );
+        assert!(reasons(plan_of(&dup, json!({ "layers": names_only() }))).contains("stackup"));
+        let dup_general = SIX_LAYER.replace(
+            "\t(paper \"A4\")\n",
+            "\t(general (thickness 2))\n\t(paper \"A4\")\n",
+        );
+        assert!(
+            reasons(plan_of(&dup_general, json!({ "layers": names_only() }))).contains("general")
+        );
+        let malformed = SIX_LAYER.replace("(epsilon_r 4.5)", "(epsilon_r 4.5 4.6)");
+        assert!(plan_of(&malformed, json!({ "layers": names_only() })).is_err());
+        let trailing = format!("{SIX_LAYER}(stray)");
+        assert!(plan_of(&trailing, json!({ "layers": names_only() })).is_err());
+    }
+
+    #[test]
+    fn an_absent_stackup_is_inserted_as_setups_first_clause() {
+        let bare = without_stackup();
+        // Nothing to inherit: every new entry must state its values.
+        assert!(plan_of(&bare, json!({ "layers": names_only() })).is_err());
+        let full: Vec<Value> = names_only()
+            .into_iter()
+            .map(|entry| {
+                let name = entry["name"].as_str().unwrap().to_string();
+                match saved::Kind::of_name(&name).unwrap() {
+                    saved::Kind::Copper => json!({ "name": name, "thickness_mm": 0.035 }),
+                    saved::Kind::Dielectric => json!({
+                        "name": name, "type": "core", "thickness_mm": 0.25, "material": "FR4",
+                        "epsilon_r": 4.5, "loss_tangent": 0.02 }),
+                    saved::Kind::Mask => json!({ "name": name, "thickness_mm": 0.01 }),
+                    _ => entry,
+                }
+            })
+            .collect();
+        let plan = plan_of(&bare, json!({ "layers": full, "finish": "ENIG" })).unwrap();
+        assert!(plan.before.is_none());
+        assert!(plan.candidate.contains(
+            "\t(setup\n\t\t(stackup\n\t\t\t(layer \"F.SilkS\"\n\t\t\t\t(type \"Top Silk Screen\")\n\t\t\t)"
+        ));
+        assert!(only_spans_changed(&bare, &plan.candidate, &plan.edits));
+        let read = saved::read(&plan.candidate).unwrap();
+        assert_eq!(read.stackup.unwrap().entries.len(), 17);
+        assert!(!plan_of(
+            &plan.candidate,
+            json!({ "layers": names_only(), "finish": "ENIG" })
+        )
+        .unwrap()
+        .changed());
+    }
+
+    // ─── Through the handler ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dry_run_apply_saved_read_and_idempotence_through_the_handlers() {
+        let (_dir, board) = board_with(SIX_LAYER);
+        let ctx = ctx_talking_to(String::new());
+        let mut layers = names_only();
+        layers[6] = json!({ "name": "dielectric 2", "thickness_mm": 0.36, "type": "prepreg" });
+        let args = json!({ "board": board, "layers": layers, "finish": "ENIG",
+                           "impedance_controlled": true });
+
+        let (error, plan) = call(&ctx, args.clone()).await;
+        assert!(!error, "{plan}");
+        assert_eq!(plan["status"], "ready");
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            SIX_LAYER,
+            "a dry run writes nothing"
+        );
+        let revision = plan["revision"].as_str().unwrap().to_string();
+
+        // An apply without a revision, or with another one, writes nothing.
+        let mut apply = args.clone();
+        apply["dry_run"] = json!(false);
+        let (error, refused) = call(&ctx, apply.clone()).await;
+        assert!(error, "{refused}");
+        apply["expected_revision"] = json!("0".repeat(64));
+        let (error, refused) = call(&ctx, apply.clone()).await;
+        assert!(error);
+        assert_eq!(refused["error"]["reason"], "stale_revision", "{refused}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), SIX_LAYER);
+
+        apply["expected_revision"] = json!(revision);
+        let (error, applied) = call(&ctx, apply.clone()).await;
+        assert!(!error, "{applied}");
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["write"]["persisted_bytes_match_plan"], true);
+        assert_eq!(
+            applied["write"]["persisted_readback"]["bytes_outside_planned_spans_unchanged"],
+            true
+        );
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(
+            applied["write"]["written_sha256"],
+            closed_board::sha256_hex(written.as_bytes())
+        );
+        assert_eq!(
+            applied["write"]["original_sha256"],
+            closed_board::sha256_hex(SIX_LAYER.as_bytes())
+        );
+
+        // The same revision cannot be applied twice: the bytes it covers are gone.
+        let (error, stale) = call(&ctx, apply).await;
+        assert!(error);
+        assert_eq!(stale["error"]["reason"], "stale_revision", "{stale}");
+
+        // The saved read reports what was written, marked as the saved file.
+        let read = handle_get_board_stackup(
+            &json!({ "board": board, "source": "saved",
+                     "expected": { "finish": "enig", "impedance_controlled": true,
+                                   "copper_layer_count": 6,
+                                   "layers": [{ "name": "dielectric 2", "thickness_mm": 0.36 }] } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!read.is_error);
+        let read = body(&read);
+        assert_eq!(read["finding_count"], 0, "{read}");
+        assert_eq!(read["source"], "saved");
+        assert_eq!(read["sources"]["stackup"], "saved_board");
+        assert_eq!(
+            read["source_evidence"]["excludes_unsaved_editor_state"],
+            true
+        );
+        assert_eq!(read["layers"][6]["dielectric_type"], "prepreg");
+        assert_eq!(read["layers"][4]["sublayers"][0]["thickness_locked"], true);
+        assert_eq!(read["nominal_board_thickness_mm"], 1.6);
+        assert!((read["board_thickness_mm"].as_f64().unwrap() - 1.32).abs() < 1e-9);
+
+        // Idempotent: the same request now plans nothing.
+        let (error, again) = call(&ctx, args).await;
+        assert!(!error);
+        assert_eq!(again["status"], "noop");
+        assert_eq!(again["difference_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_changed_file_after_the_dry_run_is_stale() {
+        let (_dir, board) = board_with(SIX_LAYER);
+        let ctx = ctx_talking_to(String::new());
+        let args = json!({ "board": board, "layers": names_only(), "finish": "OSP" });
+        let (_, plan) = call(&ctx, args.clone()).await;
+        let edited = SIX_LAYER.replace("keep (setup) text", "edited elsewhere");
+        std::fs::write(&board, &edited).unwrap();
+        let mut apply = args;
+        apply["dry_run"] = json!(false);
+        apply["expected_revision"] = plan["revision"].clone();
+        let (error, stale) = call(&ctx, apply).await;
+        assert!(error);
+        assert_eq!(stale["error"]["reason"], "stale_revision", "{stale}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), edited);
+    }
+
+    #[tokio::test]
+    async fn an_open_locked_ambiguous_or_refusing_kicad_is_never_written() {
+        let (_dir, board) = board_with(SIX_LAYER);
+        let args = json!({ "board": board, "layers": names_only(), "finish": "OSP" });
+
+        // KiCad holds this exact board.
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let (error, refused) =
+            call(&ctx_talking_to(server.address().to_string()), args.clone()).await;
+        assert!(error);
+        assert_eq!(
+            refused["error"]["reasons"][0], "board_open_in_kicad",
+            "{refused}"
+        );
+        drop(server);
+
+        // KiCad lists a board Konnect cannot place: closure is not proven.
+        let server =
+            spawn_kicad_reporting_documents(vec![board_document("mystery.kicad_pcb")], |_| None);
+        let (error, refused) =
+            call(&ctx_talking_to(server.address().to_string()), args.clone()).await;
+        assert!(error, "{refused}");
+        assert_eq!(
+            refused["error"]["kind"], "ambiguous_open_board",
+            "{refused}"
+        );
+        drop(server);
+
+        // KiCad answers, but not with an open-document list.
+        let server = crate::test_support::MockIpcServer::spawn("stackup-busy", |_| {
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsBusy as i32,
+                    error_message: "busy".to_string(),
+                }),
+                header: None,
+                message: None,
+            }
+        });
+        let (error, refused) =
+            call(&ctx_talking_to(server.address().to_string()), args.clone()).await;
+        assert!(error, "{refused}");
+        assert_eq!(
+            refused["error"]["reasons"][0], "closure_not_proven",
+            "{refused}"
+        );
+        drop(server);
+
+        // The exact board's KiCad lock, at planning and at apply.
+        let ctx = ctx_talking_to(String::new());
+        let (_, plan) = call(&ctx, args.clone()).await;
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "someone@host").unwrap();
+        let (error, refused) = call(&ctx, args.clone()).await;
+        assert!(error);
+        assert_eq!(
+            refused["error"]["reason"], "kicad_lock_present",
+            "{refused}"
+        );
+        let mut apply = args.clone();
+        apply["dry_run"] = json!(false);
+        apply["expected_revision"] = plan["revision"].clone();
+        let (error, _) = call(&ctx, apply.clone()).await;
+        assert!(error);
+        std::fs::remove_file(&lock).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            SIX_LAYER,
+            "nothing was written"
+        );
+        let (error, applied) = call(&ctx, apply).await;
+        assert!(!error, "{applied}");
+    }
+
+    // ─── Live honesty and saved provenance ───────────────────────────────────
+
+    /// What KiCad 10.0.4 sends: no finish, impedance or edge message, every
+    /// `enabled` unset, dielectric detail present but empty.
+    fn kicad_10_0_4_reply() -> prost_types::Any {
+        use kiapi::board::types::BoardLayer as L;
+        use kiapi::board::BoardStackupLayerType as T;
+        let entry = |layer: L, kind: T, nm: i64| kiapi::board::BoardStackupLayer {
+            thickness: Some(kiapi::common::types::Distance { value_nm: nm }),
+            layer: layer as i32,
+            r#type: kind as i32,
+            ..Default::default()
+        };
+        let mut core = entry(L::BlUndefined, T::BsltDielectric, 1_510_000);
+        core.details = Some(kiapi::board::board_stackup_layer::Details::Dielectric(
+            kiapi::board::BoardStackupDielectricLayer::default(),
+        ));
+        let mut f_cu = entry(L::BlFCu, T::BsltCopper, 35_000);
+        f_cu.material_name = "copper".to_string();
+        let mut b_cu = entry(L::BlBCu, T::BsltCopper, 35_000);
+        b_cu.material_name = "copper".to_string();
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::commands::BoardStackupResponse {
+                stackup: Some(kiapi::board::BoardStackup {
+                    layers: vec![
+                        entry(L::BlFMask, T::BsltSoldermask, 10_000),
+                        f_cu,
+                        core,
+                        b_cu,
+                        entry(L::BlBMask, T::BsltSoldermask, 10_000),
+                    ],
+                    ..Default::default()
+                }),
+            },
+            "kiapi.board.commands.BoardStackupResponse",
+        )
+    }
+
+    #[tokio::test]
+    async fn kicad_10_0_4s_partial_live_answer_is_null_and_not_reported_never_zero_or_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live.kicad_pcb");
+        let server = spawn_kicad_holding_board(&board, |command| {
+            command
+                .type_url
+                .ends_with("GetBoardStackup")
+                .then(kicad_10_0_4_reply)
+        });
+        let ctx = ctx_talking_to(server.address().to_string());
+        let result = handle_get_board_stackup(
+            &json!({ "board": board, "expected": {
+                "copper_layer_count": 2, "board_thickness_mm": 1.6, "finish": "ENIG",
+                "impedance_controlled": true,
+                "layers": [{ "name": "dielectric 1", "thickness_mm": 1.51, "epsilon_r": 4.5 }]
+            } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let live = body(&result);
+        for field in [
+            "copper_layer_count",
+            "board_thickness_mm",
+            "finish",
+            "impedance_controlled",
+            "edge_connector",
+            "has_edge_plating",
+        ] {
+            assert!(live[field].is_null(), "{field}: {live}");
+        }
+        assert_eq!(live["copper_entry_count"], 2);
+        assert_eq!(live["live_answer_complete"], false);
+        assert!(live["partial_answer_note"]
+            .as_str()
+            .unwrap()
+            .contains("10.0.4"));
+        assert!(live["layers"][1]["enabled"].is_null());
+        assert!(live["layers"][2]["thickness_mm"].is_null());
+        assert_eq!(live["layers"][2]["first_sublayer_thickness_mm"], 1.51);
+        assert_eq!(live["layers"][2]["sublayers_reported"], false);
+        let findings = live["findings"].as_array().unwrap();
+        assert!(findings.len() >= 6, "{live}");
+        for found in findings {
+            assert_eq!(
+                found["kind"], "not_reported",
+                "nothing is missing or a mismatch: {found}"
+            );
+        }
+        assert!(!board.exists(), "a live read never touches the file");
+    }
+
+    const FOUR_LAYER: &str =
+        include_str!("../../../konnect-ipc/tests/fixtures/four_layer_stackup_kicad10.kicad_pcb");
+
+    /// KiCad 10.0.6's captured answer for its own four-layer board and the
+    /// saved read of that board's file say the same stackup.
+    #[tokio::test]
+    async fn the_saved_read_agrees_with_kicad_10_0_6s_live_answer_for_the_same_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("four_layer_stackup_kicad10.kicad_pcb");
+        std::fs::write(&board, FOUR_LAYER).unwrap();
+        let captured = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.commands.BoardStackupResponse".to_string(),
+            value: include_bytes!(
+                "../../../konnect-ipc/tests/fixtures/four_layer_stackup_kicad10.ipc.bin"
+            )
+            .to_vec(),
+        };
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            command
+                .type_url
+                .ends_with("GetBoardStackup")
+                .then(|| captured.clone())
+        });
+        let ctx = ctx_talking_to(server.address().to_string());
+        let live = body(
+            &handle_get_board_stackup(&json!({ "board": board }), &ctx)
+                .await
+                .unwrap(),
+        );
+        // Asked for while KiCad holds the board: the file, said to be the file.
+        let saved = body(
+            &handle_get_board_stackup(&json!({ "board": board, "source": "saved" }), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(live["live_answer_complete"], true, "{live}");
+        assert_eq!(saved["source"], "saved");
+        assert_eq!(
+            saved["source_evidence"]["may_be_stale_relative_to_open_editor"], true,
+            "{saved}"
+        );
+        for field in [
+            "copper_layer_count",
+            "board_thickness_mm",
+            "finish",
+            "impedance_controlled",
+            "edge_connector",
+            "has_edge_plating",
+            "count",
+            "finding_count",
+        ] {
+            assert_eq!(live[field], saved[field], "{field}");
+        }
+        let pairs = live["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(saved["layers"].as_array().unwrap());
+        for (l, s) in pairs {
+            for field in ["name", "type", "thickness_mm", "dielectric_type"] {
+                assert_eq!(l.get(field), s.get(field), "{field}: {l} / {s}");
+            }
+            if let Some(plies) = l["sublayers"].as_array() {
+                for (lp, sp) in plies.iter().zip(s["sublayers"].as_array().unwrap()) {
+                    for field in [
+                        "thickness_mm",
+                        "material",
+                        "epsilon_r",
+                        "loss_tangent",
+                        "thickness_locked",
+                    ] {
+                        assert_eq!(lp[field], sp[field], "{field}");
+                    }
+                }
+            }
+        }
+        assert_eq!(saved["nominal_board_thickness_mm"], 0.7912);
+    }
+
+    #[tokio::test]
+    async fn a_saved_board_without_a_stackup_says_so_and_invents_none() {
+        let (_dir, board) = board_with(&without_stackup());
+        let read = body(
+            &handle_get_board_stackup(
+                &json!({ "board": board, "source": "saved",
+                         "expected": { "copper_layer_count": 6 } }),
+                &ctx_talking_to(String::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(read["stackup_defined"], false);
+        assert!(read["copper_layer_count"].is_null());
+        assert_eq!(read["layer_table_copper_count"], 6);
+        assert_eq!(read["expected_not_compared"], true);
+        assert_eq!(read["findings"][0]["field"], "stackup");
     }
 }

@@ -3,6 +3,252 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: closed-board stackup and Reference-field edits, compact readers
+
+`get_board_stackup` accepts `source` (`live`, the default; or `saved`). The live
+answer no longer reports a value KiCad did not serialize as a protobuf default:
+KiCad 10.0.4 sends no finish, impedance or edge message, no layer `enabled` flag
+and no dielectric sub-layers, so `finish`, `impedance_controlled`,
+`edge_connector`, `has_edge_plating`, each layer's `enabled`, and — when those
+are unknown — `copper_layer_count` and `board_thickness_mm` are `null`, a
+dielectric's `thickness_mm` and `sublayers` are `null` (with
+`first_sublayer_thickness_mm`), and findings say `not_reported` instead of
+`missing` or `mismatch`. New keys: `copper_entry_count`, `unobserved_fields`,
+`live_answer_complete`, `partial_answer_note`. A complete KiCad 10.0.6 answer
+reads as before. `source: "saved"` reads the saved `(setup (stackup …))` and
+`(general (thickness …))` (`nominal_board_thickness_mm`, distinct from the stack
+sum `board_thickness_mm`), reports `stackup_defined`, `unrecognized_clauses` and
+`layer_table_copper_count`, and marks the answer as excluding unsaved editor
+state. There is still no automatic file fallback. In `konnect-ipc`,
+`IpcBoardStackup`'s finish, impedance and edge fields and `IpcStackupLayer.enabled`
+are now `Option`, and a `BSDT_UNKNOWN` dielectric type is `None`.
+
+The `pcb_board` toolset adds `set_closed_board_stackup`, a dry-run-first,
+revision-checked edit of the saved stackup of a board KiCad provably does not
+hold (closure and sibling lock re-proven before the write). Only the stackup span
+and, when `nominal_board_thickness_mm` is given, the nominal-thickness span
+change.
+
+The `placement` toolset adds `set_reference_field_presentations`, a batch,
+revision-checked closed-board edit of Reference-field position, angle, width,
+height and stroke. `edit_component` accepts `reference_field` for one field;
+an empty object inspects it. Combining `value`, `attributes` and
+`reference_field` is refused.
+
+`get_component_pads` accepts `detail: "connectivity"` and the exact filters
+`pad_numbers` and `nets`; without them the response is unchanged.
+`get_component_list` accepts `references` and `source` (`live`, the default, or
+`saved`) and now reports each footprint's `uuid`. `set_component_placements`
+accepts an optional per-placement `layer` (`F.Cu`/`B.Cu`) on a closed board
+only. `get_board_stackup` and `get_component_list` are now classified
+live-preferred rather than live-only, since each has an explicit saved read.
+
+## Unreleased: schematic BOM inclusion and saved footprint attributes
+
+`edit_schematic_component` accepts a boolean `in_bom`, applied to every placed
+unit through the existing verified schematic command path. Readback checks the
+requested flag before commit and after persistence. Getters expose in_bom,
+on_board and dnp on the anchor and each placed unit. BOM inclusion remains
+independent of PCB inclusion; no pin, wire, UUID or other flag is rewritten.
+
+`edit_component` accepts an attributes object with optional boolean board_only,
+exclude_from_bom and exclude_from_pos_files entries. This branch requires the
+exact board closed, refuses remaining locks and uncertain live observations,
+and edits only the saved attribute clause with atomic revision checking and
+exact persisted readback. Unknown existing attributes and every other clause
+are preserved. An empty object inspects saved attributes without writing.
+Value edits keep the existing live path; combining value and attributes is
+refused before mutation. Board-access classification is now mode-dependent.
+
+## Unreleased: complete PCB inclusion and compact inspection
+
+Schematic-to-PCB sync uses the schematic's on-board flag independently of its
+BOM flag. An on-board test point excluded from the BOM still gets its footprint;
+an excluded-from-BOM symbol with no footprint still reports its missing assignment.
+DNP behavior is unchanged. Schematic files and BOM flags are not rewritten.
+
+For large designs, pass `response_detail: "summary"` to `update_pcb_from_schematic`.
+It retains every diagnostic, count, plan revision, property-preservation fact,
+parking result and write/readback outcome. It omits per-instance changes and
+input-file inventories, explicitly reporting their counts. The default remains
+the full response; presentation does not change the plan or its revision.
+
+`get_component_pads` accepts `detail: "fabrication"` to return every pad number
+and fabrication property with the same source and observability facts, omitting
+geometry. This keeps large BGA reads within agent response limits. Full geometry
+remains the default; a live property remains unobservable, never absent.
+
+## Unreleased: closed-board initial import, bounded parking and pad fabrication-property guards (minor release)
+
+`update_pcb_from_schematic` accepts `backend` (`live`, the default, unchanged;
+or `closed_initial`). `closed_initial` imports every schematic footprint into a
+board KiCad provably does not hold — the live write gate must classify the
+board as not held and KiCad's sibling lock must be absent, for the dry run as
+well as the apply — by copying each resolved library footprint's complete text:
+pad fabrication properties, padstacks and margins, custom pads, graphics,
+properties, models, net ties and groups. Only instance clauses change: the full
+library identifier, a root UUID and remapped child UUIDs and group members
+(derived deterministically from the plan's inputs, unique across instances and
+the board), reference and value, `path`/`sheetname`/`sheetfile`, the schematic's
+DNP, pad nets (every pad with a connected number; unnumbered pads never), and
+schematic fields (an existing library property takes the schematic's text; an
+absent one is added hidden on `F.Fab`; empty and `~` values, `Footprint`,
+`Reference` and `Value` are not copied). Library-only `version`, `generator`
+and `generator_version` clauses are removed. A KiCad 10 board gets pad net
+names; a board with a numbered net table gets the next codes.
+
+It is an initial import only: a board with a linked footprint, a footprint the
+schematic already names, a netted pad, or any track, arc, via or zone is
+refused, as is any source conflict — an unresolved or unreadable library, a
+missing connected pad, an invalid or duplicate library identity, a dangling
+group member, or a library format KiCad would read differently at the board's
+format version. One conflict refuses the whole import. The revision covers the
+board, every saved hierarchy file, every resolved library file, the netlist's
+design sections (not its export date) and the backend version, and all inputs
+are re-read before the single `write_atomic_if_unchanged`. The planned and the
+persisted board are both read back against the plan. The response adds
+`backend`, `board_closure`, `inputs`, `report` (net table, preserved board-only
+footprints, instances, pad fabrication properties, parking, readback) and
+`write`. Native reopen and DRC remain required; there is no KiCad undo step.
+
+**Changed behaviour (both backends):** additions are parked in a bounded,
+non-overlapping shelf region to the right of the board, sized from each
+footprint's conservative extent, instead of one unbounded column; a plan whose
+parking region would leave ±2000 mm is a `parking_extent_out_of_range`
+conflict. The response adds `parking`. The tool's board-access class is now
+`ApplyModeDependent`.
+
+**Pad fabrication-property guard.** KiCad 10's `Pad` protobuf has no
+fabrication-property field and `FOOTPRINT::Deserialize` re-creates pads from it,
+so a live whole-footprint update drops the property. `move_component`,
+`rotate_component`, `set_component_placements`, `edit_component` (value),
+`align_components`, `edit_board_footprint_graphic`,
+`set_placed_footprint_models`, `update_footprints_from_library` and the live
+backend's schematic updates now refuse, before anything is sent, any target
+whose saved-board copy or library footprint carries a pad fabrication property,
+or for which neither can be read (`plan_blocked`, or a
+`fabrication_property_rebuild_refused` diagnostic). Batches stay all or nothing.
+The closed-board file paths of the placement tools are unchanged and keep every
+pad clause. Not covered: `repair_corrupted_footprints`, `duplicate_component`.
+
+`get_component_pads` accepts `source` (`auto`, the default, unchanged; or
+`saved`, which reads the saved file even while KiCad holds the board). Saved
+reads add each pad's `fabrication_property` (`"none"` when absent); live reads
+add `fabrication_property: null` and `pad_fabrication_properties.status:
+"unobservable_via_live_typed_api"`.
+
+## Unreleased: normalize redundant custom-pad polygon closing points
+
+`edit_footprint_pad` accepts `normalize_polygon_closures: true`. It removes
+only trailing points equal to the first point of a straight-edge custom-pad
+polygon. Every retained coordinate, pad attribute, other primitive and other
+file byte is preserved. This removes zero-length closing edges so the library
+and KiCad API use the same closed-polygon representation. The option cannot be
+combined with other pad edits, rejects curves and invalid coordinates, and
+uses the existing revision-aware atomic writer. The response reports
+`normalized_closing_points`; repeating the operation removes zero points.
+
+## Unreleased: custom-shape pads are placed with their exact primitives (minor release)
+
+`place_component`, `update_pcb_from_schematic` and every other caller of the
+typed footprint builder now carry a `custom` pad: its anchor (`circle` or
+`rect`) and its primitives, pad-local, in `PadStackLayer.custom_anchor_shape`
+and `custom_shapes`. Supported primitives are `gr_poly` (straight edges),
+`gr_rect`, `gr_circle`, `gr_line` and `gr_arc`, each with an explicit width
+(and fill for the closed shapes). A footprint that previously failed with
+`unsupported_library_footprint` because it had custom pads now plans and
+applies when every custom pad uses only that subset.
+
+Still refused, with `unsupported_library_footprint` naming the pad and the
+clause: `(clearance convexhull)` (the API has no field for it), polygon `arc`
+edges, bezier (`gr_curve`), annotation (`gr_bbox`, `gr_vector`), rounded
+rectangles, missing `(options …)`/anchor/width/fill, non-finite or degenerate
+geometry, and unknown clauses. Back-side library refresh refuses custom pads.
+
+**Changed behaviour:** a pad shape the builder does not know is refused instead
+of being sent as a rectangle. `update_pcb_from_schematic` now fails an apply
+whose readback lost or changed custom-pad layers, rotation, anchor or
+primitives, as it already did for a gained pad. Millimetre values are rounded
+to the nearest nanometre rather than truncated.
+
+`get_component_pads` adds three optional fields to a `custom` entry of
+`copper_layers`: `custom_anchor_shape`, `custom_primitives` (pad-local mm,
+tagged by `kind`) and `custom_primitives_unreadable` (why primitives could not
+be described). Ordinary entries are unchanged.
+
+**Library data and pad zone connections.** `place_component` (and
+`add_mounting_hole` when it places the library footprint) now sends the
+library's instance attributes (mounting style and exclusion flags), its
+description and keywords, and every 3D model with its offset, scale, rotation,
+opacity and visibility, as `update_pcb_from_schematic` already did. A footprint
+whose `(attr …)` or `(model …)` the shared reader refuses is refused instead of
+placed without them. Inline geometry is unchanged.
+
+A pad's `(zone_connect N)` (`-1` inherited, `0` none, `1` thermal, `2` solid,
+`3` PTH thermal) is sent as `PadStack.zone_settings.zone_connection`; a pad
+without it is sent as inherited (see the thermal settings below). Another value, a repeated
+clause or a non-integer is refused. `update_pcb_from_schematic` fails an apply
+whose readback changed any pad's zone connection. `update_footprints_from_library`
+now refreshes front-side custom pads and `zone_connect`; it still refuses a
+back-side custom pad and everything listed above.
+
+**Pad thermal settings.** A pad's `(thermal_bridge_width mm)` (or legacy
+`(thermal_width mm)`), `(thermal_gap mm)` and `(thermal_bridge_angle deg)` are
+now carried as `PadStack.zone_settings.thermal_spokes` (`width`, `gap`,
+`angle`). An unwritten width or gap stays unset (it inherits) and an explicit
+`0` stays an explicit zero. Every footprint-file pad is now sent with its
+spoke angle, because KiCad 10's file parser always sets one: the written
+value, or 45° for a circle or circle-anchored custom pad (90° for the latter
+in files of format 20211014 or older) and 90° otherwise. Without it, KiCad's
+API would hold its own shape default, which is 45° for every custom pad, so a
+rect-anchored custom pad would not match its library. A pad without
+`zone_connect` but with thermal settings is sent as `inherited`. A repeated
+clause, a value that is not one bare number, a non-finite value, a negative
+or out-of-range width or gap, and spokes without an angle are refused before
+anything is created. `update_pcb_from_schematic` fails an apply whose readback
+changed any pad's thermal settings. `update_footprints_from_library` compares
+them exactly, filling in only KiCad's own default for a stack sent without
+zone settings.
+
+`get_component_pads` and `get_footprint_info` (`include_pads`) add `thermal`
+(`spoke_width` and `gap` in mm when set, `spoke_angle` in degrees) and
+`thermal_spoke_angle_explicit` (whether a footprint file wrote the angle;
+`null` for a live pad).
+
+**Refresh pad diagnostics.** When `update_footprints_from_library` plans a
+`pads` change, the change now carries `pad_differences`: one entry per pad and
+typed field (for example `pad_stack.zone_settings.thermal_spokes.angle_degrees`
+or `pad_stack.copper_layers[0].custom_shapes[0].polygon[0].outline.vertex_count`)
+with the library value as `expected` and the board value as `observed`. A
+polygon reports its vertex count and its first differing vertex, not every
+coordinate; at most 64 entries are listed and `pad_differences_omitted` counts
+the rest. A field the diff does not name is still reported as `unclassified`.
+Entries the plan does not count carry `ignored_by_plan` with the reason. An
+explicit closing polygon vertex that KiCad's API drops is one: re-applying
+cannot keep it, but KiCad's file parser keeps it and its native library-parity
+check compares vertex counts, so it can still cause `lib_footprint_mismatch`.
+On an unchanged footprint such entries appear in the new top-level
+`pad_parity_notes`, which never affects `status`, `coverage` or the plan
+revision. The pad comparison now also ignores what KiCad assigns itself on
+custom-pad primitives (KIID, net, read-only parent, an unset lock state, a zero
+rectangle corner radius), so a freshly placed custom pad is no longer planned
+as changed for those alone.
+
+**Changed behaviour:** every typed placement path now refuses a pad clause it
+has no field for, naming the pad and clause, instead of dropping it: a pad
+`(property …)` such as `pad_prop_heatsink`, mask/paste margins, clearance
+overrides, chamfers, `rect_delta`, a drill `(offset …)`,
+`(remove_unused_layers yes)`, `(padstack …)` and pad flags such as `locked`.
+KiCad 10's stock `Texas_RJE0020A` and `VQFN-20-1EP_3x3mm` footprints carry
+`(property pad_prop_heatsink)` on their exposed pad, so they are refused again
+for that clause alone.
+
+`get_component_pads` and `get_footprint_info` (`include_pads`) add two optional
+pad-level fields: `corner_rounding_ratio`, reported even for a pad without
+copper (a paste-only aperture), and `zone_connection` (`inherited`, `none`,
+`thermal`, `solid` or `pth_thermal`). A footprint file pad without the clause
+reads as `inherited`; a live pad whose stack reports no zone settings omits it.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
@@ -822,9 +1068,9 @@ nothing is planned or applied.
 
 Callers do not change their requests. A caller that matched
 `footprint_library_resolution_failed` to detect custom-shape pads should match
-`unsupported_library_footprint` instead. Custom-shape pads are still not
-supported; the fix is that the refusal now says which footprint to substitute
-and for which parts.
+`unsupported_library_footprint` instead. Custom-shape pads were still not
+supported at this point; the fix was that the refusal said which footprint to
+substitute and for which parts. (Later supported; see the entry above.)
 
 ## Unreleased: `get_layer_list` and `get_netclasses` answer about the live board (minor release)
 

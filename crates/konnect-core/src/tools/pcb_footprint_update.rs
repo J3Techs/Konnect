@@ -48,6 +48,8 @@ struct PreparedUpdate {
     item: prost_types::Any,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    pad_differences: Vec<PadDifference>,
+    pad_differences_omitted: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -146,6 +148,26 @@ struct PlannedUpdate {
     library_id: String,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    /// Which pads differ and in which typed fields; see [`pad_differences`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pad_differences: Vec<PadDifference>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pad_differences_omitted: usize,
+}
+
+/// Pad differences on a footprint the plan leaves unchanged, all of them
+/// ignored by the plan, reported because they can still matter natively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PadParityNote {
+    reference: String,
+    library_id: String,
+    pad_differences: Vec<PadDifference>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pad_differences_omitted: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -161,6 +183,7 @@ struct UpdatePlan {
     plan_revision: String,
     coverage: UpdateCoverage,
     changes: Vec<PlannedUpdate>,
+    pad_parity_notes: Vec<PadParityNote>,
     diagnostics: Vec<UpdateDiagnostic>,
     prepared_items: Vec<prost_types::Any>,
 }
@@ -274,6 +297,7 @@ pub(crate) async fn handle_update_footprints_from_library(
                 &routed_nets,
                 &filters,
             );
+            refuse_updates_that_would_drop_pad_properties(&planning_board_path, &mut plan);
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 return Ok(plan_response(&plan, false));
@@ -327,6 +351,46 @@ pub(crate) async fn handle_update_footprints_from_library(
             preflight_conflict(message)
         }
     })
+}
+
+/// Each prepared update sends a whole footprint back, and KiCad re-creates
+/// its pads from a message with no field for a pad's fabrication property.
+/// The library side is already refused by the typed reader; this refuses a
+/// placed footprint whose saved board copy carries one, or that neither the
+/// saved board nor its library can speak for.
+fn refuse_updates_that_would_drop_pad_properties(board_path: &Path, plan: &mut UpdatePlan) {
+    use crate::tools::footprint_fabrication::{check_live_rebuild, RebuildTarget, Remedy};
+
+    let targets = plan
+        .prepared_items
+        .iter()
+        .filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+        })
+        .map(|footprint| RebuildTarget::from_instance(&footprint))
+        .collect::<Vec<_>>();
+    let Err(refusal) = check_live_rebuild(
+        board_path,
+        "update_footprints_from_library",
+        &targets,
+        Remedy::NoLosslessPath,
+    ) else {
+        return;
+    };
+    for finding in &refusal.findings {
+        plan.diagnostics.push(UpdateDiagnostic {
+            code: "fabrication_property_rebuild_refused".to_string(),
+            message: format!(
+                "{} A live library refresh would re-create its pads without it.",
+                finding.reason()
+            ),
+            reference: Some(finding.reference.clone()),
+        });
+    }
+    plan.status = PlanStatus::Conflict;
+    plan.coverage.conflicts.planned += refusal.findings.len();
+    plan.changes.clear();
+    plan.prepared_items.clear();
 }
 
 fn snapshot_routed_nets(
@@ -394,6 +458,7 @@ fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
             "conflicts": plan.coverage.conflicts
         },
         "changes": plan.changes,
+        "pad_parity_notes": plan.pad_parity_notes,
         "diagnostics": plan.diagnostics,
         "undo": if applied {
             Some("Ctrl-Z reverses the whole footprint library update.")
@@ -605,6 +670,7 @@ fn plan_updates(
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
     let mut changes = Vec::new();
+    let mut pad_parity_notes = Vec::new();
     let mut prepared_items = Vec::new();
     for candidate in selected {
         if candidate.library_id.is_empty() {
@@ -688,6 +754,14 @@ fn plan_updates(
         hasher.update(source.as_bytes());
         if prepared.changed_domains.is_empty() {
             coverage.unchanged.planned += 1;
+            if !prepared.pad_differences.is_empty() {
+                pad_parity_notes.push(PadParityNote {
+                    reference: candidate.reference,
+                    library_id: candidate.library_id,
+                    pad_differences: prepared.pad_differences,
+                    pad_differences_omitted: prepared.pad_differences_omitted,
+                });
+            }
         } else {
             coverage.changed.planned += 1;
             changes.push(PlannedUpdate {
@@ -695,6 +769,8 @@ fn plan_updates(
                 library_id: candidate.library_id,
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
+                pad_differences: prepared.pad_differences,
+                pad_differences_omitted: prepared.pad_differences_omitted,
             });
             prepared_items.push(prepared.item);
         }
@@ -703,6 +779,7 @@ fn plan_updates(
     if !diagnostics.is_empty() {
         coverage.conflicts.planned = diagnostics.len();
         changes.clear();
+        pad_parity_notes.clear();
         prepared_items.clear();
         coverage.changed.planned = 0;
         return UpdatePlan {
@@ -710,6 +787,7 @@ fn plan_updates(
             plan_revision: format!("{:x}", hasher.finalize()),
             coverage,
             changes,
+            pad_parity_notes,
             diagnostics,
             prepared_items,
         };
@@ -725,6 +803,7 @@ fn plan_updates(
         plan_revision: format!("{:x}", hasher.finalize()),
         coverage,
         changes,
+        pad_parity_notes,
         diagnostics,
         prepared_items,
     }
@@ -1414,23 +1493,40 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
         .get(3)
         .and_then(konnect_sexp::SexpNode::as_str)
         .context("footprint pad is missing its shape")?;
-    if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
+    // A custom pad's anchor and primitives, and every pad's zone connection,
+    // are read by the shared pad parser `parse_library_footprint` runs next,
+    // which refuses what it cannot carry (a `convexhull` clearance, curved
+    // polygon edges, …). Mirroring one onto the back is refused separately,
+    // in `mirror_pad`.
+    if !matches!(shape, "circle" | "rect" | "oval" | "roundrect" | "custom") {
         bail!("pad shape '{shape}' is not supported by typed library refresh");
     }
+    super::pcb_components::pad_zone_connection(pad)
+        .context("pad zone connection is not supported by typed library refresh")?;
+    super::pcb_components::pad_thermal(pad, None)
+        .context("pad thermal settings are not supported by typed library refresh")?;
     for child in pad.children().unwrap_or_default().iter().skip(4) {
         let Some(tag) = child.head() else {
             continue;
         };
-        if !matches!(
-            tag,
-            "at" | "size"
-                | "layers"
-                | "drill"
-                | "roundrect_rratio"
-                | "uuid"
-                | "tstamp"
-                | "remove_unused_layers"
-        ) {
+        let custom_clause = shape == "custom" && matches!(tag, "options" | "primitives");
+        if !custom_clause
+            && !matches!(
+                tag,
+                "at" | "size"
+                    | "layers"
+                    | "drill"
+                    | "roundrect_rratio"
+                    | "zone_connect"
+                    | "thermal_bridge_width"
+                    | "thermal_width"
+                    | "thermal_gap"
+                    | "thermal_bridge_angle"
+                    | "uuid"
+                    | "tstamp"
+                    | "remove_unused_layers"
+            )
+        {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
         if tag == "remove_unused_layers" {
@@ -1621,10 +1717,19 @@ fn build_updated_instance(
 
     let changed_domains = changed_domains(current, &updated)?;
     let preserved = PreservedState::derive(current, &updated, &old_nets);
+    let (pad_differences, pad_differences_omitted) = pad_differences(
+        current_definition,
+        updated
+            .definition
+            .as_ref()
+            .context("missing updated definition")?,
+    )?;
     Ok(PreparedUpdate {
         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
         changed_domains,
         preserved,
+        pad_differences,
+        pad_differences_omitted,
     })
 }
 
@@ -1760,6 +1865,16 @@ fn readable_property_angle(degrees: f64) -> f64 {
 }
 
 fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPadDefinition> {
+    // Mirroring would have to flip every pad-local primitive as well; until
+    // that is implemented and verified, a back-side custom pad is refused.
+    if pad.custom.is_some() {
+        bail!(
+            "custom pad '{}' cannot be mirrored onto the back side by typed library refresh",
+            pad.number
+        );
+    }
+    // Thermal settings stay as they are: KiCad's `PAD::Flip` negates the pad
+    // orientation but leaves the spoke angle, width and gap alone.
     let mut mirrored = pad.clone();
     mirrored.y = -mirrored.y;
     mirrored.rotation = -mirrored.rotation;
@@ -1953,6 +2068,577 @@ fn changed_domains(
     Ok(changed)
 }
 
+/// The most pad differences one footprint reports; the rest are counted.
+const PAD_DIFFERENCE_LIMIT: usize = 64;
+
+/// One typed pad field where the pad rebuilt from the library source
+/// (`expected`) and the pad KiCad reports on the board (`observed`) differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PadDifference {
+    pad: String,
+    field: String,
+    expected: serde_json::Value,
+    observed: serde_json::Value,
+    /// Set when the plan does not count this difference, with why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ignored_by_plan: Option<String>,
+}
+
+/// Why the plan ignores a dropped closing vertex, and why it is reported.
+const CLOSING_VERTEX_NOTE: &str = "KiCad's API drops an explicit closing vertex \
+     (UnpackPolyLine closes the chain), so re-applying cannot change it; KiCad 10's \
+     footprint parser keeps the vertex and its library parity check compares polygon \
+     vertex counts exactly, so native DRC can still report lib_footprint_mismatch";
+
+/// Which pads, and which of their typed fields, differ between the board
+/// (`current`) and the rebuild (`updated`), with both values. Bounded: a
+/// polygon reports its vertex count and its first differing vertex, not
+/// every coordinate, and at most [`PAD_DIFFERENCE_LIMIT`] entries are kept;
+/// the second value counts the rest.
+///
+/// Pads pair by number; pads sharing a number pair identical ones first and
+/// the rest in position order. Every difference the plan counts is listed,
+/// and a pad whose normalized form differs in a field not named here is
+/// still reported, as `unclassified`.
+fn pad_differences(
+    current: &kiapi::board::types::Footprint,
+    updated: &kiapi::board::types::Footprint,
+) -> Result<(Vec<PadDifference>, usize)> {
+    use kiapi::board::types::Pad;
+    fn pads(definition: &kiapi::board::types::Footprint) -> Result<BTreeMap<String, Vec<Pad>>> {
+        let mut pads = BTreeMap::<String, Vec<Pad>>::new();
+        for item in &definition.items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let pad = Pad::decode(item.value.as_slice())?;
+                pads.entry(pad.number.clone())
+                    .or_default()
+                    .push(normalized_pad(pad, false));
+            }
+        }
+        Ok(pads)
+    }
+    let full = |pad: &Pad| normalized_pad(pad.clone(), true).encode_to_vec();
+    let position = |pad: &Pad| pad.position.map(|p| (p.x_nm, p.y_nm));
+
+    let mut observed_pads = pads(current)?;
+    let mut expected_pads = pads(updated)?;
+    let numbers = observed_pads
+        .keys()
+        .chain(expected_pads.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    for number in numbers {
+        let mut expected = expected_pads.remove(&number).unwrap_or_default();
+        let mut observed = observed_pads.remove(&number).unwrap_or_default();
+        let mut pairs = Vec::new();
+        expected.retain(
+            |want| match observed.iter().position(|got| full(got) == full(want)) {
+                Some(index) => {
+                    pairs.push((want.clone(), observed.remove(index)));
+                    false
+                }
+                None => true,
+            },
+        );
+        expected.sort_by_key(position);
+        observed.sort_by_key(position);
+        let unmatched = expected.len().max(observed.len());
+        let mut expected = expected.into_iter();
+        let mut observed = observed.into_iter();
+        for _ in 0..unmatched {
+            match (expected.next(), observed.next()) {
+                (Some(want), Some(got)) => pairs.push((want, got)),
+                (want, got) => out.push(PadDifference {
+                    pad: number.clone(),
+                    field: "pad".to_string(),
+                    expected: json!(if want.is_some() { "present" } else { "absent" }),
+                    observed: json!(if got.is_some() { "present" } else { "absent" }),
+                    ignored_by_plan: None,
+                }),
+            }
+        }
+        for (want, got) in pairs {
+            let before = out.len();
+            PadRecorder {
+                pad: &number,
+                out: &mut out,
+            }
+            .pad(&want, &got);
+            let counted = out[before..]
+                .iter()
+                .any(|difference| difference.ignored_by_plan.is_none());
+            if !counted && full(&want) != full(&got) {
+                let text = |pad: &Pad| {
+                    let mut text = format!("{pad:?}");
+                    if text.len() > 2000 {
+                        let end = (0..=2000).rev().find(|&i| text.is_char_boundary(i));
+                        text.truncate(end.unwrap_or(0));
+                        text.push('…');
+                    }
+                    text
+                };
+                out.push(PadDifference {
+                    pad: number.clone(),
+                    field: "unclassified".to_string(),
+                    expected: json!(text(&want)),
+                    observed: json!(text(&got)),
+                    ignored_by_plan: None,
+                });
+            }
+        }
+    }
+    let omitted = out.len().saturating_sub(PAD_DIFFERENCE_LIMIT);
+    out.truncate(PAD_DIFFERENCE_LIMIT);
+    Ok((out, omitted))
+}
+
+struct PadRecorder<'a> {
+    pad: &'a str,
+    out: &'a mut Vec<PadDifference>,
+}
+
+fn debug_value<T: std::fmt::Debug>(value: &T) -> serde_json::Value {
+    json!(format!("{value:?}"))
+}
+
+/// A protocol enum by name, or its number when this build does not know it.
+fn enum_value<E: TryFrom<i32> + std::fmt::Debug>(value: i32) -> serde_json::Value {
+    E::try_from(value).map_or_else(|_| json!(value), |known| debug_value(&known))
+}
+
+fn point_value(node: &kiapi::common::types::PolyLineNode) -> serde_json::Value {
+    use kiapi::common::types::poly_line_node::Geometry;
+    match node.geometry.as_ref() {
+        Some(Geometry::Point(point)) => json!({ "x_nm": point.x_nm, "y_nm": point.y_nm }),
+        other => debug_value(&other),
+    }
+}
+
+impl PadRecorder<'_> {
+    fn note(
+        &mut self,
+        field: String,
+        expected: serde_json::Value,
+        observed: serde_json::Value,
+        ignored_by_plan: Option<&str>,
+    ) {
+        if expected != observed {
+            self.out.push(PadDifference {
+                pad: self.pad.to_string(),
+                field,
+                expected,
+                observed,
+                ignored_by_plan: ignored_by_plan.map(str::to_string),
+            });
+        }
+    }
+
+    fn field(&mut self, field: &str, expected: serde_json::Value, observed: serde_json::Value) {
+        self.note(field.to_string(), expected, observed, None);
+    }
+
+    fn pad(&mut self, want: &kiapi::board::types::Pad, got: &kiapi::board::types::Pad) {
+        use kiapi::board::types::PadType;
+        use kiapi::common::types::LockedState;
+        self.field(
+            "type",
+            enum_value::<PadType>(want.r#type),
+            enum_value::<PadType>(got.r#type),
+        );
+        self.field(
+            "locked",
+            enum_value::<LockedState>(want.locked),
+            enum_value::<LockedState>(got.locked),
+        );
+        self.field(
+            "position",
+            debug_value(&want.position),
+            debug_value(&got.position),
+        );
+        self.field(
+            "copper_clearance_override",
+            debug_value(&want.copper_clearance_override),
+            debug_value(&got.copper_clearance_override),
+        );
+        match (want.pad_stack.as_ref(), got.pad_stack.as_ref()) {
+            (Some(want), Some(got)) => self.stack(want, got),
+            (want, got) => self.field("pad_stack", json!(want.is_some()), json!(got.is_some())),
+        }
+    }
+
+    fn stack(&mut self, want: &kiapi::board::types::PadStack, got: &kiapi::board::types::PadStack) {
+        use kiapi::board::types::{BoardLayer, PadStackType, UnconnectedLayerRemoval};
+        let layers = |stack: &kiapi::board::types::PadStack| {
+            json!(stack
+                .layers
+                .iter()
+                .map(|layer| enum_value::<BoardLayer>(*layer))
+                .collect::<Vec<_>>())
+        };
+        self.field(
+            "pad_stack.type",
+            enum_value::<PadStackType>(want.r#type),
+            enum_value::<PadStackType>(got.r#type),
+        );
+        self.field("pad_stack.layers", layers(want), layers(got));
+        self.field(
+            "pad_stack.angle_degrees",
+            json!(want.angle.as_ref().map(|angle| angle.value_degrees)),
+            json!(got.angle.as_ref().map(|angle| angle.value_degrees)),
+        );
+        self.field(
+            "pad_stack.unconnected_layer_removal",
+            enum_value::<UnconnectedLayerRemoval>(want.unconnected_layer_removal),
+            enum_value::<UnconnectedLayerRemoval>(got.unconnected_layer_removal),
+        );
+        for (field, want, got) in [
+            (
+                "pad_stack.drill",
+                debug_value(&want.drill),
+                debug_value(&got.drill),
+            ),
+            (
+                "pad_stack.front_outer_layers",
+                debug_value(&want.front_outer_layers),
+                debug_value(&got.front_outer_layers),
+            ),
+            (
+                "pad_stack.back_outer_layers",
+                debug_value(&want.back_outer_layers),
+                debug_value(&got.back_outer_layers),
+            ),
+            (
+                "pad_stack.secondary_drill",
+                debug_value(&want.secondary_drill),
+                debug_value(&got.secondary_drill),
+            ),
+            (
+                "pad_stack.tertiary_drill",
+                debug_value(&want.tertiary_drill),
+                debug_value(&got.tertiary_drill),
+            ),
+            (
+                "pad_stack.front_post_machining",
+                debug_value(&want.front_post_machining),
+                debug_value(&got.front_post_machining),
+            ),
+            (
+                "pad_stack.back_post_machining",
+                debug_value(&want.back_post_machining),
+                debug_value(&got.back_post_machining),
+            ),
+        ] {
+            self.field(field, want, got);
+        }
+        self.zone_settings(
+            "pad_stack.zone_settings",
+            want.zone_settings.as_ref(),
+            got.zone_settings.as_ref(),
+        );
+        self.field(
+            "pad_stack.copper_layers.count",
+            json!(want.copper_layers.len()),
+            json!(got.copper_layers.len()),
+        );
+        for (index, (want, got)) in want
+            .copper_layers
+            .iter()
+            .zip(&got.copper_layers)
+            .enumerate()
+        {
+            self.copper_layer(&format!("pad_stack.copper_layers[{index}]"), want, got);
+        }
+    }
+
+    fn zone_settings(
+        &mut self,
+        prefix: &str,
+        want: Option<&kiapi::board::types::ZoneConnectionSettings>,
+        got: Option<&kiapi::board::types::ZoneConnectionSettings>,
+    ) {
+        use kiapi::board::types::ZoneConnectionStyle;
+        let connection = |settings: Option<&kiapi::board::types::ZoneConnectionSettings>| {
+            settings.map_or(serde_json::Value::Null, |settings| {
+                enum_value::<ZoneConnectionStyle>(settings.zone_connection)
+            })
+        };
+        self.note(
+            format!("{prefix}.zone_connection"),
+            connection(want),
+            connection(got),
+            None,
+        );
+        let spokes = |settings: Option<&kiapi::board::types::ZoneConnectionSettings>| {
+            settings.and_then(|settings| settings.thermal_spokes)
+        };
+        let (want, got) = (spokes(want), spokes(got));
+        self.note(
+            format!("{prefix}.thermal_spokes.width_nm"),
+            json!(want
+                .and_then(|spokes| spokes.width)
+                .map(|width| width.value_nm)),
+            json!(got
+                .and_then(|spokes| spokes.width)
+                .map(|width| width.value_nm)),
+            None,
+        );
+        self.note(
+            format!("{prefix}.thermal_spokes.gap_nm"),
+            json!(want.and_then(|spokes| spokes.gap).map(|gap| gap.value_nm)),
+            json!(got.and_then(|spokes| spokes.gap).map(|gap| gap.value_nm)),
+            None,
+        );
+        self.note(
+            format!("{prefix}.thermal_spokes.angle_degrees"),
+            json!(want
+                .and_then(|spokes| spokes.angle)
+                .map(|angle| angle.value_degrees)),
+            json!(got
+                .and_then(|spokes| spokes.angle)
+                .map(|angle| angle.value_degrees)),
+            None,
+        );
+    }
+
+    fn copper_layer(
+        &mut self,
+        prefix: &str,
+        want: &kiapi::board::types::PadStackLayer,
+        got: &kiapi::board::types::PadStackLayer,
+    ) {
+        use kiapi::board::types::{BoardLayer, PadStackShape};
+        let mut field = |name: &str, want: serde_json::Value, got: serde_json::Value| {
+            self.note(format!("{prefix}.{name}"), want, got, None);
+        };
+        field(
+            "layer",
+            enum_value::<BoardLayer>(want.layer),
+            enum_value::<BoardLayer>(got.layer),
+        );
+        field(
+            "shape",
+            enum_value::<PadStackShape>(want.shape),
+            enum_value::<PadStackShape>(got.shape),
+        );
+        field("size", debug_value(&want.size), debug_value(&got.size));
+        field(
+            "corner_rounding_ratio",
+            json!(want.corner_rounding_ratio),
+            json!(got.corner_rounding_ratio),
+        );
+        field(
+            "chamfer_ratio",
+            json!(want.chamfer_ratio),
+            json!(got.chamfer_ratio),
+        );
+        field(
+            "chamfered_corners",
+            debug_value(&want.chamfered_corners),
+            debug_value(&got.chamfered_corners),
+        );
+        field(
+            "custom_anchor_shape",
+            enum_value::<PadStackShape>(want.custom_anchor_shape),
+            enum_value::<PadStackShape>(got.custom_anchor_shape),
+        );
+        field(
+            "trapezoid_delta",
+            debug_value(&want.trapezoid_delta),
+            debug_value(&got.trapezoid_delta),
+        );
+        field(
+            "offset",
+            debug_value(&want.offset),
+            debug_value(&got.offset),
+        );
+        field(
+            "custom_shapes.count",
+            json!(want.custom_shapes.len()),
+            json!(got.custom_shapes.len()),
+        );
+        self.zone_settings(
+            &format!("{prefix}.zone_settings"),
+            want.zone_settings.as_ref(),
+            got.zone_settings.as_ref(),
+        );
+        for (index, (want, got)) in want
+            .custom_shapes
+            .iter()
+            .zip(&got.custom_shapes)
+            .enumerate()
+        {
+            self.primitive(&format!("{prefix}.custom_shapes[{index}]"), want, got);
+        }
+    }
+
+    fn primitive(
+        &mut self,
+        prefix: &str,
+        want: &kiapi::board::types::BoardGraphicShape,
+        got: &kiapi::board::types::BoardGraphicShape,
+    ) {
+        use kiapi::board::types::BoardLayer;
+        use kiapi::common::types::{graphic_shape::Geometry, LockedState};
+        self.note(
+            format!("{prefix}.layer"),
+            enum_value::<BoardLayer>(want.layer),
+            enum_value::<BoardLayer>(got.layer),
+            None,
+        );
+        self.note(
+            format!("{prefix}.locked"),
+            enum_value::<LockedState>(want.locked),
+            enum_value::<LockedState>(got.locked),
+            None,
+        );
+        let attributes = |shape: &kiapi::board::types::BoardGraphicShape| {
+            shape.shape.as_ref().and_then(|shape| shape.attributes)
+        };
+        let (want_attributes, got_attributes) = (attributes(want), attributes(got));
+        let stroke = |attributes: &Option<kiapi::common::types::GraphicAttributes>| {
+            attributes.as_ref().and_then(|a| a.stroke)
+        };
+        let (want_stroke, got_stroke) = (stroke(&want_attributes), stroke(&got_attributes));
+        self.note(
+            format!("{prefix}.stroke.width_nm"),
+            json!(want_stroke
+                .as_ref()
+                .and_then(|s| s.width)
+                .map(|w| w.value_nm)),
+            json!(got_stroke
+                .as_ref()
+                .and_then(|s| s.width)
+                .map(|w| w.value_nm)),
+            None,
+        );
+        self.note(
+            format!("{prefix}.stroke.style"),
+            want_stroke.as_ref().map_or(serde_json::Value::Null, |s| {
+                enum_value::<kiapi::common::types::StrokeLineStyle>(s.style)
+            }),
+            got_stroke.as_ref().map_or(serde_json::Value::Null, |s| {
+                enum_value::<kiapi::common::types::StrokeLineStyle>(s.style)
+            }),
+            None,
+        );
+        self.note(
+            format!("{prefix}.stroke.color"),
+            debug_value(&want_stroke.as_ref().and_then(|s| s.color)),
+            debug_value(&got_stroke.as_ref().and_then(|s| s.color)),
+            None,
+        );
+        self.note(
+            format!("{prefix}.fill"),
+            debug_value(&want_attributes.as_ref().and_then(|a| a.fill)),
+            debug_value(&got_attributes.as_ref().and_then(|a| a.fill)),
+            None,
+        );
+        let geometry = |shape: &kiapi::board::types::BoardGraphicShape| {
+            shape
+                .shape
+                .as_ref()
+                .and_then(|shape| shape.geometry.clone())
+        };
+        match (geometry(want), geometry(got)) {
+            (Some(Geometry::Polygon(want)), Some(Geometry::Polygon(got))) => {
+                self.note(
+                    format!("{prefix}.polygon.count"),
+                    json!(want.polygons.len()),
+                    json!(got.polygons.len()),
+                    None,
+                );
+                for (index, (want, got)) in want.polygons.iter().zip(&got.polygons).enumerate() {
+                    let path = format!("{prefix}.polygon[{index}]");
+                    let empty = kiapi::common::types::PolyLine::default();
+                    let (want_outline, got_outline) = (
+                        want.outline.as_ref().unwrap_or(&empty),
+                        got.outline.as_ref().unwrap_or(&empty),
+                    );
+                    self.polyline(&format!("{path}.outline"), want_outline, got_outline);
+                    self.note(
+                        format!("{path}.holes.count"),
+                        json!(want.holes.len()),
+                        json!(got.holes.len()),
+                        None,
+                    );
+                    for (hole, (want, got)) in want.holes.iter().zip(&got.holes).enumerate() {
+                        self.polyline(&format!("{path}.holes[{hole}]"), want, got);
+                    }
+                }
+            }
+            (want, got) => self.note(
+                format!("{prefix}.geometry"),
+                debug_value(&want),
+                debug_value(&got),
+                None,
+            ),
+        }
+    }
+
+    /// A closed outline's difference: whether it is closed, its vertex
+    /// count, and its first differing vertex with how many differ, never
+    /// every coordinate. A dropped explicit closing vertex alone is reported
+    /// as ignored by the plan.
+    fn polyline(
+        &mut self,
+        prefix: &str,
+        want: &kiapi::common::types::PolyLine,
+        got: &kiapi::common::types::PolyLine,
+    ) {
+        self.note(
+            format!("{prefix}.closed"),
+            json!(want.closed),
+            json!(got.closed),
+            None,
+        );
+        let (want, got) = (&want.nodes, &got.nodes);
+        if want == got {
+            return;
+        }
+        let closing = |longer: &[kiapi::common::types::PolyLineNode],
+                       shorter: &[kiapi::common::types::PolyLineNode]| {
+            longer.len() == shorter.len() + 1
+                && longer.len() > 3
+                && longer.first() == longer.last()
+                && longer[..shorter.len()] == *shorter
+        };
+        if closing(want, got) || closing(got, want) {
+            self.note(
+                format!("{prefix}.vertex_count"),
+                json!(want.len()),
+                json!(got.len()),
+                Some(CLOSING_VERTEX_NOTE),
+            );
+            return;
+        }
+        self.note(
+            format!("{prefix}.vertex_count"),
+            json!(want.len()),
+            json!(got.len()),
+            None,
+        );
+        let differing = want
+            .iter()
+            .zip(got.iter())
+            .enumerate()
+            .filter(|(_, (want, got))| want != got)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(&first) = differing.first() {
+            self.note(
+                format!(
+                    "{prefix}.vertex[{first}] (first of {} differing vertices)",
+                    differing.len()
+                ),
+                point_value(&want[first]),
+                point_value(&got[first]),
+                None,
+            );
+        }
+    }
+}
+
 fn normalized_items(
     definition: &kiapi::board::types::Footprint,
     suffix: &str,
@@ -1963,33 +2649,8 @@ fn normalized_items(
         .filter(|item| item.type_url.ends_with(suffix))
         .map(|item| {
             if suffix == "Pad" {
-                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-                pad.id = None;
-                pad.net = None;
-                pad.pad_to_die_length = None;
-                pad.symbol_pin = None;
-                pad.pad_to_die_delay = None;
-                if let Some(stack) = pad.pad_stack.as_mut() {
-                    stack.layers.sort_unstable();
-                    if stack.drill.as_ref().is_some_and(|drill| {
-                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill.end_layer
-                                == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill
-                                .diameter
-                                .as_ref()
-                                .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
-                    }) {
-                        stack.drill = None;
-                    }
-                    if stack.zone_settings.as_ref().is_some_and(|settings| {
-                        settings.zone_connection
-                            == kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
-                    }) {
-                        stack.zone_settings = None;
-                    }
-                }
-                Ok(pad.encode_to_vec())
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                Ok(normalized_pad(pad, true).encode_to_vec())
             } else if suffix == "Field" {
                 let mut field = kiapi::board::types::Field::decode(item.value.as_slice())?;
                 field.id = None;
@@ -2004,6 +2665,102 @@ fn normalized_items(
         .collect::<Result<Vec<_>>>()?;
     items.sort();
     Ok(items)
+}
+
+/// A pad without what is not library content or what KiCad assigns itself,
+/// so a pad as rebuilt and the same pad as KiCad reports it compare equal:
+/// identities (the pad's and each primitive's KIID, the read-only parent),
+/// nets and schematic pin data, layer order, an empty drill, an unset
+/// primitive lock state (KiCad holds it unlocked) and a zero rectangle corner
+/// radius. Zone settings
+/// are compared as KiCad holds them, thermal spokes included (see
+/// [`konnect_ipc::builders::canonical_pad_zone_settings`]); KiCad 10's own
+/// library parity check compares primitives by shape, points, stroke and
+/// fill, never by identity.
+///
+/// `drop_closing` also removes a custom polygon's explicit closing vertex,
+/// which KiCad's API drops on the way in (`UnpackPolyLine` closes the
+/// chain). The plan ignores that, since re-applying cannot keep it; the pad
+/// diff reports it, because KiCad's file parser keeps the vertex and its
+/// native parity check counts vertices.
+fn normalized_pad(
+    mut pad: kiapi::board::types::Pad,
+    drop_closing: bool,
+) -> kiapi::board::types::Pad {
+    pad.id = None;
+    pad.net = None;
+    pad.pad_to_die_length = None;
+    pad.symbol_pin = None;
+    pad.pad_to_die_delay = None;
+    pad.parent = None;
+    if let Some(stack) = pad.pad_stack.as_mut() {
+        stack.layers.sort_unstable();
+        if stack.drill.as_ref().is_some_and(|drill| {
+            drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                && drill.end_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                && drill
+                    .diameter
+                    .as_ref()
+                    .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
+        }) {
+            stack.drill = None;
+        }
+        stack.zone_settings = Some(konnect_ipc::builders::canonical_pad_zone_settings(stack));
+        for layer in &mut stack.copper_layers {
+            for shape in &mut layer.custom_shapes {
+                shape.id = None;
+                shape.net = None;
+                shape.parent = None;
+                // `PCB_SHAPE::Deserialize` locks only on `LS_LOCKED`.
+                if shape.locked == kiapi::common::types::LockedState::LsUnknown as i32 {
+                    shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                }
+                if let Some(kiapi::common::types::graphic_shape::Geometry::Rectangle(rectangle)) =
+                    shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+                {
+                    if rectangle
+                        .corner_radius
+                        .as_ref()
+                        .is_some_and(|radius| radius.value_nm == 0)
+                    {
+                        rectangle.corner_radius = None;
+                    }
+                }
+                if drop_closing {
+                    drop_closing_vertices(shape);
+                }
+            }
+        }
+    }
+    pad
+}
+
+/// Remove a polygon outline's last vertex where it repeats the first.
+fn drop_closing_vertices(shape: &mut kiapi::board::types::BoardGraphicShape) {
+    use kiapi::common::types::{graphic_shape::Geometry, poly_line_node};
+    let Some(Geometry::Polygon(set)) = shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+    else {
+        return;
+    };
+    for outline in set
+        .polygons
+        .iter_mut()
+        .filter_map(|polygon| polygon.outline.as_mut())
+    {
+        let point = |node: Option<&kiapi::common::types::PolyLineNode>| match node
+            .and_then(|node| node.geometry.as_ref())
+        {
+            Some(poly_line_node::Geometry::Point(point)) => Some((point.x_nm, point.y_nm)),
+            _ => None,
+        };
+        let nodes = &outline.nodes;
+        if nodes.len() > 3
+            && point(nodes.first()).is_some()
+            && point(nodes.first()) == point(nodes.last())
+        {
+            outline.nodes.pop();
+        }
+    }
 }
 
 fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Vec<Vec<u8>>> {
@@ -3072,15 +3829,18 @@ mod tests {
                         ..Default::default()
                     });
                 }
-                stack.zone_settings = Some(kiapi::board::types::ZoneConnectionSettings {
-                    zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
-                    thermal_spokes: Some(kiapi::board::types::ThermalSpokeSettings {
-                        angle: Some(kiapi::common::types::Angle {
-                            value_degrees: 90.0,
-                        }),
-                        ..Default::default()
-                    }),
-                });
+                // KiCad always reports the connection and the spoke angle.
+                stack.zone_settings = Some(builders::canonical_pad_zone_settings(stack));
+                for shape in &mut stack
+                    .copper_layers
+                    .iter_mut()
+                    .flat_map(|layer| layer.custom_shapes.iter_mut())
+                {
+                    shape.id = Some(kiapi::common::types::Kiid {
+                        value: "kicad-primitive".to_string(),
+                    });
+                    shape.net = Some(kiapi::board::types::Net::default());
+                }
                 *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
             } else if item
                 .type_url
@@ -3796,5 +4556,658 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+
+    // ─── Custom pads and zone connections through the typed refresh ─────────
+
+    const TEXAS_CUSTOM_PADS: &str =
+        include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod");
+    use crate::test_support::without_heatsink_property as carried;
+
+    fn pad_by_number<'a>(
+        pads: &'a [kiapi::board::types::Pad],
+        number: &str,
+    ) -> &'a kiapi::board::types::Pad {
+        pads.iter()
+            .find(|pad| pad.number == number)
+            .unwrap_or_else(|| panic!("pad '{number}'"))
+    }
+
+    /// The stock custom-pad footprint (less its unrepresentable heatsink
+    /// property) refreshes: custom anchors and pad-local primitives as the
+    /// shared parser reads them, the exposed pad's `(zone_connect 2)` in the
+    /// pad stack, nets kept, and rebuilding the result changes nothing, even
+    /// after KiCad spells out zone settings and drops a polygon's closing
+    /// vertex.
+    #[test]
+    fn refresh_rebuilds_supported_custom_pads_and_zone_connect_losslessly() {
+        use kiapi::board::types::{PadStackShape, ZoneConnectionStyle};
+        let source = carried(TEXAS_CUSTOM_PADS);
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+
+        let first =
+            build_updated_instance(&current, &library, &net_codes, &BTreeSet::new()).unwrap();
+        assert!(first.changed_domains.contains(&ChangedDomain::Pads));
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice()).unwrap();
+        let pads = decoded_pads(&applied);
+        assert_eq!(pads.len(), library.pads.len());
+
+        for want in &library.pads {
+            let pad = pad_by_number(&pads, &want.number);
+            if want.number.is_empty() {
+                continue;
+            }
+            let stack = pad.pad_stack.as_ref().unwrap();
+            let copper = &stack.copper_layers[0];
+            match &want.custom {
+                Some(custom) => {
+                    assert_eq!(copper.shape, PadStackShape::PssCustom as i32);
+                    assert_eq!(copper.custom_anchor_shape, PadStackShape::PssCircle as i32);
+                    let primitives = copper
+                        .custom_shapes
+                        .iter()
+                        .map(|shape| builders::pad_primitive_from_proto(shape).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(primitives, custom.primitives, "pad {}", want.number);
+                }
+                None => assert!(copper.custom_shapes.is_empty()),
+            }
+            assert_eq!(
+                stack
+                    .zone_settings
+                    .as_ref()
+                    .map(|settings| settings.zone_connection),
+                Some(if want.number == "21" {
+                    ZoneConnectionStyle::ZcsFull
+                } else {
+                    ZoneConnectionStyle::ZcsInherited
+                } as i32),
+                "pad {}",
+                want.number
+            );
+        }
+        assert_eq!(pad_by_number(&pads, "1").net.as_ref().unwrap().name, "ROW1");
+        assert_eq!(pad_by_number(&pads, "2").net.as_ref().unwrap().name, "COL1");
+
+        let second =
+            build_updated_instance(&applied, &library, &net_codes, &BTreeSet::new()).unwrap();
+        assert!(
+            second.changed_domains.is_empty(),
+            "{:?}",
+            second.changed_domains
+        );
+
+        // As KiCad reports it back: every pad's zone settings and spoke angle
+        // spelled out, a fresh KIID and empty net on each primitive, and each
+        // custom polygon closed explicitly.
+        let mut reported = applied.clone();
+        for item in &mut reported.definition.as_mut().unwrap().items {
+            if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            let stack = pad.pad_stack.as_mut().unwrap();
+            stack.zone_settings = Some(builders::canonical_pad_zone_settings(stack));
+            for shape in &mut stack.copper_layers[0].custom_shapes {
+                shape.id = Some(kiapi::common::types::Kiid {
+                    value: "kicad-primitive".to_string(),
+                });
+                shape.net = Some(kiapi::board::types::Net::default());
+                shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                use kiapi::common::types::graphic_shape::Geometry;
+                if let Some(Geometry::Polygon(set)) =
+                    shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+                {
+                    let outline = set.polygons[0].outline.as_mut().unwrap();
+                    let first = outline.nodes[0];
+                    outline.nodes.push(first);
+                }
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        assert!(changed_domains(&reported, &applied).unwrap().is_empty());
+
+        // A lost zone connection is still a pad change.
+        let mut lost = applied.clone();
+        for item in &mut lost.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.pad_stack.as_mut().unwrap().zone_settings = None;
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        assert!(changed_domains(&lost, &applied)
+            .unwrap()
+            .contains(&ChangedDomain::Pads));
+
+        // The source was only read.
+        assert_eq!(source, carried(TEXAS_CUSTOM_PADS));
+    }
+
+    /// Mirroring a custom pad's primitives onto the back is not implemented,
+    /// so a back-side instance is refused rather than rebuilt unmirrored.
+    #[test]
+    fn refresh_still_refuses_a_back_side_custom_pad() {
+        let library = parse_library_footprint("Test:Socket", &carried(TEXAS_CUSTOM_PADS)).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let error = build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be mirrored onto the back side"),
+            "{error:#}"
+        );
+    }
+
+    /// The validator accepts the custom and zone-connect clauses and still
+    /// names what the typed refresh cannot carry.
+    #[test]
+    fn refresh_validation_accepts_custom_and_zone_connect_and_names_the_rest() {
+        let carried_source = carried(TEXAS_CUSTOM_PADS);
+        assert!(parse_library_footprint("Test:Socket", &carried_source).is_ok());
+        for (from, to, named) in [
+            (
+                "(clearance outline)",
+                "(clearance convexhull)",
+                "convexhull",
+            ),
+            ("(zone_connect 2)", "(zone_connect 7)", "zone connection"),
+            (
+                "(zone_connect 2)",
+                "(zone_connect 2) (thermal_gap 0.3) (thermal_gap 0.3)",
+                "thermal_gap",
+            ),
+            (
+                "(zone_connect 2)",
+                "(zone_connect 2) (thermal_bridge_width -0.1)",
+                "negative",
+            ),
+            (
+                "(xy 0.253358 -0.09)",
+                "(arc (start 0.253358 -0.09) (mid 0.3 0) (end 0.4275 0.084142))",
+                "arc",
+            ),
+        ] {
+            assert!(carried_source.contains(from), "{from}");
+            let unsupported = carried_source.replacen(from, to, 1);
+            let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
+            assert!(format!("{error:#}").contains(named), "{to}: {error:#}");
+        }
+        let error = parse_library_footprint("Test:Socket", TEXAS_CUSTOM_PADS).unwrap_err();
+        assert!(format!("{error:#}").contains("property"), "{error:#}");
+    }
+
+    /// All or nothing: a refresh selecting a supported custom-pad footprint
+    /// and one whose custom pad cannot be carried prepares neither.
+    #[test]
+    fn planner_refuses_every_update_when_one_custom_pad_footprint_is_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let library_dir = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library_dir).unwrap();
+        let supported = carried(TEXAS_CUSTOM_PADS);
+        std::fs::write(library_dir.join("Socket.kicad_mod"), &supported).unwrap();
+        std::fs::write(
+            library_dir.join("Hull.kicad_mod"),
+            supported.replace("(clearance outline)", "(clearance convexhull)"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+
+        let both = vec![
+            plan_item("SW1", Some("Test:Socket"), "kiid-1"),
+            plan_item("SW2", Some("Test:Hull"), "kiid-2"),
+        ];
+        let plan = plan_updates(
+            &board,
+            &both,
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert!(plan.changes.is_empty());
+        assert!(plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "unsupported_library_footprint"
+                && diagnostic.message.contains("convexhull")
+        }));
+
+        let alone = vec![plan_item("SW1", Some("Test:Socket"), "kiid-1")];
+        let plan = plan_updates(
+            &board,
+            &alone,
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.prepared_items.len(), 1);
+    }
+
+    // ─── Pad diagnostics in the dry run ─────────────────────────────────────
+
+    /// The Texas fixture with its first custom polygon closed explicitly (the
+    /// first point repeated last), as many KiCad-written footprints are.
+    fn texas_with_closing_vertex() -> String {
+        let source = carried(TEXAS_CUSTOM_PADS).replace("\r\n", "\n");
+        let closed = source.replacen(
+            "(xy -0.4275 0.09)\n\t\t\t\t)",
+            "(xy -0.4275 0.09)\n\t\t\t\t\t(xy -0.4275 -0.09)\n\t\t\t\t)",
+            1,
+        );
+        assert_ne!(closed, source, "the fixture's first polygon moved");
+        closed
+    }
+
+    /// `applied` as KiCad 10 reports it back: zone settings and spoke angle
+    /// spelled out, a fresh KIID, empty net and lock state on every
+    /// primitive, the solid stroke style reported by the native editor, and
+    /// each explicit closing vertex dropped (`UnpackPolyLine` closes the chain).
+    fn as_kicad_reports(
+        applied: &kiapi::board::types::FootprintInstance,
+    ) -> kiapi::board::types::FootprintInstance {
+        use kiapi::common::types::graphic_shape::Geometry;
+        let mut reported = applied.clone();
+        for item in &mut reported.definition.as_mut().unwrap().items {
+            if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            pad.id = Some(kiapi::common::types::Kiid {
+                value: format!("kicad-pad-{}", pad.number),
+            });
+            let stack = pad.pad_stack.as_mut().unwrap();
+            stack.zone_settings = Some(builders::canonical_pad_zone_settings(stack));
+            for shape in &mut stack.copper_layers[0].custom_shapes {
+                shape.id = Some(kiapi::common::types::Kiid {
+                    value: "kicad-primitive".to_string(),
+                });
+                shape.net = Some(kiapi::board::types::Net::default());
+                shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                if let Some(stroke) = shape
+                    .shape
+                    .as_mut()
+                    .and_then(|graphic| graphic.attributes.as_mut())
+                    .and_then(|attributes| attributes.stroke.as_mut())
+                {
+                    if stroke.style == kiapi::common::types::StrokeLineStyle::SlsUnknown as i32 {
+                        stroke.style = kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                    }
+                }
+                if let Some(Geometry::Polygon(set)) =
+                    shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+                {
+                    for outline in set.polygons.iter_mut().filter_map(|p| p.outline.as_mut()) {
+                        if outline.nodes.len() > 3 && outline.nodes.first() == outline.nodes.last()
+                        {
+                            outline.nodes.pop();
+                        }
+                    }
+                }
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        reported
+    }
+
+    /// `instance` with `edit` applied to pad `number`.
+    fn edit_pad(
+        instance: &mut kiapi::board::types::FootprintInstance,
+        number: &str,
+        edit: impl Fn(&mut kiapi::board::types::Pad),
+    ) {
+        for item in &mut instance.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                if pad.number == number {
+                    edit(&mut pad);
+                    *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                }
+            }
+        }
+    }
+
+    fn first_outline(pad: &mut kiapi::board::types::Pad) -> &mut kiapi::common::types::PolyLine {
+        use kiapi::common::types::graphic_shape::Geometry;
+        let shape = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0].custom_shapes[0];
+        match shape.shape.as_mut().and_then(|s| s.geometry.as_mut()) {
+            Some(Geometry::Polygon(set)) => set.polygons[0].outline.as_mut().unwrap(),
+            other => panic!("pad's first primitive is not a polygon: {other:?}"),
+        }
+    }
+
+    /// The library pad whose first polygon `texas_with_closing_vertex`
+    /// closed explicitly.
+    fn explicitly_closed_pad(library: &LibraryFootprint) -> String {
+        library
+            .pads
+            .iter()
+            .find(|pad| {
+                pad.custom
+                    .as_ref()
+                    .is_some_and(|custom| match &custom.primitives[0] {
+                        konnect_ipc::IpcPadPrimitive::Polygon { points, .. } => {
+                            points.len() > 3 && points.first() == points.last()
+                        }
+                        _ => false,
+                    })
+            })
+            .expect("one explicitly closed polygon")
+            .number
+            .clone()
+    }
+
+    /// A fresh create through the API drops an explicit closing vertex and
+    /// gives every primitive its own KIID. Neither is a planned change, so
+    /// the refresh stays a noop, but the dropped vertex is still reported,
+    /// with both counts and why it can matter natively. KIIDs are not.
+    #[test]
+    fn dry_run_keeps_a_dropped_closing_vertex_harmless_and_reports_it() {
+        let library = parse_library_footprint("Test:Socket", &texas_with_closing_vertex()).unwrap();
+        let closed = explicitly_closed_pad(&library);
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let first = build_updated_instance(
+            &current_instance(kiapi::board::types::BoardLayer::BlFCu),
+            &library,
+            &net_codes,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice()).unwrap();
+        let reported = as_kicad_reports(&applied);
+
+        let second =
+            build_updated_instance(&reported, &library, &net_codes, &BTreeSet::new()).unwrap();
+        assert!(
+            second.changed_domains.is_empty(),
+            "{:?}",
+            second.changed_domains
+        );
+        assert_eq!(
+            second.pad_differences,
+            vec![PadDifference {
+                pad: closed,
+                field:
+                    "pad_stack.copper_layers[0].custom_shapes[0].polygon[0].outline.vertex_count"
+                        .to_string(),
+                expected: json!(6),
+                observed: json!(5),
+                ignored_by_plan: Some(CLOSING_VERTEX_NOTE.to_string()),
+            }]
+        );
+        assert_eq!(second.pad_differences_omitted, 0);
+    }
+
+    /// A native-like change is named by pad and typed field with the library
+    /// value and the board value: a spoke angle KiCad holds as 0° (what it
+    /// makes of spokes sent without an angle) and a moved polygon vertex.
+    /// The harmless closing vertex beside them neither hides them nor is
+    /// counted, and a polygon reports its first differing vertex, not every
+    /// coordinate.
+    #[test]
+    fn dry_run_names_each_changed_pad_field_with_library_and_board_values() {
+        let library = parse_library_footprint("Test:Socket", &texas_with_closing_vertex()).unwrap();
+        let closed = explicitly_closed_pad(&library);
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let first = build_updated_instance(
+            &current_instance(kiapi::board::types::BoardLayer::BlFCu),
+            &library,
+            &net_codes,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice()).unwrap();
+        let library_angle = decoded_pads(&applied)
+            .iter()
+            .find(|pad| pad.number == "21")
+            .and_then(|pad| {
+                pad.pad_stack
+                    .as_ref()?
+                    .zone_settings
+                    .as_ref()?
+                    .thermal_spokes?
+                    .angle
+            })
+            .map(|angle| angle.value_degrees)
+            .unwrap();
+        let mut reported = as_kicad_reports(&applied);
+        edit_pad(&mut reported, "21", |pad| {
+            let settings = pad
+                .pad_stack
+                .as_mut()
+                .unwrap()
+                .zone_settings
+                .as_mut()
+                .unwrap();
+            settings.thermal_spokes.as_mut().unwrap().angle =
+                Some(kiapi::common::types::Angle { value_degrees: 0.0 });
+        });
+        let moved = library
+            .pads
+            .iter()
+            .find(|pad| pad.custom.is_some() && pad.number != closed)
+            .unwrap()
+            .number
+            .clone();
+        edit_pad(&mut reported, &moved, |pad| {
+            use kiapi::common::types::poly_line_node::Geometry;
+            let outline = first_outline(pad);
+            for node in &mut outline.nodes {
+                if let Some(Geometry::Point(point)) = node.geometry.as_mut() {
+                    point.x_nm += 10_000;
+                }
+            }
+        });
+
+        let second =
+            build_updated_instance(&reported, &library, &net_codes, &BTreeSet::new()).unwrap();
+        assert!(second.changed_domains.contains(&ChangedDomain::Pads));
+        let find = |pad: &str, field: &str| {
+            second
+                .pad_differences
+                .iter()
+                .find(|difference| difference.pad == pad && difference.field.starts_with(field))
+                .unwrap_or_else(|| panic!("{pad} {field}: {:#?}", second.pad_differences))
+        };
+
+        let angle = find("21", "pad_stack.zone_settings.thermal_spokes.angle_degrees");
+        assert_eq!(angle.expected, json!(library_angle));
+        assert_eq!(angle.observed, json!(0.0));
+        assert_eq!(angle.ignored_by_plan, None);
+
+        let library_vertex = decoded_pads(&applied)
+            .into_iter()
+            .find(|pad| pad.number == moved)
+            .map(|mut pad| first_outline(&mut pad).nodes[0])
+            .unwrap();
+        let Some(kiapi::common::types::poly_line_node::Geometry::Point(point)) =
+            library_vertex.geometry
+        else {
+            panic!("a point vertex");
+        };
+        let vertex = find(
+            &moved,
+            "pad_stack.copper_layers[0].custom_shapes[0].polygon[0].outline.vertex[0]",
+        );
+        assert!(
+            vertex.field.ends_with("(first of 5 differing vertices)"),
+            "{}",
+            vertex.field
+        );
+        assert_eq!(
+            vertex.expected,
+            json!({ "x_nm": point.x_nm, "y_nm": point.y_nm })
+        );
+        assert_eq!(
+            vertex.observed,
+            json!({ "x_nm": point.x_nm + 10_000, "y_nm": point.y_nm })
+        );
+        assert_eq!(
+            second
+                .pad_differences
+                .iter()
+                .filter(|difference| difference.pad == moved)
+                .count(),
+            1,
+            "one entry per changed polygon: {:#?}",
+            second.pad_differences
+        );
+
+        let closing = find(&closed, "pad_stack.copper_layers[0].custom_shapes[0]");
+        assert_eq!(
+            closing.ignored_by_plan.as_deref(),
+            Some(CLOSING_VERTEX_NOTE)
+        );
+        assert!(second
+            .pad_differences
+            .iter()
+            .all(|difference| difference.field != "unclassified"));
+
+        // The response carries the differences on the planned change.
+        let planned = serde_json::to_value(PlannedUpdate {
+            reference: "SW1".to_string(),
+            library_id: "Test:Socket".to_string(),
+            changed_domains: second.changed_domains.clone(),
+            preserved: second.preserved.clone(),
+            pad_differences: second.pad_differences.clone(),
+            pad_differences_omitted: second.pad_differences_omitted,
+        })
+        .unwrap();
+        assert_eq!(planned["pad_differences"].as_array().unwrap().len(), 3);
+        assert!(planned.get("pad_differences_omitted").is_none());
+    }
+
+    /// A library pad's explicit thermal override is compared with what the
+    /// board holds, an explicit zero against an unset width included.
+    #[test]
+    fn dry_run_compares_explicit_thermal_overrides() {
+        let base = carried(TEXAS_CUSTOM_PADS);
+        let library = parse_library_footprint("Test:Socket", &base).unwrap();
+        let overridden = base.replacen(
+            "(zone_connect 2)",
+            "(zone_connect 2) (thermal_bridge_width 0) (thermal_gap 0.3) (thermal_bridge_angle 30)",
+            1,
+        );
+        assert_ne!(overridden, base);
+        let with_override = parse_library_footprint("Test:Socket", &overridden).unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let plain =
+            build_updated_instance(&current, &library, &net_codes, &BTreeSet::new()).unwrap();
+        let board = as_kicad_reports(
+            &kiapi::board::types::FootprintInstance::decode(plain.item.value.as_slice()).unwrap(),
+        );
+
+        let refresh =
+            build_updated_instance(&board, &with_override, &net_codes, &BTreeSet::new()).unwrap();
+        assert!(refresh.changed_domains.contains(&ChangedDomain::Pads));
+        let fields = refresh
+            .pad_differences
+            .iter()
+            .map(|d| {
+                (
+                    d.pad.as_str(),
+                    d.field.as_str(),
+                    d.expected.clone(),
+                    d.observed.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&(
+            "21",
+            "pad_stack.zone_settings.thermal_spokes.width_nm",
+            json!(0),
+            serde_json::Value::Null
+        )));
+        assert!(fields.contains(&(
+            "21",
+            "pad_stack.zone_settings.thermal_spokes.gap_nm",
+            json!(300_000),
+            serde_json::Value::Null
+        )));
+        assert!(fields.iter().any(|(pad, field, expected, _)| *pad == "21"
+            && *field == "pad_stack.zone_settings.thermal_spokes.angle_degrees"
+            && *expected == json!(30.0)));
+
+        // Once the board holds the overrides, the refresh is a noop.
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(refresh.item.value.as_slice()).unwrap();
+        let again = build_updated_instance(
+            &as_kicad_reports(&applied),
+            &with_override,
+            &net_codes,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(
+            again.changed_domains.is_empty(),
+            "{:?}",
+            again.pad_differences
+        );
+    }
+
+    /// The planner keeps its all-or-nothing response shape: a footprint whose
+    /// only pad difference is the harmless closing vertex is unchanged (noop)
+    /// and the difference is reported as a parity note, not a conflict.
+    #[test]
+    fn planner_reports_ignored_pad_differences_as_notes_on_a_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let library_dir = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library_dir).unwrap();
+        let source = texas_with_closing_vertex();
+        std::fs::write(library_dir.join("Socket.kicad_mod"), &source).unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current.id = Some(kiapi::common::types::Kiid {
+            value: "kiid-1".to_string(),
+        });
+        let applied =
+            build_updated_instance(&current, &library, &net_codes, &BTreeSet::new()).unwrap();
+        let reported = as_kicad_reports(
+            &kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap(),
+        );
+        let items = vec![builders::pack_any(
+            &reported,
+            "kiapi.board.types.FootprintInstance",
+        )];
+
+        let plan = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+        assert_eq!(plan.status, PlanStatus::Noop, "{:?}", plan.diagnostics);
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.coverage.conflicts.planned, 0);
+        assert_eq!(plan.pad_parity_notes.len(), 1);
+        assert_eq!(plan.pad_parity_notes[0].reference, "SW1");
+        assert!(plan.pad_parity_notes[0]
+            .pad_differences
+            .iter()
+            .all(|difference| difference.ignored_by_plan.is_some()));
+        let response = plan_response(&plan, false);
+        let text = serde_json::to_string(&response).unwrap();
+        assert!(text.contains("pad_parity_notes") && text.contains("vertex_count"));
     }
 }

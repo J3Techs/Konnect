@@ -732,6 +732,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "plan_blocked",
         // Placement evidence source value, not a callable tool.
         "live_ipc",
+        // `update_pcb_from_schematic` backend value, not a callable tool.
+        "closed_initial",
         // Structured schematic-placement response fields, not callable tools.
         "junctions_added_count",
         "junctions_pruned_count",

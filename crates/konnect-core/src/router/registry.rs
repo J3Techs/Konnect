@@ -78,7 +78,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -96,7 +96,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "placement",
         description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
-        tool_count: 5,
+        tool_count: 6,
     },
     ToolsetMeta {
         name: "pcb_export",

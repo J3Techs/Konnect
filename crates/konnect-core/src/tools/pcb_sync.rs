@@ -18,6 +18,138 @@ use prost::Message;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+mod closed_initial;
+mod parking;
+
+#[cfg(test)]
+mod inclusion_and_response_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn symbol(reference: &str, in_bom: &str, on_board: &str, dnp: &str) -> String {
+        format!(
+            r#"(symbol (uuid "{reference}") (in_bom {in_bom}) (on_board {on_board}) (dnp {dnp})
+            (instances (project "test" (path "/sheet" (reference "{reference}")))))"#
+        )
+    }
+
+    fn component(reference: &str) -> DesignComponent {
+        DesignComponent {
+            reference: reference.to_string(),
+            value: "test".to_string(),
+            footprint_id: "Test:Pad".to_string(),
+            symbol_path: format!("/sheet/{reference}"),
+            dnp: false,
+            pad_nets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn bom_exclusion_never_drops_a_board_component_or_missing_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schematic = tmp.path().join("flags.kicad_sch");
+        let source = format!(
+            "(kicad_sch {} {} {} {} {})",
+            symbol("TP1", "no", "yes", "no"),
+            symbol("C1", "no", "yes", "yes"),
+            symbol("R1", "yes", "no", "no"),
+            symbol("U1", "no", "yes", "no"),
+            symbol("U2", "no", "no", "no")
+        );
+        std::fs::write(&schematic, &source).unwrap();
+        let mut design = ExportedDesign {
+            components: ["TP1", "C1", "R1"].map(component).to_vec(),
+            skipped: vec![],
+            unassigned: ["U1", "U2"]
+                .map(|reference| UnassignedComponent {
+                    reference: reference.to_string(),
+                    value: "missing".to_string(),
+                    lib_id: None,
+                    symbol_path: format!("/sheet/{reference}"),
+                })
+                .to_vec(),
+        };
+        apply_saved_symbol_flags(std::slice::from_ref(&schematic), &mut design).unwrap();
+        assert_eq!(
+            design
+                .components
+                .iter()
+                .map(|c| c.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["TP1", "C1"]
+        );
+        assert!(
+            design.components[1].dnp,
+            "DNP is retained independently of BOM inclusion"
+        );
+        assert_eq!(design.unassigned.len(), 1);
+        assert_eq!(
+            design.unassigned[0].reference, "U1",
+            "BOM-excluded missing assignments must remain visible"
+        );
+        assert_eq!(
+            design
+                .skipped
+                .iter()
+                .map(|c| c.reference.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["R1", "U2"])
+        );
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+    }
+
+    #[test]
+    fn summary_keeps_all_diagnostics_counts_revision_and_fabrication_facts() {
+        let original = json!({
+            "status": "conflict", "plan_revision": "exact-revision", "backend": "closed_initial",
+            "coverage": {"footprints_added": {"planned": 2466}, "conflicts": {"planned": 2}},
+            "changes": (0..2466).map(|n| json!({"reference":format!("R{n}"),"nets":["GND"]})).collect::<Vec<_>>(),
+            "diagnostics": [{"code":"first"},{"code":"last"}], "unassigned_footprints": [{"reference":"U7"}],
+            "inputs": {"board":{"sha256":"original"},"hierarchy":["a","b"],"libraries":["x"],"netlist_identity_sha256":"netlist","konnect_version":"0.13.0"},
+            "report": {"instances":vec![json!({"reference":"R"});2466], "pad_fabrication_properties":{"U1":[{"pad":"A1","property":"pad_prop_bga"}]}, "planned_readback":{"verified":true},"parking":{"parked":2466}},
+            "write": null
+        });
+        let full = CallToolResult::json(&original);
+        let summarized = summarize_sync_result(full.clone());
+        let ToolContent::Text { text } = &summarized.content[0] else {
+            panic!("expected JSON")
+        };
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        for key in [
+            "status",
+            "plan_revision",
+            "backend",
+            "coverage",
+            "diagnostics",
+            "unassigned_footprints",
+            "write",
+        ] {
+            assert_eq!(value[key], original[key], "{key} must not be condensed");
+        }
+        for key in ["pad_fabrication_properties", "planned_readback", "parking"] {
+            assert_eq!(value["report"][key], original["report"][key]);
+        }
+        assert_eq!(value["omitted_detail_counts"]["changes"], 2466);
+        assert_eq!(value["omitted_detail_counts"]["report.instances"], 2466);
+        assert_eq!(value["input_summary"]["hierarchy_files"], 2);
+        assert_eq!(value["input_summary"]["board"]["sha256"], "original");
+        assert!(
+            text.len() < 2000,
+            "large plans must fit an agent response: {}",
+            text.len()
+        );
+        let ToolContent::Text { text: full_text } = &full.content[0] else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(full_text).unwrap(),
+            original
+        );
+        let error = CallToolResult::error("unparsed failure".to_string());
+        assert!(summarize_sync_result(error).is_error);
+    }
+}
+
 // Count bound only: this does not claim a byte-size or listener-size limit.
 const SYNC_CREATE_CHUNK_SIZE: usize = 32;
 
@@ -217,6 +349,11 @@ struct SyncPlan {
     /// Not part of the plan's identity: `sync_response` reports it.
     #[serde(skip)]
     staging: Option<StagingEvidence>,
+    /// Where the additions were parked and what their boxes were measured
+    /// from; reported beside `staging`, never part of the plan's identity
+    /// except through the positions in `changes`.
+    #[serde(skip)]
+    parking: Option<serde_json::Value>,
 }
 
 /// What added footprints were staged beside (#688).
@@ -283,24 +420,121 @@ struct PreparedFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     fields: konnect_ipc::IpcFieldPlacement,
-    /// The library's `(attr …)`: mounting style and exclusion flags.
-    attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
-    /// The library's description and keywords, which KiCad keeps on the
-    /// footprint definition.
-    description_and_keywords: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
-    models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
-    width: f64,
-    height: f64,
+    /// The library.s attributes, description, keywords and 3D models.
+    library: super::library_footprint::LibraryData,
+    /// The footprint's conservative local box, for parking.
+    extent: parking::LocalBox,
+    /// What `extent` was measured from: the library's own geometry, or the
+    /// typed definitions when that geometry could not be measured.
+    extent_source: &'static str,
 }
 
 pub(crate) async fn handle_update_pcb_from_schematic(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> Result<CallToolResult> {
+    let summary = match args["response_detail"].as_str().unwrap_or("full") {
+        "full" => false,
+        "summary" => true,
+        other => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "response_detail".to_string(),
+                    reason: format!("expected 'full' or 'summary', got '{other}'"),
+                },
+                "response_detail must be 'full' or 'summary'.",
+            ))
+        }
+    };
+    let result = handle_sync(args, ctx).await?;
+    Ok(if summary {
+        summarize_sync_result(result)
+    } else {
+        result
+    })
+}
+
+/// Presentation only: all diagnostics, coverage, revision and preservation
+/// facts remain visible; per-instance plans and input-file inventories can
+/// otherwise exceed an agent's tool-response limit on a large board.
+fn summarize_sync_result(mut result: CallToolResult) -> CallToolResult {
+    for content in &mut result.content {
+        let ToolContent::Text { text } = content else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if !object.contains_key("coverage") {
+            continue;
+        }
+        let mut omitted = serde_json::Map::new();
+        if let Some(changes) = object.remove("changes") {
+            omitted.insert(
+                "changes".to_string(),
+                serde_json::json!(changes.as_array().map(Vec::len)),
+            );
+        }
+        if let Some(inputs) = object.remove("inputs") {
+            let summary = serde_json::json!({
+                "board": inputs["board"],
+                "hierarchy_files": inputs["hierarchy"].as_array().map(Vec::len),
+                "library_files": inputs["libraries"].as_array().map(Vec::len),
+                "netlist_identity_sha256": inputs["netlist_identity_sha256"],
+                "konnect_version": inputs["konnect_version"]
+            });
+            object.insert("input_summary".to_string(), summary);
+            omitted.insert(
+                "inputs.hierarchy".to_string(),
+                serde_json::json!(inputs["hierarchy"].as_array().map(Vec::len)),
+            );
+            omitted.insert(
+                "inputs.libraries".to_string(),
+                serde_json::json!(inputs["libraries"].as_array().map(Vec::len)),
+            );
+        }
+        if let Some(report) = object
+            .get_mut("report")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(instances) = report.remove("instances") {
+                omitted.insert(
+                    "report.instances".to_string(),
+                    serde_json::json!(instances.as_array().map(Vec::len)),
+                );
+            }
+        }
+        object.insert("response_detail".to_string(), serde_json::json!("summary"));
+        object.insert(
+            "omitted_detail_counts".to_string(),
+            serde_json::Value::Object(omitted),
+        );
+        *text = value.to_string();
+    }
+    result
+}
+
+async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<CallToolResult> {
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    let closed = match args["backend"].as_str().unwrap_or("live") {
+        "live" => false,
+        closed_initial::BACKEND => true,
+        other => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "backend".to_string(),
+                    reason: format!("must be 'live' or 'closed_initial', got '{other}'"),
+                },
+                format!("Unknown backend '{other}'. Expected 'live' or 'closed_initial'."),
+            ))
+        }
+    };
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -323,45 +557,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             format!("{} does not exist", missing.display()),
         ));
     }
+    if closed {
+        return closed_initial::handle(ctx, &schematic, &board, dry_run, expected_revision).await;
+    }
 
-    let hierarchy = match saved_hierarchy_files(&schematic) {
-        Ok(files) => files,
-        Err(error) => {
-            return Ok(conflict_result(format!(
-                "saved schematic preflight failed: {error:#}"
-            )))
-        }
+    let SavedDesign {
+        hierarchy,
+        netlist_source,
+        design,
+    } = match read_saved_design(ctx, &schematic).await? {
+        Ok(saved) => saved,
+        Err(message) => return Ok(conflict_result(message)),
     };
-    let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
-    if let Err(error) =
-        super::cli::export_netlist(&ctx.config.kicad_cli, &schematic, temp.path(), "kicadsexpr")
-            .await
-    {
-        return Ok(conflict_result(format!(
-            "KiCad netlist export failed: {error:#}"
-        )));
-    }
-    let netlist_source = match std::fs::read_to_string(temp.path()) {
-        Ok(source) => source,
-        Err(error) => {
-            return Ok(conflict_result(format!(
-                "KiCad netlist export could not be read: {error}"
-            )))
-        }
-    };
-    let mut design = match parse_exported_netlist(&netlist_source) {
-        Ok(design) => design,
-        Err(error) => {
-            return Ok(conflict_result(format!(
-                "netlist preflight failed: {error:#}"
-            )))
-        }
-    };
-    if let Err(error) = apply_saved_symbol_flags(&hierarchy, &mut design) {
-        return Ok(conflict_result(format!(
-            "schematic flag preflight failed: {error:#}"
-        )));
-    }
 
     let what = if dry_run {
         "PCB sync dry run"
@@ -388,11 +595,24 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .map(UnpreparedFootprint::into_diagnostic)
                 .collect::<Vec<_>>();
             preflight.extend(additions_missing_pads(&plan, &prepared));
+            // An update sends the whole live footprint back, and KiCad
+            // re-creates its pads from a message with no field for a pad's
+            // fabrication property: refuse those before anything is sent.
+            preflight.extend(updates_that_would_drop_pad_properties(
+                &library_board,
+                &plan,
+                &snapshot.state,
+            ));
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
             }
-            restage_additions(&mut plan, &prepared, snapshot.state.bounds);
+            if let Err(diagnostic) =
+                restage_additions(&mut plan, &prepared, snapshot.state.bounds)
+            {
+                refuse_plan(&mut plan, vec![diagnostic]);
+                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+            }
             refresh_revision_with_staging(&mut plan);
 
             if dry_run || plan.status == PlanStatus::Conflict {
@@ -513,9 +733,111 @@ fn sync_response(
         // measured it, with the classes it would not list (#688). Null only
         // when the plan never reached the board.
         "staging": plan.staging.as_ref().map(StagingEvidence::json),
+        // Where additions were parked: a bounded shelf region beside the
+        // board, inside KiCad's coordinate range. Parking, not placement.
+        "parking": plan.parking,
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
     CallToolResult::json(&value)
+}
+
+/// The saved hierarchy, its exported netlist, and the design read from both,
+/// as every backend plans from them.
+struct SavedDesign {
+    hierarchy: Vec<PathBuf>,
+    netlist_source: String,
+    design: ExportedDesign,
+}
+
+/// Export and read the saved hierarchy rooted at `schematic`. `Ok(Err)`
+/// carries the preflight refusal, worded for a conflict diagnostic.
+async fn read_saved_design(
+    ctx: &ToolContext,
+    schematic: &Path,
+) -> Result<std::result::Result<SavedDesign, String>> {
+    let hierarchy = match saved_hierarchy_files(schematic) {
+        Ok(files) => files,
+        Err(error) => return Ok(Err(format!("saved schematic preflight failed: {error:#}"))),
+    };
+    let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
+    if let Err(error) =
+        super::cli::export_netlist(&ctx.config.kicad_cli, schematic, temp.path(), "kicadsexpr")
+            .await
+    {
+        return Ok(Err(format!("KiCad netlist export failed: {error:#}")));
+    }
+    let netlist_source = match std::fs::read_to_string(temp.path()) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(Err(format!(
+                "KiCad netlist export could not be read: {error}"
+            )))
+        }
+    };
+    let mut design = match parse_exported_netlist(&netlist_source) {
+        Ok(design) => design,
+        Err(error) => return Ok(Err(format!("netlist preflight failed: {error:#}"))),
+    };
+    if let Err(error) = apply_saved_symbol_flags(&hierarchy, &mut design) {
+        return Ok(Err(format!("schematic flag preflight failed: {error:#}")));
+    }
+    Ok(Ok(SavedDesign {
+        hierarchy,
+        netlist_source,
+        design,
+    }))
+}
+
+/// Planned updates whose live footprint KiCad would re-create without a pad
+/// fabrication property the saved board or its library shows it carrying, or
+/// for which neither can be read.
+fn updates_that_would_drop_pad_properties(
+    board_path: &Path,
+    plan: &SyncPlan,
+    board: &BoardState,
+) -> Vec<SyncDiagnostic> {
+    use super::footprint_fabrication::{check_live_rebuild, RebuildTarget};
+
+    let targets = plan
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            PlannedChange::Update { kiid, .. } => board
+                .footprints
+                .iter()
+                .find(|footprint| &footprint.kiid == kiid),
+            PlannedChange::Add { .. } => None,
+        })
+        .map(|footprint| RebuildTarget {
+            reference: footprint.reference.clone(),
+            kiid: footprint.kiid.clone(),
+            footprint_id: footprint.footprint_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    match check_live_rebuild(
+        board_path,
+        "update_pcb_from_schematic",
+        &targets,
+        super::footprint_fabrication::Remedy::NoLosslessPath,
+    ) {
+        Ok(()) => Vec::new(),
+        Err(refusal) => refusal
+            .findings
+            .iter()
+            .map(|finding| {
+                footprint_conflict(
+                    "fabrication_property_rebuild_refused",
+                    format!(
+                        "{} Konnect has no lossless path for updating an existing footprint \
+                         like this one; use KiCad's own Update PCB from Schematic for it.",
+                        finding.reason()
+                    ),
+                    &finding.footprint_id,
+                    vec![finding.reference.clone()],
+                )
+            })
+            .collect(),
+    }
 }
 
 /// A refusal before any plan exists: the saved hierarchy, the netlist export
@@ -900,6 +1222,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
+        parking: None,
     }
 }
 
@@ -1319,13 +1642,348 @@ fn apply_footprint_fields(
 /// graphic became a pad, so pads went up by exactly the number of drawings, and
 /// drawings went to zero. The attributes and models are what #789's sync used
 /// to leave off.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 struct FootprintShape {
     pads: usize,
     drawings: usize,
     attributes: AttributeSet,
     /// Sorted, so the comparison does not depend on the order KiCad lists them.
     model_files: Vec<String>,
+    /// Every custom-shape pad, so a board that kept the pad but lost or moved
+    /// its copper is caught where a pad count cannot see it.
+    custom_pads: Vec<CustomPadCopper>,
+    /// Every pad's number and zone settings, sorted, so a pad that lost its
+    /// library `(zone_connect …)` or thermal overrides is caught as well.
+    zone_connections: Vec<(String, PadZoneSettings)>,
+}
+
+/// A pad's zone connection and thermal spokes as KiCad holds them (see
+/// [`konnect_ipc::builders::canonical_pad_zone_settings`]), in integers so
+/// the readback can sort and compare them exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct PadZoneSettings {
+    connection: i32,
+    spoke_width_nm: Option<i64>,
+    gap_nm: Option<i64>,
+    /// The spoke angle in nanodegrees.
+    spoke_angle_ndeg: Option<i64>,
+}
+
+impl PadZoneSettings {
+    fn of(pad: &konnect_ipc::gen::kiapi::board::types::Pad) -> Self {
+        let Some(stack) = pad.pad_stack.as_ref() else {
+            return Self {
+                connection: pad_zone_connection(pad),
+                ..Default::default()
+            };
+        };
+        let settings = konnect_ipc::builders::canonical_pad_zone_settings(stack);
+        let spokes = settings.thermal_spokes.unwrap_or_default();
+        Self {
+            connection: settings.zone_connection,
+            spoke_width_nm: spokes.width.map(|width| width.value_nm),
+            gap_nm: spokes.gap.map(|gap| gap.value_nm),
+            spoke_angle_ndeg: spokes
+                .angle
+                .map(|angle| (angle.value_degrees * 1e9).round() as i64),
+        }
+    }
+
+    fn describe(&self) -> String {
+        let mm = |nm: Option<i64>| {
+            nm.map_or_else(
+                || "unset".to_string(),
+                |nm| format!("{} mm", konnect_ipc::builders::nm_to_mm(nm)),
+            )
+        };
+        format!(
+            "zone connection {}, thermal spoke width {}, gap {}, angle {}",
+            zone_connection_name(self.connection),
+            mm(self.spoke_width_nm),
+            mm(self.gap_nm),
+            self.spoke_angle_ndeg.map_or_else(
+                || "unset".to_string(),
+                |ndeg| format!("{}°", ndeg as f64 / 1e9)
+            )
+        )
+    }
+}
+
+/// The copper of one custom pad as a pad message describes it, without the
+/// KIIDs KiCad regenerates. Primitives are pad-local, so they compare directly
+/// whatever the footprint's placement.
+#[derive(Debug, Clone, PartialEq)]
+struct CustomPadCopper {
+    number: String,
+    position_nm: Option<(i64, i64)>,
+    pad_type: i32,
+    net_name: String,
+    /// Sorted `BoardLayer` values: copper, mask and paste.
+    layers: Vec<i32>,
+    /// Pad-stack angle in degrees, normalised to [0, 360).
+    angle: f64,
+    /// See [`pad_zone_connection`].
+    zone_connection: i32,
+    /// One entry per copper layer KiCad reports.
+    copper: Vec<CustomCopperLayer>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CustomCopperLayer {
+    layer: i32,
+    shape: i32,
+    anchor: i32,
+    anchor_size_nm: (i64, i64),
+    offset_nm: (i64, i64),
+    /// The primitives, or why they could not be read.
+    primitives: std::result::Result<Vec<konnect_ipc::IpcPadPrimitive>, String>,
+}
+
+impl CustomPadCopper {
+    fn of(pad: &konnect_ipc::gen::kiapi::board::types::Pad) -> Option<Self> {
+        use konnect_ipc::gen::kiapi::board::types::PadStackShape;
+        let stack = pad.pad_stack.as_ref()?;
+        if !stack
+            .copper_layers
+            .iter()
+            .any(|layer| layer.shape == PadStackShape::PssCustom as i32)
+        {
+            return None;
+        }
+        let mut layers = stack.layers.clone();
+        layers.sort_unstable();
+        Some(Self {
+            number: pad.number.clone(),
+            position_nm: pad.position.map(|position| (position.x_nm, position.y_nm)),
+            pad_type: pad.r#type,
+            net_name: pad
+                .net
+                .as_ref()
+                .map(|net| net.name.clone())
+                .unwrap_or_default(),
+            layers,
+            angle: stack
+                .angle
+                .as_ref()
+                .map_or(0.0, |angle| angle.value_degrees)
+                .rem_euclid(360.0),
+            zone_connection: pad_zone_connection(pad),
+            copper: stack
+                .copper_layers
+                .iter()
+                .map(|layer| CustomCopperLayer {
+                    layer: layer.layer,
+                    shape: layer.shape,
+                    anchor: layer.custom_anchor_shape,
+                    anchor_size_nm: layer.size.map_or((0, 0), |size| (size.x_nm, size.y_nm)),
+                    offset_nm: layer
+                        .offset
+                        .map_or((0, 0), |offset| (offset.x_nm, offset.y_nm)),
+                    primitives: layer
+                        .custom_shapes
+                        .iter()
+                        .map(|shape| {
+                            konnect_ipc::builders::pad_primitive_from_proto(shape)
+                                .map_err(|error| format!("{error:#}"))
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Why `got` is not this pad's copper, or `None` when it is. Exact to a
+    /// nanometre, except for what KiCad legitimately recomputes: an arc's
+    /// midpoint (from its centre), which end of an arc comes first, which
+    /// corners name a rectangle, and where a closed outline starts.
+    fn difference(&self, got: &Self) -> Option<String> {
+        if self.position_nm != got.position_nm {
+            return Some(format!(
+                "position {:?} nm became {:?} nm",
+                self.position_nm, got.position_nm
+            ));
+        }
+        if self.pad_type != got.pad_type {
+            return Some(format!(
+                "pad type {} became {}",
+                self.pad_type, got.pad_type
+            ));
+        }
+        if self.net_name != got.net_name {
+            return Some(format!("net '{}' became '{}'", self.net_name, got.net_name));
+        }
+        if self.layers != got.layers {
+            return Some(format!("layers {:?} became {:?}", self.layers, got.layers));
+        }
+        let turn = (self.angle - got.angle).abs();
+        if turn.min(360.0 - turn) > 1e-6 {
+            return Some(format!("rotation {}° became {}°", self.angle, got.angle));
+        }
+        if self.zone_connection != got.zone_connection {
+            return Some(format!(
+                "zone connection {} became {}",
+                zone_connection_name(self.zone_connection),
+                zone_connection_name(got.zone_connection)
+            ));
+        }
+        if self.copper.len() != got.copper.len() {
+            return Some(format!(
+                "{} copper layer entries became {}",
+                self.copper.len(),
+                got.copper.len()
+            ));
+        }
+        for (want, got) in self.copper.iter().zip(&got.copper) {
+            if want.offset_nm != got.offset_nm {
+                return Some(format!(
+                    "offset {:?} nm became {:?} nm",
+                    want.offset_nm, got.offset_nm
+                ));
+            }
+            if (want.layer, want.shape, want.anchor) != (got.layer, got.shape, got.anchor) {
+                return Some(format!(
+                    "shape/anchor {}/{} became {}/{}",
+                    want.shape, want.anchor, got.shape, got.anchor
+                ));
+            }
+            let size = (want.anchor_size_nm.0 - got.anchor_size_nm.0)
+                .abs()
+                .max((want.anchor_size_nm.1 - got.anchor_size_nm.1).abs());
+            if size > 1 {
+                return Some(format!(
+                    "anchor size {:?} nm became {:?} nm",
+                    want.anchor_size_nm, got.anchor_size_nm
+                ));
+            }
+            let (want, got) = match (&want.primitives, &got.primitives) {
+                (Ok(want), Ok(got)) => (want, got),
+                (_, Err(reason)) => return Some(format!("primitives unreadable: {reason}")),
+                (Err(reason), _) => return Some(format!("sent primitives unreadable: {reason}")),
+            };
+            if want.len() != got.len() {
+                return Some(format!("{} primitives became {}", want.len(), got.len()));
+            }
+            for (index, (want, got)) in want.iter().zip(got).enumerate() {
+                if !same_primitive(want, got) {
+                    return Some(format!("primitive {index} {want:?} became {got:?}"));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A pad's zone connection as the protocol value. A stack with no zone
+/// settings is the inherited connection the builder means by leaving them out.
+fn pad_zone_connection(pad: &konnect_ipc::gen::kiapi::board::types::Pad) -> i32 {
+    pad.pad_stack
+        .as_ref()
+        .and_then(|stack| stack.zone_settings.as_ref())
+        .map_or(
+            konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+            |settings| settings.zone_connection,
+        )
+}
+
+fn zone_connection_name(value: i32) -> String {
+    konnect_ipc::IpcPadZoneConnection::from_proto(value).map_or_else(
+        || format!("unknown ({value})"),
+        |connection| {
+            serde_json::to_value(connection)
+                .ok()
+                .and_then(|name| name.as_str().map(str::to_string))
+                .unwrap_or_default()
+        },
+    )
+}
+
+fn same_primitive(want: &konnect_ipc::IpcPadPrimitive, got: &konnect_ipc::IpcPadPrimitive) -> bool {
+    use konnect_ipc::IpcPadPrimitive as P;
+    const NM: f64 = 1.5e-6;
+    let near = |a: f64, b: f64, tolerance: f64| (a - b).abs() <= tolerance;
+    let at = |a: (f64, f64), b: (f64, f64), tolerance: f64| {
+        near(a.0, b.0, tolerance) && near(a.1, b.1, tolerance)
+    };
+    if !near(want.width(), got.width(), NM) || want.filled() != got.filled() {
+        return false;
+    }
+    match (want, got) {
+        (P::Polygon { points: a, .. }, P::Polygon { points: b, .. }) => {
+            let open = |points: &[(f64, f64)]| {
+                let mut points = points.to_vec();
+                if points.len() > 1 && at(points[0], points[points.len() - 1], NM) {
+                    points.pop();
+                }
+                points
+            };
+            let (a, b) = (open(a), open(b));
+            a.len() == b.len()
+                && (0..b.len().max(1)).any(|shift| {
+                    a.iter()
+                        .enumerate()
+                        .all(|(i, p)| at(*p, b[(i + shift) % b.len()], NM))
+                })
+        }
+        (
+            P::Rect {
+                start: s1, end: e1, ..
+            },
+            P::Rect {
+                start: s2, end: e2, ..
+            },
+        ) => {
+            let corners = |s: &(f64, f64), e: &(f64, f64)| {
+                ((s.0.min(e.0), s.1.min(e.1)), (s.0.max(e.0), s.1.max(e.1)))
+            };
+            let (a, b) = (corners(s1, e1), corners(s2, e2));
+            at(a.0, b.0, NM) && at(a.1, b.1, NM)
+        }
+        (
+            P::Circle {
+                center: c1,
+                end: e1,
+                ..
+            },
+            P::Circle {
+                center: c2,
+                end: e2,
+                ..
+            },
+        ) => {
+            at(*c1, *c2, NM)
+                && near(
+                    (e1.0 - c1.0).hypot(e1.1 - c1.1),
+                    (e2.0 - c2.0).hypot(e2.1 - c2.1),
+                    NM,
+                )
+        }
+        (
+            P::Segment {
+                start: s1, end: e1, ..
+            },
+            P::Segment {
+                start: s2, end: e2, ..
+            },
+        ) => (at(*s1, *s2, NM) && at(*e1, *e2, NM)) || (at(*s1, *e2, NM) && at(*e1, *s2, NM)),
+        (
+            P::Arc {
+                start: s1,
+                mid: m1,
+                end: e1,
+                ..
+            },
+            P::Arc {
+                start: s2,
+                mid: m2,
+                end: e2,
+                ..
+            },
+        ) => {
+            ((at(*s1, *s2, NM) && at(*e1, *e2, NM)) || (at(*s1, *e2, NM) && at(*e1, *s2, NM)))
+                && at(*m1, *m2, 1e-3)
+        }
+        _ => false,
+    }
 }
 
 /// Every instance attribute KiCad reports for a footprint, named by the
@@ -1411,7 +2069,17 @@ fn footprint_shapes<'a>(
         };
         for child in &definition.items {
             match konnect_ipc::builders::any_type_name(child) {
-                "kiapi.board.types.Pad" => shape.pads += 1,
+                "kiapi.board.types.Pad" => {
+                    shape.pads += 1;
+                    if let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) {
+                        shape
+                            .zone_connections
+                            .push((pad.number.clone(), PadZoneSettings::of(&pad)));
+                        if let Some(custom) = CustomPadCopper::of(&pad) {
+                            shape.custom_pads.push(custom);
+                        }
+                    }
+                }
                 "kiapi.board.types.BoardGraphicShape" | "kiapi.board.types.BoardText" => {
                     shape.drawings += 1
                 }
@@ -1426,6 +2094,7 @@ fn footprint_shapes<'a>(
             }
         }
         shape.model_files.sort();
+        shape.zone_connections.sort();
         out.insert(reference, shape);
     }
     out
@@ -1443,8 +2112,12 @@ fn footprint_shapes<'a>(
 /// in place it should never fire. `delete_footprint` already re-queries after
 /// mutating; this follows it.
 ///
-/// **It fails the call only on a gained pad.** KiCad has no business inventing
-/// one, so that is unambiguous and is #244's exact signature. A *drop* in
+/// **It fails the call only on a gained pad, or on custom-pad copper that is
+/// not what was sent.** KiCad has no business inventing a pad, so that is
+/// unambiguous and is #244's exact signature. A custom pad is compared by its
+/// layers, rotation, anchor and normalised pad-local primitives: a board that
+/// kept the pad but lost or moved its primitives has copper the library never
+/// drew, and a count cannot see that. A *drop* in
 /// drawings is reported instead of refused, because it has a benign
 /// explanation this check cannot yet rule out — KiCad re-creates a footprint's
 /// children from the message on deserialize, and if it promotes a `BoardText`
@@ -1469,12 +2142,18 @@ fn verify_board_matches_what_was_sent(
     let actual = footprint_shapes(items.iter());
 
     let mut corrupted = Vec::new();
+    let mut lost_copper = Vec::new();
     let mut suspicious = Vec::new();
     for (reference, want) in expected {
         // A reference the read-back cannot see is its own problem, but not this
         // check's: KiCad may name it differently after a rename, and failing
         // here would turn a successful sync into an error over bookkeeping.
         let Some(got) = actual.get(reference) else {
+            if !want.custom_pads.is_empty() {
+                lost_copper.push(format!(
+                    "{reference}: footprint with custom pads is missing from readback"
+                ));
+            }
             continue;
         };
         let detail = format!(
@@ -1485,6 +2164,32 @@ fn verify_board_matches_what_was_sent(
             corrupted.push(detail);
         } else if (got.pads, got.drawings) != (want.pads, want.drawings) {
             suspicious.push(detail);
+        }
+        if let Some(difference) = custom_pad_difference(&want.custom_pads, &got.custom_pads) {
+            lost_copper.push(format!("{reference}: {difference}"));
+        } else if got.pads == want.pads && got.zone_connections != want.zone_connections {
+            let changed = want
+                .zone_connections
+                .iter()
+                .zip(&got.zone_connections)
+                .find(|(want, got)| want != got)
+                .map(|((number, want), (got_number, got))| {
+                    if want.connection != got.connection {
+                        format!(
+                            "pad '{number}' zone connection {} became pad '{got_number}' {}",
+                            zone_connection_name(want.connection),
+                            zone_connection_name(got.connection)
+                        )
+                    } else {
+                        format!(
+                            "pad '{number}' {} became pad '{got_number}' {}",
+                            want.describe(),
+                            got.describe()
+                        )
+                    }
+                })
+                .unwrap_or_default();
+            lost_copper.push(format!("{reference}: {changed}"));
         }
         if got.attributes != want.attributes {
             suspicious.push(format!(
@@ -1509,7 +2214,49 @@ fn verify_board_matches_what_was_sent(
             corrupted.join("; ")
         );
     }
+    if !lost_copper.is_empty() {
+        bail!(
+            "KiCad's board does not hold the custom-pad copper or pad zone connections \
+             this sync sent, so those pads are not the library's — inspect the board \
+             and do not save it: {}",
+            lost_copper.join("; ")
+        );
+    }
     Ok(suspicious)
+}
+
+/// Why the custom pads read back are not the ones sent, or `None` when every
+/// sent pad is matched by one read back. Pads are paired by number, in either
+/// order, so a renumbered, missing, extra or altered pad is each reported.
+fn custom_pad_difference(sent: &[CustomPadCopper], read: &[CustomPadCopper]) -> Option<String> {
+    let mut unmatched: Vec<&CustomPadCopper> = read.iter().collect();
+    for want in sent {
+        let candidates = unmatched
+            .iter()
+            .enumerate()
+            .filter(|(_, got)| got.number == want.number)
+            .map(|(index, got)| (index, want.difference(got)))
+            .collect::<Vec<_>>();
+        match candidates
+            .iter()
+            .find(|(_, difference)| difference.is_none())
+        {
+            Some((index, _)) => {
+                unmatched.remove(*index);
+            }
+            None => {
+                return Some(match candidates.first() {
+                    Some((_, Some(difference))) => {
+                        format!("custom pad '{}' {difference}", want.number)
+                    }
+                    _ => format!("custom pad '{}' is missing", want.number),
+                });
+            }
+        }
+    }
+    unmatched
+        .first()
+        .map(|extra| format!("custom pad '{}' was not sent", extra.number))
 }
 
 fn set_field_text(
@@ -1583,7 +2330,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
     struct Flags {
         reference: String,
         symbol_path: String,
-        in_bom: bool,
         on_board: bool,
         dnp: bool,
     }
@@ -1597,7 +2343,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             let Some(uuid) = symbol.find_str("uuid") else {
                 continue;
             };
-            let in_bom = symbol.find_str("in_bom") != Some("no");
             let on_board = symbol.find_str("on_board") != Some("no");
             let dnp = symbol.find_str("dnp") == Some("yes");
             let projects = symbol
@@ -1618,7 +2363,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
                     flags.push(Flags {
                         reference: reference.to_string(),
                         symbol_path: format!("{base}/{uuid}").replace("//", "/"),
-                        in_bom,
                         on_board,
                         dnp,
                     });
@@ -1636,12 +2380,11 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             .iter()
             .filter(|entry| entry.reference == reference)
             .collect::<Vec<_>>();
-        if entries.iter().any(|entry| {
-            entry.in_bom != entries[0].in_bom
-                || entry.on_board != entries[0].on_board
-                || entry.dnp != entries[0].dnp
-        }) {
-            bail!("multi-unit reference {reference} has inconsistent board/BOM/DNP flags");
+        if entries
+            .iter()
+            .any(|entry| entry.on_board != entries[0].on_board || entry.dnp != entries[0].dnp)
+        {
+            bail!("multi-unit reference {reference} has inconsistent board/DNP flags");
         }
     }
 
@@ -1657,9 +2400,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1670,9 +2410,8 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         component.dnp = entry.dnp;
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
+    // PCB inclusion is independent of BOM inclusion, including for symbols
+    // whose missing footprint must still be reported. Only on_board=no skips.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1685,9 +2424,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1698,7 +2434,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -2001,27 +2737,28 @@ fn prepare_footprint_source(
     let root = konnect_sexp::parse_sexp(source)
         .context("invalid footprint S-expression")
         .map_err(unsupported)?;
-    let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
-    let description_and_keywords = super::library_footprint::description_and_keywords(&root);
-    let models = super::library_footprint::models(&root).map_err(unsupported)?;
-    let (width, height) = footprint_dimensions(&pads, &graphics);
+    let library = super::library_footprint::LibraryData::read(&root).map_err(unsupported)?;
+    let (extent, extent_source) = match konnect_sexp::bounds::footprint_parking_extent(&root) {
+        Ok(bbox) => (parking::LocalBox::from_bbox(bbox), "library_geometry"),
+        Err(_) => (
+            footprint_typed_extent(&pads, &graphics),
+            "typed_definition_estimate",
+        ),
+    };
     Ok(PreparedFootprint {
         pads,
         graphics,
         fields,
-        attributes,
-        description_and_keywords,
-        models,
-        width,
-        height,
+        library,
+        extent,
+        extent_source,
     })
 }
 
 /// Give a footprint built from pads, drawings and fields the rest of what its
-/// library carries: the instance attributes, the definition's description and
-/// keywords, and its 3D models. Without them a synced SMD part had no `smd`
-/// attribute, so KiCad treated it as unspecified, and `export_3d`'s default
-/// left every one of them out of the STEP (#789).
+/// library carries (see [`super::library_footprint::LibraryData::apply`]).
+/// Without it `export_3d`'s default left every synced part out of the STEP
+/// (#789).
 ///
 /// Runs before [`apply_footprint_fields`], which sets DNP from the schematic,
 /// so the schematic overrides a library `dnp` as KiCad's own update does.
@@ -2029,18 +2766,7 @@ fn apply_library_data(
     footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
     part: &PreparedFootprint,
 ) -> Result<()> {
-    footprint.attributes = Some(part.attributes.clone());
-    let definition = footprint
-        .definition
-        .as_mut()
-        .context("built footprint has no definition")?;
-    definition.attributes = Some(part.description_and_keywords.clone());
-    definition.items.extend(
-        part.models.iter().map(|model| {
-            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
-        }),
-    );
-    Ok(())
+    part.library.apply(footprint)
 }
 
 /// Prepare every footprint the plan adds. One that cannot be prepared does
@@ -2139,10 +2865,13 @@ fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
     plan.changes.clear();
 }
 
-fn footprint_dimensions(
+/// A footprint's local box from its typed pads and drawings, for a library
+/// whose own geometry could not be measured. A footprint with neither is
+/// given a 10 mm square around its anchor.
+fn footprint_typed_extent(
     pads: &[konnect_ipc::IpcPadDefinition],
     graphics: &[konnect_ipc::IpcGraphicDefinition],
-) -> (f64, f64) {
+) -> parking::LocalBox {
     use konnect_ipc::IpcGraphicDefinition as Graphic;
 
     let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
@@ -2156,6 +2885,13 @@ fn footprint_dimensions(
     for pad in pads {
         include(pad.x - pad.size_x / 2.0, pad.y - pad.size_y / 2.0);
         include(pad.x + pad.size_x / 2.0, pad.y + pad.size_y / 2.0);
+        // A custom pad's copper reaches past its anchor; bound it by the
+        // farthest primitive at any pad rotation.
+        if let Some(custom) = &pad.custom {
+            let reach = custom.primitive_reach();
+            include(pad.x - reach, pad.y - reach);
+            include(pad.x + reach, pad.y + reach);
+        }
     }
     for graphic in graphics {
         match graphic {
@@ -2187,35 +2923,58 @@ fn footprint_dimensions(
         }
     }
     if !min_x.is_finite() {
-        return (10.0, 10.0);
+        return parking::LocalBox {
+            min_x: -5.0,
+            min_y: -5.0,
+            max_x: 5.0,
+            max_y: 5.0,
+        };
     }
-    ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0))
+    parking::LocalBox {
+        min_x,
+        min_y,
+        max_x: max_x.max(min_x + 1.0),
+        max_y: max_y.max(min_y + 1.0),
+    }
 }
 
+/// Park every addition in a bounded region beside `bounds` (see
+/// [`parking`]). The diagnostic refuses the plan when that region would
+/// leave KiCad's coordinate range; nothing has been sent by then.
 fn restage_additions(
     plan: &mut SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     bounds: Bounds,
-) {
-    let mut next_y = bounds.min_y;
-    for change in &mut plan.changes {
-        let PlannedChange::Add {
-            footprint_id,
-            position,
-            ..
-        } = change
-        else {
-            continue;
-        };
-        let dimensions = prepared.get(footprint_id);
-        let width = dimensions.map(|part| part.width).unwrap_or(10.0);
-        let height = dimensions.map(|part| part.height).unwrap_or(10.0);
-        *position = Point {
-            x: bounds.max_x + 5.0 + width / 2.0,
-            y: next_y + height / 2.0,
-        };
-        next_y += height + 5.0;
+) -> std::result::Result<(), SyncDiagnostic> {
+    let mut boxes = Vec::new();
+    let mut sources = BTreeMap::<&str, usize>::new();
+    for change in &plan.changes {
+        if let PlannedChange::Add { footprint_id, .. } = change {
+            let part = prepared.get(footprint_id);
+            boxes.push(part.map(|part| part.extent).unwrap_or(parking::LocalBox {
+                min_x: -5.0,
+                min_y: -5.0,
+                max_x: 5.0,
+                max_y: 5.0,
+            }));
+            *sources
+                .entry(part.map_or("unprepared_estimate", |part| part.extent_source))
+                .or_insert(0) += 1;
+        }
     }
+    let (positions, summary) = parking::park(&boxes, bounds)
+        .map_err(|reason| conflict("parking_extent_out_of_range", reason, None))?;
+    let mut positions = positions.into_iter();
+    for change in &mut plan.changes {
+        if let PlannedChange::Add { position, .. } = change {
+            *position = positions.next().expect("one position per addition");
+        }
+    }
+    plan.parking = Some(serde_json::json!({
+        "summary": summary,
+        "extent_sources": sources,
+    }));
+    Ok(())
 }
 
 /// One footprint the plan adds, as `CreateItems` receives it: built from the
@@ -3073,6 +3832,9 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                zone_connection: None,
+                thermal: Default::default(),
+                custom: None,
             }],
             &[
                 konnect_ipc::IpcGraphicDefinition::Line {
@@ -3256,6 +4018,16 @@ mod tests {
             FootprintShape {
                 pads: 1,
                 drawings: 6,
+                // No zone settings sent: KiCad holds the inherited
+                // connection and a rectangle's 90° spokes.
+                zone_connections: vec![(
+                    "1".to_string(),
+                    PadZoneSettings {
+                        connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+                        spoke_angle_ndeg: Some(90_000_000_000),
+                        ..Default::default()
+                    }
+                )],
                 ..Default::default()
             }
         );
@@ -3278,12 +4050,10 @@ mod tests {
         // #239 reported footprints losing their *graphics* while their
         // reference and value text stayed put.
         assert_eq!(
-            actual["U4"],
-            FootprintShape {
-                pads: 6,
-                drawings: 1,
-                ..Default::default()
-            }
+            (actual["U4"].pads, actual["U4"].drawings),
+            (6, 1),
+            "{:?}",
+            actual["U4"]
         );
         assert_ne!(actual["U4"], expected["U4"]);
     }
@@ -3351,6 +4121,9 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                zone_connection: None,
+                thermal: Default::default(),
+                custom: None,
             }],
             &[],
             &konnect_ipc::IpcFieldPlacement::default(),
@@ -4459,12 +5232,41 @@ mod tests {
         "Package_DFN_QFN:Texas_RJE0020A_VQFN-20-1EP_3x3mm_P0.45mm_EP0.675x0.76mm";
     const GENERIC_VQFN: &str = "Package_DFN_QFN:VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
     const STOCK_0603: &str = "Capacitor_SMD:C_0603_1608Metric";
+    /// The Texas fixture with every custom pad's clearance set to
+    /// `convexhull`, which KiCad's API has no field to carry.
+    const CONVEXHULL_VQFN: &str = "Package_DFN_QFN:Konnect_Test_VQFN-20_ConvexHull";
+    /// The generic fixture with one custom-pad polygon edge made an arc,
+    /// which the typed primitive cannot carry.
+    const ARC_EDGE_VQFN: &str = "Package_DFN_QFN:Konnect_Test_VQFN-20_ArcEdge";
+
+    const TEXAS_SOURCE: &str =
+        include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod");
+    const GENERIC_SOURCE: &str =
+        include_str!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod");
+    use crate::test_support::without_heatsink_property as carried;
+
+    fn convexhull_source() -> String {
+        assert!(TEXAS_SOURCE.contains("(clearance outline)"));
+        TEXAS_SOURCE.replace("(clearance outline)", "(clearance convexhull)")
+    }
+
+    fn arc_edge_source() -> String {
+        const EDGE: &str = "(xy 0.254289 -0.075)";
+        assert!(GENERIC_SOURCE.contains(EDGE));
+        GENERIC_SOURCE.replacen(
+            EDGE,
+            "(arc (start 0.254289 -0.075) (mid 0.34 -0.04) (end 0.375 0.045711))",
+            1,
+        )
+    }
 
     /// A project whose own `fp-lib-table` resolves three stock KiCad 10.0.5
     /// footprints: the two with custom-shape pads that #657 met on a real
     /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`)
     /// and a plain 0603. A project table shadows the global one, so these
-    /// files are the ones read whether or not KiCad is installed.
+    /// files are the ones read whether or not KiCad is installed. Two
+    /// derivatives of the custom-pad fixtures carry geometry the typed path
+    /// genuinely cannot send, for the refusals.
     fn project_with_stock_footprints() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("carrier.kicad_pcb");
@@ -4473,15 +5275,13 @@ mod tests {
             include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
         )
         .unwrap();
-        let stock: [(&str, &[u8]); 3] = [
-            (
-                TEXAS_VQFN,
-                include_bytes!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
-            ),
-            (
-                GENERIC_VQFN,
-                include_bytes!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod"),
-            ),
+        let (convexhull, arc_edge) = (convexhull_source(), arc_edge_source());
+        let (texas, generic) = (carried(TEXAS_SOURCE), carried(GENERIC_SOURCE));
+        let stock: [(&str, &[u8]); 5] = [
+            (CONVEXHULL_VQFN, convexhull.as_bytes()),
+            (ARC_EDGE_VQFN, arc_edge.as_bytes()),
+            (TEXAS_VQFN, texas.as_bytes()),
+            (GENERIC_VQFN, generic.as_bytes()),
             (
                 STOCK_0603,
                 include_bytes!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
@@ -4531,6 +5331,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             staging: None,
+            parking: None,
         }
     }
 
@@ -4540,18 +5341,19 @@ mod tests {
     fn every_unusable_footprint_is_named_with_the_parts_that_need_it() {
         let (_temp, board) = project_with_stock_footprints();
         let plan = plan_adding(vec![
-            planned_add("U1", TEXAS_VQFN, &["1"]),
+            planned_add("U1", CONVEXHULL_VQFN, &["1"]),
             planned_add("C1", STOCK_0603, &["1", "2"]),
-            planned_add("U3", GENERIC_VQFN, &["1"]),
-            planned_add("U2", TEXAS_VQFN, &["1"]),
+            planned_add("U3", ARC_EDGE_VQFN, &["1"]),
+            planned_add("U2", CONVEXHULL_VQFN, &["1"]),
+            planned_add("U4", TEXAS_VQFN, &["1"]),
         ]);
 
         let (prepared, unprepared) = prepare_additions(&board, &plan);
 
         assert_eq!(
-            prepared.keys().map(String::as_str).collect::<Vec<_>>(),
-            [STOCK_0603],
-            "a footprint that can be placed is still prepared"
+            prepared.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([STOCK_0603, TEXAS_VQFN]),
+            "footprints that can be placed, custom pads included, are still prepared"
         );
         let diagnostics = unprepared
             .into_iter()
@@ -4559,27 +5361,71 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
 
-        let texas = &diagnostics[0];
-        assert_eq!(texas.code, "unsupported_library_footprint");
-        assert_eq!(texas.footprint_id.as_deref(), Some(TEXAS_VQFN));
-        assert_eq!(texas.references, ["U1", "U2"]);
+        let hull = &diagnostics[1];
+        assert_eq!(hull.code, "unsupported_library_footprint");
+        assert_eq!(hull.footprint_id.as_deref(), Some(CONVEXHULL_VQFN));
+        assert_eq!(hull.references, ["U1", "U2"]);
         assert_eq!(
-            texas.reference, None,
+            hull.reference, None,
             "two parts are concerned, so no single one is named"
         );
         assert!(
-            texas.message.contains(TEXAS_VQFN)
-                && texas.message.contains("U1, U2")
-                && texas.message.contains("custom-shape pads"),
-            "{}",
-            texas.message
+            hull.message.contains(CONVEXHULL_VQFN)
+                && hull.message.contains("U1, U2")
+                && hull.message.contains("custom pad '1'")
+                && hull.message.contains("(clearance convexhull)")
+                && hull.message.contains("'outline' clearance"),
+            "the reason names the pad, the clause and what to change: {}",
+            hull.message
         );
 
-        let generic = &diagnostics[1];
-        assert_eq!(generic.code, "unsupported_library_footprint");
-        assert_eq!(generic.footprint_id.as_deref(), Some(GENERIC_VQFN));
-        assert_eq!(generic.references, ["U3"]);
-        assert_eq!(generic.reference.as_deref(), Some("U3"));
+        let arc = &diagnostics[0];
+        assert_eq!(arc.code, "unsupported_library_footprint");
+        assert_eq!(arc.footprint_id.as_deref(), Some(ARC_EDGE_VQFN));
+        assert_eq!(arc.references, ["U3"]);
+        assert_eq!(arc.reference.as_deref(), Some("U3"));
+        assert!(
+            arc.message.contains("custom pad '1'")
+                && arc.message.contains("primitive 0 (gr_poly)")
+                && arc.message.contains("curved (arc …) edge"),
+            "{}",
+            arc.message
+        );
+    }
+
+    /// The owner-facing case #657 blocked: both stock custom-pad footprints
+    /// now prepare, every pad present and every custom pad carrying its
+    /// primitives, and the staging extent covers the primitives' copper.
+    #[test]
+    fn stock_custom_pad_footprints_are_prepared_with_their_primitives() {
+        let (_temp, board) = project_with_stock_footprints();
+        let plan = plan_adding(vec![
+            planned_add("U1", TEXAS_VQFN, &["1", "5", "21"]),
+            planned_add("U2", GENERIC_VQFN, &["1", "20"]),
+        ]);
+
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+
+        assert!(unprepared.is_empty());
+        for (id, pads) in [(TEXAS_VQFN, 22), (GENERIC_VQFN, 25)] {
+            let footprint = &prepared[id];
+            assert_eq!(footprint.pads.len(), pads, "{id}");
+            assert_eq!(
+                footprint
+                    .pads
+                    .iter()
+                    .filter(|pad| pad.custom.is_some())
+                    .count(),
+                8,
+                "{id}"
+            );
+            assert!(
+                footprint.extent.width() >= 3.0 && footprint.extent.height() >= 3.0,
+                "{id}"
+            );
+            assert_eq!(footprint.extent_source, "library_geometry", "{id}");
+        }
+        assert!(additions_missing_pads(&plan, &prepared).is_empty());
     }
 
     /// The caller's next step differs with the stage that failed: fix the
@@ -4597,7 +5443,7 @@ mod tests {
         let plan = plan_adding(vec![
             planned_add("J1", "Konnect_No_Such_Library:Nothing", &["1"]),
             planned_add("C9", "Capacitor_SMD:Unreadable", &["1"]),
-            planned_add("U1", TEXAS_VQFN, &["1"]),
+            planned_add("U1", CONVEXHULL_VQFN, &["1"]),
         ]);
 
         let (prepared, unprepared) = prepare_additions(&board, &plan);
@@ -4779,6 +5625,26 @@ mod tests {
         /// What was sent with its mounting style and models, but DNP cleared:
         /// one flag lost while everything the old check looked at survives.
         WithoutDnp,
+        /// Every custom pad kept, but with its primitives dropped: the pad
+        /// and drawing counts are exactly what was sent.
+        WithoutCustomPrimitives,
+        /// One custom-pad polygon vertex moved by 10 µm.
+        ShiftedCustomPrimitive,
+        /// A pad moved while its pad-local primitives stayed intact.
+        ShiftedCustomPadPosition,
+        /// The returned footprint cannot be identified by its expected reference.
+        WithoutFootprintReference,
+        /// The same copper described the way KiCad may legitimately rewrite
+        /// it: each polygon starting at another vertex, the angle a turn on.
+        CustomPadsRenormalised,
+        /// Every pad's zone settings cleared: pad 21's `(zone_connect 2)` lost
+        /// while every count and all custom copper survive.
+        WithoutZoneConnections,
+        /// Zone settings as KiCad reports them: an inherited pad's spelled
+        /// out, and thermal spoke defaults on every pad.
+        ZoneSettingsAsKiCadReports,
+        /// Every pad's zone connection kept but its thermal spokes dropped.
+        WithoutThermalSpokes,
     }
 
     impl ServedSync {
@@ -5111,7 +5977,150 @@ mod tests {
                 }
                 konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
             }
+            Readback::WithoutCustomPrimitives => edit_custom_pads(item, |stack| {
+                for layer in &mut stack.copper_layers {
+                    layer.custom_shapes.clear();
+                }
+            }),
+            Readback::ShiftedCustomPadPosition => {
+                use konnect_ipc::gen::kiapi::board::types::{
+                    FootprintInstance, Pad, PadStackShape,
+                };
+                let mut footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+                for child in &mut footprint.definition.as_mut().unwrap().items {
+                    if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                        continue;
+                    }
+                    let mut pad = Pad::decode(child.value.as_slice()).unwrap();
+                    if pad.pad_stack.as_ref().is_some_and(|stack| {
+                        stack
+                            .copper_layers
+                            .iter()
+                            .any(|layer| layer.shape == PadStackShape::PssCustom as i32)
+                    }) {
+                        pad.position.as_mut().unwrap().x_nm += 10_000;
+                        *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                        break;
+                    }
+                }
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::WithoutFootprintReference => {
+                let mut footprint =
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .unwrap();
+                footprint.reference_field = None;
+                footprint.definition.as_mut().unwrap().reference_field = None;
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::ShiftedCustomPrimitive => {
+                let shifted = std::cell::Cell::new(false);
+                edit_custom_pads(item, |stack| {
+                    if shifted.replace(true) {
+                        return;
+                    }
+                    if let Some(point) = first_polygon_points(stack).into_iter().next() {
+                        point.x_nm += 10_000;
+                    }
+                })
+            }
+            Readback::CustomPadsRenormalised => edit_custom_pads(item, |stack| {
+                if let Some(angle) = stack.angle.as_mut() {
+                    angle.value_degrees += 360.0;
+                }
+                for layer in &mut stack.copper_layers {
+                    for shape in &mut layer.custom_shapes {
+                        use konnect_ipc::gen::kiapi::common::types::graphic_shape::Geometry;
+                        if let Some(Geometry::Polygon(set)) =
+                            shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+                        {
+                            for polygon in &mut set.polygons {
+                                if let Some(outline) = polygon.outline.as_mut() {
+                                    outline.nodes.rotate_left(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            Readback::WithoutZoneConnections => edit_every_pad(item, |stack| {
+                stack.zone_settings = None;
+            }),
+            // KiCad 10 always reports the connection and the spoke angle:
+            // what was sent, or for a stack sent without zone settings its
+            // inherited connection and shape default.
+            Readback::ZoneSettingsAsKiCadReports => edit_every_pad(item, |stack| {
+                stack.zone_settings =
+                    Some(konnect_ipc::builders::canonical_pad_zone_settings(stack));
+            }),
+            Readback::WithoutThermalSpokes => edit_every_pad(item, |stack| {
+                if let Some(settings) = stack.zone_settings.as_mut() {
+                    settings.thermal_spokes = None;
+                }
+            }),
         }
+    }
+
+    /// `item` with `edit` applied to the pad stack of every pad.
+    fn edit_every_pad(
+        item: &prost_types::Any,
+        edit: impl Fn(&mut konnect_ipc::gen::kiapi::board::types::PadStack),
+    ) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
+        let mut footprint = FootprintInstance::decode(item.value.as_slice()).expect("a footprint");
+        for child in &mut footprint.definition.as_mut().unwrap().items {
+            if konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                let mut pad = Pad::decode(child.value.as_slice()).unwrap();
+                edit(pad.pad_stack.as_mut().unwrap());
+                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    /// `item` with `edit` applied to the pad stack of each custom pad.
+    fn edit_custom_pads(
+        item: &prost_types::Any,
+        edit: impl Fn(&mut konnect_ipc::gen::kiapi::board::types::PadStack),
+    ) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{FootprintInstance, Pad, PadStackShape};
+        let mut footprint = FootprintInstance::decode(item.value.as_slice()).expect("a footprint");
+        for child in &mut footprint.definition.as_mut().unwrap().items {
+            if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = Pad::decode(child.value.as_slice()).unwrap();
+            let stack = pad.pad_stack.as_mut().unwrap();
+            if stack.copper_layers[0].shape == PadStackShape::PssCustom as i32 {
+                edit(stack);
+                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn first_polygon_points(
+        stack: &mut konnect_ipc::gen::kiapi::board::types::PadStack,
+    ) -> Vec<&mut konnect_ipc::gen::kiapi::common::types::Vector2> {
+        use konnect_ipc::gen::kiapi::common::types::{graphic_shape::Geometry, poly_line_node};
+        let shape = &mut stack.copper_layers[0].custom_shapes[0];
+        let Some(Geometry::Polygon(set)) = shape.shape.as_mut().and_then(|s| s.geometry.as_mut())
+        else {
+            return Vec::new();
+        };
+        set.polygons[0]
+            .outline
+            .as_mut()
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .filter_map(|node| match node.geometry.as_mut() {
+                Some(poly_line_node::Geometry::Point(point)) => Some(point),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `netlist` with `reference` marked DNP the way `kicad-cli` exports it.
@@ -5269,10 +6278,10 @@ mod tests {
 
         let refused = served
             .dry_run(&exported_netlist(&[
-                ("U1", TEXAS_VQFN, &["1", "2"]),
+                ("U1", CONVEXHULL_VQFN, &["1", "2"]),
                 ("C1", STOCK_0603, &["1", "2"]),
-                ("U3", GENERIC_VQFN, &["1", "2"]),
-                ("U2", TEXAS_VQFN, &["1", "2"]),
+                ("U3", ARC_EDGE_VQFN, &["1", "2"]),
+                ("U2", CONVEXHULL_VQFN, &["1", "2"]),
             ]))
             .await;
 
@@ -5280,28 +6289,34 @@ mod tests {
         assert_eq!(refused["changes"], serde_json::json!([]));
         assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
         assert_eq!(refused["coverage"]["conflicts"]["planned"], 2);
+        let hull_message = format!(
+            "{CONVEXHULL_VQFN} cannot be placed (needed by U1, U2): custom pad '1' cannot be \
+             carried by KiCad 10's typed placement path: '(clearance convexhull)' cannot be \
+             sent: KiCad's API has no field for a custom pad's zone clearance shape, so the \
+             pad would arrive with the 'outline' default. Change the pad to 'outline' \
+             clearance in the footprint editor if that is acceptable"
+        );
+        let arc_message = format!(
+            "{ARC_EDGE_VQFN} cannot be placed (needed by U3): custom pad '1' cannot be \
+             carried by KiCad 10's typed placement path: primitive 0 (gr_poly): gr_poly has \
+             a curved (arc …) edge, which is not supported"
+        );
         assert_eq!(
             refused["diagnostics"],
             serde_json::json!([
                 {
                     "code": "unsupported_library_footprint",
-                    "message": format!(
-                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
-                    ),
-                    "reference": null,
-                    "references": ["U1", "U2"],
-                    "footprint_id": TEXAS_VQFN
+                    "message": arc_message,
+                    "reference": "U3",
+                    "references": ["U3"],
+                    "footprint_id": ARC_EDGE_VQFN
                 },
                 {
                     "code": "unsupported_library_footprint",
-                    "message": format!(
-                        "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
-                    ),
-                    "reference": "U3",
-                    "references": ["U3"],
-                    "footprint_id": GENERIC_VQFN
+                    "message": hull_message,
+                    "reference": null,
+                    "references": ["U1", "U2"],
+                    "footprint_id": CONVEXHULL_VQFN
                 }
             ])
         );
@@ -5312,6 +6327,367 @@ mod tests {
         assert_eq!(placeable["status"], "ready", "{placeable:#}");
         assert_eq!(placeable["coverage"]["footprints_added"]["planned"], 1);
         assert_eq!(placeable["diagnostics"], serde_json::json!([]));
+    }
+
+    /// The netlist for the two stock custom-pad footprints #657 refused.
+    fn custom_pad_netlist() -> String {
+        exported_netlist(&[
+            ("U1", TEXAS_VQFN, &["1", "5", "21"]),
+            ("U2", GENERIC_VQFN, &["1", "20"]),
+        ])
+    }
+
+    /// Both stock custom-pad footprints now plan as `ready` and apply, and
+    /// what `CreateItems` receives holds every pad with its net, and each
+    /// custom pad's anchor and primitives exactly as the library draws them.
+    #[tokio::test]
+    async fn stock_custom_pad_footprints_sync_with_exact_primitives() {
+        use konnect_ipc::gen::kiapi::board::types::{Pad, PadStackShape};
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let plan = served.dry_run(&custom_pad_netlist()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_added"]["planned"], 2);
+        assert_eq!(plan["diagnostics"], serde_json::json!([]));
+
+        let applied = served.apply(&custom_pad_netlist()).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 2);
+        for footprint in &sent {
+            let reference = field_text(&footprint.reference_field);
+            let source = if reference == "U1" {
+                TEXAS_SOURCE
+            } else {
+                GENERIC_SOURCE
+            };
+            let library =
+                super::super::pcb_components::extract_pad_definitions(&carried(source)).unwrap();
+            let pads: Vec<Pad> = footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+                .map(|child| Pad::decode(child.value.as_slice()).unwrap())
+                .collect();
+            assert_eq!(pads.len(), library.len(), "{reference}: every pad is sent");
+            for (pad, want) in pads.iter().zip(&library) {
+                assert_eq!(pad.number, want.number);
+                let copper = &pad.pad_stack.as_ref().unwrap().copper_layers[0];
+                match &want.custom {
+                    Some(custom) => {
+                        assert_eq!(copper.shape, PadStackShape::PssCustom as i32);
+                        assert_eq!(copper.custom_anchor_shape, PadStackShape::PssCircle as i32);
+                        let primitives = copper
+                            .custom_shapes
+                            .iter()
+                            .map(|shape| {
+                                konnect_ipc::builders::pad_primitive_from_proto(shape).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            primitives, custom.primitives,
+                            "{reference} pad {}",
+                            pad.number
+                        );
+                    }
+                    None => assert!(copper.custom_shapes.is_empty()),
+                }
+                assert_eq!(
+                    pad.pad_stack
+                        .as_ref()
+                        .unwrap()
+                        .zone_settings
+                        .as_ref()
+                        .map(|settings| settings.zone_connection),
+                    // An absent clause goes out as inherited, beside the
+                    // spoke angle every library pad is sent with.
+                    Some(
+                        want.zone_connection
+                            .unwrap_or(konnect_ipc::IpcPadZoneConnection::Inherited)
+                            .to_proto() as i32
+                    ),
+                    "{reference} pad {}: the library zone connection is sent",
+                    pad.number
+                );
+            }
+            let pad1 = pads.iter().find(|pad| pad.number == "1").unwrap();
+            assert_eq!(
+                pad1.net.as_ref().map(|net| net.name.as_str()),
+                Some(format!("{reference}-1").as_str()),
+                "a custom pad keeps its pin's net"
+            );
+        }
+    }
+
+    /// A board that kept every pad but not its custom copper fails the apply,
+    /// by pad, even though every count matches what was sent.
+    #[tokio::test]
+    async fn the_readback_refuses_custom_pad_copper_the_board_did_not_keep() {
+        for (readback, symptom) in [
+            (Readback::WithoutCustomPrimitives, "1 primitives became 0"),
+            (Readback::ShiftedCustomPrimitive, "primitive 0"),
+            (Readback::ShiftedCustomPadPosition, "position"),
+        ] {
+            let served = ServedSync::reading_back(readback).await;
+            let plan = served.dry_run(&custom_pad_netlist()).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            let (is_error, body) = served
+                .call(serde_json::json!({
+                    "schematic": served.schematic.to_string_lossy(),
+                    "board": served.board.to_string_lossy(),
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }))
+                .await;
+            let text = body.to_string();
+            assert!(is_error, "{body:#}");
+            assert!(
+                text.contains("custom-pad copper")
+                    && text.contains("U1: custom pad '1'")
+                    && text.contains(symptom),
+                "{body:#}"
+            );
+        }
+    }
+
+    /// The comparison is to the copper, not to KiCad's exact wording of it:
+    /// a polygon that starts at another vertex and an angle a whole turn on
+    /// are the same pad.
+    #[tokio::test]
+    async fn the_readback_accepts_the_same_custom_copper_renormalised() {
+        let served = ServedSync::reading_back(Readback::CustomPadsRenormalised).await;
+        let applied = served.apply(&custom_pad_netlist()).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+    }
+
+    /// A board that kept every pad and all custom copper but not the exposed
+    /// pad's `(zone_connect 2)` fails the apply, naming the pad, where a
+    /// count could not see it.
+    #[tokio::test]
+    async fn the_readback_refuses_a_lost_pad_zone_connection() {
+        let served = ServedSync::reading_back(Readback::WithoutZoneConnections).await;
+        let plan = served.dry_run(&custom_pad_netlist()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let (is_error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+        let text = body.to_string();
+        assert!(is_error, "{body:#}");
+        assert!(
+            text.contains("pad zone connections")
+                && text.contains("pad '21' zone connection solid became pad '21' inherited"),
+            "{body:#}"
+        );
+    }
+
+    /// KiCad spelling out an inherited pad's settings, and adding its thermal
+    /// spoke defaults, is the same zone connection.
+    #[tokio::test]
+    async fn the_readback_accepts_zone_settings_as_kicad_reports_them() {
+        let served = ServedSync::reading_back(Readback::ZoneSettingsAsKiCadReports).await;
+        let applied = served.apply(&custom_pad_netlist()).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+    }
+
+    /// The spoke angle every library pad is sent with (KiCad's parser always
+    /// sets one) is part of the readback: a board that kept every zone
+    /// connection but lost the thermal spokes fails the apply, naming the
+    /// pad and both settings.
+    #[tokio::test]
+    async fn the_readback_refuses_lost_thermal_spokes() {
+        let served = ServedSync::reading_back(Readback::WithoutThermalSpokes).await;
+        let plan = served.dry_run(&custom_pad_netlist()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let (is_error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+        let text = body.to_string();
+        assert!(is_error, "{body:#}");
+        assert!(
+            text.contains(
+                "zone connection inherited, thermal spoke width unset, gap unset, angle 90° \
+                 became pad '' zone connection inherited, thermal spoke width unset, gap \
+                 unset, angle unset"
+            ),
+            "{body:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_readback_refuses_a_missing_custom_pad_footprint() {
+        let served = ServedSync::reading_back(Readback::WithoutFootprintReference).await;
+        let plan = served.dry_run(&custom_pad_netlist()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let (is_error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+        assert!(is_error, "{body:#}");
+        assert!(
+            body.to_string()
+                .contains("footprint with custom pads is missing from readback"),
+            "{body:#}"
+        );
+    }
+
+    /// All or nothing: one footprint whose custom pad cannot be carried
+    /// refuses the whole plan, so the supported footprint beside it is not
+    /// placed alone and the apply sends KiCad nothing.
+    #[tokio::test]
+    async fn one_unsupported_custom_pad_refuses_the_whole_sync() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[
+            ("U1", TEXAS_VQFN, &["1", "2"]),
+            ("U2", CONVEXHULL_VQFN, &["1", "2"]),
+        ]);
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(plan["changes"], serde_json::json!([]));
+        assert_eq!(plan["coverage"]["footprints_added"]["planned"], 0);
+        assert_eq!(
+            plan["diagnostics"][0]["footprint_id"], CONVEXHULL_VQFN,
+            "{plan:#}"
+        );
+
+        let (_, applied) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+        assert_ne!(applied["status"], "applied", "{applied:#}");
+        assert!(
+            served.created.lock().unwrap().is_empty(),
+            "nothing reaches KiCad"
+        );
+    }
+
+    /// The comparison itself: each kind of loss is named, and each harmless
+    /// re-description KiCad may make is accepted.
+    #[test]
+    fn custom_pad_difference_names_each_loss() {
+        use konnect_ipc::IpcPadPrimitive as P;
+        let pad = |primitives: Vec<P>| CustomPadCopper {
+            number: "1".to_string(),
+            position_nm: Some((10_000_000, 20_000_000)),
+            pad_type: 2,
+            net_name: "GND".to_string(),
+            layers: vec![3, 5],
+            angle: 90.0,
+            zone_connection: 4,
+            copper: vec![CustomCopperLayer {
+                layer: 3,
+                shape: 7,
+                anchor: 1,
+                anchor_size_nm: (100_000, 100_000),
+                offset_nm: (0, 0),
+                primitives: Ok(primitives),
+            }],
+        };
+        let arc = P::Arc {
+            start: (0.0, -0.6),
+            mid: (0.3, -0.3),
+            end: (0.0, 0.0),
+            width: 0.08,
+        };
+        let rect = P::Rect {
+            start: (1.0, 1.0),
+            end: (0.0, 0.0),
+            width: 0.0,
+            filled: true,
+        };
+        let sent = pad(vec![arc.clone(), rect.clone()]);
+        // KiCad may swap an arc's ends, recompute its mid by a few nm, and
+        // name a rectangle by its other corners.
+        let rewritten = pad(vec![
+            P::Arc {
+                start: (0.0, 0.0),
+                mid: (0.300_004, -0.299_998),
+                end: (0.0, -0.6),
+                width: 0.08,
+            },
+            P::Rect {
+                start: (0.0, 0.0),
+                end: (1.0, 1.0),
+                width: 0.0,
+                filled: true,
+            },
+        ]);
+        assert_eq!(
+            custom_pad_difference(std::slice::from_ref(&sent), &[rewritten]),
+            None
+        );
+
+        let mut rotated = sent.clone();
+        rotated.angle = 0.0;
+        let mut relayered = sent.clone();
+        relayered.layers = vec![3];
+        let mut anchored = sent.clone();
+        anchored.copper[0].anchor = 2;
+        let unfilled = pad(vec![
+            arc.clone(),
+            P::Rect {
+                start: (1.0, 1.0),
+                end: (0.0, 0.0),
+                width: 0.0,
+                filled: false,
+            },
+        ]);
+        let mut renumbered = sent.clone();
+        renumbered.number = "2".to_string();
+        let mut moved = sent.clone();
+        moved.position_nm.as_mut().unwrap().0 += 10_000;
+        let mut reassigned = sent.clone();
+        reassigned.net_name = "WRONG_NET".to_string();
+        let mut changed_type = sent.clone();
+        changed_type.pad_type = 1;
+        let mut offset = sent.clone();
+        offset.copper[0].offset_nm.0 = 10_000;
+        let mut unzoned = sent.clone();
+        unzoned.zone_connection = 1;
+        for (read, symptom) in [
+            (vec![rotated], "rotation"),
+            (vec![relayered], "layers"),
+            (vec![anchored], "shape/anchor"),
+            (vec![unfilled], "primitive 1"),
+            (vec![renumbered], "custom pad '1' is missing"),
+            (vec![moved], "position"),
+            (vec![reassigned], "net 'GND'"),
+            (vec![changed_type], "pad type"),
+            (vec![offset], "offset"),
+            (vec![unzoned], "zone connection solid became inherited"),
+            (vec![], "custom pad '1' is missing"),
+        ] {
+            let difference = custom_pad_difference(std::slice::from_ref(&sent), &read)
+                .unwrap_or_else(|| panic!("{symptom} was not seen"));
+            assert!(difference.contains(symptom), "{difference}");
+        }
+        assert!(custom_pad_difference(&[], std::slice::from_ref(&sent))
+            .unwrap()
+            .contains("was not sent"));
     }
 
     /// A dry run said `ready` for a part whose schematic connects a pad its
@@ -5373,7 +6749,7 @@ mod tests {
 
         // The same keys as a diagnostic from planning, so one reader serves both.
         let planned = served
-            .dry_run(&exported_netlist(&[("U1", TEXAS_VQFN, &["1"])]))
+            .dry_run(&exported_netlist(&[("U1", CONVEXHULL_VQFN, &["1"])]))
             .await;
         let keys = |diagnostic: &serde_json::Value| {
             diagnostic
@@ -5559,11 +6935,11 @@ mod tests {
         };
 
         // The stock 0603 is not DNP in the library; the schematic says it is.
-        assert!(!part.attributes.do_not_populate);
+        assert!(!part.library.attributes.do_not_populate);
         assert!(built_dnp(&part, true));
 
         // A library footprint marked DNP; the schematic says it is fitted.
-        part.attributes.do_not_populate = true;
+        part.library.attributes.do_not_populate = true;
         assert!(!built_dnp(&part, false));
     }
 
@@ -5583,5 +6959,20 @@ mod tests {
             "{}",
             refusal.1
         );
+    }
+
+    /// A pad clause KiCad's API cannot carry refuses the footprint, under the
+    /// same code, before the sync can create it without the clause.
+    #[test]
+    fn an_uncarried_pad_property_refuses_the_footprint() {
+        for source in [TEXAS_SOURCE, GENERIC_SOURCE] {
+            let refusal = prepare_footprint_source(source).unwrap_err();
+            assert_eq!(refusal.0, "unsupported_library_footprint");
+            assert!(
+                refusal.1.contains("pad '21'") && refusal.1.contains("pad_prop_heatsink"),
+                "{}",
+                refusal.1
+            );
+        }
     }
 }

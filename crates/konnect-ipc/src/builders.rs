@@ -5,9 +5,11 @@
 
 use crate::gen::kiapi;
 
-/// Converts millimeters to KiCAD nanometers.
+/// Converts millimeters to KiCAD nanometers, rounding to the nearest one as
+/// KiCad's own file parser does. Truncating turned a library's `0.254289` into
+/// 254288 nm, because `0.254289 * 1e6` is `254288.99999999997`.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -457,9 +459,9 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
     kiapi::common::types::StrokeAttributes {
         width: Some(distance(width_mm)),
-        // ponytail: leave style/color at proto default (solid, board default color).
-        // Add args when a caller needs dashed/colored graphics.
-        style: 0,
+        // KiCad reports a solid stroke explicitly. Zero is SLS_UNKNOWN,
+        // which otherwise makes an unchanged native pad look different.
+        style: kiapi::common::types::StrokeLineStyle::SlsSolid as i32,
         color: None,
     }
 }
@@ -624,6 +626,204 @@ pub fn board_polygon(
         kiapi::common::types::graphic_shape::Geometry::Polygon(kiapi::common::types::PolySet {
             polygons,
         }),
+    )
+}
+
+/// Build the `BoardGraphicShape` KiCad deserializes into one custom-pad
+/// primitive (`PADSTACK::unpackCopperLayer` → `PCB_SHAPE::Deserialize`).
+///
+/// Coordinates are emitted PAD-LOCAL and untransformed: KiCad stores pad
+/// primitives relative to the pad at zero rotation and applies the pad's
+/// position and angle itself. The layer is `F.Cu`, the layer KiCad gives a
+/// primitive it loads from a footprint file; a primitive draws on every
+/// layer of its pad regardless.
+pub fn pad_primitive(primitive: &crate::IpcPadPrimitive) -> kiapi::board::types::BoardGraphicShape {
+    use crate::IpcPadPrimitive as Primitive;
+    use kiapi::common::types::graphic_shape::Geometry;
+    const LAYER: &str = "F.Cu";
+    match primitive {
+        Primitive::Polygon {
+            points,
+            width,
+            filled,
+        } => board_polygon(LAYER, *width, *filled, std::slice::from_ref(points)),
+        Primitive::Rect {
+            start,
+            end,
+            width,
+            filled,
+        } => board_rectangle(LAYER, *width, start.0, start.1, end.0, end.1, *filled),
+        // Not `board_circle`: that re-derives the circumference point from a
+        // radius, and this keeps the library's own point exactly.
+        Primitive::Circle {
+            center,
+            end,
+            width,
+            filled,
+        } => board_shape(
+            LAYER,
+            attrs(*width, *filled),
+            Geometry::Circle(kiapi::common::types::GraphicCircleAttributes {
+                center: Some(vec2(center.0, center.1)),
+                radius_point: Some(vec2(end.0, end.1)),
+            }),
+        ),
+        Primitive::Segment { start, end, width } => {
+            board_segment(LAYER, *width, start.0, start.1, end.0, end.1)
+        }
+        Primitive::Arc {
+            start,
+            mid,
+            end,
+            width,
+        } => board_arc(LAYER, *width, start.0, start.1, mid.0, mid.1, end.0, end.1),
+    }
+}
+
+/// A pad stack's zone settings as KiCad 10 holds them once it has
+/// deserialized the stack, so a stack as sent and the same stack as KiCad
+/// reports it compare equal.
+///
+/// The one default this fills in is source-backed: a stack sent without
+/// `zone_settings` is held as an inherited connection, no width or gap
+/// override, and `PADSTACK::DefaultThermalSpokeAngleForShape` for the angle
+/// (90° for oval, rectangle, rounded and chamfered rectangle, 45° otherwise,
+/// custom pads included), which `PADSTACK::Serialize` then always reports.
+/// Settings that are present are returned as they are: an explicit override
+/// is never dropped, and settings without spokes are not guessed at.
+pub fn canonical_pad_zone_settings(
+    stack: &kiapi::board::types::PadStack,
+) -> kiapi::board::types::ZoneConnectionSettings {
+    use kiapi::board::types::{
+        PadStackShape, ThermalSpokeSettings, ZoneConnectionSettings, ZoneConnectionStyle,
+    };
+    if let Some(settings) = stack.zone_settings.as_ref() {
+        return *settings;
+    }
+    let shape = stack
+        .copper_layers
+        .first()
+        .and_then(|layer| PadStackShape::try_from(layer.shape).ok());
+    let angle = match shape {
+        Some(
+            PadStackShape::PssOval
+            | PadStackShape::PssRectangle
+            | PadStackShape::PssRoundrect
+            | PadStackShape::PssChamferedrect,
+        ) => 90.0,
+        _ => 45.0,
+    };
+    ZoneConnectionSettings {
+        zone_connection: ZoneConnectionStyle::ZcsInherited as i32,
+        thermal_spokes: Some(ThermalSpokeSettings {
+            width: None,
+            angle: Some(kiapi::common::types::Angle {
+                value_degrees: angle,
+            }),
+            gap: None,
+        }),
+    }
+}
+
+/// Read one custom-pad primitive KiCad reported, in pad-local mm. The inverse
+/// of [`pad_primitive`]; anything it could not have produced — a bezier, a
+/// rounded rectangle, a polygon with holes, several outlines or arc edges —
+/// is refused by name rather than approximated.
+pub fn pad_primitive_from_proto(
+    shape: &kiapi::board::types::BoardGraphicShape,
+) -> anyhow::Result<crate::IpcPadPrimitive> {
+    use crate::IpcPadPrimitive as Primitive;
+    use kiapi::common::types::graphic_shape::Geometry;
+    let graphic = shape
+        .shape
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the primitive carries no shape"))?;
+    let attributes = graphic.attributes.as_ref();
+    let width = attributes
+        .and_then(|a| a.stroke.as_ref())
+        .and_then(|stroke| stroke.width.as_ref())
+        .map(|width| nm_to_mm(width.value_nm))
+        .unwrap_or(0.0);
+    let filled = attributes
+        .and_then(|a| a.fill.as_ref())
+        .map(|fill| fill.fill_type)
+        == Some(kiapi::common::types::GraphicFillType::GftFilled as i32);
+    let point = |label: &str, v: Option<&kiapi::common::types::Vector2>| {
+        v.map(|v| (nm_to_mm(v.x_nm), nm_to_mm(v.y_nm)))
+            .ok_or_else(|| anyhow::anyhow!("the primitive has no {label} point"))
+    };
+    Ok(
+        match graphic
+            .geometry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the primitive has no geometry"))?
+        {
+            Geometry::Segment(segment) => Primitive::Segment {
+                start: point("start", segment.start.as_ref())?,
+                end: point("end", segment.end.as_ref())?,
+                width,
+            },
+            Geometry::Rectangle(rect) => {
+                let radius = rect.corner_radius.as_ref().map_or(0, |r| r.value_nm);
+                anyhow::ensure!(
+                    radius == 0,
+                    "a rounded-rectangle primitive (corner radius {radius} nm) is not supported"
+                );
+                Primitive::Rect {
+                    start: point("top-left", rect.top_left.as_ref())?,
+                    end: point("bottom-right", rect.bottom_right.as_ref())?,
+                    width,
+                    filled,
+                }
+            }
+            Geometry::Circle(circle) => Primitive::Circle {
+                center: point("center", circle.center.as_ref())?,
+                end: point("radius", circle.radius_point.as_ref())?,
+                width,
+                filled,
+            },
+            Geometry::Arc(arc) => Primitive::Arc {
+                start: point("start", arc.start.as_ref())?,
+                mid: point("mid", arc.mid.as_ref())?,
+                end: point("end", arc.end.as_ref())?,
+                width,
+            },
+            Geometry::Polygon(set) => {
+                let [polygon] = set.polygons.as_slice() else {
+                    anyhow::bail!(
+                        "a polygon primitive with {} outlines is not supported",
+                        set.polygons.len()
+                    );
+                };
+                anyhow::ensure!(
+                    polygon.holes.is_empty(),
+                    "a polygon primitive with holes is not supported"
+                );
+                let outline = polygon
+                    .outline
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("the polygon primitive has no outline"))?;
+                let points = outline
+                    .nodes
+                    .iter()
+                    .map(|node| match node.geometry.as_ref() {
+                        Some(kiapi::common::types::poly_line_node::Geometry::Point(p)) => {
+                            Ok((nm_to_mm(p.x_nm), nm_to_mm(p.y_nm)))
+                        }
+                        Some(kiapi::common::types::poly_line_node::Geometry::Arc(_)) => {
+                            anyhow::bail!("a polygon primitive with arc edges is not supported")
+                        }
+                        None => anyhow::bail!("a polygon primitive has an empty node"),
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Primitive::Polygon {
+                    points,
+                    width,
+                    filled,
+                }
+            }
+            Geometry::Bezier(_) => anyhow::bail!("a bezier primitive is not supported"),
+        },
     )
 }
 

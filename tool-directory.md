@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 13 tools
+### `pcb_board` · 14 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -242,7 +242,8 @@ and Windows servers do not.
 | `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
-| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
+| `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. `source: "live"` (default) reads the open board with no file fallback; a value KiCad's answer does not carry (KiCad 10.0.4 omits finish, impedance, edge, layer enabled and dielectric sub-layers) is `null`/`not_reported`, never a default. `source: "saved"` reads the saved `(setup (stackup …))` and nominal `(general (thickness …))`, marked as excluding unsaved editor state. Read-only. |
+| `set_closed_board_stackup` | Set the saved physical stackup of a board KiCad does not hold open (KiCad 10 cannot change a stackup over IPC): a complete ordered stack whose copper must be the enabled copper layers in physical order (not layer-ID order), with finish, impedance control and edge settings. Unrequested saved values — locks, materials, colors, sub-layers — are kept; the nominal board thickness changes only when asked and no ply is adjusted to meet it. Refuses duplicate/malformed clauses and clauses KiCad does not know. Dry run by default; apply needs its revision, re-proves the board closed and unlocked, writes once atomically and reads the bytes back. Only the stackup (and requested nominal-thickness) span changes. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
@@ -261,19 +262,19 @@ and Windows servers do not.
 | `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
 | `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
 | `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
-| `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. |
+| `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. On a closed board a placement may name `layer` (`F.Cu`/`B.Cu`): that footprint is mirrored by the closed-board flip first, then placed; an unsupported footprint or an open board refuses the whole batch. |
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu. On a board open in KiCad 10.0.6+, uses KiCad's native FlipItems IPC command, including the 3D-model transform. Falls back to a revision-aware file edit only when no live KiCad holds the board; an older reachable KiCad returns `unsupported_capability`. The file path refuses unsupported 3D-model geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
-| `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
+| `edit_component` | Update a placed footprint's value via KiCAD IPC, or — with the exact board closed — inspect or edit its saved assembly `attributes` or its Reference field's presentation (`reference_field`: local or board position, text angle, width, height, stroke). Saved edits change only the targeted spans. |
 | `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placed-instance state and pad nets while refreshing supported library-owned content. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
 | `set_placed_footprint_models` | Inspect, append, replace, or remove one exact indexed 3D-model entry on a placed footprint through live KiCad IPC. Mutations require the latest inspection revision, update the complete parent footprint in one undo step, preserve unrelated entries, and return fresh readback. There is no open-board file fallback. |
-| `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. |
+| `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. `detail: "connectivity"` returns only each physical pad's number, net, board-space position, rotation, type, UUID and fabrication property plus the footprint's pose, UUID, layer and library ID; `pad_numbers`/`nets` filter on exact values, keep duplicate pad numbers, and list requested values that matched nothing. |
 | `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
-| `get_component_list` | List all footprints on the board with positions, layers, and values. |
+| `get_component_list` | List footprints with positions, rotations, layers, values, library IDs and UUIDs. `references` limits the answer to exact references and reports unknown and duplicated ones; `source: "saved"` reads the saved file, marked as excluding unsaved editor state (default `live`, no file fallback). |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
@@ -301,7 +302,7 @@ and Windows servers do not.
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `placement` · 5 tools
+### `placement` · 6 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
 **Source:** [`crates/konnect-core/src/tools/placement.rs`](crates/konnect-core/src/tools/placement.rs)
 
@@ -312,6 +313,7 @@ and Windows servers do not.
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | **Deprecated:** diagnostic planning only. It can return a deterministic net-clustered starting plan and before/after scores, but autonomous whole-board mutation is retired. `dry_run: false` returns structured `plan_blocked` without writing; apply bounded, explicit `move_component` operations instead. |
 | `refine_placement_force_directed` | **Deprecated:** diagnostic deterministic spring embedder, not a recommended bulk-placement workflow. Dry-run reports applicability and displacement; non-converged, non-improving (including score ties), hard-fail, off-board, unbounded, or over-limit plans cannot apply. A board outline that is not provably rectangular is refused with `plan_blocked` before any plan is made. Use explicit moves for justified score-neutral changes. |
+| `set_reference_field_presentations` | Set many placed footprints' Reference-field position, angle, width, height and stroke in one atomic write to a closed board's saved file. Only each field's `(at …)`, `(size …)` and `(thickness …)` change; UUID, text, layer, mirror, visibility, pads, nets and models stay byte for byte. One unknown, duplicate or malformed member refuses the whole batch. Dry run by default; apply needs its revision and re-proves the board closed and unlocked. |
 
 ---
 

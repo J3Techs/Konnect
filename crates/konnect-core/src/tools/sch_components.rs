@@ -88,6 +88,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "in_bom": { "type": "boolean", "description": "Include this component in the BOM, consistently on every placed unit. Independent of on_board and DNP; no pins, wires, identity or other flags change." },
                     "fields": {
                         "type": "object",
                         "additionalProperties": true,
@@ -1422,6 +1423,9 @@ fn component_mutation_readback_from_schematic(
             "field_placements": field_placements,
             "instance_paths": instance_paths,
             "instance_references": instance_references
+            ,"in_bom": symbol.in_bom,
+            "on_board": symbol.on_board,
+            "dnp": symbol.dnp
         }));
     }
     let anchor = observed[0];
@@ -1443,6 +1447,9 @@ fn component_mutation_readback_from_schematic(
         "unit_count": units.len(),
         "units": units,
         "fields": fields
+        ,"in_bom": anchor.in_bom,
+        "on_board": anchor.on_board,
+        "dnp": anchor.dnp
     }))
 }
 
@@ -1459,6 +1466,7 @@ struct ComponentMutationIntent {
     target: ComponentTarget,
     field_placements: Vec<(String, FieldPlacement)>,
     placement_unit: Option<u32>,
+    in_bom: Option<bool>,
 }
 
 impl ComponentMutationIntent {
@@ -1467,6 +1475,7 @@ impl ComponentMutationIntent {
             target,
             field_placements: Vec::new(),
             placement_unit: None,
+            in_bom: None,
         }
     }
 
@@ -1520,9 +1529,34 @@ fn verify_component_mutation_intents(
     for intent in intents {
         let observed = verified_component_readback(path, schematic, &intent.target)?;
         verify_requested_field_placements(path, &observed, intent, phase)?;
+        verify_requested_bom(path, &observed, intent.in_bom, phase)?;
         observations.push(observed);
     }
     Ok(observations)
+}
+
+fn verify_requested_bom(
+    path: &std::path::Path,
+    observed: &serde_json::Value,
+    requested: Option<bool>,
+    phase: &str,
+) -> Result<(), CallToolResult> {
+    if let Some(expected) = requested {
+        let units = observed["units"].as_array();
+        if units.is_none_or(|units| {
+            units.is_empty()
+                || units
+                    .iter()
+                    .any(|unit| unit["in_bom"].as_bool() != Some(expected))
+        }) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("{phase}: not every placed unit retained requested in_bom={expected}"),
+            )
+            .into_result());
+        }
+    }
+    Ok(())
 }
 
 fn tool_error_summary(error: &CallToolResult) -> String {
@@ -1660,6 +1694,9 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "unit_count",
         "units",
         "fields",
+        "in_bom",
+        "on_board",
+        "dnp",
     ] {
         result[key] = observed[key].clone();
     }
@@ -2351,6 +2388,52 @@ fn property_insert_edit(
 /// Custom fields may be present on only some units in a legacy/broken sheet;
 /// `add_missing=true` updates those copies and fills the missing ones in the
 /// same atomic document command.
+/// Edit only the placed units' BOM clauses, preserving all other source bytes.
+/// The caller binds the reference to unique UUIDs and commits through the
+/// existing verified schematic command path.
+fn set_component_bom_flag(content: &str, reference: &str, include: bool) -> Result<String, String> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(format!("component '{reference}' not found"));
+    }
+    let desired = if include { "yes" } else { "no" };
+    let mut edits = Vec::new();
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        let flags = find_direct_child_blocks(block, "symbol")
+            .into_iter()
+            .filter(|(a, b)| {
+                parse_sexp(&block[*a..*b]).is_ok_and(|node| node.head() == Some("in_bom"))
+            })
+            .collect::<Vec<_>>();
+        match flags.as_slice() {
+            [(a, b)] => {
+                let node = parse_sexp(&block[*a..*b]).map_err(|e| e.to_string())?;
+                let value = node.get(1).and_then(|n| n.as_str());
+                if !matches!(value, Some("yes" | "no")) {
+                    return Err(format!("{reference} has an unreadable in_bom clause"));
+                }
+                if value != Some(desired) {
+                    edits.push(SexpEdit::replace(
+                        start + a,
+                        start + b,
+                        format!("(in_bom {desired})"),
+                    ));
+                }
+            }
+            [] => {
+                let eol = if block.contains("\r\n") { "\r\n" } else { "\n" };
+                edits.push(SexpEdit::insert(
+                    end - 1,
+                    format!("{eol}\t\t(in_bom {desired}){eol}\t"),
+                ));
+            }
+            _ => return Err(format!("{reference} has duplicate in_bom clauses")),
+        }
+    }
+    Ok(apply_edits(content.to_string(), edits))
+}
+
 pub(crate) fn set_property_value(
     content: &str,
     reference: &str,
@@ -2707,6 +2790,17 @@ async fn handle_edit_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let requested_bom = match args.get("in_bom") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_bool() {
+            Some(value) => Some(value),
+            None => {
+                return Ok(CallToolResult::error(
+                    "in_bom must be true or false".to_string(),
+                ))
+            }
+        },
+    };
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
@@ -2774,6 +2868,17 @@ async fn handle_edit_schematic_component(
     }
     if let Some(ds) = opt_str(args, "datasheet") {
         apply!("Datasheet", ds);
+    }
+
+    if let Some(include) = requested_bom {
+        let updated = match set_component_bom_flag(&content, edit_reference, include) {
+            Ok(updated) => updated,
+            Err(error) => return Ok(CallToolResult::error(error)),
+        };
+        if updated != content {
+            changed.push(format!("in_bom -> {include} (all placed units)"));
+        }
+        content = updated;
     }
 
     // `fields` has been in this tool's schema since it shipped and the handler
@@ -2925,8 +3030,9 @@ async fn handle_edit_schematic_component(
         )));
     }
 
-    let intent = ComponentMutationIntent::new(target.with_fields(&expected_fields))
+    let mut intent = ComponentMutationIntent::new(target.with_fields(&expected_fields))
         .with_field_placements(applied_placements, placement_unit);
+    intent.in_bom = requested_bom;
     let observed = if !changed.is_empty() {
         let item_ids = match target.item_ids() {
             Ok(item_ids) => item_ids,
@@ -2955,6 +3061,10 @@ async fn handle_edit_schematic_component(
         }
     };
 
+    if let Err(error) = verify_requested_bom(&sch_path, &observed, requested_bom, "saved readback")
+    {
+        return Ok(error);
+    }
     let mut result = json!({
         "reference": observed["reference"],
         "changes": changed
@@ -3020,6 +3130,9 @@ async fn handle_get_schematic_component(
                 "mirror_x": unit_mirror.contains('x'),
                 "mirror_y": unit_mirror.contains('y'),
                 "uuid": symbol.uuid
+                ,"in_bom": symbol.in_bom,
+                "on_board": symbol.on_board,
+                "dnp": symbol.dnp
             })
         })
         .collect();
@@ -3037,6 +3150,9 @@ async fn handle_get_schematic_component(
         "unit_count": units.len(),
         "units": units,
         "properties": symbol_properties(anchor)
+        ,"in_bom": anchor.in_bom,
+        "on_board": anchor.on_board,
+        "dnp": anchor.dnp
     })))
 }
 
@@ -3065,6 +3181,9 @@ async fn handle_list_schematic_components(
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
                 "properties": symbol_properties(sym)
+                ,"in_bom": sym.in_bom,
+                "on_board": sym.on_board,
+                "dnp": sym.dnp
             })
         })
         .collect();
@@ -6888,6 +7007,91 @@ mod component_delete_connectivity_tests {
 
 #[cfg(test)]
 mod multi_unit_component_tests {
+    #[tokio::test]
+    async fn bom_flag_edit_updates_every_unit_and_preserves_other_items() {
+        let (_tmp, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let original = cse::Schematic::load(&path).unwrap();
+        let args = json!({"schematic":path,"reference":"U1","in_bom":false});
+        let result = handle_edit_schematic_component(&args, &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let observed = cse::Schematic::load(&path).unwrap();
+        let changed = observed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+            .collect::<Vec<_>>();
+        assert_eq!(changed.len(), 2);
+        assert!(changed.iter().all(|symbol| !symbol.in_bom));
+        for symbol in &observed.symbols {
+            let old = original
+                .symbols
+                .iter()
+                .find(|old| old.uuid == symbol.uuid)
+                .unwrap();
+            assert_eq!(symbol.on_board, old.on_board);
+            assert_eq!(symbol.dnp, old.dnp);
+            assert_eq!(symbol.position(), old.position());
+        }
+        for (start, end) in find_direct_child_blocks(&before, "kicad_sch") {
+            let node = parse_sexp(&before[start..end]).unwrap();
+            if node.head() != Some("symbol") {
+                assert!(after.contains(&before[start..end]));
+            }
+        }
+        let getter =
+            handle_get_schematic_component(&json!({"schematic":path,"reference":"U1"}), &context())
+                .await
+                .unwrap();
+        let ToolContent::Text { text } = &getter.content[0] else {
+            panic!()
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["in_bom"], false);
+        assert!(body["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unit| unit["in_bom"] == false));
+        assert!(
+            !handle_edit_schematic_component(&args, &context())
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after,
+            "repeating the flag is a byte-exact no-op"
+        );
+        let bad = handle_edit_schematic_component(
+            &json!({"schematic":path,"reference":"U1","in_bom":"no","value":"must-not-change"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(bad.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        let target = component_target_from_source(&path, &after, "U1").unwrap();
+        let mut intent = ComponentMutationIntent::new(target);
+        intent.in_bom = Some(true);
+        assert!(verify_component_mutation_intents(
+            &path,
+            &observed,
+            &[intent],
+            "deliberate flag drift"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bom_flag_helper_refuses_duplicate_clauses() {
+        let source = SCHEMATIC.replace("(unit 1)", "(unit 1) (in_bom yes) (in_bom no)");
+        assert!(set_component_bom_flag(&source, "U1", false).is_err());
+    }
     use super::*;
     use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
     use crate::tools::ServerConfig;
