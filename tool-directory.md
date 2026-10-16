@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **235 registered tools** + **7 always-visible meta-tools** = **242 total**
+- **236 registered tools** + **7 always-visible meta-tools** = **243 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -281,7 +281,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 17 tools
+### `pcb_routing` · 18 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -303,6 +303,7 @@ and Windows servers do not.
 | `assign_net_to_class` | Assign a net (`net_name`) or many (`net_names`, one write) to an existing netclass via `netclass_patterns` entries in the `.kicad_pro`; reassigning moves the entry. |
 | `add_routing` | Add many tracks and through vias to the open board in one `CreateItems` (one undo step), inline or from `routing_file`. Every member is validated and every net resolved in one `GetNets` before anything is sent; `locked` creates the copper locked so later bulk edits and the autorouter leave it alone. |
 | `delete_routing` | Delete tracks, arcs and vias from the open board by area, nets and kind; locked items kept unless `include_locked`. Dry run by default; apply needs `expected_count` from that dry run and refuses if the selection changed. One undo step; footprints, pads and zones are never touched. |
+| `delete_zones` | Delete zones from the open board by name, net and layer; locked zones kept unless `include_locked`. Dry run by default listing name, net, layers, priority and outline size; apply needs `expected_count`, deletes in one undo step and proves the zones gone. Replacing a zone is `delete_zones` then `add_zone`. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
 ### `placement` · 6 tools
