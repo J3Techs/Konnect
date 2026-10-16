@@ -1040,6 +1040,7 @@ mod tests {
                 layer: "F.Cu",
                 net_name: &net.name,
                 points: &points,
+                holes: &[],
                 clearance_mm: 0.3,
                 min_thickness_mm: 0.25,
                 name: "issue408-live-refill",

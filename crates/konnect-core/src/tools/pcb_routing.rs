@@ -315,6 +315,19 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
         ),
         tool!(
+            "add_routing",
+            "Add many copper tracks and through vias to the board KiCad holds open, in one \
+             CreateItems (one undo step). Items come inline (tracks/vias) or from \
+             'routing_file', a JSON object with the same keys. Every member is validated and \
+             every net name resolved in one GetNets before anything is sent; one bad member or \
+             unknown net refuses the whole batch. 'locked' creates every item locked, so later \
+             bulk edits and the autorouter leave it alone. Vias are through vias (F.Cu to \
+             B.Cu). Run run_drc afterwards: KiCad, not this tool, checks clearances.",
+            super::routing_batch::schema(),
+            |args, ctx| async move { handle_add_routing(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "route_differential_pair",
             "Route a differential pair (two parallel traces with a specified gap).",
             json!({
@@ -556,6 +569,72 @@ fn get_live_pad(
         .find(|p| p.number == pad)
         .map(|p| (p.x, p.y))
         .ok_or_else(|| format!("Pad '{pad}' not found on '{reference}'")))
+}
+
+async fn handle_add_routing(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use super::routing_batch;
+    let file = match args.get("routing_file").and_then(serde_json::Value::as_str) {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()))
+        {
+            Ok(v) => Some(v),
+            Err(reason) => {
+                return Ok(crate::tools::invalid_arg(
+                    "routing_file",
+                    &format!("cannot be read as JSON: {reason}"),
+                ))
+            }
+        },
+    };
+    let batch = match routing_batch::parse(args, file.as_ref()) {
+        Ok(b) => b,
+        Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
+    };
+    let summary = batch.summary();
+    let created = ipc!(ctx, args, |c, document| {
+        let codes: BTreeMap<String, i32> = c
+            .get_nets_in(document.clone())?
+            .into_iter()
+            .map(|n| (n.name, n.netcode))
+            .collect();
+        match batch.items(&codes) {
+            Err(missing) => Ok(Err(missing)),
+            Ok(items) => {
+                let n = items.len();
+                c.create_items_in(document, items)?;
+                Ok(Ok(n))
+            }
+        }
+    });
+    match created {
+        Err(missing) => Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "net".to_string(),
+                reason: format!(
+                    "{} net(s) not on the board: {}",
+                    missing.len(),
+                    missing.join(", ")
+                ),
+            },
+            format!(
+                "Nothing was created: {} net name(s) are not on the board open in KiCad: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+        )),
+        Ok(count) => {
+            let mut body = summary;
+            body["created"] = json!(count);
+            body["source"] = json!("ipc");
+            body["next"] = json!("Run run_drc to check clearances against the board's rules.");
+            Ok(CallToolResult::json(&body))
+        }
+    }
 }
 
 async fn handle_add_via(

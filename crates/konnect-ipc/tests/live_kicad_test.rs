@@ -913,6 +913,7 @@ fn adding_a_zone_creates_it_on_the_live_board() {
             layer: "B.Cu",
             net_name: &net.name,
             points: &points,
+            holes: &[],
             clearance_mm: 0.3,
             min_thickness_mm: 0.25,
             name,

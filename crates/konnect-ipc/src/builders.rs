@@ -326,6 +326,8 @@ pub struct ZoneSpec<'a> {
     pub net_name: &'a str,
     /// Outline vertices in mm. The loop is closed for you.
     pub points: &'a [(f64, f64)],
+    /// Holes cut out of the outline, each a closed loop of vertices in mm.
+    pub holes: &'a [Vec<(f64, f64)>],
     pub clearance_mm: f64,
     pub min_thickness_mm: f64,
     /// Zone name as shown in pcbnew's zone properties; empty leaves it unnamed.
@@ -350,21 +352,21 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         ZoneFillMode, ZoneType,
     };
 
+    let ring = |points: &[(f64, f64)]| kiapi::common::types::PolyLine {
+        nodes: points
+            .iter()
+            .map(|&(x, y)| kiapi::common::types::PolyLineNode {
+                geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(vec2(
+                    x, y,
+                ))),
+            })
+            .collect(),
+        closed: true,
+    };
     let outline = kiapi::common::types::PolySet {
         polygons: vec![kiapi::common::types::PolygonWithHoles {
-            outline: Some(kiapi::common::types::PolyLine {
-                nodes: spec
-                    .points
-                    .iter()
-                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
-                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
-                            vec2(x, y),
-                        )),
-                    })
-                    .collect(),
-                closed: true,
-            }),
-            holes: vec![],
+            outline: Some(ring(spec.points)),
+            holes: spec.holes.iter().map(|hole| ring(hole)).collect(),
         }],
     };
 
@@ -961,6 +963,7 @@ pub(crate) mod tests {
                 layer: "In1.Cu",
                 net_name: "GND",
                 points: &points,
+                holes: &[],
                 clearance_mm: 0.3,
                 min_thickness_mm: 0.25,
                 name: "ground pour",
@@ -1034,6 +1037,7 @@ pub(crate) mod tests {
                 layer: "F.Cu",
                 net_name: "GND",
                 points: &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                holes: &[],
                 clearance_mm: 0.2,
                 min_thickness_mm: 0.2,
                 name: "",
@@ -1044,6 +1048,32 @@ pub(crate) mod tests {
         );
         assert!(!zone.filled);
         assert!(zone.filled_polygons.is_empty());
+    }
+
+    #[test]
+    fn build_zone_carries_every_hole_inside_the_outline() {
+        let holes = vec![
+            vec![(1.0, 1.0), (2.0, 1.0), (2.0, 2.0)],
+            vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 6.0)],
+        ];
+        let zone = build_zone(
+            &ZoneSpec {
+                layer: "In1.Cu",
+                net_name: "GND",
+                points: &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                holes: &holes,
+                clearance_mm: 0.2,
+                min_thickness_mm: 0.2,
+                name: "",
+                priority: 0,
+                connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+            },
+            1,
+        );
+        let polygon = &zone.outline.as_ref().unwrap().polygons[0];
+        assert_eq!(polygon.holes.len(), 2);
+        assert_eq!(polygon.holes[1].nodes.len(), 4);
+        assert!(polygon.holes.iter().all(|h| h.closed));
     }
 
     /// `BL_UNDEFINED` is not something KiCad rejects, it is something it
@@ -1057,6 +1087,7 @@ pub(crate) mod tests {
                     layer,
                     net_name: "GND",
                     points: &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                    holes: &[],
                     clearance_mm: 0.2,
                     min_thickness_mm: 0.2,
                     name: "",

@@ -522,6 +522,15 @@ pub(crate) fn zone_schema() -> serde_json::Value {
                 "description": "Polygon vertices as [{x, y}], in mm",
                 "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
             },
+            "holes": {
+                "type": "array",
+                "description": "Cut-outs inside the outline, each an array of at least 3 {x, y} vertices in mm. Needs a live KiCad: the file fallback refuses holes",
+                "items": {
+                    "type": "array",
+                    "minItems": 3,
+                    "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] }
+                }
+            },
             "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM },
             "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM },
             "name":       { "type": "string", "description": "Optional zone name, as shown in pcbnew's zone properties" },
@@ -2562,12 +2571,41 @@ pub(crate) async fn add_zone_impl(
     if points.len() < 3 {
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
+    let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
+    if let Some(items) = args.get("holes").filter(|v| !v.is_null()) {
+        let Some(items) = items.as_array() else {
+            return Ok(crate::tools::invalid_arg(
+                "holes",
+                "must be an array of vertex arrays",
+            ));
+        };
+        for (index, hole) in items.iter().enumerate() {
+            let vertices: Option<Vec<(f64, f64)>> = hole.as_array().map(|pts| {
+                pts.iter()
+                    .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .collect()
+            });
+            match vertices {
+                Some(v) if v.len() >= 3 && v.len() == hole.as_array().map_or(0, Vec::len) => {
+                    holes.push(v)
+                }
+                _ => {
+                    return Ok(crate::tools::invalid_arg(
+                        &format!("holes[{index}]"),
+                        "must hold at least 3 {x, y} vertices with finite numbers",
+                    ))
+                }
+            }
+        }
+    }
 
     let describe = || {
         json!({
             "net": net_name,
             "layer": layer,
             "point_count": points.len(),
+            "hole_count": holes.len(),
             "name": zone_name,
             "priority": priority,
             "pad_connection": connection.as_str(),
@@ -2578,11 +2616,13 @@ pub(crate) async fn add_zone_impl(
     let layer_ipc = layer.clone();
     let name_ipc = zone_name.clone();
     let points_ipc = points.clone();
+    let holes_ipc = holes.clone();
     let ipc_attempt = attempt_ipc_write(ctx, &board_path, "zone", move |c| {
         c.add_zone(&konnect_ipc::builders::ZoneSpec {
             layer: &layer_ipc,
             net_name: &net_ipc,
             points: &points_ipc,
+            holes: &holes_ipc,
             clearance_mm: clearance,
             min_thickness_mm: min_width,
             name: &name_ipc,
@@ -2605,6 +2645,12 @@ pub(crate) async fn add_zone_impl(
         }
         BoardWrite::File(reason) => reason,
     };
+    if !holes.is_empty() {
+        return Ok(CallToolResult::error(
+            "A zone with holes needs KiCad running with this board open: the file fallback \
+             cannot write cut-outs, so nothing was written. Open the board and retry.",
+        ));
+    }
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
@@ -5043,6 +5089,37 @@ mod zone_net_format_tests {
             "{warning}"
         );
         assert!(warning.contains("crashed or was force-quit"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn holes_need_a_live_kicad_and_the_file_is_left_alone() {
+        let holes =
+            json!({ "holes": [[{ "x": 1, "y": 1 }, { "x": 2, "y": 1 }, { "x": 2, "y": 2 }]] });
+        let (result, after) = zone_with(KICAD_10, holes).await;
+        assert!(
+            result.is_error,
+            "a file fallback must not drop the holes silently"
+        );
+        assert!(
+            text_of(&result).contains("cannot write cut-outs"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(after, KICAD_10, "nothing may be written");
+    }
+
+    #[tokio::test]
+    async fn malformed_holes_are_refused_by_index() {
+        for bad in [
+            json!({ "holes": [[{ "x": 1, "y": 1 }, { "x": 2, "y": 1 }]] }),
+            json!({ "holes": [[{ "x": 1, "y": 1 }, { "x": 2 }, { "x": 2, "y": 2 }]] }),
+            json!({ "holes": "square" }),
+        ] {
+            let (result, after) = zone_with(KICAD_10, bad.clone()).await;
+            assert!(result.is_error, "{bad} was accepted");
+            assert!(text_of(&result).contains("holes"), "{}", text_of(&result));
+            assert_eq!(after, KICAD_10);
+        }
     }
 
     #[tokio::test]
