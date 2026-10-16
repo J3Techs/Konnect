@@ -30,6 +30,10 @@ pub struct McpHandler {
     /// to receive the same notifications. Without this, notifications are
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
+    /// Raw-JSON-line sinks for progress notifications, which a transport must
+    /// write while the call that sends them is still running (a long
+    /// Freerouting job), not after it returns like `notif_sinks`.
+    progress_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
     /// Meta-tools bypass the domain router, so their advertised schemas are
     /// compiled here once and enforced at the same dispatch boundary.
@@ -105,6 +109,7 @@ impl McpHandler {
             reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
+            progress_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
             meta_input_validators: Arc::new(meta_input_validators),
         })
@@ -145,6 +150,13 @@ impl McpHandler {
     /// JSON-RPC string, which the transport writes to its output stream.
     pub async fn register_notification_sink(&self, tx: mpsc::Sender<String>) {
         self.notif_sinks.write().await.push(tx);
+    }
+
+    /// Register a raw-JSON-line sink for progress notifications. Unlike
+    /// `register_notification_sink`, the transport must write these as they
+    /// arrive, while the request that sends them is still being handled.
+    pub async fn register_progress_sink(&self, tx: mpsc::Sender<String>) {
+        self.progress_sinks.write().await.push(tx);
     }
 
     /// Process one JSON-RPC message and return an optional response.
@@ -285,7 +297,20 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let reporter = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("progressToken"))
+            .filter(|token| token.is_string() || token.is_number())
+            .map(|token| {
+                super::progress::Reporter::new(
+                    token.clone(),
+                    self.sse_senders.clone(),
+                    self.progress_sinks.clone(),
+                )
+            });
+        let (result, status, error_kind) =
+            super::progress::scope(reporter, self.dispatch_tool(&params.name, &args)).await;
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);

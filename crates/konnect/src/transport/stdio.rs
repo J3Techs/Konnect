@@ -1,8 +1,9 @@
 use anyhow::Result;
 use konnect_core::mcp::{handler::McpHandler, protocol::*};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info};
 
 pub enum StdioExit {
@@ -17,10 +18,26 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     info!("Starting STDIO transport");
 
     let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut reader = BufReader::new(stdin);
-    let mut stdout = stdout;
     let mut line = String::new();
+
+    // Progress notifications are written as they arrive, from their own task,
+    // while the call that sends them is still running; requests themselves
+    // are still handled one at a time below. stdout is shared under a lock so
+    // a progress line never interleaves with a response.
+    let (progress_tx, mut progress_rx) = mpsc::channel::<String>(64);
+    handler.register_progress_sink(progress_tx).await;
+    let progress_out = stdout.clone();
+    tokio::spawn(async move {
+        while let Some(mut json) = progress_rx.recv().await {
+            json.push('\n');
+            let mut out = progress_out.lock().await;
+            if out.write_all(json.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+    });
 
     // Server-initiated notifications (e.g. tools/list_changed after
     // load_toolset / unload_toolset) are queued here by the handler and
@@ -69,6 +86,7 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
             let mut json = serde_json::to_string(&resp)?;
             json.push('\n');
             debug!("STDIO send: {}", json.trim());
+            let mut stdout = stdout.lock().await;
             stdout.write_all(json.as_bytes()).await?;
             stdout.flush().await?;
         }
@@ -79,6 +97,7 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
             let mut json = notif;
             json.push('\n');
             debug!("STDIO send notification: {}", json.trim());
+            let mut stdout = stdout.lock().await;
             stdout.write_all(json.as_bytes()).await?;
             stdout.flush().await?;
         }

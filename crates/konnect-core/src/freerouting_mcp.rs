@@ -358,6 +358,18 @@ async fn run_state_machine(
             .await?;
         poll_count = poll_count.saturating_add(1);
         let state = required_string(&details, &["state", "status"], "job state")?;
+        // Keep the client's idle timer from abandoning a long job, and say
+        // what the router reports about it.
+        crate::mcp::progress::report(
+            f64::from(poll_count),
+            None,
+            &format!(
+                "Freerouting job {job_id}: {state} after {:.0} s{}",
+                started.elapsed().as_secs_f64(),
+                job_progress_summary(&details)
+            ),
+        )
+        .await;
         match state.to_ascii_uppercase().as_str() {
             "COMPLETED" => break "COMPLETED".to_string(),
             "FAILED" | "CANCELLED" | "CANCELED" => {
@@ -383,6 +395,37 @@ async fn run_state_machine(
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
     })
+}
+
+/// The numeric and short text fields of a job-details answer, for a
+/// progress message (Freerouting reports pass numbers, counts and scores).
+fn job_progress_summary(details: &Value) -> String {
+    let mut parts = Vec::new();
+    let mut collect = |object: &serde_json::Map<String, Value>, prefix: &str| {
+        for (key, value) in object {
+            if key == "state" || key == "status" || parts.len() >= 8 {
+                continue;
+            }
+            match value {
+                Value::Number(n) => parts.push(format!("{prefix}{key}={n}")),
+                Value::String(s) if s.len() <= 40 => parts.push(format!("{prefix}{key}={s}")),
+                _ => {}
+            }
+        }
+    };
+    if let Some(object) = details.as_object() {
+        collect(object, "");
+        for (key, value) in object {
+            if let Some(inner) = value.as_object() {
+                collect(inner, &format!("{key}."));
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 fn validate_tool_contracts(tools: &BTreeMap<String, Value>) -> Result<()> {

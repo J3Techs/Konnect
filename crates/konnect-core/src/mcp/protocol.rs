@@ -139,6 +139,9 @@ pub struct CallToolParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Option<Value>,
+    /// Request metadata; `progressToken` asks for `notifications/progress`.
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// tools/call response
