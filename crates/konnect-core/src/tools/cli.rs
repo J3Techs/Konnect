@@ -281,6 +281,19 @@ pub struct DrcReport {
     /// category at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schematic_parity_diagnostic: Option<String>,
+    /// What kicad-cli itself printed while running DRC, one entry per
+    /// non-empty line. A custom-rules file KiCad cannot parse is only ever
+    /// reported here: DRC then runs without any of its rules and the JSON
+    /// report looks normal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cli_messages: Vec<String>,
+    /// Set when the board's custom rules did not load (see [`RulesCheck`]),
+    /// so this DRC ran without any of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_rules_error: Option<String>,
+    /// The custom-rules check for this run; absent when the board has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_rules: Option<RulesCheck>,
 }
 
 impl DrcReport {
@@ -996,6 +1009,83 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
     })
 }
 
+// ─── Custom rules: proving KiCad loads them ──────────────────────────────────
+
+/// A one-track board for rules checks: DRC on it takes about a second.
+const RULES_PROBE_BOARD: &str = include_str!("rules_probe_board.kicad_pcb");
+/// A rule that must fire on the probe board's 0.2 mm track.
+const RULES_CANARY: &str = "konnect_rules_canary";
+
+/// Whether KiCad loaded a board's custom rules.
+///
+/// KiCad parses a .kicad_dru all or nothing. When one rule fails to parse,
+/// kicad-cli prints nothing about it and runs DRC with no custom rule at all,
+/// so a report can look normal while every exception and every tightened
+/// limit is gone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RulesCheck {
+    pub loaded: bool,
+    /// When not loaded: the rules that fail even alone.
+    pub broken_rules: Vec<String>,
+}
+
+/// Run DRC on the probe board with `rules_text` plus a canary rule appended;
+/// the canary's violation appears exactly when KiCad loaded the file.
+async fn rules_text_loads(cli: &str, rules_text: &str) -> Result<bool> {
+    let dir = tempfile::tempdir().context("temporary directory for the rules check")?;
+    let board = dir.path().join("rules_probe.kicad_pcb");
+    tokio::fs::write(&board, RULES_PROBE_BOARD).await?;
+    let text = format!(
+        "{}\n\n(rule \"{RULES_CANARY}\"\n  (constraint track_width (min 50mm)))\n",
+        rules_text.trim_end()
+    );
+    tokio::fs::write(board.with_extension("kicad_dru"), text).await?;
+    let out_path = board.with_extension("drc.json");
+    let args = vec![
+        "pcb",
+        "drc",
+        "--output",
+        out_path.to_str().context("temporary path is not UTF-8")?,
+        "--format",
+        "json",
+        board.to_str().context("temporary path is not UTF-8")?,
+    ];
+    run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
+    let report = tokio::fs::read_to_string(&out_path)
+        .await
+        .context("rules check: DRC output file not found")?;
+    Ok(report.contains(RULES_CANARY))
+}
+
+/// Check the custom rules beside `pcb`; `None` when the board has none.
+pub async fn check_rules_file(cli: &str, pcb: &Path) -> Result<Option<RulesCheck>> {
+    let path = pcb.with_extension("kicad_dru");
+    let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        return Ok(None);
+    };
+    check_rules_text(cli, &content).await.map(Some)
+}
+
+/// Check rules text; when it does not load, name each rule that fails alone.
+pub async fn check_rules_text(cli: &str, content: &str) -> Result<RulesCheck> {
+    if rules_text_loads(cli, content).await? {
+        return Ok(RulesCheck {
+            loaded: true,
+            broken_rules: Vec::new(),
+        });
+    }
+    let mut broken_rules = Vec::new();
+    for (name, text) in super::custom_rules::rules_in(content) {
+        if !rules_text_loads(cli, &format!("(version 1)\n{text}")).await? {
+            broken_rules.push(name);
+        }
+    }
+    Ok(RulesCheck {
+        loaded: false,
+        broken_rules,
+    })
+}
+
 // ─── DRC ─────────────────────────────────────────────────────────────────────
 
 /// Run DRC on a PCB and return parsed violations.
@@ -1018,6 +1108,28 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
 
     let mut report = parse_drc_report(&raw)?;
     apply_parity_evidence(&mut report, &output.stderr, pcb);
+    apply_cli_messages(&mut report, &output.stdout, &output.stderr);
+    match check_rules_file(cli, pcb).await {
+        Ok(Some(check)) => {
+            if !check.loaded {
+                report.custom_rules_error = Some(format!(
+                    "KiCad did not load {}, so this DRC ran without any custom rule. Rules that fail alone: {}",
+                    pcb.with_extension("kicad_dru").display(),
+                    if check.broken_rules.is_empty() {
+                        "none (the file itself is malformed)".to_string()
+                    } else {
+                        check.broken_rules.join(", ")
+                    }
+                ));
+            }
+            report.custom_rules = Some(check);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            report.custom_rules_error =
+                Some(format!("could not check the custom rules: {error:#}"));
+        }
+    }
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
     // here — the one path `run_drc` and `get_drc_violations` share — so the two
@@ -1092,6 +1204,17 @@ fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
 ///
 /// A **non-empty** array is KiCad's evidence and is kept whatever stderr or
 /// the filesystem say: findings cannot be un-found by a lookup failing.
+/// Keep kicad-cli's own lines with the report.
+fn apply_cli_messages(report: &mut DrcReport, stdout: &str, stderr: &str) {
+    report.cli_messages = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+}
+
 fn apply_parity_evidence(report: &mut DrcReport, stderr: &str, pcb: &Path) {
     let Some(parity) = report.schematic_parity.as_ref() else {
         return;
@@ -1173,6 +1296,9 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
     }
 
     Ok(DrcReport {
+        cli_messages: Vec::new(),
+        custom_rules_error: None,
+        custom_rules: None,
         // A report without this key is not a DRC report. Defaulting it to an
         // empty list would render as a clean board, which is the failure mode
         // this whole change exists to remove.
@@ -3687,6 +3813,100 @@ mod drc_ownership_tests {
     /// ignored like the other live tests:
     ///
     ///     cargo test -p konnect-core --lib drc_ownership -- --ignored --nocapture
+    /// A rules file KiCad cannot parse is dropped whole while DRC carries on;
+    /// run_drc must say so instead of returning a report that merely looks
+    /// normal. Live, like its neighbours:
+    ///
+    ///     cargo test -p konnect-core --lib unparseable_custom_rules -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli on PATH"]
+    async fn unparseable_custom_rules_are_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("rules_probe.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        std::fs::write(
+            board.with_extension("kicad_dru"),
+            "(version 1)\n(rule \"broken\"\n  (constraint no_such_constraint (min 1mm)))\n",
+        )
+        .unwrap();
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let report = run_drc(&cli, &board, false)
+            .await
+            .expect("kicad-cli pcb drc");
+        println!("cli_messages: {:#?}", report.cli_messages);
+        assert!(
+            report.custom_rules_error.is_some(),
+            "an unparseable rules file must be reported; kicad-cli said {:?}",
+            report.cli_messages
+        );
+    }
+
+    /// Print what kicad-cli says about each candidate rule text in
+    /// KONNECT_RULE_PROBES (separated by `;;`), each written alone beside the
+    /// fixture board. Development aid for new constraint syntax.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli and KONNECT_RULE_PROBES"]
+    async fn track_angle_measures_the_interior_angle() {
+        // A 90 degree corner (interior 90) and a 45 degree bend (interior
+        // 135) under `track_angle (min 100)`: an interior-angle convention
+        // flags only the corner, a turn-angle convention flags both.
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("angles.kicad_pcb");
+        let segment = |x1: f64, y1: f64, x2: f64, y2: f64, id: u32| {
+            format!(
+                "\t(segment (start {x1} {y1}) (end {x2} {y2}) (width 0.2) (layer \"F.Cu\") (net \"N\") (uuid \"d0000000-0000-4000-8000-{id:012}\"))\n"
+            )
+        };
+        let tracks = [
+            segment(1.0, 1.0, 4.0, 1.0, 1),
+            segment(4.0, 1.0, 4.0, 3.0, 2),
+            segment(1.0, 7.0, 4.0, 7.0, 3),
+            segment(4.0, 7.0, 6.0, 9.0, 4),
+        ]
+        .concat();
+        let source = RULES_PROBE_BOARD.replacen("\t(segment", &format!("{tracks}\t(segment"), 1);
+        std::fs::write(&board, source).unwrap();
+        std::fs::write(
+            board.with_extension("kicad_dru"),
+            "(version 1)\n(rule \"angle\"\n  (constraint track_angle (min 100)))\n",
+        )
+        .unwrap();
+        let report = run_drc(&cli, &board, false)
+            .await
+            .expect("kicad-cli pcb drc");
+        let flagged: Vec<_> = report
+            .all()
+            .filter(|v| v.rule == "track_angle")
+            .map(|v| v.description.clone())
+            .collect();
+        println!("{flagged:#?}");
+        assert_eq!(report.custom_rules.as_ref().map(|c| c.loaded), Some(true));
+        // KiCad reports a failing joint once per segment; the 45 degree bend
+        // (interior 135) passes min 100, so every hit is the 90 degree corner.
+        assert!(!flagged.is_empty(), "the 90 degree corner breaks min 100");
+        assert!(
+            flagged.iter().all(|d| d.contains("actual 90.000")),
+            "only the corner may be flagged: {flagged:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli and KONNECT_RULE_PROBES"]
+    async fn probe_rule_texts() {
+        let probes = std::env::var("KONNECT_RULE_PROBES").expect("set KONNECT_RULE_PROBES");
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        for (index, rule) in probes.split(";;").enumerate() {
+            let check = check_rules_text(&cli, &format!("(version 1)\n{rule}"))
+                .await
+                .unwrap();
+            println!(
+                "probe {index}: loaded={} broken={:?}  {rule}",
+                check.loaded, check.broken_rules
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs a real kicad-cli on PATH"]
     async fn run_drc_enriches_items_from_the_board_it_ran_on() {

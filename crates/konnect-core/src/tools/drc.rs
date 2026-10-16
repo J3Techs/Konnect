@@ -373,6 +373,9 @@ mod tests {
 
     fn report() -> cli::DrcReport {
         cli::DrcReport {
+            cli_messages: Vec::new(),
+            custom_rules_error: None,
+            custom_rules: None,
             violations: vec![
                 finding("silk_overlap", "warning"),
                 finding("clearance", "error"),

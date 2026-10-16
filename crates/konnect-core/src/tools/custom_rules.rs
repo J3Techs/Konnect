@@ -20,7 +20,7 @@ use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 
 /// Numeric KiCad 10 rule constraints. All take lengths in mm except
-/// `track_angle`, which takes degrees (see [`unit`]).
+/// `track_angle`, which takes a bare number of degrees (see [`unit`]).
 const CONSTRAINTS: &[&str] = &[
     "annular_width",
     "clearance",
@@ -48,9 +48,13 @@ const CONSTRAINTS: &[&str] = &[
 ];
 
 /// KiCad's unit suffix for a constraint's values.
+///
+/// KiCad 10.0.4 takes `track_angle` as a bare number of degrees: `deg` (which
+/// its own rule editor writes) or `rad` makes the whole rules file fail to
+/// load, silently. Proven with `cli::check_rules_text`.
 fn unit(kind: &str) -> &'static str {
     if kind == "track_angle" {
-        "deg"
+        ""
     } else {
         "mm"
     }
@@ -249,7 +253,7 @@ fn parse(args: &serde_json::Value) -> Result<Rule, Refusal> {
 }
 
 /// Every top-level `(rule "…" …)` in the file, by name, in order.
-fn rules_in(content: &str) -> Vec<(String, String)> {
+pub(crate) fn rules_in(content: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(found) = content[from..].find("(rule \"") {
@@ -293,9 +297,12 @@ pub(crate) fn set_tool() -> ToolDef {
          file: an optional KiCad condition expression (single-quoted strings, e.g. \
          \"A.Type == 'Via' && !A.intersectsCourtyard('U5801')\"), an optional layer ('outer', \
          'inner' or a layer name) and numeric constraints in mm (min/opt/max), except \
-         track_angle, which is in degrees: the angle between two connected segments, so a \
-         minimum forbids sharp bends, while track_segment_length's minimum catches slivers and \
-         jogs. A rule of the same \
+         track_angle, which is in degrees: the interior angle between two connected segments \
+         (180 is straight, 90 a right-angle corner), so a minimum forbids sharp bends, while \
+         track_segment_length's minimum catches slivers and jogs. KiCad drops the whole rules \
+         file, silently, when one rule fails to parse, so with kicad-cli configured the updated \
+         file is proven to load (canary DRC on a one-track board) before it is written, and a \
+         rule that would break it is refused. A rule of the same \
          name is replaced in place; 'remove' deletes it. Board constraints remain absolute floors \
          that no rule can go below, so an exception needs the floor lowered (set_design_rules) and \
          a rule holding everything else to the stronger value. Konnect checks the rule's shape, \
@@ -359,7 +366,7 @@ async fn read_rules(path: &std::path::Path) -> anyhow::Result<Option<String>> {
 
 async fn handle_set_custom_rule(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let path = rules_path(&board);
@@ -392,6 +399,34 @@ async fn handle_set_custom_rule(
     let text = rule.text();
     let updated = upsert_named_rule(&content, &rule.name, &text);
     let changed = existing.as_deref() != Some(updated.as_str());
+    // KiCad drops a whole rules file when one rule fails to parse, without a
+    // word, so prove the updated file loads before it replaces the old one.
+    let cli = ctx.config.kicad_cli.as_str();
+    let check = if changed && !cli.is_empty() {
+        Some(super::cli::check_rules_text(cli, &updated).await?)
+    } else {
+        None
+    };
+    if let Some(check) = check.as_ref().filter(|c| !c.loaded) {
+        let alone = if check.broken_rules.is_empty() {
+            "none alone (the combination fails)".to_string()
+        } else {
+            check.broken_rules.join(", ")
+        };
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "constraints".to_string(),
+                reason: "KiCad would not load the rules file with this rule".to_string(),
+            },
+            format!(
+                "Refused, nothing written: KiCad would not load {} with rule '{}' in it, and it \
+                 drops the whole file (every custom rule) when one rule fails. Rules that fail \
+                 alone: {alone}. Rule text: {text}",
+                path.display(),
+                rule.name,
+            ),
+        ));
+    }
     if changed {
         write_atomic(&path, &updated)?;
     }
@@ -400,7 +435,12 @@ async fn handle_set_custom_rule(
         "name": rule.name,
         "status": if !changed { "unchanged" } else if replaced { "replaced" } else { "added" },
         "rule": text,
-        "next": "Run run_drc: KiCad parses the rules file there and reports a syntax or expression error.",
+        "kicad_loads_file": check.as_ref().map(|c| c.loaded),
+        "next": if check.is_some() {
+            "KiCad loads the rules file. Run run_drc to see what the rule finds."
+        } else {
+            "Run run_drc: it reports whether KiCad loaded the rules file (custom_rules_loaded)."
+        },
     })))
 }
 
@@ -482,7 +522,7 @@ mod tests {
         ] })))
         .unwrap();
         assert!(
-            r.text().contains("(constraint track_angle (min 135deg))"),
+            r.text().contains("(constraint track_angle (min 135))"),
             "{}",
             r.text()
         );

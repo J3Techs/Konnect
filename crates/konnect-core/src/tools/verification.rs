@@ -302,6 +302,11 @@ async fn handle_run_drc(
             // beside the board — kicad-cli writes an empty array then, which
             // is not a checked zero (#516).
             "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
+            // A .kicad_dru KiCad could not parse is dropped whole, silently in
+            // the JSON report: surface the parser's complaint and its output.
+            "custom_rules_error": report.custom_rules_error,
+            "custom_rules_loaded": report.custom_rules.as_ref().map(|c| c.loaded),
+            "cli_messages": report.cli_messages,
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,
