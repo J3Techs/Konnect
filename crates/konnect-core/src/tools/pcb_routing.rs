@@ -243,7 +243,9 @@ pub fn tools() -> Vec<ToolDef> {
              named 'Default' is special: it is written complete, because KiCad \
              replaces its own default with it and backfills every other class \
              from it. Calling this on an existing, incomplete 'Default' \
-             repairs it in place without touching values already set.",
+             repairs it in place without touching values already set. The \
+             differential-pair width, gap and via gap are written only when given, \
+             so a class that names none keeps inheriting them from the Default.",
             json!({
                 "type": "object",
                 "properties": {
@@ -252,7 +254,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
                     "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
                     "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "diff_pair_width":   { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair track width in mm. Written only when given; otherwise inherited from the Default" },
+                    "diff_pair_gap":     { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair gap in mm. Written only when given" },
+                    "diff_pair_via_gap": { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair via gap in mm. Written only when given" }
                 },
                 "required": ["board", "name"]
             }),
@@ -293,7 +298,8 @@ pub fn tools() -> Vec<ToolDef> {
             "assign_net_to_class",
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
              the sibling .kicad_pro. The class must already exist (create_netclass). \
-             Reassigning moves the net's entry to the new class. Refuses while KiCad \
+             Reassigning moves the net's entry to the new class. Give one net as \
+             'net_name' or several as 'net_names' (one write). Refuses while KiCad \
              holds the board open, because KiCad's next save rewrites the project \
              file from its own copy.",
             json!({
@@ -301,9 +307,10 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board":     { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
                     "net_name":  { "type": "string", "description": "Net name to assign" },
+                    "net_names": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": 5000, "description": "Several net names, assigned in one write, instead of net_name" },
                     "netclass":  { "type": "string", "description": "Netclass name to assign the net to" }
                 },
-                "required": ["board", "net_name", "netclass"]
+                "required": ["board", "netclass"]
             }),
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
         ),
@@ -1398,6 +1405,22 @@ async fn handle_create_netclass(
         ("via_drill", "via_drill", 0.4),
         ("via_diameter", "via_diameter", 0.8),
     ];
+    // Written only when named, on creation as on update: a sparse class keeps
+    // inheriting these from the Default.
+    const OPTIONAL_FIELDS: [&str; 3] = ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"];
+    for key in OPTIONAL_FIELDS {
+        if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
+            match value.as_f64() {
+                Some(v) if v.is_finite() && v > 0.0 => {}
+                _ => {
+                    return Ok(crate::tools::invalid_arg(
+                        key,
+                        "must be a positive number of mm",
+                    ))
+                }
+            }
+        }
+    }
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
@@ -1433,6 +1456,11 @@ async fn handle_create_netclass(
                 class[key] = json!(value);
             }
         }
+        for key in OPTIONAL_FIELDS {
+            if let Some(value) = opt_f64(args, key) {
+                class[key] = json!(value);
+            }
+        }
         // KiCad backfills from the Default, never into it, so a Default left
         // incomplete by an older Konnect can only be repaired here. Absent
         // keys only: overwriting one already set is #220.
@@ -1463,6 +1491,11 @@ async fn handle_create_netclass(
                 class[key] = json!(value);
             }
         }
+        for key in OPTIONAL_FIELDS {
+            if let Some(value) = opt_f64(args, key) {
+                class[key] = json!(value);
+            }
+        }
         classes.push(class);
         false
     } else {
@@ -1472,6 +1505,11 @@ async fn handle_create_netclass(
         let mut class = json!({ "name": name, "priority": -1 });
         for (key, arg, default) in FIELDS {
             class[key] = json!(opt_f64(args, arg).unwrap_or(default));
+        }
+        for key in OPTIONAL_FIELDS {
+            if let Some(value) = opt_f64(args, key) {
+                class[key] = json!(value);
+            }
         }
         classes.push(class);
         false
@@ -1816,9 +1854,42 @@ async fn handle_assign_net_to_class(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
+    let batch: Option<Vec<String>> = match args.get("net_names").filter(|v| !v.is_null()) {
+        None => None,
+        Some(value) => {
+            let names: Option<Vec<String>> = value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().filter(|s| !s.is_empty()).map(String::from))
+                    .collect()
+            });
+            match names {
+                Some(names)
+                    if !names.is_empty() && names.len() == value.as_array().map_or(0, Vec::len) =>
+                {
+                    Some(names)
+                }
+                _ => {
+                    return Ok(crate::tools::invalid_arg(
+                        "net_names",
+                        "must be a non-empty array of non-empty net names",
+                    ))
+                }
+            }
+        }
+    };
+    if batch.is_some() && args.get("net_name").is_some_and(|v| !v.is_null()) {
+        return Ok(crate::tools::invalid_arg(
+            "net_names",
+            "give net_name or net_names, not both",
+        ));
+    }
+    let net_name = match &batch {
+        Some(names) => names[0].clone(),
+        None => match require_str(args, "net_name") {
+            Ok(v) => v.to_string(),
+            Err(e) => return Ok(e),
+        },
     };
     let netclass = match require_str(args, "netclass") {
         Ok(v) => v.to_string(),
@@ -1870,6 +1941,40 @@ async fn handle_assign_net_to_class(
             pro.display()
         )
     })?;
+
+    if let Some(names) = batch {
+        let mut assigned = Vec::new();
+        let mut moved = Vec::new();
+        let mut already = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for name in names {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(entry) = patterns.iter_mut().find(|p| p["pattern"] == json!(name)) {
+                if entry["netclass"] == json!(netclass) {
+                    already.push(name);
+                    continue;
+                }
+                moved
+                    .push(json!({ "net_name": name, "previous_class": entry["netclass"].clone() }));
+                entry["netclass"] = json!(netclass);
+            } else {
+                patterns.push(json!({ "netclass": netclass, "pattern": name }));
+                assigned.push(name);
+            }
+        }
+        if !assigned.is_empty() || !moved.is_empty() {
+            save_project_settings(&pro, &settings)?;
+        }
+        return Ok(CallToolResult::json(&json!({
+            "netclass": netclass,
+            "assigned": assigned,
+            "moved": moved,
+            "already_assigned": already,
+            "file": pro.display().to_string()
+        })));
+    }
 
     let mut previous_class: Option<String> = None;
     if let Some(entry) = patterns
@@ -2665,6 +2770,79 @@ mod netclass_tests {
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0]["netclass"], json!("LV"));
 
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
+    async fn diff_pair_settings_are_written_only_when_named() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "USB", "trace_width": 0.106, "diff_pair_width": 0.106, "diff_pair_gap": 0.1 })).await;
+        let usb = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(usb["diff_pair_width"], json!(0.106), "{usb}");
+        assert_eq!(usb["diff_pair_gap"], json!(0.1), "{usb}");
+        assert!(
+            usb.get("diff_pair_via_gap").is_none(),
+            "unnamed stays inherited: {usb}"
+        );
+
+        // An update naming only the gap leaves the width alone.
+        create(&board, json!({ "name": "USB", "diff_pair_gap": 0.15 })).await;
+        let usb = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(usb["diff_pair_gap"], json!(0.15), "{usb}");
+        assert_eq!(usb["diff_pair_width"], json!(0.106), "{usb}");
+        assert_eq!(usb["track_width"], json!(0.106), "{usb}");
+
+        let bad = create(&board, json!({ "name": "USB", "diff_pair_gap": 0 })).await;
+        assert!(bad.is_error, "{}", text_of(&bad));
+        assert_eq!(
+            project_json(&board)["net_settings"]["classes"][0]["diff_pair_gap"],
+            json!(0.15)
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_many_nets_in_one_write() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        create(&board, json!({ "name": "LV" })).await;
+        assign(&board, "GND", "HV").await;
+        assign(&board, "VCC", "LV").await;
+
+        let res = handle_assign_net_to_class(
+            &json!({ "board": board.to_str().unwrap(), "net_names": ["GND", "VCC", "SIG", "SIG"], "netclass": "LV" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{}", text_of(&res));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(body["assigned"], json!(["SIG"]), "{body}");
+        assert_eq!(
+            body["moved"],
+            json!([{ "net_name": "GND", "previous_class": "HV" }]),
+            "{body}"
+        );
+        assert_eq!(body["already_assigned"], json!(["VCC"]), "{body}");
+        let patterns = project_json(&board)["net_settings"]["netclass_patterns"].clone();
+        assert_eq!(patterns.as_array().unwrap().len(), 3, "{patterns}");
+        assert!(patterns
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["netclass"] == json!("LV")));
+
+        for bad in [
+            json!({ "net_names": [], "netclass": "LV" }),
+            json!({ "net_names": ["A", ""], "netclass": "LV" }),
+            json!({ "net_names": ["A"], "net_name": "B", "netclass": "LV" }),
+        ] {
+            let mut args = bad.clone();
+            args["board"] = json!(board.to_str().unwrap());
+            let res = handle_assign_net_to_class(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(res.is_error, "{bad} was accepted");
+        }
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
     }
 

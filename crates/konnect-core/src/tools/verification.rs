@@ -45,9 +45,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
-             project file. Refuses while KiCad holds the board open, because KiCad's next save \
-             rewrites the project file from its own copy.",
+            "Set board-level design rules (clearance, trace width, via size and drill, annular \
+             ring, copper-to-edge clearance, hole-to-hole) in the sibling KiCAD project file. These \
+             are KiCad's absolute floors: no netclass or custom rule can go below them. Refuses \
+             while KiCad holds the board open, because KiCad's next save rewrites the project file \
+             from its own copy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +58,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
                     "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
                     "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
+                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" },
+                    "min_via_annular_width": { "type": "number", "description": "Minimum via annular ring in mm" },
+                    "min_copper_edge_clearance": { "type": "number", "description": "Minimum copper-to-board-edge clearance in mm" }
                 },
                 "required": ["board"]
             }),
@@ -200,6 +204,8 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
         ),
+        super::custom_rules::set_tool(),
+        super::custom_rules::get_tool(),
         tool!(
             "check_clearance",
             "Measure spacing between two footprints on the requested board. `mode: anchor` \
@@ -365,7 +371,7 @@ fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
 }
 
-fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
+pub(crate) fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     let needle = format!("(rule \"{name}\"");
     let start = content.find(&needle)?;
     let mut depth = 0i32;
@@ -406,7 +412,7 @@ fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
+pub(crate) fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
     if let Some((start, end)) = named_rule_range(content, name) {
         return format!("{}{}{}", &content[..start], rule, &content[end..]);
     }
@@ -449,6 +455,8 @@ async fn handle_set_design_rules(
         ("min_through_hole_diameter", "min_via_drill"),
         ("min_via_size", "min_via_size"),
         ("min_hole_to_hole", "min_hole_to_hole"),
+        ("min_via_annular_width", "min_via_annular_width"),
+        ("min_copper_edge_clearance", "min_copper_edge_clearance"),
     ];
 
     let project_rules = project_rules_mut(&mut project)?;
@@ -498,7 +506,9 @@ async fn handle_get_design_rules(
                 "min_trace_width": project_rule_value(&project, "min_track_width"),
                 "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
                 "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
+                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole"),
+                "min_via_annular_width": project_rule_value(&project, "min_via_annular_width"),
+                "min_copper_edge_clearance": project_rule_value(&project, "min_copper_edge_clearance")
             }
         }))
         .unwrap(),
@@ -1635,7 +1645,9 @@ mod tests {
             "min_trace_width": 0.25,
             "min_via_drill": 0.30,
             "min_via_size": 0.70,
-            "min_hole_to_hole": 0.45
+            "min_hole_to_hole": 0.45,
+            "min_via_annular_width": 0.05,
+            "min_copper_edge_clearance": 0.2
         });
         let result = handle_set_design_rules(&args, &test_ctx()).await.unwrap();
         assert!(!result.is_error);
@@ -1649,6 +1661,15 @@ mod tests {
         assert_eq!(rules["min_through_hole_diameter"], 0.30);
         assert_eq!(rules["min_via_diameter"], 0.70);
         assert_eq!(rules["min_hole_to_hole"], 0.45);
+        assert_eq!(rules["min_via_annular_width"], 0.05);
+        assert_eq!(rules["min_copper_edge_clearance"], 0.2);
+
+        let read = handle_get_design_rules(&json!({ "board": board }), &test_ctx())
+            .await
+            .unwrap();
+        let read: serde_json::Value = serde_json::from_str(&text_of(&read)).unwrap();
+        assert_eq!(read["rules"]["min_via_annular_width"], 0.05, "{read}");
+        assert_eq!(read["rules"]["min_copper_edge_clearance"], 0.2, "{read}");
     }
 
     fn text_of(result: &CallToolResult) -> String {

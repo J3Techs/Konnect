@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **231 registered tools** + **7 always-visible meta-tools** = **238 total**
+- **233 registered tools** + **7 always-visible meta-tools** = **240 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -298,9 +298,9 @@ and Windows servers do not.
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
-| `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
+| `create_netclass` | Create or update a netclass (including differential-pair width, gap and via gap, written only when given) in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
-| `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
+| `assign_net_to_class` | Assign a net (`net_name`) or many (`net_names`, one write) to an existing netclass via `netclass_patterns` entries in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
 ### `placement` · 6 tools
@@ -396,21 +396,23 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 10 tools
-**Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
+### `verification` · 12 tools
+**Purpose:** DRC, design rules, layer constraints, conditional custom rules, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
-| `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
+| `set_design_rules` | Set board-level design rules (clearance, trace width, via size and drill, via annular ring, copper-to-edge clearance, hole-to-hole) in the sibling `.kicad_pro` project file. These are KiCad's absolute floors. The board file is not modified. |
+| `get_design_rules` | Return the current design rule constraints, annular ring and copper-to-edge clearance included, from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
+| `set_custom_rule` | Create, replace or remove one named rule in the sibling `.kicad_dru`: optional KiCad condition expression, optional layer (`outer`, `inner` or a layer name) and numeric min/opt/max constraints in mm. Checks the rule's shape; `run_drc` afterwards makes KiCad parse the condition. Use with `set_design_rules` for an exception below a board floor, such as small vias under one BGA. |
+| `get_custom_rules` | Read the sibling `.kicad_dru`: whether it exists, its version and every named rule's full text, in file order. Read-only. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
 
 ---
