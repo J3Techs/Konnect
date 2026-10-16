@@ -248,7 +248,7 @@ pub fn tools() -> Vec<ToolDef> {
              planes the router does not track on), footprints on either side, circle, rect, \
              roundrect, oval and custom pads (rounded corners and custom shapes are lowered \
              to enclosing polygons), NPTH holes and enlarged local pad clearances as keepouts, \
-             copper zones on power layers as planes (holes cut out exactly), locked tracks and \
+             copper zones on power layers as planes (holes cut out exactly; split planes of several nets on one layer as long as they do not overlap), locked tracks and \
              locked through vias of any size as fixed wiring, and one straight-line closed \
              outline. Refused: unlocked or arc routing, blind/buried vias, zones on routing \
              layers, rule areas, chamfered pads and incomplete effective routing rules. A \

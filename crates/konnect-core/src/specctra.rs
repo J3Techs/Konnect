@@ -1180,7 +1180,7 @@ fn planes(
         }
     }
     let mut planes = Vec::new();
-    let mut used_layers = BTreeSet::new();
+    let mut placed: Vec<PlacedPlane> = Vec::new();
     for zone in tree.find_all("zone") {
         let name = zone.find_str("name").unwrap_or("").to_string();
         let label = if name.is_empty() {
@@ -1249,9 +1249,16 @@ fn planes(
                     "{label} is on routing layer {layer}; pour zones on routing layers after routing, or make {layer} a power layer"
                 );
             }
-            if !used_layers.insert(layer.clone()) {
-                bail!("more than one copper zone on {layer}; overlapping planes are not supported");
+            // Split planes are fine; overlapping ones would make the router
+            // believe two nets' copper shares an area.
+            if let Some((other, _)) = placed
+                .iter()
+                .filter(|(_, (other_layer, _))| *other_layer == layer)
+                .find(|(_, (_, other_pieces))| pieces_overlap(&pieces, other_pieces))
+            {
+                bail!("{label} overlaps {other} on {layer}; overlapping planes are not supported");
             }
+            placed.push((label.clone(), (layer.clone(), pieces.clone())));
             planes.push(PlaneModel {
                 net: net.clone(),
                 layer,
@@ -1261,6 +1268,64 @@ fn planes(
     }
     planes.sort_by(|left, right| left.layer.cmp(&right.layer));
     Ok(planes)
+}
+
+/// A zone already lowered to plane pieces: its label, layer and pieces.
+type PlacedPlane = (String, (String, Vec<Vec<(i64, i64)>>));
+
+/// The vertical extent of a convex piece at `x`, if the line x = `x` meets it.
+fn piece_span_at(piece: &[(i64, i64)], x: f64) -> Option<(f64, f64)> {
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for edge in piece.windows(2) {
+        let ((x1, y1), (x2, y2)) = (edge[0], edge[1]);
+        let (x1, y1, x2, y2) = (x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+        if (x < x1.min(x2)) || (x > x1.max(x2)) {
+            continue;
+        }
+        let ys = if x1 == x2 {
+            vec![y1, y2]
+        } else {
+            vec![y1 + (y2 - y1) * (x - x1) / (x2 - x1)]
+        };
+        for y in ys {
+            low = low.min(y);
+            high = high.max(y);
+        }
+    }
+    (low <= high).then_some((low, high))
+}
+
+/// Whether two sets of trapezoid pieces share any area (touching is not
+/// overlapping). Each piece has vertical sides and straight top and bottom
+/// edges, so within a shared x-span the overlap of two pieces changes
+/// linearly and is found at the span's ends.
+fn pieces_overlap(a: &[Vec<(i64, i64)>], b: &[Vec<(i64, i64)>]) -> bool {
+    let x_range = |piece: &[(i64, i64)]| {
+        let xs = piece.iter().map(|p| p.0);
+        (xs.clone().min().unwrap_or(0), xs.max().unwrap_or(0))
+    };
+    for pa in a {
+        let (a1, a2) = x_range(pa);
+        for pb in b {
+            let (b1, b2) = x_range(pb);
+            let (from, to) = (a1.max(b1) as f64, a2.min(b2) as f64);
+            if to - from <= 1.0 {
+                continue;
+            }
+            let inset = ((to - from) / 1000.0).min(1.0);
+            for x in [from + inset, to - inset] {
+                if let (Some((la, ha)), Some((lb, hb))) =
+                    (piece_span_at(pa, x), piece_span_at(pb, x))
+                {
+                    if ha.min(hb) - la.max(lb) > 1.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Even-odd decomposition of polygon rings (an outline and its holes) into
@@ -3037,6 +3102,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("routing layer In2.Cu"), "{error}");
+    }
+
+    fn with_in1_zone(net: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+        let zone = format!(
+            "\t(zone\n\t\t(net \"{net}\")\n\t\t(layer \"In1.Cu\")\n\t\t(uuid \"f0000000-0000-4000-8000-000000000009\")\n\t\t(name \"island\")\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy {x1} {y1}) (xy {x2} {y1}) (xy {x2} {y2}) (xy {x1} {y2})\n\t\t\t)\n\t\t)\n\t)\n\t(embedded_fonts no)"
+        );
+        MULTILAYER.replacen("\t(embedded_fonts no)", &zone, 1)
+    }
+
+    #[test]
+    fn an_island_in_a_plane_hole_is_a_split_plane() {
+        // The GND plane on In1 has a hole at 15..25 x 5..15 mm.
+        let source = with_in1_zone("SIG", 16.0, 6.0, 24.0, 14.0);
+        let export =
+            export_dsn(Path::new("board.kicad_pcb"), &source, &multilayer_rules()).unwrap();
+        let pcb = parsed(&export.dsn);
+        let nets: BTreeSet<_> = pcb
+            .structure
+            .planes
+            .iter()
+            .map(|p| p.net.as_str())
+            .collect();
+        assert_eq!(nets, BTreeSet::from(["GND", "SIG"]));
+        assert_eq!(export.plane_count, 2);
+    }
+
+    #[test]
+    fn overlapping_planes_on_one_layer_are_refused() {
+        let source = with_in1_zone("SIG", 10.0, 10.0, 20.0, 20.0);
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &multilayer_rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps"), "{error}");
+    }
+
+    #[test]
+    fn touching_pieces_do_not_overlap() {
+        let left = vec![vec![(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]];
+        let right = vec![vec![(10, 0), (20, 0), (20, 10), (10, 10), (10, 0)]];
+        let above = vec![vec![(0, 10), (10, 10), (10, 20), (0, 20), (0, 10)]];
+        assert!(!pieces_overlap(&left, &right));
+        assert!(!pieces_overlap(&left, &above));
+        let inside = vec![vec![(2, 2), (8, 2), (8, 8), (2, 8), (2, 2)]];
+        assert!(pieces_overlap(&left, &inside));
     }
 
     #[test]
