@@ -8,6 +8,127 @@ use std::{path::Path, time::Duration};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The schema fragment both DRC tools share for narrowing what they return.
+pub(crate) fn selection_schema(default_limit: Option<u64>) -> Value {
+    let mut limit = json!({
+        "type": "integer",
+        "minimum": 0,
+        "description": "Maximum number of violations to list after filtering; 0 lists none \
+                        (the counts in by_rule still cover every match). Omit for the default."
+    });
+    if let Some(default) = default_limit {
+        limit["default"] = json!(default);
+    }
+    json!({
+        "limit": limit,
+        "rules": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Only these KiCad rule keys (e.g. 'clearance', 'courtyards_overlap', \
+                            'unconnected_items')."
+        },
+        "exclude_rules": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Leave out these KiCad rule keys (e.g. 'silk_overlap', \
+                            'unconnected_items')."
+        }
+    })
+}
+
+/// Which findings a DRC tool returns: a minimum severity, an optional rule
+/// allow-list, a rule deny-list and a cap on how many are listed.
+pub(crate) struct ViolationSelection {
+    min_rank: u8,
+    rules: Option<Vec<String>>,
+    exclude_rules: Vec<String>,
+    pub(crate) limit: Option<usize>,
+}
+
+pub(crate) fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "error" => 2,
+        "warning" => 1,
+        _ => 0,
+    }
+}
+
+impl ViolationSelection {
+    /// Read the selection from tool arguments. A `rules` or `exclude_rules`
+    /// that is not an array of strings is refused rather than ignored, so a
+    /// typo cannot silently widen the result back to every rule.
+    pub(crate) fn from_args(
+        args: &Value,
+        severity: &str,
+        default_limit: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let list = |name: &str| -> anyhow::Result<Option<Vec<String>>> {
+            match &args[name] {
+                Value::Null => Ok(None),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow::anyhow!("'{name}' must hold only strings"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .map(Some),
+                _ => anyhow::bail!("'{name}' must be an array of rule keys"),
+            }
+        };
+        let limit = match &args["limit"] {
+            Value::Null => default_limit,
+            value => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("'limit' must be a non-negative integer"))?
+                    as usize,
+            ),
+        };
+        Ok(Self {
+            min_rank: severity_rank(severity),
+            rules: list("rules")?,
+            exclude_rules: list("exclude_rules")?.unwrap_or_default(),
+            limit,
+        })
+    }
+
+    pub(crate) fn matches(&self, violation: &cli::DrcViolation) -> bool {
+        severity_rank(&violation.severity) >= self.min_rank
+            && self
+                .rules
+                .as_ref()
+                .is_none_or(|rules| rules.contains(&violation.rule))
+            && !self.exclude_rules.contains(&violation.rule)
+    }
+
+    /// Every matching finding, in report order.
+    pub(crate) fn select<'a>(&self, report: &'a cli::DrcReport) -> Vec<&'a cli::DrcViolation> {
+        report.all().filter(|v| self.matches(v)).collect()
+    }
+
+    /// How many of the selected findings are listed.
+    pub(crate) fn shown(&self, selected: usize) -> usize {
+        self.limit.map_or(selected, |limit| selected.min(limit))
+    }
+}
+
+/// Selected findings counted by rule key, then by severity, so a caller can
+/// see the shape of a large report without listing it.
+pub(crate) fn counts_by_rule(selected: &[&cli::DrcViolation]) -> Value {
+    let mut counts: std::collections::BTreeMap<&str, std::collections::BTreeMap<&str, usize>> =
+        Default::default();
+    for violation in selected {
+        *counts
+            .entry(violation.rule.as_str())
+            .or_default()
+            .entry(violation.severity.as_str())
+            .or_default() += 1;
+    }
+    json!(counts)
+}
+
 /// Publish by sibling-file replacement, never by truncating a destination inode.
 /// This also preserves the source board if an output path is a distinct hard link.
 pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result<()> {
@@ -239,6 +360,99 @@ mod tests {
     use konnect_ipc::gen::kiapi;
     use prost::Message;
     use std::sync::{Arc, Mutex};
+
+    fn finding(rule: &str, severity: &str) -> cli::DrcViolation {
+        cli::DrcViolation {
+            severity: severity.to_string(),
+            description: String::new(),
+            rule: rule.to_string(),
+            pos: None,
+            items: Vec::new(),
+        }
+    }
+
+    fn report() -> cli::DrcReport {
+        cli::DrcReport {
+            violations: vec![
+                finding("silk_overlap", "warning"),
+                finding("clearance", "error"),
+                finding("silk_overlap", "warning"),
+                finding("text_height", "warning"),
+            ],
+            unconnected_items: Some(vec![
+                finding("unconnected_items", "error"),
+                finding("unconnected_items", "error"),
+            ]),
+            schematic_parity: Some(Vec::new()),
+            ownership_diagnostic: None,
+            schematic_parity_diagnostic: None,
+        }
+    }
+
+    /// Rule allow- and deny-lists narrow every category, the severity floor
+    /// still applies, and the counts cover every match even when the listed
+    /// findings are capped.
+    #[test]
+    fn violation_selection_filters_by_rule_and_counts_beyond_the_limit() {
+        let report = report();
+        let only = ViolationSelection::from_args(
+            &json!({ "exclude_rules": ["silk_overlap", "unconnected_items"] }),
+            "warning",
+            None,
+        )
+        .unwrap();
+        let rules: Vec<_> = only
+            .select(&report)
+            .iter()
+            .map(|v| v.rule.as_str())
+            .collect();
+        assert_eq!(rules, ["clearance", "text_height"]);
+
+        let errors = ViolationSelection::from_args(
+            &json!({ "rules": ["unconnected_items", "silk_overlap"], "limit": 1 }),
+            "error",
+            Some(50),
+        )
+        .unwrap();
+        let selected = errors.select(&report);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(errors.shown(selected.len()), 1);
+        assert_eq!(
+            counts_by_rule(&selected),
+            json!({ "unconnected_items": { "error": 2 } })
+        );
+
+        let none_listed =
+            ViolationSelection::from_args(&json!({ "limit": 0 }), "warning", None).unwrap();
+        let selected = none_listed.select(&report);
+        assert_eq!(none_listed.shown(selected.len()), 0);
+        assert_eq!(
+            counts_by_rule(&selected),
+            json!({
+                "clearance": { "error": 1 },
+                "silk_overlap": { "warning": 2 },
+                "text_height": { "warning": 1 },
+                "unconnected_items": { "error": 2 }
+            })
+        );
+        let unlimited = ViolationSelection::from_args(&json!({}), "warning", None).unwrap();
+        assert_eq!(unlimited.shown(6), 6);
+    }
+
+    #[test]
+    fn violation_selection_refuses_malformed_filters() {
+        for args in [
+            json!({ "rules": "clearance" }),
+            json!({ "exclude_rules": [1] }),
+            json!({ "limit": -1 }),
+            json!({ "limit": "ten" }),
+        ] {
+            assert!(
+                ViolationSelection::from_args(&args, "warning", None).is_err(),
+                "{args}"
+            );
+        }
+    }
 
     const OLD: &str = include_str!("../../tests/fixtures/drc_ownership_j1.kicad_pcb");
     const LIVE: &str = include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");

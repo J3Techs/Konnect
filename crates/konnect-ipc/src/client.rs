@@ -4111,6 +4111,12 @@ impl KiCadIpcClient {
                     pad.number
                 )
             })?;
+            pad.margins.validate().with_context(|| {
+                format!(
+                    "footprint '{lib_id}' pad '{}' has mask or paste margins that cannot be placed",
+                    pad.number
+                )
+            })?;
         }
         for graphic in graphics {
             crate::builders::try_layer_from_name(graphic.layer()).with_context(|| {
@@ -4286,6 +4292,10 @@ impl KiCadIpcClient {
                             }
                         })
                     },
+                    // KiCad holds one mask and one paste margin per pad, so
+                    // the same overrides go to both outer sides.
+                    front_outer_layers: pad.margins.to_outer_layer(),
+                    back_outer_layers: pad.margins.to_outer_layer(),
                     ..Default::default()
                 };
                 let pad_type = match pad.pad_type.as_str() {
@@ -4300,6 +4310,7 @@ impl KiCadIpcClient {
                     pad_stack: Some(stack),
                     position: Some(crate::builders::vec2(board_x, board_y)),
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    copper_clearance_override: pad.margins.clearance_proto(),
                     ..Default::default()
                 };
                 crate::builders::pack_any(&item, "kiapi.board.types.Pad")
@@ -6536,6 +6547,7 @@ mod footprint_graphics_tests {
             thermal: Default::default(),
             custom: None,
             rotation: 0.0,
+            margins: Default::default(),
         };
 
         for layer in ["F.Cu", "B.Cu"] {
@@ -6685,6 +6697,7 @@ mod footprint_graphics_tests {
             thermal: Default::default(),
             custom: None,
             rotation: 0.0,
+            margins: Default::default(),
         }];
         let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));
         assert!(error.contains("Nope.Cu"), "{error}");
@@ -7300,6 +7313,7 @@ mod pad_thermal_tests {
             custom: None,
             zone_connection: None,
             thermal,
+            margins: Default::default(),
         }
     }
 
@@ -7466,6 +7480,7 @@ mod footprint_input_validation_tests {
                     filled: true,
                 }],
             }),
+            margins: Default::default(),
         };
         let build = |pad: &IpcPadDefinition, x, y, rotation| {
             KiCadIpcClient::build_footprint_item(

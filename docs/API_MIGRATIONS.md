@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: pad clearance and mask/paste margins, DRC rule filters
+
+**Pad clearance and mask/paste margins.** A footprint pad's `(clearance mm)`,
+`(solder_mask_margin mm)`, `(solder_paste_margin mm)` and
+`(solder_paste_margin_ratio ratio)` were refused by name, so `place_component`
+could not place any stock `Fiducial:` footprint. They are now carried: the
+clearance as `Pad.copper_clearance_override`, the mask and paste values as
+`PadStack.front_outer_layers` / `back_outer_layers` overrides (the same values
+on both, since KiCad keeps one margin per pad). An unwritten clause stays
+unset and inherits. A repeated clause, a non-number, a non-finite value, a
+negative clearance or a paste ratio outside -1 to 1 is refused. In
+`konnect-ipc`, `IpcPadDefinition` gains `margins: IpcPadMargins` (all `None`
+by default).
+
+**DRC rule filters.** `run_drc` and `get_drc_violations` accept `rules` (only
+these rule keys) and `exclude_rules` (leave these out), applied after the
+severity floor; a value that is not an array of strings is refused. Both
+return `by_rule`, every selected finding counted by rule key and severity,
+plus `shown` and `truncated`. `get_drc_violations` accepts `limit` (default:
+list every match, as before); `limit: 0` returns the counts only. `run_drc`'s
+`limit` keeps its default of 50 and now also accepts 0.
+
 ## Unreleased: closed-board stackup and Reference-field edits, compact readers
 
 `get_board_stackup` accepts `source` (`live`, the default; or `saved`). The live

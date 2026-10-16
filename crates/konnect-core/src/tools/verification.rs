@@ -23,8 +23,10 @@ pub fn tools() -> Vec<ToolDef> {
              with separate error and warning counts in the summary. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
-             complete configured DRC ruleset; kicad-cli has no per-test selector.",
-            json!({
+             complete configured DRC ruleset; kicad-cli has no per-test selector, but \
+             `rules`/`exclude_rules` narrow what is returned and `by_rule` counts every \
+             match by rule key and severity.",
+            with_selection(json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
@@ -36,14 +38,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of violations to return",
-                        "default": 50
-                    }
                 },
                 "required": ["board"]
-            }),
+            }), Some(50)),
             |args, ctx| async move { handle_run_drc(args, ctx).await }
         ),
         tool!(
@@ -235,12 +232,19 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-fn severity_rank(s: &str) -> u8 {
-    match s {
-        "error" => 2,
-        "warning" => 1,
-        _ => 0,
+/// Add the shared DRC selection properties (`limit`, `rules`,
+/// `exclude_rules`) to a tool schema.
+pub(crate) fn with_selection(
+    mut schema: serde_json::Value,
+    default_limit: Option<u64>,
+) -> serde_json::Value {
+    if let (Some(properties), serde_json::Value::Object(extra)) = (
+        schema["properties"].as_object_mut(),
+        super::drc::selection_schema(default_limit),
+    ) {
+        properties.extend(extra);
     }
+    schema
 }
 
 async fn handle_run_drc(
@@ -249,8 +253,7 @@ async fn handle_run_drc(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
-    let min_rank = severity_rank(severity_filter);
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let selection = super::drc::ViolationSelection::from_args(args, severity_filter, Some(50))?;
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -268,15 +271,12 @@ async fn handle_run_drc(
     // Every category, not just `violations`. An unrouted net is reported under
     // `unconnected_items`, which Konnect used to discard — so a board that
     // KiCad called unrouted came back from here clean (#245).
-    let filtered: Vec<_> = report
-        .all()
-        .filter(|v| severity_rank(&v.severity) >= min_rank)
-        .collect();
+    let filtered = selection.select(&report);
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
-    let shown = filtered.len().min(limit);
-    let truncated = filtered.len() > limit;
+    let shown = selection.shown(filtered.len());
+    let truncated = filtered.len() > shown;
     let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
@@ -300,9 +300,10 @@ async fn handle_run_drc(
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
+            "by_rule": super::drc::counts_by_rule(&filtered),
             "shown": shown,
             "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
+            "violations": filtered.iter().take(shown).map(|v| json!({
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,

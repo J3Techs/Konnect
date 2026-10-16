@@ -3835,6 +3835,7 @@ mod tests {
                 zone_connection: None,
                 thermal: Default::default(),
                 custom: None,
+                margins: Default::default(),
             }],
             &[
                 konnect_ipc::IpcGraphicDefinition::Line {
@@ -4124,6 +4125,7 @@ mod tests {
                 zone_connection: None,
                 thermal: Default::default(),
                 custom: None,
+                margins: Default::default(),
             }],
             &[],
             &konnect_ipc::IpcFieldPlacement::default(),

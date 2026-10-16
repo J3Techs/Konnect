@@ -587,6 +587,140 @@ pub struct IpcPadDefinition {
     /// [`file_default_thermal_spoke_angle`]), because KiCad's parser always
     /// sets one; empty sends no thermal settings at all.
     pub thermal: IpcPadThermal,
+    /// The pad's own clearance, solder mask and paste margins, or empty when
+    /// it takes them from the footprint and board rules.
+    pub margins: IpcPadMargins,
+}
+
+/// A pad's local clearance, solder mask and paste overrides as a footprint
+/// file writes them: `(clearance mm)`, `(solder_mask_margin mm)`,
+/// `(solder_paste_margin mm)` and `(solder_paste_margin_ratio ratio)`. `None`
+/// leaves the value to the footprint and board rules, the same as the file
+/// leaving the clause out.
+///
+/// The clearance travels in `Pad.copper_clearance_override`; the mask and
+/// paste values in the pad stack's outer-layer overrides.
+/// KiCad keeps one margin for both outer sides of a pad
+/// (`PadStackOuterLayer` notes it does not yet support different top and
+/// bottom expansion), so the builder sends the same overrides to both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpcPadMargins {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solder_mask_margin: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solder_paste_margin: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solder_paste_margin_ratio: Option<f64>,
+}
+
+impl IpcPadMargins {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Refuse a margin KiCad could not hold as written: every value must be
+    /// finite, the clearance is not negative, and the paste ratio lies
+    /// between -100 % and +100 %.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("clearance", self.clearance),
+            ("solder_mask_margin", self.solder_mask_margin),
+            ("solder_paste_margin", self.solder_paste_margin),
+            ("solder_paste_margin_ratio", self.solder_paste_margin_ratio),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(value.is_finite(), "{name} {value} is not finite");
+            }
+        }
+        if let Some(clearance) = self.clearance {
+            anyhow::ensure!(clearance >= 0.0, "clearance {clearance} mm is negative");
+        }
+        if let Some(ratio) = self.solder_paste_margin_ratio {
+            anyhow::ensure!(
+                (-1.0..=1.0).contains(&ratio),
+                "solder_paste_margin_ratio {ratio} is outside -1 to 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// The pad's copper clearance override as the `Pad` message carries it.
+    pub fn clearance_proto(&self) -> Option<crate::gen::kiapi::common::types::Distance> {
+        self.clearance
+            .map(|mm| crate::gen::kiapi::common::types::Distance {
+                value_nm: (mm * 1_000_000.0).round() as i64,
+            })
+    }
+
+    /// The outer-layer settings a pad stack carries the mask and paste
+    /// overrides in, or `None` when there are none to send.
+    pub fn to_outer_layer(&self) -> Option<crate::gen::kiapi::board::types::PadStackOuterLayer> {
+        use crate::gen::kiapi::board::types as bt;
+        if self.solder_mask_margin.is_none()
+            && self.solder_paste_margin.is_none()
+            && self.solder_paste_margin_ratio.is_none()
+        {
+            return None;
+        }
+        let distance = |mm: f64| crate::gen::kiapi::common::types::Distance {
+            value_nm: (mm * 1_000_000.0).round() as i64,
+        };
+        let paste = (self.solder_paste_margin.is_some()
+            || self.solder_paste_margin_ratio.is_some())
+        .then(|| bt::SolderPasteOverrides {
+            solder_paste_margin: self.solder_paste_margin.map(distance),
+            solder_paste_margin_ratio: self
+                .solder_paste_margin_ratio
+                .map(|value| crate::gen::kiapi::common::types::Ratio { value }),
+        });
+        Some(bt::PadStackOuterLayer {
+            solder_mask_mode: bt::SolderMaskMode::SmmFromDesignRules as i32,
+            solder_paste_mode: bt::SolderPasteMode::SpmFromDesignRules as i32,
+            solder_mask_settings: self.solder_mask_margin.map(|mm| bt::SolderMaskOverrides {
+                solder_mask_margin: Some(distance(mm)),
+            }),
+            solder_paste_settings: paste,
+            ..Default::default()
+        })
+    }
+
+    /// Read the overrides back from a live pad: its clearance override and
+    /// its stack's front outer layers.
+    pub fn from_pad(pad: &crate::gen::kiapi::board::types::Pad) -> Self {
+        let mm = |distance: &crate::gen::kiapi::common::types::Distance| {
+            distance.value_nm as f64 / 1_000_000.0
+        };
+        let outer = pad
+            .pad_stack
+            .as_ref()
+            .and_then(|stack| stack.front_outer_layers.as_ref());
+        let Some(layer) = outer else {
+            return Self {
+                clearance: pad.copper_clearance_override.as_ref().map(mm),
+                ..Self::default()
+            };
+        };
+        Self {
+            clearance: pad.copper_clearance_override.as_ref().map(mm),
+            solder_mask_margin: layer
+                .solder_mask_settings
+                .as_ref()
+                .and_then(|settings| settings.solder_mask_margin.as_ref())
+                .map(mm),
+            solder_paste_margin: layer
+                .solder_paste_settings
+                .as_ref()
+                .and_then(|settings| settings.solder_paste_margin.as_ref())
+                .map(mm),
+            solder_paste_margin_ratio: layer
+                .solder_paste_settings
+                .as_ref()
+                .and_then(|settings| settings.solder_paste_margin_ratio.as_ref())
+                .map(|ratio| ratio.value),
+        }
+    }
 }
 
 /// The anchor of a custom pad: the ordinary pad shape, sized by the pad's

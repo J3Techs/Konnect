@@ -15,16 +15,6 @@ use tokio::task;
 
 use super::cli;
 
-// ─── Severity filter helpers ──────────────────────────────────────────────────
-
-fn severity_rank(s: &str) -> u8 {
-    match s {
-        "error" => 2,
-        "warning" => 1,
-        _ => 0,
-    }
-}
-
 fn invalid_export_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
     let reason = reason.into();
     CallToolResult::error_kind(
@@ -403,8 +393,10 @@ pub fn tools() -> Vec<ToolDef> {
              Provided in `pcb_export` because the output is handy to bundle alongside \
              Gerbers when preparing a build package. For interactive / iterative DRC \
              work, prefer `run_drc` (verification toolset) — same kicad-cli check, \
-             cleaner summary with error/warning counts.",
-            json!({
+             cleaner summary with error/warning counts. `rules`/`exclude_rules` narrow \
+             the list, `limit` caps it (all by default), and `by_rule` counts every \
+             match by rule key and severity.",
+            super::verification::with_selection(json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
@@ -418,7 +410,7 @@ pub fn tools() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["board"]
-            }),
+            }), None),
             |args, ctx| async move { handle_get_drc_violations(args, ctx).await }
         ),
     ]
@@ -1066,7 +1058,7 @@ async fn handle_get_drc_violations(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
-    let min_rank = severity_rank(severity_filter);
+    let selection = super::drc::ViolationSelection::from_args(args, severity_filter, None)?;
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -1086,10 +1078,8 @@ async fn handle_get_drc_violations(
         }
     }
 
-    let filtered: Vec<_> = report
-        .all()
-        .filter(|v| severity_rank(&v.severity) >= min_rank)
-        .collect();
+    let filtered = selection.select(&report);
+    let shown = selection.shown(filtered.len());
 
     let summary = json!({
         "total": report.all().count(),
@@ -1104,7 +1094,10 @@ async fn handle_get_drc_violations(
         "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
-        "violations": filtered.iter().map(|v| json!({
+        "by_rule": super::drc::counts_by_rule(&filtered),
+        "shown": shown,
+        "truncated": filtered.len() > shown,
+        "violations": filtered.iter().take(shown).map(|v| json!({
             "severity": v.severity,
             "rule": v.rule,
             "description": v.description,

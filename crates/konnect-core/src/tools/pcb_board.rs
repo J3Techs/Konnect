@@ -915,6 +915,7 @@ fn mounting_hole_pad(drill_diameter_mm: f64) -> konnect_ipc::IpcPadDefinition {
         zone_connection: None,
         thermal: Default::default(),
         custom: None,
+        margins: Default::default(),
     }
 }
 

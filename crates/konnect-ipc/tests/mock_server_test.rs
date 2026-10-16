@@ -773,6 +773,7 @@ fn place_footprint_sends_graphics_children() {
         zone_connection: None,
         thermal: Default::default(),
         custom: None,
+        margins: Default::default(),
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
@@ -1626,6 +1627,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             zone_connection: None,
             thermal: Default::default(),
             custom: None,
+            margins: Default::default(),
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],

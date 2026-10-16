@@ -339,6 +339,9 @@ pub(crate) fn extract_pad_definitions(
             let (thermal, _) = pad_thermal(pad, format_version).with_context(|| {
                 format!("pad '{number}' cannot be carried by KiCad 10's typed placement path")
             })?;
+            let margins = pad_margins(pad).with_context(|| {
+                format!("pad '{number}' cannot be carried by KiCad 10's typed placement path")
+            })?;
             let at = pad
                 .find("at")
                 .context("footprint pad is missing its position")?;
@@ -397,9 +400,46 @@ pub(crate) fn extract_pad_definitions(
                 custom,
                 zone_connection,
                 thermal,
+                margins,
             })
         })
         .collect()
+}
+
+/// A pad's own `(clearance mm)`, `(solder_mask_margin mm)`,
+/// `(solder_paste_margin mm)` and `(solder_paste_margin_ratio ratio)`, each
+/// `None` unless written. A repeated
+/// clause, one that is not a single bare number, and a value KiCad could not
+/// hold are refused rather than dropped.
+pub(crate) fn pad_margins(
+    pad: &konnect_sexp::SexpNode,
+) -> anyhow::Result<konnect_ipc::IpcPadMargins> {
+    let value = |tag: &str| -> anyhow::Result<Option<f64>> {
+        let clauses = pad.find_all(tag);
+        let clause = match clauses.as_slice() {
+            [] => return Ok(None),
+            [clause] => clause,
+            _ => anyhow::bail!("the pad has {} ({tag} …) clauses", clauses.len()),
+        };
+        let values = clause.children().unwrap_or_default();
+        anyhow::ensure!(
+            values.len() == 2 && matches!(values[1], konnect_sexp::SexpNode::Atom(_)),
+            "({tag} …) must hold exactly one bare number"
+        );
+        let text = values[1].as_str().unwrap_or_default();
+        let number: f64 = text
+            .parse()
+            .with_context(|| format!("{tag} '{text}' is not a number"))?;
+        Ok(Some(number))
+    };
+    let margins = konnect_ipc::IpcPadMargins {
+        clearance: value("clearance")?,
+        solder_mask_margin: value("solder_mask_margin")?,
+        solder_paste_margin: value("solder_paste_margin")?,
+        solder_paste_margin_ratio: value("solder_paste_margin_ratio")?,
+    };
+    margins.validate()?;
+    Ok(margins)
 }
 
 /// A pad's `(zone_connect N)`: `None` when the pad leaves it out and so
@@ -518,8 +558,8 @@ pub(crate) fn pad_thermal(
 
 /// Refuse a pad clause the typed placement path would drop. A pad is built
 /// from its position, size, layers, drill, corner ratio, custom shape, zone
-/// connection and thermal settings; anything else that changes the pad (a
-/// fabrication property, mask or paste margins, clearance overrides, chamfers, a
+/// connection, thermal settings and clearance/mask/paste margins; anything
+/// else that changes the pad (a fabrication property, chamfers, a
 /// trapezoid delta, a drill offset, removed unused layers, a padstack, …) has
 /// no field it could travel in, so placing the pad without it would put a
 /// different pad on the board than the library holds.
@@ -539,6 +579,13 @@ fn refuse_uncarried_pad_clauses(pad: &konnect_sexp::SexpNode, shape: &str) -> an
             | "pinfunction" | "pintype" => {}
             // Read and validated by `pad_thermal`.
             "thermal_bridge_width" | "thermal_width" | "thermal_gap" | "thermal_bridge_angle" => {}
+            // Read and validated by `pad_margins`: the clearance is carried
+            // in the pad's clearance override, the rest in the pad stack's
+            // outer-layer overrides.
+            "clearance"
+            | "solder_mask_margin"
+            | "solder_paste_margin"
+            | "solder_paste_margin_ratio" => {}
             "options" | "primitives" if shape == "custom" => {}
             "drill" => {
                 if let Some(nested) = child
@@ -7967,6 +8014,93 @@ mod tests {
         }
     }
 
+    /// KiCad's stock fiducials give their one pad a local clearance and mask
+    /// margin. Both are read and reach the built pad: the clearance as the
+    /// pad's clearance override, the mask margin on both outer sides of the
+    /// pad stack. A pad that leaves them out sends neither.
+    #[test]
+    fn stock_fiducial_pad_carries_its_clearance_and_mask_margin() {
+        const FIDUCIAL: &str = r#"(footprint "Fiducial_1mm_Mask2mm"
+	(version 20250318)
+	(layer "F.Cu")
+	(property "Reference" "REF**" (at 0 -2 0) (layer "F.SilkS"))
+	(property "Value" "Fiducial_1mm_Mask2mm" (at 0 2 0) (layer "F.Fab"))
+	(attr smd exclude_from_bom)
+	(pad "" smd circle
+		(at 0 0)
+		(size 1 1)
+		(layers "F.Cu" "F.Mask")
+		(solder_mask_margin 0.5)
+		(clearance 0.6)
+	)
+	(pad "2" smd circle
+		(at 3 0)
+		(size 1 1)
+		(layers "F.Cu" "F.Mask")
+	)
+)"#;
+        let pads = extract_pad_definitions(FIDUCIAL).unwrap();
+        assert_eq!(
+            pads[0].margins,
+            konnect_ipc::IpcPadMargins {
+                clearance: Some(0.6),
+                solder_mask_margin: Some(0.5),
+                ..Default::default()
+            }
+        );
+        assert!(pads[1].margins.is_empty());
+        let built = built_pads(&build_at(&pads, 10.0, 20.0, 0.0).unwrap());
+        assert_eq!(
+            built[0]
+                .copper_clearance_override
+                .as_ref()
+                .map(|d| d.value_nm),
+            Some(600_000)
+        );
+        let stack = built[0].pad_stack.as_ref().unwrap();
+        for outer in [&stack.front_outer_layers, &stack.back_outer_layers] {
+            let margin = outer
+                .as_ref()
+                .and_then(|layer| layer.solder_mask_settings.as_ref())
+                .and_then(|settings| settings.solder_mask_margin.as_ref())
+                .map(|d| d.value_nm);
+            assert_eq!(margin, Some(500_000));
+        }
+        assert_eq!(
+            konnect_ipc::IpcPadMargins::from_pad(&built[0]),
+            pads[0].margins
+        );
+        assert!(built[1].copper_clearance_override.is_none());
+        let plain = built[1].pad_stack.as_ref().unwrap();
+        assert!(plain.front_outer_layers.is_none() && plain.back_outer_layers.is_none());
+    }
+
+    /// Margins KiCad could not hold are refused by name, not dropped.
+    #[test]
+    fn unholdable_pad_margins_are_refused() {
+        for (clause, needle) in [
+            ("(clearance -0.1)", "clearance"),
+            (
+                "(solder_paste_margin_ratio 1.5)",
+                "solder_paste_margin_ratio",
+            ),
+            (
+                "(solder_mask_margin 0.1) (solder_mask_margin 0.2)",
+                "solder_mask_margin",
+            ),
+            ("(solder_mask_margin wide)", "solder_mask_margin"),
+        ] {
+            let source = format!(
+                r#"(footprint "F" (layer "F.Cu") (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") {clause}))"#
+            );
+            let error = format!("{:#}", extract_pad_definitions(&source).unwrap_err());
+            assert!(
+                error.contains("pad '1'") && error.contains(needle),
+                "{error}"
+            );
+        }
+    }
+
     /// `(zone_connect 2)` on the fixtures' exposed pad is read, built into the
     /// pad stack's own zone settings (not the per-layer field the protocol
     /// reserves) and every other pad, which leaves it out, stays inherited:
@@ -8327,11 +8461,13 @@ mod tests {
         };
         assert!(extract_pad_definitions(&pad("(zone_connect 1) (pinfunction \"A\")")).is_ok());
         assert!(extract_pad_definitions(&pad("(remove_unused_layers no)")).is_ok());
+        assert!(extract_pad_definitions(&pad(
+            "(solder_mask_margin 0.05) (solder_paste_margin -0.02) \
+             (solder_paste_margin_ratio -0.1) (clearance 0.2)"
+        ))
+        .is_ok());
         for (clause, named) in [
             ("(property pad_prop_bga)", "pad_prop_bga"),
-            ("(solder_mask_margin 0.05)", "solder_mask_margin"),
-            ("(solder_paste_margin -0.02)", "solder_paste_margin"),
-            ("(clearance 0.2)", "clearance"),
             ("(chamfer_ratio 0.2)", "chamfer_ratio"),
             ("(remove_unused_layers yes)", "remove_unused_layers yes"),
             ("(options (anchor rect))", "options"),
@@ -10175,6 +10311,7 @@ mod placement_library_data_tests {
             custom: None,
             zone_connection: None,
             thermal: Default::default(),
+            margins: Default::default(),
         }];
         let prepared = PreparedFootprintPlacement::from_inline(
             "MountingHole".into(),
