@@ -66,8 +66,8 @@ pub(crate) struct RouteEvidence {
     pub session_id: String,
     pub job_id: String,
     pub final_state: String,
-    /// Konnect stopped the job at its time limit: the SES holds the routing
-    /// done so far, not a finished run.
+    /// Konnect stopped the job at its time limit or on request: the SES holds
+    /// the routing done so far, not a finished run.
     pub partial: bool,
     /// The last job state and figures the router reported.
     pub last_status: String,
@@ -141,11 +141,57 @@ pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
     }
 }
 
+/// One poll of a running job, as a [`JobMonitor`] sees it.
+pub(crate) struct PollReport<'a> {
+    pub session_id: &'a str,
+    pub job_id: &'a str,
+    pub state: &'a str,
+    pub last_status: &'a str,
+    pub details: &'a Value,
+    pub poll_count: u32,
+    pub elapsed: Duration,
+}
+
+/// What a [`JobMonitor`] asks of the poll loop after a poll.
+#[derive(Debug, Default)]
+pub(crate) struct PollAction {
+    /// End the job now and keep the board routed so far (partial).
+    pub stop: bool,
+    /// Download the board routed so far to this path; the job keeps running.
+    pub checkpoint: Option<PathBuf>,
+}
+
+/// Watches a job from inside the poll loop: the detached runner writes its
+/// status file, saves checkpoints and takes stop requests through this.
+pub(crate) trait JobMonitor: Send {
+    fn polled(&mut self, report: &PollReport<'_>) -> PollAction;
+    /// A checkpoint download asked for by [`PollAction::checkpoint`] finished.
+    fn checkpoint_downloaded(&mut self, _path: &Path, _result: &Result<()>) {}
+}
+
+struct NoMonitor;
+
+impl JobMonitor for NoMonitor {
+    fn polled(&mut self, _report: &PollReport<'_>) -> PollAction {
+        PollAction::default()
+    }
+}
+
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
     ses_output: &Path,
     settings: &RouteSettings,
+) -> Result<RouteEvidence> {
+    route_local_monitored(jar, dsn, ses_output, settings, &mut NoMonitor).await
+}
+
+pub(crate) async fn route_local_monitored(
+    jar: &Path,
+    dsn: &Path,
+    ses_output: &Path,
+    settings: &RouteSettings,
+    monitor: &mut dyn JobMonitor,
 ) -> Result<RouteEvidence> {
     validate_inputs(jar, dsn, ses_output, settings)?;
     if let Some(parent) = ses_output
@@ -168,7 +214,7 @@ pub(crate) async fn route_local(
     let started = Instant::now();
     let route_result = match timeout(
         settings.overall_timeout,
-        run_state_machine(&mut client, dsn, &temporary, settings, started),
+        run_state_machine(&mut client, dsn, &temporary, settings, started, monitor),
     )
     .await
     {
@@ -245,7 +291,7 @@ async fn write_diagnostics(output: &Path, diagnostics: &str) -> Result<Option<St
     Ok(Some(path.display().to_string()))
 }
 
-fn validate_inputs(
+pub(crate) fn validate_inputs(
     jar: &Path,
     dsn: &Path,
     ses_output: &Path,
@@ -298,6 +344,7 @@ async fn run_state_machine(
     temporary: &Path,
     settings: &RouteSettings,
     started: Instant,
+    monitor: &mut dyn JobMonitor,
 ) -> Result<RouteEvidence> {
     let tools = client.list_tools().await?;
     validate_tool_contracts(&tools)?;
@@ -366,7 +413,7 @@ async fn run_state_machine(
         limit = limit.min(Duration::from_secs(seconds));
     }
     let deadline = started + limit;
-    let mut stopped_at_deadline = false;
+    let mut stopped_early = false;
     let mut poll_count = 0u32;
     let mut last_status: String;
     let final_state = loop {
@@ -387,9 +434,39 @@ async fn run_state_machine(
             ),
         )
         .await;
-        match job_outcome(&state) {
+        let action = monitor.polled(&PollReport {
+            session_id: &session_id,
+            job_id: &job_id,
+            state: &state,
+            last_status: &last_status,
+            details: &details,
+            poll_count,
+            elapsed: started.elapsed(),
+        });
+        let outcome = job_outcome(&state);
+        if outcome == JobOutcome::Running && !action.stop {
+            if let Some(checkpoint) = action.checkpoint {
+                // A running job's download is the board routed so far.
+                let result = match absolute_utf8(&checkpoint) {
+                    Ok(path) => client
+                        .call_tool(
+                            "download_job_output_to_local_file",
+                            json!({ "jobId": job_id, "filePath": path }),
+                        )
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                };
+                monitor.checkpoint_downloaded(&checkpoint, &result);
+            }
+        }
+        match outcome {
+            JobOutcome::Running if action.stop => {
+                stopped_early = true;
+                break "STOPPED_ON_REQUEST".to_string();
+            }
             JobOutcome::Running if Instant::now() + settings.poll_interval >= deadline => {
-                stopped_at_deadline = true;
+                stopped_early = true;
                 break "STOPPED_AT_TIME_LIMIT".to_string();
             }
             JobOutcome::Running => tokio::time::sleep(settings.poll_interval).await,
@@ -406,7 +483,7 @@ async fn run_state_machine(
             json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
         )
         .await?;
-    if stopped_at_deadline && tools.contains_key("cancel_job") {
+    if stopped_early && tools.contains_key("cancel_job") {
         // The child is closed next in any case; this only ends the job cleanly.
         let _ = client
             .call_tool("cancel_job", json!({ "path": { "jobId": job_id } }))
@@ -415,7 +492,7 @@ async fn run_state_machine(
     Ok(RouteEvidence {
         session_id,
         job_id,
-        partial: stopped_at_deadline,
+        partial: stopped_early,
         final_state,
         last_status,
         poll_count,
@@ -444,7 +521,7 @@ fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
 }
 
 /// The first value under `key` anywhere in `value`.
-fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+pub(crate) fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     match value {
         Value::Object(map) => map
             .get(key)

@@ -166,6 +166,50 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
         ),
+        tool!(
+            "start_specctra_route_job",
+            "Start a long Freerouting run that outlives this MCP session, and return once Freerouting has the job running. A separate Konnect runner process, started outside the client's process tree, owns Freerouting; it keeps a status file current, saves the board routed so far as a checkpoint SES at an interval, and writes ses_output_path when the job completes, reaches job_timeout_seconds (partial: true) or is stopped. State lives in '<ses_output_path>.konnect-job/'. Follow with get_specctra_route_job; end early with stop_specctra_route_job. Same settings and checks as route_specctra_dsn.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
+                    "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "optimizer_enabled": { "type": "boolean" },
+                    "fanout_enabled": { "type": "boolean", "description": "Freerouting's fanout stage; see route_specctra_dsn." },
+                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop routing after this long and keep what is routed (partial: true). Without it the run may last up to 24 h." },
+                    "checkpoint_interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 600, "description": "How often the board routed so far is saved to checkpoint.ses in the job directory" }
+                },
+                "required": ["dsn_path", "ses_output_path"]
+            }),
+            |args, ctx| async move { handle_start_route_job(args, ctx).await }
+        ),
+        tool!(
+            "get_specctra_route_job",
+            "Report a run started by start_specctra_route_job: state (RUNNING, COMPLETED, STOPPED_AT_TIME_LIMIT, STOPPED_ON_REQUEST, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), Freerouting's pass and output figures, elapsed time, the latest checkpoint and whether the SES output exists. Reads the job directory only; works from any session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ses_output_path": { "type": "string", "description": "The ses_output_path the job was started with" }
+                },
+                "required": ["ses_output_path"]
+            }),
+            |args, ctx| async move { handle_get_route_job(args, ctx).await }
+        ),
+        tool!(
+            "stop_specctra_route_job",
+            "Ask a run started by start_specctra_route_job to stop now. The runner ends the Freerouting job at its next poll and writes the board routed so far to ses_output_path (partial: true). Waits up to wait_seconds for that to finish and reports the job.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ses_output_path": { "type": "string", "description": "The ses_output_path the job was started with" },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 600, "default": 120 }
+                },
+                "required": ["ses_output_path"]
+            }),
+            |args, ctx| async move { handle_stop_route_job(args, ctx).await }
+        ),
     ]
 }
 
@@ -2389,6 +2433,87 @@ async fn handle_route_specctra_dsn(
         "elapsed_seconds": evidence.elapsed_seconds,
         "ses_bytes": evidence.ses_bytes
     })))
+}
+
+async fn handle_start_route_job(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let dsn = get_path(args, "dsn_path")?;
+    let ses_output = get_path(args, "ses_output_path")?;
+    let jar = match resolve_freerouting_jar(args) {
+        FreeroutingJar::Found(jar) => jar,
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: path.display().to_string(),
+                },
+                format!("jar_path is not a file: {}", path.display()),
+            ));
+        }
+        FreeroutingJar::NotFound(roots) => {
+            return Ok(CallToolResult::error(format!(
+                "Freerouting JAR not found in {} searched locations; install Freerouting or \
+                 pass jar_path. check_freerouting lists every location searched.",
+                roots.len()
+            )));
+        }
+    };
+    let max_passes = args["max_passes"]
+        .as_u64()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
+    // The runner resolves nothing itself: every path it gets is absolute.
+    let absolute = |path: PathBuf| -> anyhow::Result<PathBuf> {
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        })
+    };
+    let spec = crate::freerouting_job::JobSpec {
+        jar: absolute(jar)?,
+        dsn: absolute(dsn)?,
+        ses_output: absolute(ses_output)?,
+        max_passes,
+        optimizer_enabled: args["optimizer_enabled"].as_bool(),
+        fanout_enabled: args["fanout_enabled"].as_bool(),
+        job_timeout_seconds: args["job_timeout_seconds"].as_u64(),
+        checkpoint_interval_seconds: args["checkpoint_interval_seconds"].as_u64().unwrap_or(600),
+    };
+    let body = crate::freerouting_job::start(spec)
+        .await
+        .map_err(|error| anyhow::anyhow!("Freerouting route job not started: {error:#}"))?;
+    if body["success"] == json!(false) {
+        return Ok(CallToolResult::error(format!(
+            "Freerouting route job failed to start: {}",
+            body["error"].as_str().unwrap_or("see the job status")
+        )));
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+async fn handle_get_route_job(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let ses_output = get_path(args, "ses_output_path")?;
+    Ok(CallToolResult::json(&crate::freerouting_job::status(
+        &ses_output,
+    )?))
+}
+
+async fn handle_stop_route_job(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let ses_output = get_path(args, "ses_output_path")?;
+    let wait =
+        std::time::Duration::from_secs(args["wait_seconds"].as_u64().unwrap_or(120).min(600));
+    Ok(CallToolResult::json(
+        &crate::freerouting_job::stop(&ses_output, wait).await?,
+    ))
 }
 
 #[cfg(test)]

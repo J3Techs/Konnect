@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **236 registered tools** + **7 always-visible meta-tools** = **243 total**
+- **239 registered tools** + **7 always-visible meta-tools** = **246 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -374,7 +374,7 @@ and Windows servers do not.
 
 ## Integration
 
-### `integration` · 9 tools
+### `integration` · 12 tools
 **Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
@@ -389,9 +389,13 @@ and Windows servers do not.
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. |
 | `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. Job settings (`max_passes`, `optimizer_enabled`, `fanout_enabled`) are proven applied from Freerouting's answer; progress notifications report the job while it runs; Konnect enforces the time limit and keeps the board routed so far (`partial: true`). |
+| `start_specctra_route_job` | Start a long Freerouting run that outlives the MCP session. A `konnect freerouting-runner` process, started outside the client's process tree (on Windows, broken away from the client's job object), owns Freerouting, keeps `<ses>.konnect-job/status.json` current, saves `checkpoint.ses` at an interval, and writes the SES when the job completes, times out (`partial: true`) or is stopped. Returns once Freerouting has the job running with its settings proven applied. |
+| `get_specctra_route_job` | Report a run started by `start_specctra_route_job` from its job directory: state (`RUNNER_LOST` when the heartbeat stops), Freerouting's pass and output figures, the latest checkpoint and whether the SES exists. Works from any session. |
+| `stop_specctra_route_job` | Ask a running job to stop; the runner ends it at its next poll and writes the board routed so far (`partial: true`). |
 
 Migration from the former `autoroute` tool: use `export_specctra_dsn`,
-`route_specctra_dsn`, then `plan_specctra_ses_import` / `apply_specctra_ses`.
+`route_specctra_dsn` (or, for a run of hours, `start_specctra_route_job` and
+`get_specctra_route_job`), then `plan_specctra_ses_import` / `apply_specctra_ses`.
 Konnect delegates routing to Freerouting's native MCP server instead of duplicating
 the router or relying on the KiCad ActionPlugin workflow.
 

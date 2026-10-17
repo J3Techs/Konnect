@@ -1,5 +1,6 @@
 pub mod config_resolution;
 pub mod design_hash;
+pub mod freerouting_job;
 pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod guidance;
