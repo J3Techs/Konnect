@@ -1153,6 +1153,7 @@ async fn handle_plan_specctra_ses_import(
             "track_count": plan.tracks.len(),
             "arc_count": plan.arcs.len(),
             "via_count": plan.vias.len(),
+            "skipped_point_wires": plan.skipped_point_wires,
             "preserved_locked_routing": {
                 "tracks": plan.locked_track_count,
                 "vias": plan.locked_via_count
@@ -1181,6 +1182,7 @@ struct ApplyEvidence {
     track_count: usize,
     arc_count: usize,
     via_count: usize,
+    skipped_point_wires: usize,
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
@@ -1431,6 +1433,7 @@ async fn handle_apply_specctra_ses(
                 track_count: plan.tracks.len(),
                 arc_count: plan.arcs.len(),
                 via_count: plan.vias.len(),
+                skipped_point_wires: plan.skipped_point_wires,
                 created_count: created_ids.len(),
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
@@ -1492,6 +1495,7 @@ async fn handle_apply_specctra_ses(
             "track_count": evidence.track_count,
             "arc_count": evidence.arc_count,
             "via_count": evidence.via_count,
+            "skipped_point_wires": evidence.skipped_point_wires,
             "created_count": evidence.created_count,
             "preserved_locked_routing": {
                 "tracks": evidence.preserved_locked_track_count,

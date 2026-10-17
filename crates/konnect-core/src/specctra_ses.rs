@@ -23,6 +23,9 @@ pub(crate) struct SesImportPlan {
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
+    /// Wires of a single point, which Freerouting sometimes writes and which
+    /// carry no copper. Validated, then left out of the import.
+    pub skipped_point_wires: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -207,7 +210,7 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    let (tracks, arcs, vias) = parse_network(
+    let (tracks, arcs, vias, skipped_point_wires) = parse_network(
         one_child(routes, "network_out")?,
         route_resolution,
         &manifest,
@@ -225,6 +228,7 @@ pub(crate) fn parse_import_plan(
         tracks,
         arcs,
         vias,
+        skipped_point_wires,
     })
 }
 
@@ -526,7 +530,7 @@ fn parse_network(
     node: &SexpNode,
     resolution: f64,
     manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>)> {
+) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize)> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
@@ -550,6 +554,7 @@ fn parse_network(
     let mut seen_tracks = BTreeSet::new();
     let mut seen_arcs = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
+    let mut skipped_point_wires = 0;
 
     for net_node in node.find_all("net") {
         require_direct_shape(net_node, 1, &["wire", "via"])?;
@@ -564,7 +569,7 @@ fn parse_network(
             match (path, qarc) {
                 (Some(path), None) => {
                     let data = atom_values(path)?;
-                    if data.len() < 6 || (data.len() - 2) % 2 != 0 {
+                    if data.len() < 4 || (data.len() - 2) % 2 != 0 {
                         bail!(
                             "SES path for net '{net_name}' does not contain complete point pairs"
                         );
@@ -588,6 +593,10 @@ fn parse_network(
                             Ok((x_um / UM_PER_MM, -y_um / UM_PER_MM))
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    if points.len() == 1 {
+                        skipped_point_wires += 1;
+                        continue;
+                    }
                     for pair in points.windows(2) {
                         let (x1_mm, y1_mm) = pair[0];
                         let (x2_mm, y2_mm) = pair[1];
@@ -731,7 +740,7 @@ fn parse_network(
             });
         }
     }
-    Ok((tracks, arcs, vias))
+    Ok((tracks, arcs, vias, skipped_point_wires))
 }
 
 fn parse_resolution(node: &SexpNode) -> Result<f64> {

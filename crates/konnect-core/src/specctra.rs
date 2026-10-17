@@ -3225,6 +3225,34 @@ mod tests {
         assert_eq!(plan.tracks[0].layer, "In2.Cu");
         assert_eq!((plan.vias[0].x_mm, plan.vias[0].y_mm), (20.0, 11.0));
         assert_eq!((plan.locked_track_count, plan.locked_via_count), (1, 1));
+        assert_eq!(plan.skipped_point_wires, 0);
+
+        // Freerouting sometimes writes a wire of one point; it has no copper.
+        let point_wire = ses.replace(
+            "(via konnect_via_0001",
+            "(wire (path In2.Cu 2500 100000 -110000)) (via konnect_via_0001",
+        );
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            MULTILAYER,
+            &export.manifest,
+            &point_wire,
+        )
+        .unwrap();
+        assert_eq!((plan.tracks.len(), plan.skipped_point_wires), (1, 1));
+        let unknown_layer = point_wire.replace(
+            "(path In2.Cu 2500 100000 -110000)",
+            "(path In9.Cu 2500 1 1)",
+        );
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            MULTILAYER,
+            &export.manifest,
+            &unknown_layer,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown layer"), "{error}");
 
         let three_layer_via = ses.replace(" (shape (circle In1.Cu 6000 0 0))", "");
         let error = crate::specctra_ses::parse_import_plan(
