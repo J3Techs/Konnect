@@ -92,7 +92,8 @@ fn job_props() -> Value {
                              "description": "Native routing: classes left unrouted (zones or hand copper); their connections are reported as excluded_by_policy, not as failures. Default: every class whose track width is at least 0.5 mm. [] routes every class" },
         "net_classes": { "type": "string", "enum": ["auto", "kicad", "project"], "default": "auto",
                          "description": "Where net classes come from: kicad (KiCad's effective class per net over IPC; the board must be open), project (the .kicad_pro patterns, resolved as KiCad does), auto (kicad when KiCad has the board open, else project)" },
-        "fanout_plan": { "type": "string", "description": "Native routing: write the plane fanout (S2) to this new routing_file, to apply with locked: true, and leave it out of output_plan" }
+        "fanout_plan": { "type": "string", "description": "Native routing: write the plane fanout (S2) to this new routing_file, to apply with locked: true, and leave it out of output_plan" },
+        "fanout_share_within_mm": { "type": "number", "minimum": 0, "description": "Native routing: a plane pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" }
     })
 }
 
@@ -118,7 +119,9 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "plan_plane_vias",
             "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only.",
             with_props(json!({
-                "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
+                "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
+                "share_within_mm": { "type": "number", "minimum": 0, "description": "A pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" },
+                "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits, placed against the sites already chosen" }
             }), &["board", "output_plan"]),
             |args, ctx| async move { handle_plan_plane_vias(args, ctx).await }
         ),
@@ -377,6 +380,7 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
             "layer_fallback",
             "neck_down",
             "exclude_classes",
+            "fanout_share_within_mm",
         ] {
             if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
                 allowance_args.insert(key.to_string(), v.clone());
@@ -694,14 +698,30 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
+    let mut settings = konnect_route::fanout::FanoutSettings::default();
+    match args.get("share_within_mm") {
+        None | Some(Value::Null) => {}
+        Some(v) => match v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .and_then(konnect_geom::mm_to_nm)
+        {
+            Some(nm) => settings.share_within = nm,
+            None => {
+                return Ok(invalid(
+                    "share_within_mm",
+                    "must be a non-negative length in mm",
+                ))
+            }
+        },
+    }
+    settings.retry_failed = match opt_bool(args, "retry_failed", true) {
+        Ok(b) => b,
+        Err(r) => return Ok(r),
+    };
     let conn = ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default());
     let plan = match guarded("fanout", || {
-        konnect_route::fanout::plan_plane_vias(
-            &board,
-            &rules,
-            &conn,
-            &konnect_route::fanout::FanoutSettings::default(),
-        )
+        konnect_route::fanout::plan_plane_vias(&board, &rules, &conn, &settings)
     }) {
         Ok(p) => p,
         Err(e) => return Ok(stage_failure("plan_plane_vias", e)),
@@ -729,13 +749,35 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             });
         }
     }
+    let pad_label = |pad: konnect_route::api::PadId| {
+        let p = &board.pads[pad.index()];
+        format!(
+            "{}.{}",
+            board.footprints[p.footprint.index()]
+                .reference
+                .as_deref()
+                .unwrap_or("?"),
+            p.number
+        )
+    };
     let failed: Vec<Value> = plan
         .failed
         .iter()
         .map(|(pad, why)| {
             let p = &board.pads[pad.index()];
+            let detail = plan.details.iter().find(|d| d.pad == *pad);
+            let mut top: Vec<(&String, &u32)> =
+                detail.map(|d| d.rejections.iter().collect()).unwrap_or_default();
+            top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            top.truncate(3);
             json!({ "reference": board.footprints[p.footprint.index()].reference,
-                    "pad": p.number, "failure": why })
+                    "pad": p.number,
+                    "net": p.net.map(|n| board.net(n).name.clone()),
+                    "failure": why,
+                    "candidates": detail.map(|d| d.candidates),
+                    "legal": detail.map(|d| d.legal),
+                    "top_rejections": top.into_iter().map(|(k, v)| json!({ "reason": k, "count": v })).collect::<Vec<_>>(),
+                    "blocked_by": detail.map(|d| d.blocked_by.iter().map(|b| pad_label(*b)).collect::<Vec<_>>()).unwrap_or_default() })
         })
         .collect();
     let written = routing.item_count() > 0;
@@ -757,6 +799,8 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "sites": plan.sites.len(),
+        "shared_vias": plan.stats.shared_vias,
+        "retried_sites": plan.stats.retried_sites,
         "failed": failed.len(),
         "failures": failed,
         "plan_written": written,

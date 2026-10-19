@@ -53,6 +53,11 @@ pub struct RoutingAllowances {
     /// an empty list routes every class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_classes: Option<Vec<String>>,
+    /// Plane fanout: a pad that gets no via of its own may join a via of
+    /// the same net placed for another pad within this distance, mm
+    /// ([`crate::fanout::FanoutSettings::share_within`]). Unset: never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_share_within_mm: Option<f64>,
 }
 
 /// A class's second chance on more layers.
@@ -137,6 +142,9 @@ pub struct AllowanceReport {
     pub excluded_classes: Vec<String>,
     /// Whether the exclusions are the default policy.
     pub exclusion_is_default: bool,
+    /// Fanout via sharing distance (0: off).
+    #[serde(default)]
+    pub fanout_share_within_nm: Coord,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +370,15 @@ impl RoutingAllowances {
             .iter()
             .map(|c| classes[c.index()].name.clone())
             .collect();
+
+        let share = match self.fanout_share_within_mm {
+            None => 0,
+            Some(v) => mm(v, "fanout_share_within_mm")?,
+        };
+        if let Some(f) = settings.fanout.as_mut() {
+            f.share_within = share;
+        }
+        report.fanout_share_within_nm = share;
 
         settings.layer_policy.class_layers = class_layers;
         settings.class_fallback = fallback;
