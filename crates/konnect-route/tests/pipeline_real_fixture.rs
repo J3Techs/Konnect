@@ -17,12 +17,23 @@
 //! - `KONNECT_PIPELINE_NEGOTIATE_THREADS` (default: the pipeline's);
 //! - `KONNECT_PIPELINE_ITERATIONS` (negotiation, default: the pipeline's);
 //! - `KONNECT_PIPELINE_REGION=x0,y0,x1,y1` in mm;
+//! - `KONNECT_PIPELINE_NETS_FILE=path`: route only the nets named there,
+//!   one per line (keep the file outside the repository);
 //! - `KONNECT_PIPELINE_NO_FANOUT=1`, `KONNECT_PIPELINE_NO_ACCESS=1`,
 //!   `KONNECT_PIPELINE_NO_OPTIMIZE=1`;
 //! - `KONNECT_PIPELINE_REFERENCE=1`: negotiation's reference search instead
 //!   of the kernel, for comparison;
 //! - `KONNECT_PIPELINE_CLEAR=0|1`: take out routed copper S7 still finds a
 //!   defect in (default on);
+//! - `KONNECT_PIPELINE_REPAIR=0|1`: route again what the clear stage
+//!   opened, with the connections still failed (default on);
+//! - `KONNECT_PIPELINE_RESCUE`, `KONNECT_PIPELINE_RESCUE_ITERATIONS`,
+//!   `KONNECT_PIPELINE_RESCUE_NEIGHBOURS`: the rescue rounds after
+//!   negotiation, their negotiation iterations, and how many winners a
+//!   loser may rip up; `KONNECT_PIPELINE_RESCUE_RETRY=0|1`: later rounds
+//!   retry what a round found no way for (default on);
+//! - `KONNECT_PIPELINE_CAPACITY_SCALE`: the share of global capacity
+//!   corridors are planned on, ×1000;
 //! - `KONNECT_PIPELINE_MIN_RUN=0|1`: minimum runs on rule nets (default on);
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
@@ -122,7 +133,23 @@ fn pipeline_real_board_fixture() {
             Point::from_mm(v[2], v[3]).unwrap(),
         )
     });
-    let scope = PipelineScope { nets: None, region };
+    // A file of net names, one per line: route only their connections.
+    let nets = std::env::var("KONNECT_PIPELINE_NETS_FILE").ok().map(|f| {
+        let text = std::fs::read_to_string(f).expect("nets file reads");
+        let wanted: std::collections::BTreeSet<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        board
+            .nets
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| wanted.contains(n.name.as_str()))
+            .map(|(i, _)| konnect_route::api::NetId(i as u32))
+            .collect()
+    });
+    let scope = PipelineScope { nets, region };
     let mut settings = PipelineSettings {
         threads: env_num("KONNECT_PIPELINE_THREADS", 0) as usize,
         ..PipelineSettings::default()
@@ -150,6 +177,12 @@ fn pipeline_real_board_fixture() {
     ) as u32;
     if let Ok(v) = std::env::var("KONNECT_PIPELINE_CLEAR") {
         settings.clear_findings = v == "1";
+    }
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_RESCUE_RETRY") {
+        settings.rescue_retry_unreachable = v == "1";
+    }
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_REPAIR") {
+        settings.clear_repair = v == "1";
     }
     if let Ok(v) = std::env::var("KONNECT_PIPELINE_MIN_RUN") {
         settings.search_min_run = v.trim() == "1";
@@ -179,6 +212,20 @@ fn pipeline_real_board_fixture() {
         u64::from(settings.tuning.fill_passes),
     ) as u32;
     settings.tuning.stall_iterations = env_num("KONNECT_PIPELINE_STALL", 0) as u32;
+    settings.global.capacity_scale = env_num(
+        "KONNECT_PIPELINE_CAPACITY_SCALE",
+        u64::from(settings.global.capacity_scale),
+    ) as u32;
+    settings.rescue_rounds =
+        env_num("KONNECT_PIPELINE_RESCUE", u64::from(settings.rescue_rounds)) as u32;
+    settings.rescue_neighbours = env_num(
+        "KONNECT_PIPELINE_RESCUE_NEIGHBOURS",
+        u64::from(settings.rescue_neighbours),
+    ) as u32;
+    settings.rescue_iterations = env_num(
+        "KONNECT_PIPELINE_RESCUE_ITERATIONS",
+        u64::from(settings.rescue_iterations),
+    ) as u32;
     if let Ok(v) = std::env::var("KONNECT_PIPELINE_BGA_SUBTILE_MM") {
         let mm: f64 = v.trim().parse().expect("mm");
         settings.tuning.bga_sub_tile_max = (mm * 1e6).round() as i32;

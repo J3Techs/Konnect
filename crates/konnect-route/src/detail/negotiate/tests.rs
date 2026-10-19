@@ -1220,6 +1220,77 @@ fn reopened_via_sites_match_a_full_erosion() {
 }
 
 #[test]
+fn one_nets_vias_share_a_point_but_keep_hole_to_hole_elsewhere() {
+    use super::copper::{PieceCopper, ViaCopper};
+    let mut b = BoardBuilder::new(12.0, 10.0, &["F.Cu", "B.Cu"]);
+    b.net("A");
+    b.net("B");
+    let board = b.build();
+    let net_a = board.net_by_name("A").unwrap();
+    let net_b = board.net_by_name("B").unwrap();
+    let rules = UniformRules {
+        hole_to_hole: 250_000,
+        ..UniformRules::default()
+    };
+    let via = |task: u32, net: NetId, x: Coord| {
+        Arc::new(PieceCopper::new(
+            task,
+            0,
+            net,
+            Vec::new(),
+            vec![ViaCopper {
+                center: Point::new(x, 5_000_000),
+                diameter: 450_000,
+                drill: 200_000,
+                courtyards: Vec::new(),
+            }],
+        ))
+    };
+    // Two connections of net A on one point: one via, no conflict. Moved
+    // apart by less than hole-to-hole, or of another net, they conflict.
+    for (other, expect) in [
+        (via(1, net_a, 6_000_000), 0),
+        (via(1, net_a, 6_300_000), 1),
+        (via(1, net_b, 6_000_000), 1),
+    ] {
+        let index = RoutedIndex::build(
+            vec![via(0, net_a, 6_000_000), other],
+            2,
+            rules.max_clearance() + 1,
+        );
+        let pairs = index.conflicts(&rules, board.layers.all(), &|_: &PieceCopper| true);
+        assert_eq!(pairs.len(), expect, "{pairs:?}");
+    }
+
+    // Lifting a net closes its own via's hole-to-hole ring of sites, but
+    // not the via's own node.
+    let w = Window::new(Point::new(5_000_000, 4_000_000), 50_000, 41, 41).unwrap();
+    let mut r = TileRaster::new(TileId(0), LayerId(0), crate::api::ProfileId(0), w);
+    r.via_site.fill(crate::detail::search::VIA_CHECK);
+    let c = Point::new(6_000_000, 5_000_000);
+    let reach = 450_000i64;
+    let before = r.clone();
+    let saved = run::close_sites_near(&mut r, (0, 0, 40, 40), c, reach);
+    let rows: Vec<u8> = (0..41u32)
+        .flat_map(|row| (0..41u32).map(move |col| (col, row)))
+        .map(|(col, row)| before.via_site.get(col, row))
+        .collect();
+    assert_eq!(saved, rows);
+    for row in 0..41u32 {
+        for col in 0..41u32 {
+            let q = w.node(col, row);
+            let d2 = (q - c).length2();
+            let open = r.via_site.get(col, row) != 0;
+            assert_eq!(
+                open,
+                q == c || d2 >= i128::from(reach) * i128::from(reach),
+                "({col}, {row})"
+            );
+        }
+    }
+}
+
+#[test]
 fn fill_passes_route_more_and_stay_legal() {
     let board = crossing_bundle(6);
     let blind = |fill_passes| NegotiationTuning {

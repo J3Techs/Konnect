@@ -377,6 +377,50 @@ vias, nets, findings }`; counters `pipeline_cleared_*`; time charged to
 `Stage::Check`. `PipelineResult::cleared` holds it. A struct literal of
 `PipelineSettings` needs the new field.
 
+**Wave 4: completion (rescue rounds and repair).** All additive; a struct
+literal of `PipelineSettings` or `GlobalSettings` needs the new fields.
+
+- **Rescue rounds** (`PipelineSettings::rescue_rounds`, default 3;
+  `rescue_iterations`, default 6; `rescue_neighbours`, default 2;
+  `rescue_retry_unreachable`, default on) run after negotiation, before
+  `class_fallback`. Each round makes the routed copper fixed, builds a fresh
+  GCell grid over it, routes the connections still failed for a retryable
+  reason globally on it (at most 10 global iterations, stall 3) and
+  negotiates them along those corridors. A loser's winners
+  (`Congestion::against`, when at most `rescue_neighbours`) are ripped up
+  and routed with it; the round is kept only if more of those connections
+  end up joined, otherwise its copper is dropped and later rounds rip up
+  nothing. Credit is by connectivity. With `rescue_retry_unreachable` off,
+  a connection a round's own searches found no way for (not a lost
+  negotiation) is not queued again. Counters `pipeline_rescue_{queued,
+  ripped, rejected, routed, us, us_global, us_grid, us_negotiate,
+  global_iterations, global_setup_us, global_seed_us}`; time charged to
+  `Stage::Detail`.
+- **Repair** (`PipelineSettings::clear_repair`, default on; needs
+  `clear_findings`) routes once more, around all copper left, the
+  connections the clear stage cut open, then optimizes (when S6 runs) and
+  clears the new copper against the rest. Counters
+  `pipeline_repair_{queued, routed, cleared_cut, us}`.
+- **`PipelineResult::detail` now reflects connectivity** after the rescue
+  rounds and the repair: `routed` is every connection whose two terminals
+  are joined, and a connection the clear stage left open fails as
+  `DetailFailure::ExactCheckRejected` (frozen reason `BudgetExhausted`).
+  Before, `detail` counted such connections as routed. With
+  `clear_findings` or `clear_repair` off (as in the `konnect-core` job,
+  which runs S6 and the clear stage itself), `detail` is as negotiation and
+  the rescue rounds left it.
+- **`DetailResult`** gained `track_owner: Vec<ConnectionId>` (the
+  connection behind each of `copper.tracks`) and `via_users:
+  Vec<Vec<ConnectionId>>` (the connections using each of `copper.vias`),
+  both serde default.
+- **`GlobalSettings::capacity_scale`** (×1000, default 1000): the share of
+  the computed capacity global routing may use. The pipeline's default sets
+  700: corridors planned on 70 % of the packed-track capacity left detail
+  fewer conflicts and routed more, faster.
+- **`pipeline::backend::NEGOTIATION_MAX_EXPANSIONS = 500_000`**, which
+  `KernelBackend::negotiation_config()` sets as `SearchConfig::max_expansions`;
+  a capped search fails as `BudgetExhausted`, which negotiation retries.
+
 Every stage records its time in the result's `Telemetry` (`Stage::Audit` for
 connectivity, `Fanout`, `Access`, `Global`, `Detail`, `Optimize`, `Check`
 for the guard and the check, `Plan`) plus `pipeline_*` counters. The
@@ -736,7 +780,9 @@ and part of the plan.
   `crates/konnect-route/tests/real_board_fixture.rs`.
 - `tests/pipeline_real_fixture.rs` reads its knobs from
   `KONNECT_PIPELINE_*` variables (listed in its module docs, including
-  `KONNECT_PIPELINE_GRID_CORE_MM` and `KONNECT_PIPELINE_CLEAR=0|1`).
+  `KONNECT_PIPELINE_GRID_CORE_MM`, `KONNECT_PIPELINE_CLEAR=0|1`, the rescue,
+  repair and capacity-scale knobs, and `KONNECT_PIPELINE_NETS_FILE`, a file
+  of net names kept outside the repository).
   `tests/pipeline_tail_fixture.rs` re-runs
   S6–S8 on copper a previous run saved. `tests/search_replay.rs` is a gated
   capture/replay pair; the capture refuses a directory inside any git work

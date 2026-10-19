@@ -482,12 +482,60 @@ impl TileRun {
         self.paint_own(ctx, net, k, up);
         if !up {
             self.reopen_sites(ctx, net, k);
+            self.space_own_vias(ctx, net, k);
         }
     }
 
-    /// Put back the via sites [`Self::reopen_sites`] overwrote.
+    /// Close the via sites whose hole would come within hole-to-hole of a
+    /// via the net already routed in this tile (another connection of the
+    /// net, or another piece of this one). Lifting the net hides those
+    /// vias from the search, and hole-to-hole holds between holes of any
+    /// nets, so without this the conflict is invisible to negotiation and
+    /// never resolves. A site exactly on such a via stays open: the two
+    /// connections share the via, which is drawn once.
+    fn space_own_vias(&mut self, ctx: &Ctx<'_>, net: NetId, k: usize) {
+        let Some(pieces) = self.soft.get(&net) else {
+            return;
+        };
+        let drill = ctx.net_via[net.index()].drill;
+        let h2h = ctx.rules.hole_to_hole();
+        let mut centres: Vec<(Point, Coord)> = pieces
+            .iter()
+            .flat_map(|p| p.vias.iter().map(|v| (v.center, v.drill)))
+            .collect();
+        if centres.is_empty() {
+            return;
+        }
+        centres.sort_unstable_by_key(|(p, d)| (p.x, p.y, *d));
+        centres.dedup();
+        let w = self.lattice;
+        let stack = self.stacks[k].as_mut().expect("stack at home");
+        for (c, d) in centres {
+            // Holes closer than this, centre to centre, break hole-to-hole.
+            let reach =
+                i64::from(h2h) + i64::from(drill / 2 + drill % 2) + i64::from(d / 2 + d % 2);
+            let Ok(r) = Coord::try_from(reach) else {
+                continue;
+            };
+            let Some(range) = node_range(&w, &konnect_geom::BBox::point(c).inflate(r)) else {
+                continue;
+            };
+            for (slot, layer) in stack.layers.iter_mut().enumerate() {
+                let values = close_sites_near(layer, range, c, reach);
+                self.saved_sites.push(SavedSites {
+                    stack: k,
+                    slot,
+                    range,
+                    values,
+                });
+            }
+        }
+    }
+
+    /// Put back the via sites [`Self::reopen_sites`] and
+    /// [`Self::space_own_vias`] overwrote, newest first (ranges may overlap).
     fn restore_sites(&mut self) {
-        for saved in std::mem::take(&mut self.saved_sites) {
+        for saved in std::mem::take(&mut self.saved_sites).into_iter().rev() {
             let stack = self.stacks[saved.stack].as_mut().expect("stack at home");
             let r = &mut stack.layers[saved.slot];
             let (c0, r0, c1, r1) = saved.range;
@@ -1409,6 +1457,31 @@ fn erode_into(r: &mut TileRaster, k: usize) {
             *c -= u32::from(h);
         }
     }
+}
+
+/// Over the node range, close every via site closer than `reach` to `c`
+/// except a node exactly on `c`; returns the range's sites as they were
+/// (row by row), for [`TileRun::restore_sites`].
+pub(crate) fn close_sites_near(
+    r: &mut TileRaster,
+    range: (u32, u32, u32, u32),
+    c: Point,
+    reach: i64,
+) -> Vec<u8> {
+    let (c0, r0, c1, r1) = range;
+    let w = r.window;
+    let mut values = Vec::with_capacity(((c1 - c0 + 1) * (r1 - r0 + 1)) as usize);
+    for row in r0..=r1 {
+        for col in c0..=c1 {
+            let site = r.via_site.get(col, row);
+            values.push(site);
+            let q = w.node(col, row);
+            if site != 0 && q != c && (q - c).length2() < i128::from(reach) * i128::from(reach) {
+                r.via_site.set(col, row, 0);
+            }
+        }
+    }
+    values
 }
 
 #[cfg(test)]

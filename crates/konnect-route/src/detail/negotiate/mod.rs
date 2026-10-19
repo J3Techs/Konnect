@@ -360,7 +360,7 @@ impl DetailFailure {
     }
 
     /// Whether another iteration (another tiling) could change the outcome.
-    fn retryable(&self) -> bool {
+    pub(crate) fn retryable(&self) -> bool {
         !matches!(
             self,
             DetailFailure::NoAccess { .. }
@@ -432,6 +432,13 @@ pub struct DetailResult {
     /// left for S6 to merge or straighten (lattice jogs are one or two
     /// steps long). Collinear runs split at tile pins are already merged.
     pub short_segments: Vec<ShortSegment>,
+    /// Which connection drew each of `copper.tracks` (same order).
+    #[serde(default)]
+    pub track_owner: Vec<ConnectionId>,
+    /// The connections that use each of `copper.vias` (same order): more
+    /// than one where connections of a net share a via.
+    #[serde(default)]
+    pub via_users: Vec<Vec<ConnectionId>>,
 }
 
 /// A routed track below its minimum segment length.
@@ -847,18 +854,20 @@ fn lock_state(m: &std::sync::Mutex<DagState>) -> std::sync::MutexGuard<'_, DagSt
 /// worker thread.
 ///
 /// `order` is the canonical schedule (passes in order, tiles in id order).
-/// Tile `t` depends on every earlier tile whose window meets `t`'s. Copper
-/// of an earlier tile `j` that `t` does not depend on may still be within
-/// `t`'s reach (and so in its store), but it cannot change `t`'s rasters:
+/// Tile `t` depends on every earlier tile whose window meets `t`'s, and its
+/// store holds this iteration's copper of those tiles only. Copper of an
+/// earlier tile `j` that `t` does not depend on may be within `t`'s reach,
+/// but it could not change `t`'s rasters:
 /// `j` commits centre lines a context margin inside its own window
 /// ([`Ctx::margin`], from the largest clearance and the widest copper any
 /// net draws), so that copper stays further from `t`'s disjoint window than
 /// any clearance plus half-width plus half-diagonal a node of `t` paints
-/// with. Painting it, or not, is a no-op on every node of `t`. Any
-/// execution that respects these edges therefore computes exactly what
-/// running the passes one after another computes; there are just no pass
-/// barriers, so a slow tile holds up only its neighbours. Results come
-/// back in `order`.
+/// with; but the net's own vias in it close via sites within hole-to-hole
+/// around them, further out than that margin, so whether a tile saw it
+/// depended on timing. Any execution that respects these edges therefore
+/// computes the same result on any number of threads; there are just no
+/// pass barriers, so a slow tile holds up only its neighbours. Results
+/// come back in `order`.
 ///
 /// A panic in any tile stops every worker and is re-raised here.
 #[allow(clippy::too_many_arguments)]
@@ -931,10 +940,15 @@ fn run_dag(
         results: (0..n).map(|_| None).collect(),
         panic: None,
     });
-    // Pieces committed so far this iteration. Only read for copper within
-    // a tile's reach; whatever non-dependency copper a read happens to see
-    // paints nothing (see above), so the read needs no ordering.
-    let fresh: std::sync::RwLock<Vec<Arc<PieceCopper>>> = std::sync::RwLock::new(Vec::new());
+    // Pieces committed so far this iteration, by DAG node. A tile reads
+    // only its dependencies' (all finished before it starts), in node
+    // order: copper of a tile it does not depend on would paint nothing
+    // (see above), but which of it a read saw depended on timing, and the
+    // net's own vias in it close via sites around them (hole-to-hole),
+    // further out than the context margin covers.
+    let fresh: std::sync::RwLock<Vec<Vec<Arc<PieceCopper>>>> =
+        std::sync::RwLock::new(vec![Vec::new(); n]);
+    let preds = &preds;
     let wake = std::sync::Condvar::new();
     let t0 = Instant::now();
     std::thread::scope(|scope| {
@@ -965,14 +979,14 @@ fn run_dag(
                     let near = |p: &&Arc<PieceCopper>| p.bbox.is_some_and(|b| b.intersects(&reach));
                     let mut store: Vec<Arc<PieceCopper>> =
                         kept.iter().filter(near).cloned().collect();
-                    store.extend(
-                        fresh
+                    {
+                        let fresh = fresh
                             .read()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .iter()
-                            .filter(near)
-                            .cloned(),
-                    );
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for &j in &preds[k] {
+                            store.extend(fresh[j].iter().filter(near).cloned());
+                        }
+                    }
                     let start = Instant::now();
                     let mut run = TileRun::build(ctx, spec, jobs, tasks, cache, &mut pool);
                     run.derive_masks(backend.as_mut());
@@ -986,7 +1000,7 @@ fn run_dag(
                     let busy = start.elapsed().as_micros() as u64;
                     fresh
                         .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[k]
                         .extend(
                             run.done
                                 .iter()
@@ -1758,6 +1772,13 @@ fn run_negotiation(
                     kept_new.insert(t);
                 }
             }
+            // Why the fill's own searches failed (before congestion is put
+            // back), per connection.
+            for &t in &queue {
+                if let Some(f) = &failure[t as usize] {
+                    telemetry.count(&format!("fill_failed_{}", f.name()), 1);
+                }
+            }
             for (t, f) in lost_to {
                 if routed[t as usize].is_none() {
                     failure[t as usize] = Some(f);
@@ -1851,6 +1872,7 @@ fn run_negotiation(
             via_at.insert((p.net, v.center));
         }
     }
+    let mut drawn_vias: HashMap<(NetId, Point), usize> = HashMap::new();
     for (t, task) in tasks.iter().enumerate() {
         match &routed[t] {
             Some(pieces) => {
@@ -1884,9 +1906,21 @@ fn run_negotiation(
                         seg: s.seg,
                         gen,
                     });
+                    result.track_owner.push(task.conn.id);
                 }
                 for p in pieces {
                     for v in &p.vias {
+                        // Connections of one net may share a via (conflict
+                        // detection lets them): it is drawn once.
+                        if let Some(&i) = drawn_vias.get(&(p.net, v.center)) {
+                            if !result.via_users[i].contains(&task.conn.id) {
+                                result.via_users[i].push(task.conn.id);
+                            }
+                            telemetry.count("shared_vias", 1);
+                            continue;
+                        }
+                        drawn_vias.insert((p.net, v.center), result.copper.vias.len());
+                        result.via_users.push(vec![task.conn.id]);
                         result.copper.vias.push(RoutedVia {
                             net: p.net,
                             center: v.center,

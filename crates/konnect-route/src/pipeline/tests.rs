@@ -691,3 +691,35 @@ fn excluded_classes_get_no_fanout_copper() {
     assert!(r.connections.is_empty() && r.failed.is_empty());
     assert_eq!(r.plan.item_count(), 0);
 }
+
+#[test]
+fn ripping_up_a_connection_keeps_a_via_another_one_shares() {
+    let board = clear_board(false);
+    let mut routed = routed_tracks(
+        &board,
+        &[((2.0, 5.0), (6.0, 5.0)), ((6.0, 5.0), (18.0, 5.0))],
+    );
+    let net = routed.tracks[0].net;
+    let via = |x: f64| RoutedVia {
+        net,
+        center: Point::from_mm(x, 5.0).unwrap(),
+        diameter: 600_000,
+        drill: 300_000,
+        layers: LayerMask::single(LayerId(0)).with(LayerId(1)),
+        gen: crate::api::Generation(0),
+    };
+    routed.vias.push(via(6.0));
+    routed.vias.push(via(18.0));
+    let (a, b) = (ConnectionId(0), ConnectionId(1));
+    let owners = Owners {
+        tracks: vec![a, b],
+        vias: vec![vec![a, b], vec![b]],
+    };
+    let (copper, left) = owners.without(&routed, &BTreeSet::from([b]));
+    assert_eq!(copper.tracks.len(), 1);
+    assert_eq!(copper.tracks[0], routed.tracks[0]);
+    // The shared via stays with its other user; b's own via goes.
+    assert_eq!(copper.vias, vec![routed.vias[0]]);
+    assert_eq!(left.tracks, vec![a]);
+    assert_eq!(left.vias, vec![vec![a]]);
+}

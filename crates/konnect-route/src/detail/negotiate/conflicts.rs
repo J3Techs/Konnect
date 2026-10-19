@@ -120,6 +120,12 @@ impl RoutedIndex {
         if ka == ItemKind::Via && kb == ItemKind::Via {
             let ia = self.items[a as usize];
             let ib = self.items[b as usize];
+            let (va, vb) = (&pa.vias[ia.via as usize], &pb.vias[ib.via as usize]);
+            // Two vias of one net at one point are one via: the result
+            // keeps only one of them.
+            if pa.net == pb.net && va.center == vb.center && va.drill == vb.drill {
+                return false;
+            }
             let ha = Shape::Circle(pa.vias[ia.via as usize].hole());
             let hb = Shape::Circle(pb.vias[ib.via as usize].hole());
             if gap_cmp(&ha, &hb, i64::from(rules.hole_to_hole())) == Ordering::Less {

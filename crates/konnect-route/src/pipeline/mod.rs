@@ -112,6 +112,22 @@ pub struct PipelineSettings {
     /// and never reported as failures. Empty by default; the job runner
     /// fills it from [`RoutingAllowances`] ([`default_excluded_classes`]).
     pub excluded_classes: BTreeSet<ClassId>,
+    /// Rescue rounds after negotiation ([`rescue`]): the connections still
+    /// failed for a reason another try could change are routed globally
+    /// again, over a grid whose capacity is what the copper routed so far
+    /// leaves, then negotiated among themselves around that copper (made
+    /// fixed). 0 turns it off.
+    pub rescue_rounds: u32,
+    /// Negotiation iterations of each rescue round (its fill passes follow).
+    pub rescue_iterations: u32,
+    /// A rescue round also rips up the routed connections a loser lost to,
+    /// when it lost to at most this many (0: never rip up).
+    pub rescue_neighbours: u32,
+    /// Later rescue rounds try again the connections an earlier round's own
+    /// searches found no way for (no path, no pin, budget out), not only
+    /// those that lost a negotiation. Off saves about a third of the
+    /// rescue time for a few connections.
+    pub rescue_retry_unreachable: bool,
     pub global: GlobalSettings,
     pub layer_policy: LayerPolicy,
     pub negotiation: NegotiationSettings,
@@ -137,6 +153,12 @@ pub struct PipelineSettings {
     /// still carries an S7 finding ([`clear_findings`]): the connections it
     /// made stay open, and the plan is S7-clean. Default on.
     pub clear_findings: bool,
+    /// After the clear stage, route once more ([`repair`]) the connections
+    /// it opened, around all the copper left; the new copper is optimized
+    /// and cleared against the rest. Needs [`Self::clear_findings`].
+    /// Measured on a dense real board: this joined about half of what the
+    /// clear stage opened, in a few seconds.
+    pub clear_repair: bool,
     /// Worker threads for the whole run (0: the current rayon pool). Also
     /// the negotiation thread count when that is 0.
     pub threads: usize,
@@ -151,7 +173,19 @@ impl Default for PipelineSettings {
             neck_down: None,
             class_fallback: BTreeMap::new(),
             excluded_classes: BTreeSet::new(),
-            global: GlobalSettings::default(),
+            // Measured on a dense real board: three rounds rescue most of
+            // what they can; further rounds added next to nothing.
+            rescue_rounds: 3,
+            rescue_iterations: 6,
+            rescue_neighbours: 2,
+            rescue_retry_unreachable: true,
+            // Measured on the same board: corridors planned on 70 % of the
+            // packed-track capacity leave detail fewer conflicts and route
+            // more, faster, than planning on all of it.
+            global: GlobalSettings {
+                capacity_scale: 700,
+                ..GlobalSettings::default()
+            },
             layer_policy: LayerPolicy::default(),
             // Measured on a dense real board: a 2x present-factor growth
             // (capped) and a history step of 3 route more than the gentler
@@ -168,6 +202,7 @@ impl Default for PipelineSettings {
             optimize: Some(OptimizeOptions::default()),
             guard_optimize: true,
             clear_findings: true,
+            clear_repair: true,
             threads: 0,
         }
     }
@@ -450,11 +485,34 @@ fn run(
     );
     drop(detail_global);
     let mut routed = std::mem::take(&mut detail.copper);
+    let mut owners = Owners {
+        tracks: std::mem::take(&mut detail.track_owner),
+        vias: std::mem::take(&mut detail.via_users),
+    };
     let all = work.layers.all();
     for v in &mut routed.vias {
         if v.layers.is_empty() {
             v.layers = all;
         }
+    }
+    if settings.rescue_rounds > 0 {
+        let t = Instant::now();
+        let rescued = rescue(
+            &work,
+            rules,
+            &out.connections,
+            &mut detail,
+            &mut routed,
+            &mut owners,
+            settings,
+            &negotiation,
+            &inputs,
+            backend,
+            tel,
+        );
+        tel.count("pipeline_rescue_routed", rescued as u64);
+        tel.count("pipeline_rescue_us", t.elapsed().as_micros() as u64);
+        tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
     }
     if !settings.class_fallback.is_empty() {
         let t = Instant::now();
@@ -473,10 +531,6 @@ fn run(
         tel.count("pipeline_fallback_routed", rescued as u64);
         tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
     }
-    if settings.use_access {
-        out.access = inputs.access;
-    }
-
     // 7. Optimize, guarded by the S7 checker, then by the reference planes.
     let negotiated = if settings.optimize.is_some() && has_reference(&settings.class_fallback) {
         Some(routed.clone())
@@ -520,6 +574,27 @@ fn run(
         out.cleared = clear_findings(&work, rules, &mut routed);
         out.cleared.record(tel);
         tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
+        if settings.clear_repair {
+            let t = Instant::now();
+            let repaired = repair(
+                &work,
+                rules,
+                &out.connections,
+                &mut detail,
+                &mut routed,
+                settings,
+                &negotiation,
+                &inputs,
+                backend,
+                tel,
+            );
+            tel.count("pipeline_repair_routed", repaired as u64);
+            tel.count("pipeline_repair_us", t.elapsed().as_micros() as u64);
+            tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
+        }
+    }
+    if settings.use_access {
+        out.access = inputs.access;
     }
 
     // 8. Check everything new against the board as loaded.
@@ -634,6 +709,484 @@ pub fn optimize_guarded(
         tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
     }
     (report, reverted)
+}
+
+/// Global iterations of a rescue round, at most, and its stall limit.
+const RESCUE_GLOBAL_ITERATIONS: u32 = 10;
+const RESCUE_GLOBAL_STALL: u32 = 3;
+
+/// Routed copper with the connections behind each item, parallel to a
+/// [`RoutedCopper`]'s tracks and vias (negotiation's
+/// [`DetailResult::track_owner`] and [`DetailResult::via_users`]).
+#[derive(Debug, Clone, Default)]
+struct Owners {
+    tracks: Vec<ConnectionId>,
+    vias: Vec<Vec<ConnectionId>>,
+}
+
+impl Owners {
+    /// Append the copper of `detail`, whose connection ids are positions in
+    /// `ids`, to `routed`.
+    fn extend(
+        &mut self,
+        routed: &mut RoutedCopper,
+        detail: &DetailResult,
+        ids: &[ConnectionId],
+        all: LayerMask,
+    ) {
+        let map = |c: &ConnectionId| ids[c.index()];
+        routed.tracks.extend(detail.copper.tracks.iter().copied());
+        self.tracks.extend(detail.track_owner.iter().map(map));
+        routed
+            .vias
+            .extend(detail.copper.vias.iter().map(|v| RoutedVia {
+                layers: if v.layers.is_empty() { all } else { v.layers },
+                ..*v
+            }));
+        self.vias
+            .extend(detail.via_users.iter().map(|u| u.iter().map(map).collect()));
+    }
+
+    /// `routed` without the copper only `gone` connections use (a via
+    /// another connection shares stays).
+    fn without(
+        &self,
+        routed: &RoutedCopper,
+        gone: &BTreeSet<ConnectionId>,
+    ) -> (RoutedCopper, Owners) {
+        let mut copper = RoutedCopper::default();
+        let mut owners = Owners::default();
+        for (t, o) in routed.tracks.iter().zip(&self.tracks) {
+            if !gone.contains(o) {
+                copper.tracks.push(*t);
+                owners.tracks.push(*o);
+            }
+        }
+        for (v, users) in routed.vias.iter().zip(&self.vias) {
+            let kept: Vec<ConnectionId> = users
+                .iter()
+                .copied()
+                .filter(|u| !gone.contains(u))
+                .collect();
+            if !kept.is_empty() {
+                copper.vias.push(*v);
+                owners.vias.push(kept);
+            }
+        }
+        (copper, owners)
+    }
+}
+
+/// Which of `ids` have their two terminals joined on `board` plus `copper`.
+fn joined(
+    board: &RouteBoard,
+    copper: &RoutedCopper,
+    connections: &[Connection],
+    ids: &BTreeSet<ConnectionId>,
+) -> BTreeSet<ConnectionId> {
+    let mut b = board.clone();
+    add_locked(&mut b, copper);
+    let report = ConnectivityReport::build(&b, &ArcPolicy::default());
+    let wanted: BTreeSet<ItemRef> = ids
+        .iter()
+        .flat_map(|id| [connections[id.index()].from, connections[id.index()].to])
+        .collect();
+    let mut island: BTreeMap<ItemRef, (usize, usize)> = BTreeMap::new();
+    for (n, net) in report.nets.iter().enumerate() {
+        for (i, isl) in net.islands.iter().enumerate() {
+            for item in &isl.items {
+                if wanted.contains(item) {
+                    island.insert(*item, (n, i));
+                }
+            }
+        }
+    }
+    ids.iter()
+        .copied()
+        .filter(|id| {
+            let c = &connections[id.index()];
+            matches!(
+                (island.get(&c.from), island.get(&c.to)),
+                (Some(a), Some(b)) if a == b
+            )
+        })
+        .collect()
+}
+
+/// Route `ids` (positions in `connections`) again around `work` plus
+/// `fixed` (made fixed): globally over a fresh GCell grid, whose capacity is
+/// what that copper leaves, then negotiated along those corridors for
+/// [`PipelineSettings::rescue_iterations`] (the fill passes follow). The
+/// result's connection ids are positions in `ids`.
+#[allow(clippy::too_many_arguments)]
+fn route_around(
+    work: &RouteBoard,
+    fixed: &RoutedCopper,
+    rules: &dyn RuleTable,
+    connections: &[Connection],
+    ids: &[ConnectionId],
+    settings: &PipelineSettings,
+    negotiation: &NegotiationSettings,
+    inputs: &NegotiationInputs,
+    backend: &mut (dyn RouteCompute + Send),
+    tel: &mut Telemetry,
+) -> DetailResult {
+    let mut board = work.clone();
+    add_locked(&mut board, fixed);
+    let tasks: Vec<Connection> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Connection {
+            id: ConnectionId(i as u32),
+            ..connections[id.index()]
+        })
+        .collect();
+    let mut gtel = Telemetry::default();
+    let grid = build_grid_with(&board, rules, &settings.global, &mut gtel);
+    // What is left is tight by construction: global overflow rarely
+    // reaches zero, so stop it early rather than at the stall limit.
+    let gs = GlobalSettings {
+        max_iterations: settings.global.max_iterations.min(RESCUE_GLOBAL_ITERATIONS),
+        stall_iterations: settings
+            .global
+            .stall_iterations
+            .clamp(1, RESCUE_GLOBAL_STALL),
+        ..settings.global
+    };
+    let global = route_global_with(
+        &board,
+        rules,
+        &grid,
+        &tasks,
+        &gs,
+        &settings.layer_policy,
+        &mut gtel,
+    );
+    let global = with_fallback_corridors(&board, rules, &settings.layer_policy, &tasks, &global);
+    let mut neg = *negotiation;
+    neg.max_iterations = settings.rescue_iterations;
+    let mut dtel = Telemetry::default();
+    let second = negotiate_connections_with(
+        &board,
+        rules,
+        &tasks,
+        &global,
+        Some(&grid),
+        &neg,
+        &settings.tuning,
+        inputs,
+        backend,
+        &mut dtel,
+    );
+    tel.count("pipeline_rescue_us_global", gtel.stage_us(Stage::Global));
+    for k in ["global_iterations", "global_setup_us", "global_seed_us"] {
+        if let Some(&v) = gtel.counters.get(k) {
+            tel.count(&format!("pipeline_rescue_{k}"), v);
+        }
+    }
+    tel.count(
+        "pipeline_rescue_us_grid",
+        gtel.counters.get("global_grid_us").copied().unwrap_or(0),
+    );
+    tel.count("pipeline_rescue_us_negotiate", dtel.stage_us(Stage::Detail));
+    second
+}
+
+/// Route again the connections negotiation left failed for a reason another
+/// try could change (lost negotiations, no path or pin in the corridor it
+/// was given), up to [`PipelineSettings::rescue_rounds`] times.
+///
+/// Negotiation can only move a connection within its global corridor: a
+/// piece stays in its tile, and pins sit near where the corridor crosses
+/// tile boundaries. Global routing judged capacity before any copper was
+/// down, so a loser's corridor often runs through what the winners now
+/// fill. Each round therefore makes the copper routed so far fixed, builds
+/// a fresh GCell grid over it (its capacity is what that copper leaves),
+/// routes the failed connections globally on it, and negotiates them along
+/// those corridors ([`PipelineSettings::rescue_iterations`], then the fill
+/// passes).
+///
+/// A round may also rip up the routed connections a loser lost to, when it
+/// lost to at most [`PipelineSettings::rescue_neighbours`] of them: they
+/// are routed again together with the losers, and the round is kept only
+/// if more of those connections end up joined than before; otherwise its
+/// copper is dropped and later rounds leave every routed connection in
+/// place. Credit goes by connectivity: a connection counts as routed when
+/// its two terminals are joined, whichever connection's copper joins them.
+/// Returns how many fewer connections are failed afterwards.
+#[allow(clippy::too_many_arguments)]
+fn rescue(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    connections: &[Connection],
+    detail: &mut DetailResult,
+    routed: &mut RoutedCopper,
+    owners: &mut Owners,
+    settings: &PipelineSettings,
+    negotiation: &NegotiationSettings,
+    inputs: &NegotiationInputs,
+    backend: &mut (dyn RouteCompute + Send),
+    tel: &mut Telemetry,
+) -> usize {
+    let all = work.layers.all();
+    let failed_before = detail.failure_details.len();
+    let mut neighbours = settings.rescue_neighbours;
+    // Connections a round's own searches found no way for (no path, no
+    // pin, budget out) rather than losing a negotiation: later rounds,
+    // around nearly the same copper, rarely do better and spend most of
+    // their time on them.
+    let mut hopeless: BTreeSet<ConnectionId> = BTreeSet::new();
+    for _ in 0..settings.rescue_rounds {
+        let losers: BTreeSet<ConnectionId> = detail
+            .failure_details
+            .iter()
+            .filter(|(id, f)| f.retryable() && !hopeless.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        if losers.is_empty() {
+            break;
+        }
+        let routed_now: BTreeSet<ConnectionId> = detail.routed.iter().copied().collect();
+        let ripped: BTreeSet<ConnectionId> = if neighbours > 0 {
+            detail
+                .failure_details
+                .iter()
+                .filter(|(id, _)| losers.contains(id))
+                .filter_map(|(_, f)| match f {
+                    DetailFailure::Congestion { against, .. }
+                        if !against.is_empty() && against.len() <= neighbours as usize =>
+                    {
+                        Some(against)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .copied()
+                .filter(|id| routed_now.contains(id))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let (kept, kept_owners) = owners.without(routed, &ripped);
+        let ids: Vec<ConnectionId> = losers.union(&ripped).copied().collect();
+        let second = route_around(
+            work,
+            &kept,
+            rules,
+            connections,
+            &ids,
+            settings,
+            negotiation,
+            inputs,
+            backend,
+            tel,
+        );
+        tel.count("pipeline_rescue_queued", losers.len() as u64);
+        tel.count("pipeline_rescue_ripped", ripped.len() as u64);
+        for (c, f) in &second.failure_details {
+            if !settings.rescue_retry_unreachable && !matches!(f, DetailFailure::Congestion { .. })
+            {
+                hopeless.insert(ids[c.index()]);
+            }
+        }
+        let mut copper = kept;
+        let mut new_owners = kept_owners;
+        new_owners.extend(&mut copper, &second, &ids, all);
+        // Every connection whose state this round can change.
+        let mut judged: BTreeSet<ConnectionId> =
+            detail.failure_details.iter().map(|(id, _)| *id).collect();
+        judged.extend(ripped.iter().copied());
+        let now = joined(work, &copper, connections, &judged);
+        let before = ripped.len();
+        let after = now
+            .iter()
+            .filter(|id| losers.contains(id) || ripped.contains(id))
+            .count();
+        if !ripped.is_empty() && after <= before {
+            // Ripping up did not pay: keep the old copper, and leave every
+            // routed connection in place from now on.
+            tel.count("pipeline_rescue_rejected", 1);
+            neighbours = 0;
+            continue;
+        }
+        *routed = copper;
+        *owners = new_owners;
+        // The failures this round leaves, in the run's ids.
+        let map = |c: &ConnectionId| ids[c.index()];
+        let mut reasons: BTreeMap<ConnectionId, DetailFailure> = second
+            .failure_details
+            .iter()
+            .map(|(c, f)| {
+                let f = match f {
+                    DetailFailure::Congestion {
+                        iterations,
+                        against,
+                    } => DetailFailure::Congestion {
+                        iterations: *iterations,
+                        against: against.iter().map(map).collect(),
+                    },
+                    other => other.clone(),
+                };
+                (map(c), f)
+            })
+            .collect();
+        let old: BTreeMap<ConnectionId, DetailFailure> =
+            std::mem::take(&mut detail.failure_details)
+                .into_iter()
+                .collect();
+        let failure_details: Vec<(ConnectionId, DetailFailure)> = judged
+            .iter()
+            .filter(|id| !now.contains(id))
+            .map(|id| {
+                // A lost negotiation stays the reason when this round's
+                // searches merely found no way around fixed copper.
+                let f = match (reasons.remove(id), old.get(id)) {
+                    (Some(f @ DetailFailure::Congestion { .. }), _) => f,
+                    (_, Some(f @ DetailFailure::Congestion { .. })) => f.clone(),
+                    (Some(f), _) => f,
+                    (None, Some(f)) => f.clone(),
+                    (None, None) => DetailFailure::Unreachable,
+                };
+                (*id, f)
+            })
+            .collect();
+        let still: BTreeSet<ConnectionId> = failure_details.iter().map(|(id, _)| *id).collect();
+        detail.routed = routed_now
+            .union(&now)
+            .copied()
+            .filter(|id| !still.contains(id))
+            .collect();
+        detail.failed = failure_details
+            .iter()
+            .map(|(c, f)| (*c, f.reason()))
+            .collect();
+        detail.failure_details = failure_details;
+        if after <= before {
+            break;
+        }
+    }
+    failed_before.saturating_sub(detail.failure_details.len())
+}
+
+/// Route once more, after S6 and the clear stage, the connections
+/// [`clear_findings`] cut open (routed before it, open after it), around
+/// all the copper left (made fixed; [`route_around`]). Connections that
+/// failed before are not tried again: on a dense real board the rescue
+/// rounds had already taken nearly all they could, and retrying them here
+/// cost more time than it won. The new copper is optimized (when S6 runs)
+/// and cleared against the rest, so the plan stays S7-clean, then added to
+/// `routed`. `detail` is then brought to what is joined: a connection is
+/// routed when its two terminals are joined, and one the clear stage left
+/// open fails as [`DetailFailure::ExactCheckRejected`] (its copper failed
+/// the exact check). Returns how many more connections are joined.
+#[allow(clippy::too_many_arguments)]
+fn repair(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    connections: &[Connection],
+    detail: &mut DetailResult,
+    routed: &mut RoutedCopper,
+    settings: &PipelineSettings,
+    negotiation: &NegotiationSettings,
+    inputs: &NegotiationInputs,
+    backend: &mut (dyn RouteCompute + Send),
+    tel: &mut Telemetry,
+) -> usize {
+    let every: BTreeSet<ConnectionId> = connections.iter().map(|c| c.id).collect();
+    let before = joined(work, routed, connections, &every);
+    let failed: BTreeMap<ConnectionId, DetailFailure> = std::mem::take(&mut detail.failure_details)
+        .into_iter()
+        .collect();
+    let ids: Vec<ConnectionId> = every
+        .iter()
+        .copied()
+        .filter(|id| !before.contains(id) && !failed.contains_key(id))
+        .collect();
+    tel.count("pipeline_repair_queued", ids.len() as u64);
+    let mut reasons: BTreeMap<ConnectionId, DetailFailure> = BTreeMap::new();
+    if !ids.is_empty() {
+        let second = route_around(
+            work,
+            routed,
+            rules,
+            connections,
+            &ids,
+            settings,
+            negotiation,
+            inputs,
+            backend,
+            tel,
+        );
+        let all = work.layers.all();
+        let mut fresh = second.copper.clone();
+        for v in &mut fresh.vias {
+            if v.layers.is_empty() {
+                v.layers = all;
+            }
+        }
+        let mut fixed = work.clone();
+        add_locked(&mut fixed, routed);
+        if let Some(opts) = &settings.optimize {
+            let mut opts = *opts;
+            if opts.sliver_floor_nm.is_none() {
+                opts.sliver_floor_nm = crate::optimize::sliver_floor(work, rules);
+            }
+            optimize_guarded(
+                &fixed,
+                rules,
+                &mut fresh,
+                &opts,
+                settings.guard_optimize,
+                tel,
+            );
+        }
+        let cleared = clear_findings(&fixed, rules, &mut fresh);
+        tel.count("pipeline_repair_cleared_cut", u64::from(cleared.cut_tracks));
+        routed.tracks.extend(fresh.tracks);
+        routed.vias.extend(fresh.vias);
+        let map = |c: &ConnectionId| ids[c.index()];
+        reasons = second
+            .failure_details
+            .iter()
+            .map(|(c, f)| {
+                let f = match f {
+                    DetailFailure::Congestion {
+                        iterations,
+                        against,
+                    } => DetailFailure::Congestion {
+                        iterations: *iterations,
+                        against: against.iter().map(map).collect(),
+                    },
+                    other => other.clone(),
+                };
+                (map(c), f)
+            })
+            .collect();
+    }
+    let now = joined(work, routed, connections, &every);
+    detail.failure_details = every
+        .iter()
+        .filter(|id| !now.contains(id))
+        .map(|id| {
+            // A lost negotiation stays the reason when this try merely
+            // found no way around fixed copper.
+            let f = match (reasons.remove(id), failed.get(id)) {
+                (_, Some(f @ DetailFailure::Congestion { .. })) => f.clone(),
+                (_, Some(f)) if !f.retryable() => f.clone(),
+                (Some(f), _) => f,
+                (None, Some(f)) => f.clone(),
+                (None, None) => DetailFailure::ExactCheckRejected,
+            };
+            (*id, f)
+        })
+        .collect();
+    detail.routed = now.iter().copied().collect();
+    detail.failed = detail
+        .failure_details
+        .iter()
+        .map(|(c, f)| (*c, f.reason()))
+        .collect();
+    now.len().saturating_sub(before.len())
 }
 
 /// Route again, on their class's fallback layers, the connections of
