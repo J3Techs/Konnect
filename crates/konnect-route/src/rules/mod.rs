@@ -344,6 +344,23 @@ impl ProjectRuleTable {
         }
     }
 
+    /// Put `net` in the class named `class`, overriding the patterns: for a
+    /// caller holding KiCad's own effective netclass (IPC, or a DSN export
+    /// made from it) that disagrees with the project-file resolution.
+    /// Returns `false`, changing nothing, when the class or net is unknown.
+    pub fn pin_net_class(&mut self, net: NetId, class: &str) -> bool {
+        let Some(id) = self.classes.iter().position(|c| c.name == class) else {
+            return false;
+        };
+        match self.class_by_net.get_mut(net.index()) {
+            Some(slot) => {
+                *slot = ClassId(id as u16);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn board_rules(&self) -> &BoardRules {
         &self.board
     }
@@ -1107,6 +1124,19 @@ mod tests {
         assert_eq!((v.diameter, v.drill), (650_000, 350_000));
         assert_eq!(v.min_diameter, 440_000);
         assert!(v.diameter >= v.drill + 2 * v.min_annular);
+    }
+
+    #[test]
+    fn pinned_classes_override_patterns() {
+        let b = board();
+        let mut t = table(&b);
+        let gnd = b.net_by_name("GND").unwrap();
+        assert_eq!(t.class(t.class_of(Some(gnd))).name, "Default");
+        assert!(t.pin_net_class(gnd, "Power"));
+        assert_eq!(t.class(t.class_of(Some(gnd))).name, "Power");
+        assert!(!t.pin_net_class(gnd, "Nope"));
+        assert!(!t.pin_net_class(NetId(999), "Power"));
+        assert_eq!(t.class(t.class_of(Some(gnd))).name, "Power");
     }
 
     #[test]
