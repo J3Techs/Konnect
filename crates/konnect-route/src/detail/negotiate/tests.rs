@@ -683,11 +683,13 @@ fn corridor_layers_and_missing_corridors_are_respected() {
                 connection: conns[0].id,
                 cells: Vec::new(),
                 layers: LayerMask::single(LayerId(1)),
+                assigned: LayerMask::single(LayerId(1)),
             },
             crate::global::Corridor {
                 connection: conns[1].id,
                 cells: Vec::new(),
                 layers: board.layers.all(),
+                assigned: LayerMask(0),
             },
         ],
         ..GlobalResult::default()
