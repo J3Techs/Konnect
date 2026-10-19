@@ -29,18 +29,38 @@
 //!   unit track between two cells does. Zone fills are not obstacles: a
 //!   refill pours around new copper.
 //!
-//! The rasters are painted once per *profile* (net class, track width, via
-//! size) with a representative net, recording for each cell which net's
-//! copper blocks it (none, one net, or several). A search for a terminal of
-//! net `N` treats cells blocked only by `N` as free. Because a project's
-//! custom rules may treat two nets of one class differently, every path the
-//! fast search finds is re-checked move by move with the terminal's own
-//! net, and any terminal whose path fails that check, or that the fast
-//! search finds unreachable, is searched again with exact checks for its
-//! own net. Reported reachability is therefore exact on the lattice: a path
-//! of lattice moves exists that the rules allow. A gap narrower than the
-//! lattice can resolve (under one pitch) can be missed; the pitch is in the
-//! settings.
+//! The rasters are painted once per *profile* with a representative net,
+//! recording for each cell which net's copper blocks it (none, one net, or
+//! several). A profile is a track width, a via size and a clearance
+//! signature: the clearance the rules resolve from the representative to
+//! every obstacle the raster paints. Net classes whose signatures agree
+//! share one set of rasters. A search for a terminal of net `N` treats
+//! cells blocked only by `N` as free.
+//!
+//! For the representative itself the rasters are exact. For any other
+//! member, a project's custom rules (a `NetName` condition, say) may still
+//! treat it differently, so the fast result is only trusted where it is
+//! provably exact:
+//!
+//! - every path the fast search finds is re-checked move by move with the
+//!   terminal's own net, so each layer it reports is truly reachable;
+//! - the fast result stands only when, on top of that, it already reaches
+//!   every layer a search could reach (all routable layers with new vias,
+//!   the layers the terminal's copper starts on without). Otherwise the
+//!   terminal is searched again with exact checks for its own net.
+//!
+//! The reported `reachable` mask is therefore exact on the lattice, not a
+//! lower bound: a layer is listed if and only if a path of lattice moves
+//! the rules allow reaches outside the courtyard on it. A gap narrower than
+//! the lattice can resolve (under one pitch) can be missed; the pitch is in
+//! the settings. [`AuditSettings::exact_only`] skips the rasters and checks
+//! every move exactly, for cross-checking.
+//!
+//! Lattices are capped at [`AuditSettings::max_states`] cells × routable
+//! layers. A larger footprint is audited at a coarser pitch (the smallest
+//! whole multiple of the setting that fits, still aligned to the anchor),
+//! reported in [`FootprintAudit::pitch`] and [`FootprintAudit::coarsened`]. Edge legality is cached lazily in blocks,
+//! and search buffers are kept per worker thread and reused.
 //!
 //! A track's clearance is resolved for the courtyards that track touches,
 //! segment by segment, so a lattice move inside a BGA courtyard carries the
@@ -100,11 +120,27 @@ pub struct FootprintAudit {
     pub unreachable: usize,
     /// Unreachable terminals whose net still needs a route.
     pub unreachable_needing_route: usize,
+    /// Lattice pitch used, nm (coarser than the setting when the lattice
+    /// would exceed [`AuditSettings::max_states`]).
     pub pitch: Coord,
     pub cells: usize,
+    /// Raster sets painted (net classes with the same width, via and
+    /// clearance signature share one).
     pub profiles: usize,
     pub exact_reruns: usize,
     pub wall_ms: u64,
+    /// The pitch was coarsened to respect [`AuditSettings::max_states`].
+    #[serde(default)]
+    pub coarsened: bool,
+    /// Net classes among the terminals, before profiles were merged.
+    #[serde(default)]
+    pub classes: usize,
+    /// Wall time painting rasters (signatures included), ms.
+    #[serde(default)]
+    pub paint_ms: u64,
+    /// Wall time in the terminal searches, ms.
+    #[serde(default)]
+    pub search_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -144,6 +180,20 @@ pub struct AuditSettings {
     pub vias: bool,
     /// Via size, when `vias` is on.
     pub via_size: SizeChoice,
+    /// Most lattice states (cells × routable layers) per footprint. Each
+    /// worker thread keeps 8 bytes per state, and each profile 8 bytes per
+    /// state of rasters; a footprint whose lattice would be larger is
+    /// audited at a coarser pitch.
+    #[serde(default = "default_max_states")]
+    pub max_states: usize,
+    /// Check every move exactly for each terminal's own net, without the
+    /// shared rasters (slow; for cross-checking the fast path).
+    #[serde(default)]
+    pub exact_only: bool,
+}
+
+fn default_max_states() -> usize {
+    8_000_000
 }
 
 impl Default for AuditSettings {
@@ -154,6 +204,8 @@ impl Default for AuditSettings {
             width: SizeChoice::Preferred,
             vias: true,
             via_size: SizeChoice::Preferred,
+            max_states: default_max_states(),
+            exact_only: false,
         }
     }
 }
@@ -190,6 +242,7 @@ pub fn audit_terminal_access_with(
         conn: &conn,
         islands: conn.island_of_pads(board),
         settings: *settings,
+        pool: Pool::new(),
     };
     let mut audit = AccessAudit::default();
     for f in fps {
@@ -210,6 +263,108 @@ struct Ctx<'a> {
     conn: &'a ConnectivityReport,
     islands: Vec<Option<u32>>,
     settings: AuditSettings,
+    pool: Pool,
+}
+
+// ─── Worker scratch ──────────────────────────────────────────────────────────
+
+/// One worker thread's reusable state: search buffers, exact-check memos
+/// and the clearance memo. Kept for the whole audit, so buffers are
+/// allocated once per thread rather than once per rayon split.
+#[derive(Default)]
+struct Worker {
+    search: Buffers,
+    memo: Memo,
+    cache: ClearanceCache,
+}
+
+/// One [`Worker`] per thread of the pool the audit runs in. A thread only
+/// ever locks its own slot, so the locks are uncontended; no closure run
+/// under a lock calls back into rayon.
+struct Pool {
+    slots: Vec<std::sync::Mutex<Worker>>,
+}
+
+impl Pool {
+    fn new() -> Self {
+        let n = rayon::current_num_threads().max(1);
+        Pool {
+            slots: (0..n)
+                .map(|_| std::sync::Mutex::new(Worker::default()))
+                .collect(),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut Worker) -> R) -> R {
+        let i = rayon::current_thread_index().unwrap_or(0) % self.slots.len();
+        let mut w = self.slots[i]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut w)
+    }
+}
+
+/// Exact-check answers for one search, by generation: an entry is valid
+/// when its upper bits equal the current generation, and its low bit is the
+/// answer. Starting a search is O(1), not a clear of the whole lattice.
+#[derive(Default)]
+struct Memo {
+    cells: Vec<u32>,
+    vias: Vec<u32>,
+    gen: u32,
+}
+
+impl Memo {
+    fn start(&mut self, states: usize, cells: usize) {
+        if self.cells.len() < states || self.vias.len() < cells {
+            self.cells = vec![0; states.max(self.cells.len())];
+            self.vias = vec![0; cells.max(self.vias.len())];
+            self.gen = 0;
+        }
+        self.gen += 1;
+        if self.gen >= 1 << 30 {
+            self.cells.iter_mut().for_each(|v| *v = 0);
+            self.vias.iter_mut().for_each(|v| *v = 0);
+            self.gen = 1;
+        }
+    }
+
+    #[inline]
+    fn get(&self, v: u32) -> Option<bool> {
+        (v >> 1 == self.gen).then_some(v & 1 == 1)
+    }
+
+    #[inline]
+    fn put(&self, ok: bool) -> u32 {
+        (self.gen << 1) | u32::from(ok)
+    }
+}
+
+/// Edge legality cache for one raster layer, allocated lazily in blocks so
+/// a search that touches a corner of a big lattice pays for that corner.
+struct EdgeCache {
+    blocks: Vec<std::sync::OnceLock<Box<[AtomicU32]>>>,
+}
+
+const EDGE_BLOCK_BITS: u32 = 12;
+
+impl EdgeCache {
+    fn new(edges: usize) -> Self {
+        let n = edges.div_ceil(1 << EDGE_BLOCK_BITS);
+        EdgeCache {
+            blocks: (0..n).map(|_| std::sync::OnceLock::new()).collect(),
+        }
+    }
+
+    #[inline]
+    fn slot(&self, eid: usize) -> &AtomicU32 {
+        let block = self.blocks[eid >> EDGE_BLOCK_BITS].get_or_init(|| {
+            (0..1usize << EDGE_BLOCK_BITS)
+                .map(|_| AtomicU32::new(UNKNOWN))
+                .collect()
+        });
+        &block[eid & ((1 << EDGE_BLOCK_BITS) - 1)]
+    }
 }
 
 // ─── Lattice ─────────────────────────────────────────────────────────────────
@@ -334,9 +489,11 @@ impl Grid {
 
 // ─── Profiles and rasters ────────────────────────────────────────────────────
 
+/// The sizes a profile draws with. Together with a clearance signature
+/// (see [`ProfilePaints::same_clearances`]) it decides which terminals
+/// share rasters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ProfileKey {
-    class: u16,
     width: Coord,
     via_diameter: Coord,
     via_drill: Coord,
@@ -347,7 +504,7 @@ struct LayerRaster {
     layer: LayerId,
     core: Vec<u32>,
     strict: Vec<u32>,
-    edges: Vec<AtomicU32>,
+    edges: EdgeCache,
 }
 
 struct ProfileRasters {
@@ -438,9 +595,11 @@ impl<'a> Paint<'a> {
 }
 
 /// Copper items on `layer` near the grid, with per-set clearances.
+#[allow(clippy::too_many_arguments)]
 fn copper_paints<'a>(
     space: &'a Space<'a>,
     rules: &dyn RuleTable,
+    pool: &Pool,
     grid: &Grid,
     layer: LayerId,
     keys: &[SubjectKey],
@@ -449,12 +608,13 @@ fn copper_paints<'a>(
     let area = grid.bbox().inflate(space.reach + r);
     let ids: Vec<u32> = space.items_near(layer, &area).collect();
     ids.par_iter()
-        .map_init(ClearanceCache::default, |cache, &id| {
+        .map(|&id| {
             let it = &space.items[id as usize];
-            let clr: Vec<Coord> = keys
-                .iter()
-                .map(|k| space.clearance(cache, rules, k, &it.key, layer) + it.extra)
-                .collect();
+            let clr: Vec<Coord> = pool.with(|w| {
+                keys.iter()
+                    .map(|k| space.clearance(&mut w.cache, rules, k, &it.key, layer) + it.extra)
+                    .collect()
+            });
             let max = clr.iter().copied().max().unwrap_or(0);
             Paint {
                 shape: std::borrow::Cow::Borrowed(&it.shape),
@@ -471,8 +631,8 @@ fn copper_paints<'a>(
 /// Rows per parallel painting band.
 const BAND_ROWS: usize = 16;
 
-/// Paint `obstacles` into a core raster (and a strict one, the same test
-/// with `strict_margin` more clearance), in parallel row bands.
+/// Paint `obstacles` into a core raster, and with `strict_margin` a strict
+/// one too (the same test with that much more clearance; empty without).
 fn paint_all(
     grid: &Grid,
     set: &[u16],
@@ -481,73 +641,125 @@ fn paint_all(
 ) -> (Vec<u32>, Vec<u32>) {
     let n = grid.len();
     let nx = grid.nx;
+    let band = BAND_ROWS * nx;
     let mut core = vec![FREE; n];
-    let mut strict = vec![FREE; n];
+    let mut strict = if strict_margin.is_some() {
+        vec![FREE; n]
+    } else {
+        Vec::new()
+    };
     let margin = strict_margin.unwrap_or(0);
     let ranges: Vec<Option<(usize, usize, usize, usize)>> = obstacles
         .iter()
         .map(|o| grid.cells_in(&o.shape.bbox().inflate(o.max + o.r + margin)))
         .collect();
-    core.par_chunks_mut(BAND_ROWS * nx)
-        .zip(strict.par_chunks_mut(BAND_ROWS * nx))
-        .enumerate()
-        .for_each(|(band, (cc, sc))| {
-            let rlo = band * BAND_ROWS;
-            let rhi = (rlo + BAND_ROWS).min(grid.ny) - 1;
-            for (o, rg) in obstacles.iter().zip(&ranges) {
-                let Some((c0, c1, r0, r1)) = *rg else {
-                    continue;
-                };
-                let (a, b) = (r0.max(rlo), r1.min(rhi));
-                if a > b {
-                    continue;
-                }
-                for row in a..=b {
-                    for c in c0..=c1 {
-                        let cell = row * nx + c;
-                        let local = cell - rlo * nx;
-                        if cc[local] == MULTI && sc[local] == MULTI {
+    let paint_band = |bi: usize, cc: &mut [u32], mut sc: Option<&mut [u32]>| {
+        let rlo = bi * BAND_ROWS;
+        let rhi = (rlo + BAND_ROWS).min(grid.ny) - 1;
+        for (o, rg) in obstacles.iter().zip(&ranges) {
+            let Some((c0, c1, r0, r1)) = *rg else {
+                continue;
+            };
+            let (a, b) = (r0.max(rlo), r1.min(rhi));
+            if a > b {
+                continue;
+            }
+            for row in a..=b {
+                for c in c0..=c1 {
+                    let cell = row * nx + c;
+                    let local = cell - rlo * nx;
+                    let core_full = cc[local] == MULTI;
+                    match sc.as_deref() {
+                        Some(s) if core_full && s[local] == MULTI => continue,
+                        None if core_full => continue,
+                        _ => {}
+                    }
+                    let clr = if o.clr.len() == 1 {
+                        o.clr[0]
+                    } else {
+                        o.clr[set[cell] as usize]
+                    };
+                    let disc = Shape::Circle(Circle::new(grid.center(cell), o.r));
+                    if let Some(s) = sc.as_deref_mut() {
+                        if gap_cmp(&disc, &o.shape, i64::from(clr + margin)) != Ordering::Less {
                             continue;
                         }
-                        let clr = if o.clr.len() == 1 {
-                            o.clr[0]
-                        } else {
-                            o.clr[set[cell] as usize]
-                        };
-                        let disc = Shape::Circle(Circle::new(grid.center(cell), o.r));
-                        if strict_margin.is_some() {
-                            if gap_cmp(&disc, &o.shape, i64::from(clr + margin)) != Ordering::Less {
-                                continue;
-                            }
-                            sc[local] = merge(sc[local], o.net);
-                        }
-                        if gap_cmp(&disc, &o.shape, i64::from(clr)) == Ordering::Less {
-                            cc[local] = merge(cc[local], o.net);
-                        }
+                        s[local] = merge(s[local], o.net);
+                    }
+                    if gap_cmp(&disc, &o.shape, i64::from(clr)) == Ordering::Less {
+                        cc[local] = merge(cc[local], o.net);
                     }
                 }
             }
-        });
+        }
+    };
+    if strict_margin.is_some() {
+        core.par_chunks_mut(band)
+            .zip(strict.par_chunks_mut(band))
+            .enumerate()
+            .for_each(|(bi, (cc, sc))| paint_band(bi, cc, Some(sc)));
+    } else {
+        core.par_chunks_mut(band)
+            .enumerate()
+            .for_each(|(bi, cc)| paint_band(bi, cc, None));
+    }
     (core, strict)
 }
 
-/// Paint one routable layer of a profile.
+/// Everything one profile's rasters are painted from: per routable layer
+/// the obstacles a track sees, and (with vias) the obstacles a new via
+/// sees. Built before painting so profiles can be compared.
+struct ProfilePaints<'a> {
+    layers: Vec<Vec<Paint<'a>>>,
+    via: Option<Vec<Paint<'a>>>,
+}
+
+impl ProfilePaints<'_> {
+    /// Whether both paint lists resolve the same clearance to every
+    /// obstacle (the lists hold the same obstacles in the same order when
+    /// the profile sizes agree). Copper of the two representatives' own
+    /// nets is left out: a representative never sees its own copper, so
+    /// the clearance the rules give a net against itself says nothing.
+    /// The comparison only decides sharing; exactness never rests on it.
+    fn same_clearances(&self, other: &Self, reps: [NetId; 2]) -> bool {
+        let same = |a: &[Paint<'_>], b: &[Paint<'_>]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| {
+                    x.net == y.net
+                        && x.r == y.r
+                        && (x.clr == y.clr || x.net.is_some_and(|n| reps.contains(&n)))
+                })
+        };
+        self.layers.len() == other.layers.len()
+            && self
+                .layers
+                .iter()
+                .zip(&other.layers)
+                .all(|(a, b)| same(a, b))
+            && match (&self.via, &other.via) {
+                (Some(a), Some(b)) => same(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+/// The obstacles a track of `width` sees on one routable layer.
 #[allow(clippy::too_many_arguments)]
-fn paint_layer(
-    space: &Space<'_>,
+fn layer_paints<'a>(
+    space: &'a Space<'a>,
     rules: &dyn RuleTable,
+    pool: &Pool,
     grid: &Grid,
     layer: LayerId,
     width: Coord,
-    sets: &CourtSets,
-    rep: NetId,
+    keys: &[SubjectKey],
     strict_margin: Coord,
-) -> LayerRaster {
+) -> Vec<Paint<'a>> {
     let rw = radius_of(width);
     let area = grid.bbox().inflate(space.reach + rw + strict_margin);
-    let keys = sets.keys_for(rep);
     // Copper of every net, the terminal's own included (searches skip it).
-    let mut obstacles = copper_paints(space, rules, grid, layer, &keys, rw);
+    let mut obstacles = copper_paints(space, rules, pool, grid, layer, keys, rw);
     // Holes: hole clearance to copper of other nets.
     for id in space.holes_near(&area) {
         let h = &space.holes[id as usize];
@@ -568,44 +780,33 @@ fn paint_layer(
             ));
         }
     }
-    for k in &space.board.keepouts {
+    for (k, shape) in space.board.keepouts.iter().zip(&space.keepout_shapes) {
         if k.rules.tracks && k.layers.contains(layer) && k.region.bbox().intersects(&area) {
             obstacles.push(Paint::uniform(
-                std::borrow::Cow::Owned(Shape::Polygon(k.region.clone())),
+                std::borrow::Cow::Borrowed(shape),
                 None,
                 0,
                 rw,
             ));
         }
     }
-    let (core, strict) = paint_all(grid, &sets.set, &obstacles, Some(strict_margin));
-    LayerRaster {
-        layer,
-        edges: (0..4 * grid.len())
-            .map(|_| AtomicU32::new(UNKNOWN))
-            .collect(),
-        core,
-        strict,
-    }
+    obstacles
 }
 
-/// Paint where a through via of the profile is legal.
-#[allow(clippy::too_many_arguments)]
-fn paint_vias(
-    space: &Space<'_>,
+/// The obstacles a new through via sees.
+fn via_paints<'a>(
+    space: &'a Space<'a>,
     rules: &dyn RuleTable,
+    pool: &Pool,
     grid: &Grid,
-    diameter: Coord,
-    drill: Coord,
-    sets: &CourtSets,
-    rep: NetId,
-) -> Vec<u32> {
-    let (rv, rh) = (radius_of(diameter), radius_of(drill));
+    key: ProfileKey,
+    keys: &[SubjectKey],
+) -> Vec<Paint<'a>> {
+    let (rv, rh) = (radius_of(key.via_diameter), radius_of(key.via_drill));
     let area = grid.bbox().inflate(space.reach + rv);
-    let keys = sets.keys_for(rep);
     let mut obstacles: Vec<Paint<'_>> = Vec::new();
     for layer in space.board.layers.all().iter() {
-        let copper = copper_paints(space, rules, grid, layer, &keys, rv);
+        let copper = copper_paints(space, rules, pool, grid, layer, keys, rv);
         // The via's hole against the same copper (hole clearance).
         for p in &copper {
             obstacles.push(Paint::uniform(
@@ -643,17 +844,48 @@ fn paint_vias(
             ));
         }
     }
-    for k in &space.board.keepouts {
+    for (k, shape) in space.board.keepouts.iter().zip(&space.keepout_shapes) {
         if k.rules.vias && k.region.bbox().intersects(&area) {
             obstacles.push(Paint::uniform(
-                std::borrow::Cow::Owned(Shape::Polygon(k.region.clone())),
+                std::borrow::Cow::Borrowed(shape),
                 None,
                 0,
                 rv,
             ));
         }
     }
-    paint_all(grid, &sets.set, &obstacles, None).0
+    obstacles
+}
+
+/// The strict-raster margin: half a lattice diagonal, rounded up, plus one.
+fn strict_margin(pitch: Coord) -> Coord {
+    ((f64::from(pitch) * std::f64::consts::SQRT_2 / 2.0).ceil() as Coord) + 1
+}
+
+#[allow(clippy::too_many_arguments)]
+fn profile_paints<'a>(
+    space: &'a Space<'a>,
+    rules: &dyn RuleTable,
+    pool: &Pool,
+    grid: &Grid,
+    layers: &[LayerId],
+    key: ProfileKey,
+    rep: NetId,
+    vias: bool,
+    sets: &BTreeMap<(u8, Coord), CourtSets>,
+) -> ProfilePaints<'a> {
+    let track_keys = sets[&(0, radius_of(key.width))].keys_for(rep);
+    let margin = strict_margin(grid.pitch);
+    ProfilePaints {
+        layers: layers
+            .iter()
+            .map(|&l| layer_paints(space, rules, pool, grid, l, key.width, &track_keys, margin))
+            .collect(),
+        via: vias.then(|| {
+            let via_keys = sets[&(1, radius_of(key.via_diameter))].keys_for(rep);
+            via_paints(space, rules, pool, grid, key, &via_keys)
+        }),
+    }
 }
 
 // ─── Exact checks for one net ────────────────────────────────────────────────
@@ -783,7 +1015,8 @@ impl Oracle for FastOracle<'_> {
         let Some(eid) = self.grid.edge_id(cell, d) else {
             return false;
         };
-        let mut v = lr.edges[eid].load(AtomicOrdering::Relaxed);
+        let slot = lr.edges.slot(eid);
+        let mut v = slot.load(AtomicOrdering::Relaxed);
         if v == UNKNOWN {
             v = edge_value(
                 self.space,
@@ -795,7 +1028,7 @@ impl Oracle for FastOracle<'_> {
                 self.prof.key.width,
                 self.prof.rep,
             );
-            lr.edges[eid].store(v, AtomicOrdering::Relaxed);
+            slot.store(v, AtomicOrdering::Relaxed);
         }
         passes(v, self.net)
     }
@@ -814,28 +1047,28 @@ struct ExactOracle<'a> {
     net: NetId,
     cache: &'a mut ClearanceCache,
     vias: bool,
-    cell_memo: Vec<u8>,
-    via_memo: Vec<u8>,
+    memo: &'a mut Memo,
 }
 
 impl Oracle for ExactOracle<'_> {
     fn passable(&mut self, li: usize, cell: usize) -> bool {
         let i = li * self.grid.len() + cell;
-        if self.cell_memo[i] == 0 {
-            let p = self.grid.center(cell);
-            let ok = exact_track_ok(
-                self.space,
-                self.rules,
-                self.cache,
-                self.layers[li],
-                p,
-                p,
-                self.key.width,
-                self.net,
-            );
-            self.cell_memo[i] = if ok { 1 } else { 2 };
+        if let Some(ok) = self.memo.get(self.memo.cells[i]) {
+            return ok;
         }
-        self.cell_memo[i] == 1
+        let p = self.grid.center(cell);
+        let ok = exact_track_ok(
+            self.space,
+            self.rules,
+            self.cache,
+            self.layers[li],
+            p,
+            p,
+            self.key.width,
+            self.net,
+        );
+        self.memo.cells[i] = self.memo.put(ok);
+        ok
     }
 
     fn edge_ok(&mut self, li: usize, cell: usize, d: usize) -> bool {
@@ -858,19 +1091,20 @@ impl Oracle for ExactOracle<'_> {
         if !self.vias {
             return false;
         }
-        if self.via_memo[cell] == 0 {
-            let ok = exact_via_ok(
-                self.space,
-                self.rules,
-                self.cache,
-                self.grid.center(cell),
-                self.key.via_diameter,
-                self.key.via_drill,
-                self.net,
-            );
-            self.via_memo[cell] = if ok { 1 } else { 2 };
+        if let Some(ok) = self.memo.get(self.memo.vias[cell]) {
+            return ok;
         }
-        self.via_memo[cell] == 1
+        let ok = exact_via_ok(
+            self.space,
+            self.rules,
+            self.cache,
+            self.grid.center(cell),
+            self.key.via_diameter,
+            self.key.via_drill,
+            self.net,
+        );
+        self.memo.vias[cell] = self.memo.put(ok);
+        ok
     }
 }
 
@@ -904,7 +1138,9 @@ fn search(
 ) -> SearchResult {
     let n = grid.len();
     let total = n * layers.len();
-    if buf.stamp.len() != total {
+    // Buffers only grow: entries past `total`, and entries of older
+    // generations, are never read as visited.
+    if buf.stamp.len() < total {
         buf.stamp = vec![0; total];
         buf.parent = vec![0; total];
         buf.gen = 0;
@@ -1056,6 +1292,43 @@ struct Terminal {
     own: Vec<(usize, Shape)>,
 }
 
+/// The lattice for a footprint: the setting's pitch, or the smallest whole
+/// multiple of it that keeps cells × `layers` within `max_states`. The
+/// lattice stays aligned to the footprint anchor either way.
+fn footprint_grid(
+    area: BBox,
+    anchor: Point,
+    settings: &AuditSettings,
+    layers: usize,
+) -> (Grid, bool) {
+    let base = settings.pitch.max(1);
+    let max = settings.max_states.max(1);
+    let layers = layers.max(1);
+    let mut grid = Grid::new(area, anchor, base);
+    let states = |g: &Grid| g.len().saturating_mul(layers);
+    if states(&grid) <= max {
+        return (grid, false);
+    }
+    let mut k = ((states(&grid) as f64 / max as f64).sqrt().ceil() as Coord).max(2);
+    loop {
+        grid = Grid::new(area, anchor, base.saturating_mul(k));
+        // A 3 × 3 lattice is as coarse as it gets.
+        if states(&grid) <= max || (grid.nx <= 3 && grid.ny <= 3) {
+            return (grid, true);
+        }
+        k += 1;
+    }
+}
+
+/// Terminals that share a net class and sizes, represented by the first
+/// one's net.
+#[derive(Debug, Clone, Copy)]
+struct Group {
+    class: u16,
+    key: ProfileKey,
+    rep: NetId,
+}
+
 fn audit_footprint(ctx: &Ctx<'_>, f: FootprintId) -> (Vec<TerminalAccess>, FootprintAudit) {
     let start = Instant::now();
     let space = ctx.space;
@@ -1096,8 +1369,15 @@ fn audit_footprint(ctx: &Ctx<'_>, f: FootprintId) -> (Vec<TerminalAccess>, Footp
         summary.unreachable = out.len();
         return (out, summary);
     };
-    let grid = Grid::new(court_bb.inflate(settings.margin), fp.at, settings.pitch);
+    let (grid, coarsened) = footprint_grid(
+        court_bb.inflate(settings.margin),
+        fp.at,
+        &settings,
+        layers.len(),
+    );
     summary.cells = grid.len();
+    summary.pitch = grid.pitch;
+    summary.coarsened = coarsened;
     let courts: Vec<&konnect_geom::Polygon> = fp.courtyards.iter().map(|c| &c.region).collect();
     let goal: Vec<bool> = (0..grid.len())
         .into_par_iter()
@@ -1109,14 +1389,14 @@ fn audit_footprint(ctx: &Ctx<'_>, f: FootprintId) -> (Vec<TerminalAccess>, Footp
         })
         .collect();
 
-    // Terminals and their profiles.
-    let mut profiles: Vec<(ProfileKey, NetId)> = Vec::new();
+    // Terminals, grouped by net class and sizes.
+    let mut groups: Vec<Group> = Vec::new();
     let mut terminals: Vec<Terminal> = Vec::new();
     let in_field = [f];
     for &pid in &pads {
         let pad = &board.pads[pid.index()];
         let net = pad.net.expect("netted pads only");
-        let class = rules.class_of(Some(net));
+        let class = rules.class_of(Some(net)).0;
         let track = RuleSubject::new(ItemKind::Track, Some(net)).with_courtyards(&in_field);
         let width = layers
             .iter()
@@ -1136,64 +1416,135 @@ fn audit_footprint(ctx: &Ctx<'_>, f: FootprintId) -> (Vec<TerminalAccess>, Footp
             SizeChoice::Minimum => (via.min_diameter, via.min_drill),
         };
         let key = ProfileKey {
-            class: class.0,
             width,
             via_diameter: vd,
             via_drill: vh,
         };
-        let profile = match profiles.iter().position(|(k, _)| *k == key) {
+        let group = match groups.iter().position(|g| g.class == class && g.key == key) {
             Some(i) => i,
             None => {
-                profiles.push((key, net));
-                profiles.len() - 1
+                groups.push(Group {
+                    class,
+                    key,
+                    rep: net,
+                });
+                groups.len() - 1
             }
         };
         let (needs_route, joined_to_plane, own) = own_copper(ctx, pid, &layers, &grid);
         terminals.push(Terminal {
             pad: pid,
             net,
-            profile,
+            profile: group,
             needs_route,
             joined_to_plane,
             own,
         });
     }
-    summary.profiles = profiles.len();
-
-    // Courtyard sets per (kind, disc radius), shared by the profiles.
-    let mut wanted: Vec<(u8, Coord)> = Vec::new();
-    for (k, _) in &profiles {
-        wanted.push((0, radius_of(k.width)));
-        if settings.vias {
-            wanted.push((1, radius_of(k.via_diameter)));
-        }
-    }
-    wanted.sort();
-    wanted.dedup();
-    let sets: BTreeMap<(u8, Coord), CourtSets> = wanted
-        .into_iter()
-        .map(|(kind, r)| {
-            let k = if kind == 0 {
-                ItemKind::Track
-            } else {
-                ItemKind::Via
-            };
-            ((kind, r), CourtSets::new(space, &grid, k, r))
-        })
-        .collect();
+    summary.classes = groups
+        .iter()
+        .map(|g| g.class)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     let mut results: Vec<TerminalAccess> = Vec::with_capacity(terminals.len());
-    for (pi, (key, rep)) in profiles.iter().enumerate() {
-        let members: Vec<&Terminal> = terminals.iter().filter(|t| t.profile == pi).collect();
-        let prof = build_profile(space, rules, &grid, &layers, *key, *rep, settings, &sets);
-        let out: Vec<TerminalAccess> = members
+    if settings.exact_only {
+        results = terminals
             .par_iter()
-            .map_init(
-                || (Buffers::default(), ClearanceCache::default()),
-                |(buf, cache), t| audit_terminal(ctx, &grid, &goal, &layers, &prof, t, buf, cache),
-            )
+            .map(|t| {
+                ctx.pool.with(|w| {
+                    audit_terminal(
+                        ctx,
+                        &grid,
+                        &goal,
+                        &layers,
+                        None,
+                        groups[t.profile].key,
+                        t,
+                        w,
+                    )
+                })
+            })
             .collect();
-        results.extend(out);
+    } else {
+        // Courtyard sets per (kind, disc radius), shared by the profiles.
+        let mut wanted: Vec<(u8, Coord)> = Vec::new();
+        for g in &groups {
+            wanted.push((0, radius_of(g.key.width)));
+            if settings.vias {
+                wanted.push((1, radius_of(g.key.via_diameter)));
+            }
+        }
+        wanted.sort();
+        wanted.dedup();
+        let sets: BTreeMap<(u8, Coord), CourtSets> = wanted
+            .into_iter()
+            .map(|(kind, r)| {
+                let k = if kind == 0 {
+                    ItemKind::Track
+                } else {
+                    ItemKind::Via
+                };
+                ((kind, r), CourtSets::new(space, &grid, k, r))
+            })
+            .collect();
+
+        // Groups with the same sizes and clearance signature share rasters:
+        // the first such group leads, and its net represents them all.
+        let mut paint = std::time::Duration::ZERO;
+        let mut searching = std::time::Duration::ZERO;
+        let t_sig = Instant::now();
+        let mut leaders: Vec<(usize, ProfilePaints<'_>)> = Vec::new();
+        let mut profile_of: Vec<usize> = Vec::with_capacity(groups.len());
+        for (gi, g) in groups.iter().enumerate() {
+            let paints = profile_paints(
+                space,
+                rules,
+                &ctx.pool,
+                &grid,
+                &layers,
+                g.key,
+                g.rep,
+                settings.vias,
+                &sets,
+            );
+            let found = leaders.iter().position(|(l, p)| {
+                groups[*l].key == g.key && p.same_clearances(&paints, [groups[*l].rep, g.rep])
+            });
+            match found {
+                Some(pi) => profile_of.push(pi),
+                None => {
+                    leaders.push((gi, paints));
+                    profile_of.push(leaders.len() - 1);
+                }
+            }
+        }
+        summary.profiles = leaders.len();
+        paint += t_sig.elapsed();
+
+        for (pi, (lead, paints)) in leaders.iter().enumerate() {
+            let g = groups[*lead];
+            let members: Vec<&Terminal> = terminals
+                .iter()
+                .filter(|t| profile_of[t.profile] == pi)
+                .collect();
+            let t_paint = Instant::now();
+            let prof = build_profile(&grid, &layers, g.key, g.rep, paints, &sets);
+            paint += t_paint.elapsed();
+            let t_search = Instant::now();
+            let out: Vec<TerminalAccess> = members
+                .par_iter()
+                .map(|t| {
+                    ctx.pool.with(|w| {
+                        audit_terminal(ctx, &grid, &goal, &layers, Some(&prof), g.key, t, w)
+                    })
+                })
+                .collect();
+            searching += t_search.elapsed();
+            results.extend(out);
+        }
+        summary.paint_ms = paint.as_millis() as u64;
+        summary.search_ms = searching.as_millis() as u64;
     }
     results.sort_by_key(|t| t.pad);
     summary.unreachable = results.iter().filter(|t| t.reachable.is_empty()).count();
@@ -1206,50 +1557,37 @@ fn audit_footprint(ctx: &Ctx<'_>, f: FootprintId) -> (Vec<TerminalAccess>, Footp
     (results, summary)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Paint a profile's rasters from its obstacles.
 fn build_profile(
-    space: &Space<'_>,
-    rules: &dyn RuleTable,
     grid: &Grid,
     layers: &[LayerId],
     key: ProfileKey,
     rep: NetId,
-    settings: AuditSettings,
+    paints: &ProfilePaints<'_>,
     sets: &BTreeMap<(u8, Coord), CourtSets>,
 ) -> ProfileRasters {
-    let rw = radius_of(key.width);
-    // Half a lattice diagonal, rounded up.
-    let strict_margin =
-        ((f64::from(settings.pitch) * std::f64::consts::SQRT_2 / 2.0).ceil() as Coord) + 1;
-    let track_sets = &sets[&(0, rw)];
+    let margin = strict_margin(grid.pitch);
+    let track_set = &sets[&(0, radius_of(key.width))].set;
     let out_layers: Vec<LayerRaster> = layers
         .iter()
-        .map(|&l| {
-            paint_layer(
-                space,
-                rules,
-                grid,
-                l,
-                key.width,
-                track_sets,
-                rep,
-                strict_margin,
-            )
+        .zip(&paints.layers)
+        .map(|(&layer, obstacles)| {
+            let (core, strict) = paint_all(grid, track_set, obstacles, Some(margin));
+            LayerRaster {
+                layer,
+                core,
+                strict,
+                edges: EdgeCache::new(4 * grid.len()),
+            }
         })
         .collect();
-    let via = if settings.vias {
-        let via_sets = &sets[&(1, radius_of(key.via_diameter))];
-        paint_vias(
-            space,
-            rules,
-            grid,
-            key.via_diameter,
-            key.via_drill,
-            via_sets,
-            rep,
-        )
-    } else {
-        vec![MULTI; grid.len()]
+    // Without vias the via raster is never read.
+    let via = match &paints.via {
+        Some(obstacles) => {
+            let via_set = &sets[&(1, radius_of(key.via_diameter))].set;
+            paint_all(grid, via_set, obstacles, None).0
+        }
+        None => Vec::new(),
     };
     ProfileRasters {
         key,
@@ -1319,20 +1657,27 @@ fn own_copper(
     (needs_route, joined, own)
 }
 
+/// Audit one terminal. With `prof`, the profile rasters answer first and
+/// exact checks confirm; without, every move is checked exactly.
 #[allow(clippy::too_many_arguments)]
 fn audit_terminal(
     ctx: &Ctx<'_>,
     grid: &Grid,
     goal: &[bool],
     layers: &[LayerId],
-    prof: &ProfileRasters,
+    prof: Option<&ProfileRasters>,
+    key: ProfileKey,
     t: &Terminal,
-    buf: &mut Buffers,
-    cache: &mut ClearanceCache,
+    w: &mut Worker,
 ) -> TerminalAccess {
     let space = ctx.space;
     let rules = ctx.rules;
     let vias = ctx.settings.vias;
+    let Worker {
+        search: buf,
+        memo,
+        cache,
+    } = w;
     // Seeds: lattice points inside the terminal's own copper.
     let mut seeds: Vec<(usize, usize)> = Vec::new();
     for (li, shape) in &t.own {
@@ -1366,43 +1711,85 @@ fn audit_terminal(
             Some("no lattice point lies in the terminal's copper; refine the pitch".into());
         return access;
     }
-
-    let fast = {
-        let mut oracle = FastOracle {
-            space,
-            rules,
-            grid,
-            prof,
-            net: t.net,
-            cache,
-            vias,
-        };
-        search(grid, goal, layers, &seeds, &mut oracle, buf, vias)
-    };
-    let mut verified = true;
-    for g in fast.goals.iter().flatten() {
-        if !verify_path(space, rules, cache, grid, layers, prof.key, t.net, buf, *g) {
-            verified = false;
-            break;
-        }
-    }
-    let result = if verified && (!fast.mask.is_empty() || t.net == prof.rep) {
-        fast
+    // The most any search can reach: every routable layer with new vias,
+    // the layers the copper starts on without.
+    let reachable_at_most = if vias {
+        layers.iter().fold(LayerMask::EMPTY, |m, &l| m.with(l))
     } else {
-        access.exact_rerun = true;
-        let mut oracle = ExactOracle {
-            space,
-            rules,
-            grid,
-            layers,
-            key: prof.key,
-            net: t.net,
-            cache,
-            vias,
-            cell_memo: vec![0; grid.len() * layers.len()],
-            via_memo: vec![0; grid.len()],
+        seeds
+            .iter()
+            .fold(LayerMask::EMPTY, |m, &(li, _)| m.with(layers[li]))
+    };
+
+    let fast = prof.and_then(|prof| {
+        let fast = {
+            let mut oracle = FastOracle {
+                space,
+                rules,
+                grid,
+                prof,
+                net: t.net,
+                cache,
+                vias,
+            };
+            search(grid, goal, layers, &seeds, &mut oracle, buf, vias)
         };
-        search(grid, goal, layers, &seeds, &mut oracle, buf, vias)
+        // Each layer found is truly reachable once its path passes exact
+        // checks for this net.
+        let verified = fast
+            .goals
+            .iter()
+            .flatten()
+            .all(|g| verify_path(space, rules, cache, grid, layers, key, t.net, buf, *g));
+        verified.then_some(fast)
+    });
+    // The rasters are exact for the representative. For another net a
+    // missing layer may be the representative's rules talking, so a
+    // verified result stands on its own only when nothing is missing.
+    let (result, rerun_seeds) = match fast {
+        Some(r) if prof.is_some_and(|p| p.rep == t.net) || r.mask == reachable_at_most => (r, None),
+        // Without new vias the layers never meet: only the missing ones
+        // need the exact search, and what was found stands.
+        Some(r) if !vias && !r.mask.is_empty() => {
+            let missing: Vec<(usize, usize)> = seeds
+                .iter()
+                .copied()
+                .filter(|&(li, _)| !r.mask.contains(layers[li]))
+                .collect();
+            (r, Some(missing))
+        }
+        _ => (
+            SearchResult {
+                mask: LayerMask::EMPTY,
+                goals: Vec::new(),
+                explored: 0,
+                seeds: 0,
+                via_sites: 0,
+            },
+            Some(seeds.clone()),
+        ),
+    };
+    let result = match rerun_seeds {
+        None => result,
+        Some(rerun) => {
+            access.exact_rerun = prof.is_some();
+            memo.start(grid.len() * layers.len(), grid.len());
+            let mut oracle = ExactOracle {
+                space,
+                rules,
+                grid,
+                layers,
+                key,
+                net: t.net,
+                cache,
+                vias,
+                memo,
+            };
+            let mut exact = search(grid, goal, layers, &rerun, &mut oracle, buf, vias);
+            exact.mask = exact.mask.union(result.mask);
+            exact.explored += result.explored;
+            exact
+        }
     };
     access.reachable = result.mask;
     access.explored = result.explored;
@@ -1418,7 +1805,7 @@ fn audit_terminal(
             format!(
                 "no legal track start in the terminal's copper (on {}) for a {} nm track",
                 names.join(", "),
-                prof.key.width
+                key.width
             )
         } else {
             format!(
@@ -1426,7 +1813,7 @@ fn audit_terminal(
                  {} legal via sites among them, none outside the courtyard",
                 result.explored,
                 names.join(", "),
-                prof.key.width,
+                key.width,
                 result.via_sites
             )
         });
@@ -1532,6 +1919,211 @@ mod tests {
         let t = &audit.terminals[0];
         assert_eq!(t.reachable, board.layers.all());
         assert!(t.reason.is_none());
+    }
+
+    /// Uniform rules plus net-specific behaviour, as a project's custom
+    /// rules can give: nets in `wide` get `wide_clearance` to everything,
+    /// and nets in `class_one` report class 1 (with the same values).
+    struct NetRules {
+        base: UniformRules,
+        wide: Vec<NetId>,
+        wide_clearance: Coord,
+        class_one: Vec<NetId>,
+    }
+
+    impl NetRules {
+        fn new() -> Self {
+            NetRules {
+                base: UniformRules::default(),
+                wide: Vec::new(),
+                wide_clearance: 300_000,
+                class_one: Vec::new(),
+            }
+        }
+    }
+
+    impl RuleTable for NetRules {
+        fn class_of(&self, net: Option<NetId>) -> crate::api::ClassId {
+            crate::api::ClassId(u16::from(net.is_some_and(|n| self.class_one.contains(&n))))
+        }
+        fn class(&self, _class: crate::api::ClassId) -> &crate::rules::NetClassRules {
+            &self.base.class
+        }
+        fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, layer: LayerId) -> Coord {
+            let wide = [a.net, b.net]
+                .iter()
+                .any(|n| n.is_some_and(|n| self.wide.contains(&n)));
+            if wide {
+                self.wide_clearance
+            } else {
+                self.base.clearance(a, b, layer)
+            }
+        }
+        fn track_width(&self, s: &RuleSubject<'_>, l: LayerId) -> crate::rules::WidthRule {
+            self.base.track_width(s, l)
+        }
+        fn via(&self, s: &RuleSubject<'_>) -> crate::rules::ViaRule {
+            self.base.via(s)
+        }
+        fn min_track_angle_deg(&self, s: &RuleSubject<'_>, l: LayerId) -> Option<f64> {
+            self.base.min_track_angle_deg(s, l)
+        }
+        fn min_segment_length(&self, s: &RuleSubject<'_>, l: LayerId) -> Option<Coord> {
+            self.base.min_segment_length(s, l)
+        }
+        fn edge_clearance(&self) -> Coord {
+            self.base.edge_clearance()
+        }
+        fn hole_clearance(&self) -> Coord {
+            self.base.hole_clearance()
+        }
+        fn hole_to_hole(&self) -> Coord {
+            self.base.hole_to_hole()
+        }
+        fn max_clearance(&self) -> Coord {
+            self.base.max_clearance().max(self.wide_clearance)
+        }
+        fn inert_rules(&self) -> &[crate::rules::InertRule] {
+            &[]
+        }
+    }
+
+    fn masks(a: &AccessAudit) -> Vec<(PadId, LayerMask)> {
+        a.terminals.iter().map(|t| (t.pad, t.reachable)).collect()
+    }
+
+    #[test]
+    fn a_net_specific_rule_cannot_hide_a_layer() {
+        // The representative (pad 1, net AAA) has a wide clearance; pad 2
+        // (net BBB, a through-hole pad on both layers) does not. A fence
+        // on F.Cu leaves a 0.4 mm gap: enough for BBB's track and its
+        // 0.2 mm clearance, not for AAA's 0.3 mm. B.Cu is open. The
+        // profile rasters, painted for AAA, find only B.Cu for BBB; the
+        // exact rerun must find F.Cu as well.
+        let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+        let u = b.footprint_with_courtyard("U1", (5.0, 5.0), (2.0, 2.0));
+        b.ball_pad(u, "1", "AAA", (3.5, 5.0), 0.3, "F.Cu");
+        b.th_pad(u, "2", "BBB", (5.0, 5.0), 0.6, 0.3);
+        b.track("FENCE", "F.Cu", (4.0, 4.0), (4.0, 6.0), 0.2, true)
+            .track("FENCE", "F.Cu", (4.0, 6.0), (6.0, 6.0), 0.2, true)
+            .track("FENCE", "F.Cu", (6.0, 6.0), (6.0, 5.3), 0.2, true)
+            .track("FENCE", "F.Cu", (6.0, 4.7), (6.0, 4.0), 0.2, true)
+            .track("FENCE", "F.Cu", (6.0, 4.0), (4.0, 4.0), 0.2, true);
+        let board = b.build();
+        let mut rules = NetRules::new();
+        rules.base.class.clearance = 100_000;
+        rules.wide = vec![board.net_by_name("AAA").unwrap()];
+        let settings = AuditSettings {
+            vias: false,
+            ..Default::default()
+        };
+        let f = [fp(&board, "U1")];
+        let audit = audit_terminal_access_with(&board, &rules, &f, &settings);
+        let bbb = audit
+            .terminals
+            .iter()
+            .find(|t| t.net == board.net_by_name("BBB"))
+            .unwrap();
+        assert_eq!(bbb.reachable, board.layers.all(), "{bbb:?}");
+        assert!(bbb.exact_rerun);
+        let exact = audit_terminal_access_with(
+            &board,
+            &rules,
+            &f,
+            &AuditSettings {
+                exact_only: true,
+                ..settings
+            },
+        );
+        assert_eq!(masks(&audit), masks(&exact));
+    }
+
+    #[test]
+    fn classes_with_the_same_clearances_share_rasters() {
+        let board = synthetic::bga_field(3, 3, 1.0, 0.4, false);
+        let f = [fp(&board, "BGA1")];
+        let other = board.pads[4].net.unwrap();
+        let mut rules = NetRules::new();
+        rules.class_one = vec![other];
+        let same = audit_terminal_access(&board, &rules, &f);
+        assert_eq!(same.footprints[0].classes, 2);
+        assert_eq!(same.footprints[0].profiles, 1);
+        // A wider clearance for that class's net splits the profile.
+        rules.wide = vec![other];
+        let split = audit_terminal_access(&board, &rules, &f);
+        assert_eq!(split.footprints[0].profiles, 2);
+        let exact = audit_terminal_access_with(
+            &board,
+            &rules,
+            &f,
+            &AuditSettings {
+                exact_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(masks(&split), masks(&exact));
+    }
+
+    #[test]
+    fn a_lattice_over_the_cap_is_coarsened() {
+        let board = synthetic::bga_field(3, 3, 1.5, 0.4, false);
+        let rules = UniformRules::default();
+        let f = [fp(&board, "BGA1")];
+        let full = audit_terminal_access(&board, &rules, &f);
+        let fa = &full.footprints[0];
+        assert!(!fa.coarsened);
+        assert_eq!(fa.pitch, LATTICE_FINE_PITCH_NM);
+        let layers = board.routable.iter().count();
+        let cap = fa.cells * layers / 10;
+        let settings = AuditSettings {
+            max_states: cap,
+            ..Default::default()
+        };
+        let coarse = audit_terminal_access_with(&board, &rules, &f, &settings);
+        let ca = &coarse.footprints[0];
+        assert!(ca.coarsened);
+        assert!(ca.pitch > LATTICE_FINE_PITCH_NM);
+        assert_eq!(ca.pitch % LATTICE_FINE_PITCH_NM, 0);
+        assert!(ca.cells * layers <= cap, "{ca:?}");
+        // 1.1 mm gaps between the balls are wide at any of these pitches.
+        assert_eq!(coarse.unreachable().count(), 0);
+        assert_eq!(masks(&coarse), masks(&full));
+        // An absurd cap still gives a (tiny) lattice rather than looping.
+        let tiny = AuditSettings {
+            max_states: 1,
+            ..Default::default()
+        };
+        let t = audit_terminal_access_with(&board, &rules, &f, &tiny);
+        assert!(t.footprints[0].coarsened);
+        assert_eq!(t.terminals.len(), 9);
+    }
+
+    #[test]
+    fn exact_only_agrees_with_the_profile_search() {
+        for (dogbones, vias) in [(false, true), (true, true), (true, false), (false, false)] {
+            let board = synthetic::bga_field(4, 4, 0.8, 0.4, dogbones);
+            let rules = UniformRules::default();
+            let f = [fp(&board, "BGA1")];
+            let settings = AuditSettings {
+                vias,
+                ..Default::default()
+            };
+            let fast = audit_terminal_access_with(&board, &rules, &f, &settings);
+            let exact = audit_terminal_access_with(
+                &board,
+                &rules,
+                &f,
+                &AuditSettings {
+                    exact_only: true,
+                    ..settings
+                },
+            );
+            assert_eq!(
+                masks(&fast),
+                masks(&exact),
+                "dogbones {dogbones}, vias {vias}"
+            );
+        }
     }
 
     #[test]
