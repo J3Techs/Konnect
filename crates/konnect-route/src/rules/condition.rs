@@ -121,8 +121,12 @@ pub(crate) fn wildcard_matches(pattern: &str, name: &str, case_sensitive: bool) 
             s.chars().flat_map(char::to_lowercase).collect()
         }
     };
-    let pat = fold(pattern);
-    let txt = fold(name);
+    wildcard_match_chars(&fold(pattern), &fold(name))
+}
+
+/// [`wildcard_matches`] on characters already collected (and folded), for
+/// callers matching many names against many patterns.
+pub(crate) fn wildcard_match_chars(pat: &[char], txt: &[char]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let (mut star, mut retry) = (None, 0usize);
     while t < txt.len() {
