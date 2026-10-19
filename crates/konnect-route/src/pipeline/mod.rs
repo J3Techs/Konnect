@@ -96,7 +96,10 @@ pub struct PipelineSettings {
     pub tuning: NegotiationTuning,
     /// The detailed search kernel's tuning.
     pub search: SearchConfig,
-    /// Ask the kernel for its minimum run between turns on every job.
+    /// Ask the kernel for a minimum straight run between turns on the jobs
+    /// of nets with a `track_segment_length` rule, at the longest such
+    /// minimum ([`backend::min_run_nets`]), so detail draws no segment the
+    /// rule refuses. Off: S6 merges and straightens short segments instead.
     pub search_min_run: bool,
     /// S6; `None` keeps the routed copper as negotiation drew it.
     pub optimize: Option<OptimizeOptions>,
@@ -181,10 +184,14 @@ pub fn route_board(
     scope: &PipelineScope,
     settings: &PipelineSettings,
 ) -> Result<PipelineResult, PipelineError> {
-    let mut backend = KernelBackend {
-        config: settings.search.clone(),
-        min_run: settings.search_min_run,
-    };
+    let mut backend = KernelBackend::new(settings.search.clone());
+    if settings.search_min_run {
+        if let Some((nets, min)) = backend::min_run_nets(board, rules) {
+            backend.min_run = true;
+            backend.min_run_nets = Some(std::sync::Arc::new(nets));
+            backend.config.min_run_nm = min;
+        }
+    }
     route_board_with(board, rules, scope, settings, &mut backend)
 }
 
