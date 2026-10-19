@@ -101,6 +101,9 @@ gix = { version = "0.87", features = ["status", "worktree-mutation"] }
 # already in the lock through geo-types, so this adds no new crate.
 rstar = "0.12"
 
+# Data-parallel CPU work (the router's reference raster and search backends).
+rayon = "1"
+
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }
 konnect-ipc = { path = "crates/konnect-ipc" }
