@@ -13,13 +13,18 @@
 //! | `check_route_rules` | S7 check of a `routing_file` against the board |
 //! | `route_native_region` | the pipeline on one region, in this process |
 //! | `start/get/stop_native_route_job` | the pipeline in a runner process |
+//! | `apply_route_plan` | S8 apply: a plan of any size into the open board, with a KIID ledger |
+//! | `map_route_plan_drc` | KiCad's DRC report read back onto an applied plan |
+//!
+//! `apply_route_plan` is the one tool here that writes: it creates the
+//! plan's copper in the board KiCad holds open, never the saved file.
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::native_route_job::{
     self, guarded, CopperSource, NativeJobSpec, Quiet, StageError, StopKind,
 };
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, route_native_apply, ToolContext, ToolDef};
 use konnect_route::api::Generation;
 use konnect_route::check::ViolationKind;
 use konnect_route::connectivity::ConnectivityReport;
@@ -133,6 +138,40 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                 "required": ["output_plan"]
             }),
             |args, ctx| async move { handle_get_native_route_job(args, ctx).await }
+        ),
+        tool!(
+            "apply_route_plan",
+            "Create a routing_file's tracks and vias in the board KiCad holds open, however many there are: every member, net name and (with geometry_check strict) the geometry lint is checked before anything is written, then the plan goes in as net-whole CreateItems chunks of at most 20,000 items. Writes a ledger (the KIID KiCad gave each plan item) to ledger_output for map_route_plan_drc. A failure part-way reports the chunks already created. Does not save, refill or run DRC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "The .kicad_pcb KiCad holds open" },
+                    "routing_file": { "type": "string", "description": "add_routing routing_file (a native plan) to create" },
+                    "ledger_output": { "type": "string", "description": "New JSON ledger to write; an existing file is never replaced" },
+                    "locked": { "type": "boolean", "default": false, "description": "Create every item locked" },
+                    "geometry_check": { "type": "string", "enum": ["strict", "warn"], "default": "strict",
+                                        "description": "strict refuses a plan with any geometry lint defect; warn counts them and applies" },
+                    "max_items": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 20000, "description": "Items per CreateItems call" }
+                },
+                "required": ["board", "routing_file", "ledger_output"]
+            }),
+            |args, ctx| async move { handle_apply_route_plan(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "map_route_plan_drc",
+            "Read a KiCad DRC report (run_drc's output file) back onto a plan applied with apply_route_plan: each finding's items are followed by UUID to the KIIDs in the ledger, so it says which findings touch the plan, by rule, and which plan nets an error involves (the nets to reroute). Reads files only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "routing_file": { "type": "string", "description": "The routing_file that was applied" },
+                    "ledger": { "type": "string", "description": "apply_route_plan's ledger_output" },
+                    "drc_report": { "type": "string", "description": "run_drc output JSON" },
+                    "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Plan-touching findings listed; the counts cover all" }
+                },
+                "required": ["routing_file", "ledger", "drc_report"]
+            }),
+            |args, ctx| async move { handle_map_route_plan_drc(args, ctx).await }
         ),
         tool!(
             "stop_native_route_job",
@@ -829,6 +868,223 @@ async fn handle_stop_native_route_job(
             format!("{e:#}"),
         )),
     }
+}
+
+// ─── Apply and DRC read-back ──────────────────────────────────────────────
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path, field: &str) -> Result<T, Refusal> {
+    file_must_exist(path, field)?;
+    std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        .map_err(|e| invalid(field, &format!("cannot be read: {e}")))
+}
+
+fn required_path(args: &Value, key: &str) -> Result<PathBuf, Refusal> {
+    match opt_path(args, key)? {
+        Some(p) => Ok(p),
+        None => Err(invalid(key, "is required")),
+    }
+}
+
+/// What `apply_route_plan` writes to `ledger_output`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LedgerFile {
+    routing_file: PathBuf,
+    locked: bool,
+    complete: bool,
+    ledger: route_native_apply::ApplyLedger,
+}
+
+/// The validated arguments of `apply_route_plan`.
+struct ApplyArgs {
+    plan: RoutePlan,
+    locked: bool,
+    strict: bool,
+    max_items: usize,
+}
+
+fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
+    let plan: RoutePlan = read_json(&required_path(args, "routing_file")?, "routing_file")?;
+    let locked = opt_bool(args, "locked", false)?;
+    let strict = match args.get("geometry_check").and_then(Value::as_str) {
+        None | Some("strict") => true,
+        Some("warn") => false,
+        Some(_) => return Err(invalid("geometry_check", "must be strict or warn")),
+    };
+    let max_items = match opt_count(args, "max_items", 20_000, 20_000)? {
+        0 => return Err(invalid("max_items", "must be at least 1")),
+        n => n as usize,
+    };
+    if ledger_path.exists() {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: vec![ledger_path.display().to_string()],
+            },
+            format!(
+                "{} already exists; it is never replaced. Nothing was created.",
+                ledger_path.display()
+            ),
+        ));
+    }
+    Ok(ApplyArgs {
+        plan,
+        locked,
+        strict,
+        max_items,
+    })
+}
+
+async fn handle_apply_route_plan(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use route_native_apply::{ApplyOutcome, IpcSink};
+    let board = get_path(args, "board")?;
+    let ledger_path = get_path(args, "ledger_output")?;
+    let a = match apply_args(args, &ledger_path) {
+        Ok(a) => a,
+        Err(r) => return Ok(r),
+    };
+    let routing_file = get_path(args, "routing_file")?;
+    let limits = super::route_geometry::Limits::default();
+    let t = std::time::Instant::now();
+    let applied = {
+        let plan = a.plan.clone();
+        let (locked, strict, max_items) = (a.locked, a.strict, a.max_items);
+        super::with_bound_board_ipc_classified(ctx, &board, move |client, document| {
+            let codes: BTreeMap<String, i32> = client
+                .get_nets_in(document.clone())?
+                .into_iter()
+                .map(|n| (n.name, n.netcode))
+                .collect();
+            let mut sink = IpcSink { client, document };
+            Ok(route_native_apply::apply_plan_with(
+                &plan, locked, &limits, strict, max_items, &codes, &mut sink,
+            ))
+        })
+        .await?
+    };
+    let outcome = match applied {
+        Ok(super::BoardBinding::Bound(outcome)) => outcome,
+        Ok(super::BoardBinding::Unserved { message, .. }) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {message}). Nothing was created."
+            )))
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error))
+        }
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCad IPC failed: {}. Inspect the board before retrying.",
+                error.message()
+            )))
+        }
+    };
+    let elapsed_ms = t.elapsed().as_millis() as u64;
+    let (ledger, complete, failure) = match outcome {
+        Err(refusal) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "routing_file".to_string(),
+                    reason: refusal.to_string(),
+                },
+                format!("Nothing was created: {refusal}"),
+            ))
+        }
+        Ok(ApplyOutcome::Complete(ledger)) => (ledger, true, Value::Null),
+        Ok(ApplyOutcome::Partial {
+            ledger,
+            failed_chunk,
+            error,
+        }) => (
+            ledger,
+            false,
+            json!({ "failed_chunk": failed_chunk, "error": error }),
+        ),
+    };
+    let summary = route_native_apply::ledger_summary(&ledger);
+    let record = LedgerFile {
+        routing_file,
+        locked: a.locked,
+        complete,
+        ledger,
+    };
+    let written = serde_json::to_vec(&record)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| native_route_job::write_new_atomic(&ledger_path, &bytes));
+    let body = json!({
+        "source": "ipc",
+        "complete": complete,
+        "failure": failure,
+        "applied": summary,
+        "locked": a.locked,
+        "plan_tracks": a.plan.tracks.len(),
+        "plan_vias": a.plan.vias.len(),
+        "ledger_output": if written.is_ok() { json!(ledger_path) } else { Value::Null },
+        "ledger_error": written.err().map(|e| format!("{e:#}")),
+        "elapsed_ms": elapsed_ms,
+        "next": "Refill zones, save, run_drc with an output file, then map_route_plan_drc.",
+    });
+    Ok(if complete {
+        CallToolResult::json(&body)
+    } else {
+        CallToolResult::error(format!(
+            "The plan was applied only in part; retry the chunks not applied. {body}"
+        ))
+    })
+}
+
+async fn handle_map_route_plan_drc(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let parsed = (|| -> Result<_, Refusal> {
+        let plan: RoutePlan = read_json(&required_path(args, "routing_file")?, "routing_file")?;
+        let ledger: LedgerFile = read_json(&required_path(args, "ledger")?, "ledger")?;
+        let report: super::cli::DrcReport =
+            read_json(&required_path(args, "drc_report")?, "drc_report")?;
+        let listed = opt_count(args, "max_listed", LISTED_DEFAULT, 10_000)? as usize;
+        Ok((plan, ledger, report, listed))
+    })();
+    let (plan, ledger, report, listed) = match parsed {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    let map = route_native_apply::map_drc(&report, &ledger.ledger, &plan);
+    let mut by_rule: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
+    for f in &map.findings {
+        let side = if f.touches_plan() {
+            "touching_plan"
+        } else {
+            "not_touching_plan"
+        };
+        *by_rule
+            .entry(format!("{}/{}", f.rule, f.severity))
+            .or_default()
+            .entry(side)
+            .or_default() += 1;
+    }
+    let first: Vec<&route_native_apply::MappedFinding> = map
+        .findings
+        .iter()
+        .filter(|f| f.touches_plan() && f.category == "violations")
+        .take(listed)
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "source": "saved_file",
+        "ledger_complete": ledger.complete,
+        "touching_plan": map.touching_plan,
+        "not_touching_plan": map.not_touching_plan,
+        "items_mapped": map.items_mapped,
+        "items_not_in_plan": map.items_not_in_plan,
+        "by_rule": by_rule,
+        "nets_to_reroute": map.nets_to_reroute.len(),
+        "nets": map.nets_to_reroute.iter().take(listed).collect::<Vec<_>>(),
+        "missing_categories": map.missing_categories,
+        "listed": first,
+    })))
 }
 
 #[cfg(test)]

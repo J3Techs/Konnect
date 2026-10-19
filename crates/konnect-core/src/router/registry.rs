@@ -94,9 +94,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "native_routing",
-        description: "Native autorouter on the saved board: connectivity, terminal-access audit, plane-via fanout, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan",
+        description: "Native autorouter on the saved board: connectivity, terminal-access audit, plane-via fanout, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan; then the plan applied to the open board with a KIID ledger and KiCad's DRC read back onto it",
         category: "pcb",
-        tool_count: 8,
+        tool_count: 10,
     },
     ToolsetMeta {
         name: "placement",

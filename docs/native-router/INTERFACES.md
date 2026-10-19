@@ -422,6 +422,16 @@ and part of the plan.
   straight shortcut must be exactly octilinear.
 - `konnect-core::native_route_job`: `StopKind` (typed stop reasons),
   `PipelineReport.stop_kind`/`resumed`, `CheckSummary.check_routed_error`.
+- The live apply path: `apply_route_plan` (the `native_routing` toolset)
+  creates a plan of any size in the open board through
+  `route_native_apply::apply_plan_with` (net-whole chunks, `strict_geometry`
+  off counts the lint's defects in `ApplyLedger::geometry_defects`) and
+  writes the KIID ledger; `map_route_plan_drc` reads a `run_drc` report back
+  onto the plan through that ledger.
+- `konnect-ipc::retry_while_busy` and `KiCadIpcClient::{save_board_when_ready,
+  refill_zones_when_ready}`: KiCad 10 answers reads during a zone fill and
+  refuses saves with AS_BUSY, so the DRC sync and `save_project` wait out
+  AS_BUSY on the save itself.
 
 ### Workspace
 
