@@ -407,6 +407,13 @@ fn ws_b_terminal_access_audit_of_the_ball_grids() {
         );
     }
     let mut out = serde_json::Map::new();
+    let strip = |a: &konnect_route::audit::AccessAudit| {
+        a.terminals
+            .iter()
+            .map(|t| (t.pad, t.reachable))
+            .collect::<Vec<_>>()
+    };
+    let mut checks = Vec::new();
     for (label, settings) in [
         ("preferred width, vias", AuditSettings::default()),
         (
@@ -425,24 +432,40 @@ fn ws_b_terminal_access_audit_of_the_ball_grids() {
             },
         ),
     ] {
-        let start = Instant::now();
-        let audit = tel.time(Stage::Audit, || {
-            audit_terminal_access_with(board, &l.rules, &fps, &settings)
-        });
-        let ms = start.elapsed().as_millis();
-        println!("== audit ({label}): {ms} ms, {} threads ==", tel.threads);
+        // Three runs; the machine may be shared, so the fastest is the
+        // best estimate of the stage's own cost.
+        let mut runs = Vec::new();
+        let mut audit = None;
+        for _ in 0..3 {
+            let start = Instant::now();
+            audit = Some(tel.time(Stage::Audit, || {
+                audit_terminal_access_with(board, &l.rules, &fps, &settings)
+            }));
+            runs.push(start.elapsed().as_millis());
+        }
+        let audit = audit.unwrap();
+        let ms = runs.iter().min().unwrap();
+        println!(
+            "== audit ({label}): {ms} ms (runs {runs:?}), {} threads ==",
+            tel.threads
+        );
         for f in &audit.footprints {
             let fp = &board.footprints[f.footprint.index()];
             println!(
-                "{}: {} terminals, {} unreachable ({} need a route), {} profiles, {} cells, {} exact reruns, {} ms",
+                "{}: {} terminals, {} unreachable ({} need a route), {} classes in {} profiles, {} cells at {} nm{}, {} exact reruns, {} ms ({} ms painting, {} ms searching)",
                 fp.reference.as_deref().unwrap_or("?"),
                 f.terminals,
                 f.unreachable,
                 f.unreachable_needing_route,
+                f.classes,
                 f.profiles,
                 f.cells,
+                f.pitch,
+                if f.coarsened { " (coarsened)" } else { "" },
                 f.exact_reruns,
-                f.wall_ms
+                f.wall_ms,
+                f.paint_ms,
+                f.search_ms
             );
         }
         let mut per_layer: BTreeMap<String, usize> = BTreeMap::new();
@@ -470,6 +493,7 @@ fn ws_b_terminal_access_audit_of_the_ball_grids() {
             }));
         }
         out.insert(label.to_string(), serde_json::Value::Array(listed));
+        checks.push((label, settings, strip(&audit)));
         // Every audited pad is reported once.
         let expected: usize = fps
             .iter()
@@ -482,6 +506,34 @@ fn ws_b_terminal_access_audit_of_the_ball_grids() {
             })
             .sum();
         assert_eq!(audit.terminals.len(), expected);
+    }
+    // After the timings: the fast path must give exactly what checking
+    // every move for each terminal's own net gives.
+    for (label, settings, fast_masks) in checks {
+        let start = Instant::now();
+        let exact = audit_terminal_access_with(
+            board,
+            &l.rules,
+            &fps,
+            &AuditSettings {
+                exact_only: true,
+                ..settings
+            },
+        );
+        let exact_masks = strip(&exact);
+        let differ: Vec<String> = fast_masks
+            .iter()
+            .zip(&exact_masks)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| format!("{} {:?} vs {:?}", pad_name(board, a.0), a.1, b.1))
+            .collect();
+        println!(
+            "exact-only cross-check ({label}): {} ms, {} of {} masks differ",
+            start.elapsed().as_millis(),
+            differ.len(),
+            fast_masks.len()
+        );
+        assert!(differ.is_empty(), "fast and exact masks differ: {differ:?}");
     }
     let path = report_dir().join("audit-unreachable.json");
     std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap()).unwrap();
@@ -593,22 +645,44 @@ fn ws_b_plane_fanout_plan() {
         runs.push((label, p));
     }
     let plan = &runs[0].1;
+    // Repeat runs: the machine may be shared, so the fastest is the best
+    // estimate of the stage's own cost.
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let _ = tel.time(Stage::Fanout, || {
+            plan_plane_vias_excluding(board, &l.rules, &conn, &FanoutSettings::default(), &exclude)
+        });
+        times.push(start.elapsed().as_millis());
+    }
+    println!(
+        "default fanout, 5 more runs: {times:?} ms (best {})",
+        times.iter().min().unwrap()
+    );
     // Determinism: one thread gives the same plan.
     let single = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .unwrap()
         .install(|| {
-            let start = Instant::now();
-            let p = plan_plane_vias_excluding(
-                board,
-                &l.rules,
-                &conn,
-                &FanoutSettings::default(),
-                &exclude,
+            let mut times = Vec::new();
+            let mut last = None;
+            for _ in 0..3 {
+                let start = Instant::now();
+                last = Some(plan_plane_vias_excluding(
+                    board,
+                    &l.rules,
+                    &conn,
+                    &FanoutSettings::default(),
+                    &exclude,
+                ));
+                times.push(start.elapsed().as_millis());
+            }
+            println!(
+                "single-thread fanout: {times:?} ms (best {})",
+                times.iter().min().unwrap()
             );
-            println!("single-thread fanout: {} ms", start.elapsed().as_millis());
-            p
+            last.unwrap()
         });
     assert_eq!(
         single.sites, plan.sites,
