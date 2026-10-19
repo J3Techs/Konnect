@@ -16,7 +16,7 @@
 //!    in turn, and when all of them resolve to one class other than
 //!    `Default`, the net takes it. A group's prefix and anything after its
 //!    closing brace are dropped. This is how a net named
-//!    `Net-(U1-EN{slash}UVLO)` (KiCad escapes `/` in a pin or label name as
+//!    `Net-(U9-A{slash}B)` (KiCad escapes `/` in a pin or label name as
 //!    `{slash}`) ends up in a class whose pattern is `slash`;
 //! 4. otherwise `Default`.
 //!
@@ -370,8 +370,8 @@ mod tests {
     fn escaped_names_fall_back_to_their_bus_member() {
         // KiCad parses `{slash}` as a one-member bus group.
         let r = resolver(&[("slash", 2)]);
-        assert_eq!(name_of(&r, "Net-(U5-EN{slash}UVLO)"), 2);
-        assert_eq!(name_of(&r, "unconnected-(J1-NC{slash}key-Pad7)"), 2);
+        assert_eq!(name_of(&r, "Net-(U9-A{slash}B)"), 2);
+        assert_eq!(name_of(&r, "unconnected-(P3-X{slash}Y-Pad2)"), 2);
         // Not a group: a space before the brace.
         assert_eq!(name_of(&r, "/A B{slash}C"), 0);
         // Formatting braces are not a group.
