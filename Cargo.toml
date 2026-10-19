@@ -100,6 +100,8 @@ gix = { version = "0.87", features = ["status", "worktree-mutation"] }
 # Native router (konnect-geom, konnect-route): the per-layer R-tree. 0.12 is
 # already in the lock through geo-types, so this adds no new crate.
 rstar = "0.12"
+# Native router: data-parallel stages (per-net optimize, tiled routing).
+rayon = "1"
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }

@@ -12,4 +12,5 @@ konnect-geom.workspace = true
 konnect-sexp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
