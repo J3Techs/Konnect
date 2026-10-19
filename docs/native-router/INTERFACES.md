@@ -649,6 +649,8 @@ and part of the plan.
   `FanoutStats::retried_sites`; `FailureDetail::blocked_by` (the pads whose
   chosen sites block a `Conflict`). Behaviour change: the default fanout
   places more sites. Via sharing (`share_within`) stays off by default.
+  Same-net candidates whose stubs touch on one layer are incompatible
+  (KiCad measures the angle wherever same-net tracks meet).
 - **Job runner and tools (`konnect-core`).** `NativeJobSpec` gained
   `allowances: RoutingAllowances`, `net_classes: Option<BTreeMap<String,
   Vec<String>>>` (KiCad's effective class name, then its constituents) and
