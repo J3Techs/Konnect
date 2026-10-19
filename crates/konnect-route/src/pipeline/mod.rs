@@ -537,7 +537,18 @@ fn second_chance(
             .map(|r| reference_pieces(work, r.plane))
             .unwrap_or_default();
         if let Some(r) = fallback.reference {
-            if let Some(k) = outside_keepout(&board, &pieces, r.over) {
+            let areas: Vec<BBox> = ids
+                .iter()
+                .filter_map(|id| {
+                    let c = &connections[id.index()];
+                    let pts = [c.from, c.to].map(|i| terminal_point(work, i));
+                    BBox::from_points(pts.into_iter().flatten())
+                })
+                .map(|b| b.inflate(REFERENCE_AREA_NM))
+                .collect();
+            let keepouts = outside_keepouts(&pieces, &areas, r.over, REFERENCE_CELL_NM);
+            for mut k in keepouts {
+                k.id = crate::api::KeepoutId(board.keepouts.len() as u32);
                 board.keepouts.push(k);
             }
         }
@@ -624,26 +635,97 @@ fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<Polygon> {
         .collect()
 }
 
-/// A track keepout on `layers` covering the board outside every piece.
-fn outside_keepout(board: &RouteBoard, pieces: &[Polygon], layers: LayerMask) -> Option<Keepout> {
-    let b = board.outline.bbox?.inflate(1_000_000);
-    let outline = vec![
-        b.min,
-        konnect_geom::Point::new(b.max.x, b.min.y),
-        b.max,
-        konnect_geom::Point::new(b.min.x, b.max.y),
-    ];
-    let holes = pieces.iter().map(|p| p.outline().to_vec()).collect();
-    Some(Keepout {
-        id: crate::api::KeepoutId(board.keepouts.len() as u32),
-        name: None,
-        layers,
-        region: Polygon::new(outline, holes)?,
-        rules: KeepoutRules {
-            tracks: true,
-            ..KeepoutRules::default()
-        },
-    })
+/// How far around a fallback connection's terminals the reference is
+/// enforced as keepouts (beyond it, only the final check applies).
+const REFERENCE_AREA_NM: Coord = 5_000_000;
+/// Cell size of the reference keepouts.
+const REFERENCE_CELL_NM: Coord = 250_000;
+
+fn terminal_point(board: &RouteBoard, item: ItemRef) -> Option<konnect_geom::Point> {
+    match item {
+        ItemRef::Pad(id) => board.pads.get(id.index()).map(|p| p.center),
+        ItemRef::Via(id) => board.vias.get(id.index()).map(|v| v.center),
+        ItemRef::Track(id) => board.tracks.get(id.index()).map(|t| t.seg.a),
+        _ => None,
+    }
+}
+
+/// Track keepouts on `layers` covering every `cell`-sized square within
+/// `areas` that does not lie wholly inside one piece: one rectangle per
+/// run of such cells along a row, so each is cheap to paint and check.
+fn outside_keepouts(
+    pieces: &[Polygon],
+    areas: &[BBox],
+    layers: LayerMask,
+    cell: Coord,
+) -> Vec<Keepout> {
+    let c = i64::from(cell);
+    let mut cells: Vec<(i64, i64)> = Vec::new();
+    for a in areas {
+        let (x0, x1) = (
+            i64::from(a.min.x).div_euclid(c),
+            i64::from(a.max.x).div_euclid(c),
+        );
+        let (y0, y1) = (
+            i64::from(a.min.y).div_euclid(c),
+            i64::from(a.max.y).div_euclid(c),
+        );
+        for iy in y0..=y1 {
+            for ix in x0..=x1 {
+                cells.push((iy, ix));
+            }
+        }
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    let square = |iy: i64, ix: i64| {
+        let p = |x: i64, y: i64| konnect_geom::Point::new((x * c) as Coord, (y * c) as Coord);
+        vec![p(ix, iy), p(ix + 1, iy), p(ix + 1, iy + 1), p(ix, iy + 1)]
+    };
+    let outside = |iy: i64, ix: i64| {
+        let Some(sq) = konnect_geom::ConvexPoly::new(square(iy, ix), 0) else {
+            return true;
+        };
+        let sq = Shape::ConvexPoly(sq);
+        let b = sq.bbox();
+        !pieces
+            .iter()
+            .any(|p| p.bbox().contains_bbox(&b) && shape_within_polygon(&sq, p))
+    };
+    let mut out = Vec::new();
+    let mut run: Option<(i64, i64, i64)> = None;
+    let flush = |run: Option<(i64, i64, i64)>, out: &mut Vec<Keepout>| {
+        if let Some((iy, a, b)) = run {
+            let p = |x: i64, y: i64| konnect_geom::Point::new((x * c) as Coord, (y * c) as Coord);
+            let ring = vec![p(a, iy), p(b + 1, iy), p(b + 1, iy + 1), p(a, iy + 1)];
+            if let Some(region) = Polygon::new(ring, Vec::new()) {
+                out.push(Keepout {
+                    id: crate::api::KeepoutId(0),
+                    name: None,
+                    layers,
+                    region,
+                    rules: KeepoutRules {
+                        tracks: true,
+                        ..KeepoutRules::default()
+                    },
+                });
+            }
+        }
+    };
+    for (iy, ix) in cells {
+        if !outside(iy, ix) {
+            continue;
+        }
+        run = match run {
+            Some((ry, a, b)) if ry == iy && b + 1 == ix => Some((ry, a, ix)),
+            other => {
+                flush(other, &mut out);
+                Some((iy, ix, ix))
+            }
+        };
+    }
+    flush(run, &mut out);
+    out
 }
 
 /// Whether a track's copper, grown by `margin`, lies inside one piece.
