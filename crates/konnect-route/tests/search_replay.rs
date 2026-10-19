@@ -729,6 +729,8 @@ fn replay_captured_searches() {
     let mut found_new = 0usize;
     let mut best = f64::INFINITY;
     let mut last: Vec<Summary> = Vec::new();
+    // Per search, the fastest of the repeats: robust to a busy machine.
+    let mut fastest = vec![f64::INFINITY; caps.len()];
     for rep in 0..repeat {
         let t = Instant::now();
         let outs: Vec<(Summary, f64)> = pool_n.install(|| {
@@ -736,6 +738,9 @@ fn replay_captured_searches() {
             caps.par_iter().with_max_len(1).map(run_one).collect()
         });
         let mut times: Vec<(f64, usize)> = outs.iter().enumerate().map(|(i, o)| (o.1, i)).collect();
+        for &(t, i) in &times {
+            fastest[i] = fastest[i].min(t);
+        }
         let results: Vec<Summary> = outs.into_iter().map(|o| o.0).collect();
         last = results.clone();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -810,6 +815,10 @@ fn replay_captured_searches() {
         runs_new += b;
     }
     println!("short interior runs (<= 2 steps): {short_old} -> {short_new}; runs {runs_old} -> {runs_new}");
+    println!(
+        "sum of per-search fastest times: {:.3} s",
+        fastest.iter().sum::<f64>()
+    );
     println!(
         "best {:.3} s, {:.1} ns per expansion, {} outcomes differ from the capture",
         best,

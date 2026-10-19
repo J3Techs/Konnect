@@ -789,6 +789,7 @@ impl TileRun {
     ) {
         let start = std::time::Instant::now();
         let mut round = 0;
+        let mut us_search = 0u64;
         while let Some(p) = self.prepare(ctx, tasks, iteration) {
             let mut pool = JobPool::default();
             pool.push(p.job, &p.sources, &p.targets, &[]);
@@ -797,7 +798,9 @@ impl TileRun {
                 index: round,
                 jobs: vec![0],
             };
+            let ts = std::time::Instant::now();
             let mut out = backend.search_batch(&batch, &pool, &stacks, params);
+            us_search += ts.elapsed().as_micros() as u64;
             let [stack] = stacks;
             self.put_stack(p.stack, stack);
             assert_eq!(out.len(), 1, "a backend returns one outcome per job");
@@ -805,6 +808,7 @@ impl TileRun {
             round += 1;
         }
         self.telemetry.count("tile_rounds", u64::from(round));
+        self.telemetry.count("us_tile_search", us_search);
         self.busy_us = start.elapsed().as_micros() as u64;
     }
 

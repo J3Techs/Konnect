@@ -931,6 +931,7 @@ fn run_dag(
     let mut busy_of = vec![0u64; n];
     let mut build_of = vec![0u64; n];
     let mut searches_of = vec![0u64; n];
+    let mut search_us_of = vec![0u64; n];
     let mut work = vec![0u64; n];
     for (k, r) in s.results.into_iter().enumerate() {
         let (d, t, busy) = r.expect("every tile ran");
@@ -939,6 +940,7 @@ fn run_dag(
         busy_of[k] = busy;
         build_of[k] = t.raster_rebuild_us;
         searches_of[k] = t.counters.get("searches").copied().unwrap_or(0);
+        search_us_of[k] = t.counters.get("us_tile_search").copied().unwrap_or(0);
         let e = t.counters.get("expansions").copied().unwrap_or(0);
         work[k] = e + preds[k].iter().map(|&j| work[j]).max().unwrap_or(0);
         let best = preds[k]
@@ -972,7 +974,7 @@ fn run_dag(
             if trace {
                 let t = &tiling.tiles[order[k]].tile;
                 eprintln!(
-                    "  tile {:4} phase {} colour {} core ({:.1},{:.1})-({:.1},{:.1}) busy {:.2} s build {:.2} s searches {} exp {}",
+                    "  tile {:4} phase {} colour {} core ({:.1},{:.1})-({:.1},{:.1}) busy {:.2} s build {:.2} s search {:.2} s searches {} exp {}",
                     t.id.0,
                     t.phase,
                     t.colour,
@@ -982,6 +984,7 @@ fn run_dag(
                     t.core.max.y as f64 / 1e6,
                     busy_of[k] as f64 / 1e6,
                     build_of[k] as f64 / 1e6,
+                    search_us_of[k] as f64 / 1e6,
                     searches_of[k],
                     work[k] - preds[k].iter().map(|&j| work[j]).max().unwrap_or(0)
                 );
