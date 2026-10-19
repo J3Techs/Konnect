@@ -807,3 +807,39 @@ fn warm_searches_do_not_grow_scratch() {
     assert_eq!(before, after);
     assert!(before > 0);
 }
+
+#[test]
+fn bend_costs_and_the_bend_bound_keep_open_searches_narrow() {
+    // On an empty lattice every octilinear path with one bend is optimal;
+    // without a bend-aware bound A* expands the whole parallelogram.
+    let st = stack(220, 220, 3);
+    let cfg = SearchConfig::default();
+    let ctx = SearchContext::new(&st, &cfg);
+    for (t, cost) in [
+        ((190u16, 100u16), 90 * 1414 + 90 * 1000),
+        ((60, 200), 50 * 1414 + 140 * 1000),
+    ] {
+        let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(10, 10, 0)], &[node(t.0, t.1, 0)]);
+        let (o, stats) = run_ctx(&ctx, &pool, i);
+        let p = found(&o);
+        assert_eq!(p.cost, Cost(cost + cfg.bend_45.0), "{t:?}");
+        assert_eq!(p.nodes.len(), 3);
+        assert!(
+            stats.expansions < 1_000,
+            "{t:?}: {} expansions",
+            stats.expansions
+        );
+    }
+    // Without bend costs the plateau is real and only the optimum matters.
+    let flat = SearchConfig {
+        bend_45: Cost(0),
+        bend_90: Cost(0),
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &flat);
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(10, 10, 0)], &[node(190, 100, 0)]);
+    assert_eq!(
+        found(&run_ctx(&ctx, &pool, i).0).cost,
+        Cost(90 * 1414 + 90 * 1000)
+    );
+}

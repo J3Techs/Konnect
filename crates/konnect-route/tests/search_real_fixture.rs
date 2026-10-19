@@ -11,7 +11,9 @@
 //! Optional: `KONNECT_SEARCH_TILES` (tiles to route, default 3, `all` for
 //! every tile), `KONNECT_SEARCH_VARIANTS` (`all` adds the slower variants)
 //! and `KONNECT_SEARCH_REFERENCE_DIR` (a directory holding a routed copy of
-//! the same board, whose two-pin net lengths are compared). For each chosen tile and net class it paints the fixed copper
+//! the same board, whose two-pin net lengths are compared). For timing on a
+//! busy machine, `KONNECT_SEARCH_ONLY` (comma-separated name filters) and
+//! `KONNECT_SEARCH_REPEAT` (runs per variant; take the minimum). For each chosen tile and net class it paints the fixed copper
 //! into rasters, then routes every connection whose two islands fit in the
 //! tile, one at a time against the fixed board (no negotiation): the own
 //! net is unpainted around each search and repainted after. It prints
@@ -33,9 +35,9 @@ use konnect_route::compute::{
 };
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::detail::search::{
-    derive_masks_in_lattice, derive_masks_on_lattice, paint_on_lattice, search_with, ExactCheck,
-    Heuristic, Lattice, LatticeSpec, MapLookahead, Preferred, SearchConfig, SearchContext,
-    SearchStats, ViaGeometry,
+    derive_masks_in_lattice, derive_masks_on_lattice, paint_on_lattice, search_with, CheckCache,
+    ExactCheck, Heuristic, Lattice, LatticeSpec, MapLookahead, Preferred, SearchConfig,
+    SearchContext, SearchStats, ViaGeometry,
 };
 use konnect_route::rules::RuleSubject;
 use konnect_route::telemetry::Telemetry;
@@ -55,6 +57,29 @@ fn only_file(dir: &Path, ext: &str) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext));
     let first = found.next()?;
     found.next().is_none().then_some(first)
+}
+
+/// CPU cycles this thread has run, where the platform reports them: robust
+/// against preemption on a busy machine, unlike wall time.
+#[cfg(windows)]
+fn thread_cycles() -> u64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+    }
+    let mut c = 0u64;
+    // SAFETY: the pseudo-handle of the current thread is always valid and
+    // `c` outlives the call.
+    unsafe {
+        QueryThreadCycleTime(GetCurrentThread(), &mut c);
+    }
+    c
+}
+
+#[cfg(not(windows))]
+fn thread_cycles() -> u64 {
+    0
 }
 
 // ─── Obstacles and the exact checker ─────────────────────────────────────────
@@ -659,6 +684,9 @@ fn toggle_own(cs: &mut ClassStack, b: &Board<'_>, lat: &Lattice, net: NetId, up:
 #[derive(Clone)]
 struct Variant {
     name: &'static str,
+    /// Route every tile twice through one cross-search `CheckCache` and
+    /// report the second pass (a negotiation iteration's reroute).
+    cached: bool,
     non_uniform: bool,
     config: SearchConfig,
     params: CostParams,
@@ -685,6 +713,10 @@ struct Tally {
     raster_ms: f64,
     reference: Vec<f64>,
     tiles: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cycles: u64,
+    cycle_list: Vec<u64>,
 }
 
 impl Tally {
@@ -707,6 +739,10 @@ impl Tally {
         self.raster_ms += o.raster_ms;
         self.reference.extend(&o.reference);
         self.tiles += o.tiles;
+        self.cache_hits += o.cache_hits;
+        self.cycles += o.cycles;
+        self.cycle_list.extend(&o.cycle_list);
+        self.cache_misses += o.cache_misses;
     }
 }
 
@@ -825,6 +861,9 @@ fn route_tile(
         profiles: profiles.clone(),
         memo: Mutex::new(HashMap::new()),
     };
+    let shared = CheckCache::new(&checker);
+    let check: &dyn ExactCheck = if v.cached { &shared } else { &checker };
+    let passes = if v.cached { 2 } else { 1 };
     tally.raster_ms += t0.elapsed().as_secs_f64() * 1e3;
     for (pi, (_class, list, width, via_d)) in groups.into_iter().enumerate() {
         let t1 = Instant::now();
@@ -836,111 +875,146 @@ fn route_tile(
             .collect();
         let mut cs = build_stack(b, &lat, slots, &nets, width, via_d, TileId(tj.tile as u32));
         tally.raster_ms += t1.elapsed().as_secs_f64() * 1e3;
-        for &ci in &list {
-            let c = &conns[ci];
-            let src = terminals(b.board, &lat, slots, &c.from);
-            let dst = terminals(b.board, &lat, slots, &c.to);
-            if src.is_empty() || dst.is_empty() {
-                continue;
-            }
-            let mut pool = JobPool::default();
-            let job = JobDescriptor {
-                connection: ci as u32,
-                net: c.net.0,
-                profile: pi as u16,
-                flags: JOB_ALLOW_VIA,
-                cost_bound: u32::MAX,
-                ..Default::default()
-            };
-            let ji = pool.push(job, &src, &dst, &[]);
-            toggle_own(&mut cs, b, &lat, c.net, false);
-            let ctx = SearchContext {
-                stack: &cs.stack,
-                lattice: Some(&lat),
-                config: &v.config,
-                checker: if v.checker { Some(&checker) } else { None },
-                lookahead: la.as_deref(),
-                gcells: None,
-            };
-            let mut stats = SearchStats::default();
-            let ts = Instant::now();
-            let o = search_with(&ctx, &pool, &pool.jobs[0], ji, &v.params, &mut stats);
-            let us = ts.elapsed().as_micros() as u64;
-            toggle_own(&mut cs, b, &lat, c.net, true);
-            stats.record(&o, &mut telemetry.lock().unwrap());
-            tally.jobs += 1;
-            tally.search_us += us;
-            tally.times_us.push(us);
-            tally.expansions += stats.expansions;
-            tally.window_nodes += stats.window_nodes;
-            tally.stats.add(&stats);
-            match o {
-                SearchOutcome::Found(p) => {
-                    tally.found += 1;
-                    let pts: Vec<(Point, u8)> = p
-                        .nodes
-                        .iter()
-                        .map(|n| (lat.node(n.col.into(), n.row.into()), n.layer))
-                        .collect();
-                    let mut len = 0.0;
-                    let mut last_h: Option<u8> = None;
-                    for w in pts.windows(2) {
-                        if w[0].1 != w[1].1 {
-                            tally.vias += 1;
-                            last_h = None;
-                            if !checker.via_ok(&pool.jobs[0], w[0].0) {
+        for pass in 0..passes {
+            let last = pass + 1 == passes;
+            for &ci in &list {
+                let c = &conns[ci];
+                let src = terminals(b.board, &lat, slots, &c.from);
+                let dst = terminals(b.board, &lat, slots, &c.to);
+                if src.is_empty() || dst.is_empty() {
+                    continue;
+                }
+                let mut pool = JobPool::default();
+                let job = JobDescriptor {
+                    connection: ci as u32,
+                    net: c.net.0,
+                    profile: pi as u16,
+                    flags: JOB_ALLOW_VIA,
+                    cost_bound: u32::MAX,
+                    ..Default::default()
+                };
+                let ji = pool.push(job, &src, &dst, &[]);
+                toggle_own(&mut cs, b, &lat, c.net, false);
+                let ctx = SearchContext {
+                    stack: &cs.stack,
+                    lattice: Some(&lat),
+                    config: &v.config,
+                    checker: if v.checker { Some(check) } else { None },
+                    lookahead: la.as_deref(),
+                    gcells: None,
+                };
+                let mut stats = SearchStats::default();
+                let ts = Instant::now();
+                let cy0 = thread_cycles();
+                let o = search_with(&ctx, &pool, &pool.jobs[0], ji, &v.params, &mut stats);
+                let cycles = thread_cycles() - cy0;
+                let us = ts.elapsed().as_micros() as u64;
+                toggle_own(&mut cs, b, &lat, c.net, true);
+                if !last {
+                    continue;
+                }
+                stats.record(&o, &mut telemetry.lock().unwrap());
+                tally.jobs += 1;
+                tally.search_us += us;
+                tally.times_us.push(us);
+                tally.cycles += cycles;
+                tally.cycle_list.push(cycles);
+                tally.expansions += stats.expansions;
+                tally.window_nodes += stats.window_nodes;
+                tally.stats.add(&stats);
+                match o {
+                    SearchOutcome::Found(p) => {
+                        tally.found += 1;
+                        if std::env::var_os("KONNECT_SEARCH_VERBOSE").is_some()
+                            && stats.expansions > 50_000
+                        {
+                            let a = lat.node(p.nodes[0].col.into(), p.nodes[0].row.into());
+                            let z = p
+                                .nodes
+                                .last()
+                                .map(|n| lat.node(n.col.into(), n.row.into()))
+                                .unwrap_or(a);
+                            let vias = p
+                                .nodes
+                                .windows(2)
+                                .filter(|w| w[0].layer != w[1].layer)
+                                .count();
+                            println!(
+                            "  slow: {} exp, {} us, cost {}, corners {}, vias {vias}, straight {:.2} mm, src {} dst {} nodes, window {}k, layers {}->{}",
+                            stats.expansions, us, p.cost.0, p.nodes.len(), dist(a, z) / 1e6, src.len(), dst.len(),
+                            stats.window_nodes / 1000, p.nodes[0].layer, p.nodes.last().map_or(0, |n| n.layer)
+                        );
+                        }
+                        let pts: Vec<(Point, u8)> = p
+                            .nodes
+                            .iter()
+                            .map(|n| (lat.node(n.col.into(), n.row.into()), n.layer))
+                            .collect();
+                        let mut len = 0.0;
+                        let mut last_h: Option<u8> = None;
+                        for w in pts.windows(2) {
+                            if w[0].1 != w[1].1 {
+                                tally.vias += 1;
+                                last_h = None;
+                                if !checker.via_ok(&pool.jobs[0], w[0].0) {
+                                    tally.violations += 1;
+                                }
+                                continue;
+                            }
+                            len += dist(w[0].0, w[1].0);
+                            let dx = i64::from(w[1].0.x) - i64::from(w[0].0.x);
+                            let dy = i64::from(w[1].0.y) - i64::from(w[0].0.y);
+                            assert!(
+                                dx == 0 || dy == 0 || dx.abs() == dy.abs(),
+                                "non-octilinear run"
+                            );
+                            let h = konnect_route::detail::search::heading_of(
+                                dx.signum() as i32,
+                                dy.signum() as i32,
+                            )
+                            .unwrap();
+                            if let Some(lh) = last_h {
+                                let d = (i32::from(h) - i32::from(lh)).rem_euclid(8);
+                                if matches!(d, 3..=5) {
+                                    tally.bad_turns += 1;
+                                }
+                            }
+                            last_h = Some(h);
+                            if !checker.segment_ok(&pool.jobs[0], w[0].1, w[0].0, w[1].0) {
                                 tally.violations += 1;
                             }
-                            continue;
                         }
-                        len += dist(w[0].0, w[1].0);
-                        let dx = i64::from(w[1].0.x) - i64::from(w[0].0.x);
-                        let dy = i64::from(w[1].0.y) - i64::from(w[0].0.y);
-                        assert!(
-                            dx == 0 || dy == 0 || dx.abs() == dy.abs(),
-                            "non-octilinear run"
+                        let first = pts[0].0;
+                        let lastp = pts.last().unwrap().0;
+                        let straight = dist(first, lastp).max(1.0);
+                        let (ax, ay) = (
+                            (f64::from(lastp.x) - f64::from(first.x)).abs(),
+                            (f64::from(lastp.y) - f64::from(first.y)).abs(),
                         );
-                        let h = konnect_route::detail::search::heading_of(
-                            dx.signum() as i32,
-                            dy.signum() as i32,
-                        )
-                        .unwrap();
-                        if let Some(lh) = last_h {
-                            let d = (i32::from(h) - i32::from(lh)).rem_euclid(8);
-                            if matches!(d, 3..=5) {
-                                tally.bad_turns += 1;
+                        let oct = ax.max(ay) + (2f64.sqrt() - 1.0) * ax.min(ay);
+                        if straight > 200_000.0 {
+                            tally.len_ratio.push(len / straight);
+                            tally.octile_ratio.push(len / oct.max(1.0));
+                        }
+                        if single_conn_nets.contains(&c.net) {
+                            if let Some(&rl) = reference_len.get(&c.net) {
+                                if rl > 0.0 {
+                                    tally.reference.push(len / rl);
+                                }
                             }
                         }
-                        last_h = Some(h);
-                        if !checker.segment_ok(&pool.jobs[0], w[0].1, w[0].0, w[1].0) {
-                            tally.violations += 1;
-                        }
+                        let _ = (c.from_pad, c.to_pad);
                     }
-                    let first = pts[0].0;
-                    let lastp = pts.last().unwrap().0;
-                    let straight = dist(first, lastp).max(1.0);
-                    let (ax, ay) = (
-                        (f64::from(lastp.x) - f64::from(first.x)).abs(),
-                        (f64::from(lastp.y) - f64::from(first.y)).abs(),
-                    );
-                    let oct = ax.max(ay) + (2f64.sqrt() - 1.0) * ax.min(ay);
-                    if straight > 200_000.0 {
-                        tally.len_ratio.push(len / straight);
-                        tally.octile_ratio.push(len / oct.max(1.0));
-                    }
-                    if single_conn_nets.contains(&c.net) {
-                        if let Some(&rl) = reference_len.get(&c.net) {
-                            if rl > 0.0 {
-                                tally.reference.push(len / rl);
-                            }
-                        }
-                    }
-                    let _ = (c.from_pad, c.to_pad);
+                    SearchOutcome::Unreachable { .. } => tally.unreachable += 1,
+                    SearchOutcome::BudgetExhausted { .. } => tally.budget += 1,
                 }
-                SearchOutcome::Unreachable { .. } => tally.unreachable += 1,
-                SearchOutcome::BudgetExhausted { .. } => tally.budget += 1,
             }
         }
+    }
+    if v.cached {
+        let cs = shared.stats();
+        tally.cache_hits += cs.hits;
+        tally.cache_misses += cs.misses;
     }
     tally
 }
@@ -1098,6 +1172,27 @@ fn report(name: &str, t: &Tally, wall_ms: f64, threads: usize) {
         t.lattice_nodes as f64 / t.tiles.max(1) as f64 / 1e3, t.window_nodes as f64 / t.jobs.max(1) as f64 / 1e3,
         t.stats.lazy_rejects,
     );
+    if t.cycles > 0 {
+        let mut cyc: Vec<f64> = t.cycle_list.iter().map(|&c| c as f64 / 1e6).collect();
+        println!(
+            "[{name}]   CPU cycles: {:.3} Mcycles/conn mean, p50 {:.3} p90 {:.3} p99 {:.3} | {:.0} cycles/expansion | at 4.7 GHz: {:.3} ms/conn, {:.2} M exp/s",
+            t.cycles as f64 / 1e6 / t.jobs.max(1) as f64,
+            pct(&mut cyc, 0.5),
+            pct(&mut cyc, 0.9),
+            pct(&mut cyc, 0.99),
+            t.cycles as f64 / t.expansions.max(1) as f64,
+            t.cycles as f64 / 4.7e9 * 1e3 / t.jobs.max(1) as f64,
+            t.expansions as f64 / (t.cycles as f64 / 4.7e9).max(1e-12) / 1e6,
+        );
+    }
+    if t.cache_hits + t.cache_misses > 0 {
+        println!(
+            "[{name}]   shared check cache over both passes: {} hits, {} misses ({:.0}% hits)",
+            t.cache_hits,
+            t.cache_misses,
+            100.0 * t.cache_hits as f64 / (t.cache_hits + t.cache_misses) as f64
+        );
+    }
     if !rr.is_empty() {
         println!(
             "[{name}]   vs reference routing (two-pin nets it completed, n = {}): length ratio p10 {:.3} p50 {:.3} p90 {:.3}",
@@ -1367,6 +1462,7 @@ fn search_kernel_on_real_tiles() {
     };
     let mut variants = vec![
         Variant {
+            cached: false,
             name: "uniform50/octile/exact",
             non_uniform: false,
             config: base_cfg.clone(),
@@ -1374,6 +1470,7 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         },
         Variant {
+            cached: false,
             name: "uniform50/octile/no-check",
             non_uniform: false,
             config: base_cfg.clone(),
@@ -1381,6 +1478,7 @@ fn search_kernel_on_real_tiles() {
             checker: false,
         },
         Variant {
+            cached: false,
             name: "uniform50/prefs/octile",
             non_uniform: false,
             config: pref_cfg.clone(),
@@ -1388,6 +1486,7 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         },
         Variant {
+            cached: false,
             name: "uniform50/prefs/map",
             non_uniform: false,
             config: SearchConfig {
@@ -1398,6 +1497,7 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         },
         Variant {
+            cached: false,
             name: "padaligned/octile/exact",
             non_uniform: true,
             config: base_cfg.clone(),
@@ -1405,8 +1505,37 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         },
     ];
+    variants.push(Variant {
+        cached: true,
+        name: "uniform50/octile/exact+shared-cache, 2nd pass",
+        non_uniform: false,
+        config: base_cfg.clone(),
+        params,
+        checker: true,
+    });
+    if std::env::var("KONNECT_SEARCH_VARIANTS").as_deref() == Ok("weights") {
+        variants.retain(|v| v.name == "uniform50/octile/exact");
+        for (name, f) in [
+            ("uniform50/octile/weighted1.02", 1020),
+            ("uniform50/octile/weighted1.05", 1050),
+            ("uniform50/octile/weighted1.1", 1100),
+        ] {
+            variants.push(Variant {
+                cached: false,
+                name,
+                non_uniform: false,
+                config: SearchConfig {
+                    astar_factor: f,
+                    ..base_cfg.clone()
+                },
+                params,
+                checker: true,
+            });
+        }
+    }
     if std::env::var("KONNECT_SEARCH_VARIANTS").as_deref() == Ok("all") {
         variants.push(Variant {
+            cached: false,
             name: "uniform50/octile/weighted1.2",
             non_uniform: false,
             config: SearchConfig {
@@ -1417,6 +1546,7 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         });
         variants.push(Variant {
+            cached: false,
             name: "padaligned/prefs/map",
             non_uniform: true,
             config: SearchConfig {
@@ -1427,6 +1557,17 @@ fn search_kernel_on_real_tiles() {
             checker: true,
         });
     }
+    if let Ok(only) = std::env::var("KONNECT_SEARCH_ONLY") {
+        variants.retain(|v| only.split(',').any(|o| v.name.contains(o)));
+    }
+    let repeat: usize = std::env::var("KONNECT_SEARCH_REPEAT")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(1);
+    let variants: Vec<Variant> = variants
+        .iter()
+        .flat_map(|v| std::iter::repeat_n(v.clone(), repeat))
+        .collect();
     let lookahead = Mutex::new(BTreeMap::new());
     let threads = rayon::current_num_threads();
     for v in &variants {
@@ -1472,6 +1613,9 @@ fn search_kernel_on_real_tiles() {
             );
         }
         assert_eq!(total.bad_turns, 0, "{}: 135-degree turn", v.name);
+    }
+    if variants.len() < 2 {
+        return;
     }
     if let Some(&busiest) = order.first() {
         kernel_scaling(&b, &tiles[busiest], &conns, &slots, &variants[1]);

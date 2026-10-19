@@ -331,6 +331,30 @@ fn axis_gap(v: i64, lo: i64, hi: i64) -> i64 {
     }
 }
 
+/// Whether a straight run from `(x, y)` in heading `h` (any heading for
+/// [`HEADING_NONE`]) can reach box `b`.
+#[inline]
+fn reaches(x: i64, y: i64, h: u32, b: &TBox) -> bool {
+    if h >= 8 {
+        return (0..8).any(|k| reaches(x, y, k, b));
+    }
+    let (dc, dr) = super::heading_delta(h as u8);
+    let range = |v: i64, s: i32, lo: i64, hi: i64| -> Option<(i64, i64)> {
+        match s {
+            0 => (lo..=hi).contains(&v).then_some((0, i64::MAX)),
+            1 => Some((lo - v, hi - v)),
+            _ => Some((v - hi, v - lo)),
+        }
+    };
+    let (Some((a0, a1)), Some((b0, b1))) = (
+        range(x, dc, b.min_x, b.max_x),
+        range(y, dr, b.min_y, b.max_y),
+    ) else {
+        return false;
+    };
+    a0.max(b0).max(0) <= a1.min(b1)
+}
+
 /// Index arithmetic for one search.
 #[derive(Clone, Copy)]
 struct Layout {
@@ -602,35 +626,55 @@ pub(crate) fn run<G: Grid>(
     };
     let tboxes = std::mem::take(&mut s.tboxes);
     let field = p.mode == Mode::Field;
-    let heur = |c: u32, r: u32, l: u32| -> u32 {
+    // Any path to a same-layer target off the state's heading ray turns at
+    // least once, or uses a via, which costs more than the cheapest bend.
+    let min_bend = cfg.bend_45.0.min(cfg.bend_90.0).min(via_cost);
+    let heur = |c: u32, r: u32, l: u32, h: u32| -> u32 {
         if field {
             return 0;
         }
         let x = i64::from(grid.x(c));
         let y = i64::from(grid.y(r));
-        let mut best = u32::MAX;
-        for b in &tboxes {
+        // Per box, the bound is `lo` if a straight run in the state's
+        // heading can reach it and `hi` otherwise: any path to a same-layer
+        // target off the ray turns at least once (or vias, which costs
+        // more). The minimum over boxes is `min(min hi, min lo of the
+        // reachable boxes)`, and only boxes with `lo < min hi` need the ray
+        // test, which is usually one box or none.
+        let mut lo = [0u32; MAX_TARGET_BOXES];
+        let mut hi = [0u32; MAX_TARGET_BOXES];
+        let mut min_hi = u32::MAX;
+        for (k, b) in tboxes.iter().enumerate() {
             let dx = axis_gap(x, b.min_x, b.max_x);
             let dy = axis_gap(y, b.min_y, b.max_y);
-            let mut v = octile(dx, dy, inv_pitch);
             let other_layer = b.layer != u8::MAX && u32::from(b.layer) != l;
-            match lookahead {
-                Some(la) if b.layer != u8::MAX => {
-                    match la.get(
+            let mut base = octile(dx, dy, inv_pitch);
+            let mut bend = min_bend;
+            if other_layer {
+                base = base.saturating_add(via_cost);
+                bend = 0;
+            }
+            let mut m = 0;
+            if let Some(la) = lookahead {
+                if b.layer != u8::MAX {
+                    let q = la.get(
                         l as u8,
                         b.layer,
                         dx / i64::from(pitch),
                         dy / i64::from(pitch),
-                    ) {
-                        Some(m) => v = v.max(m.saturating_sub(map_slack)),
-                        None if other_layer => v = v.saturating_add(via_cost),
-                        None => {}
-                    }
+                    );
+                    m = q.map_or(0, |v| v.saturating_sub(map_slack));
                 }
-                _ if other_layer => v = v.saturating_add(via_cost),
-                _ => {}
             }
-            best = best.min(v);
+            lo[k] = base.max(m);
+            hi[k] = base.saturating_add(bend).max(m);
+            min_hi = min_hi.min(hi[k]);
+        }
+        let mut best = min_hi;
+        for (k, b) in tboxes.iter().enumerate() {
+            if lo[k] < best && lo[k] < hi[k] && reaches(x, y, h, b) {
+                best = lo[k];
+            }
         }
         if factor == 1000 {
             best
@@ -652,7 +696,7 @@ pub(crate) fn run<G: Grid>(
             gen: sgen,
             info: info(u32::from(SEED), 0, 0),
         };
-        s.heap.push(heur(c, r, l), st);
+        s.heap.push(heur(c, r, l, none), st);
         stats.pushes += 1;
     }
 
@@ -874,7 +918,7 @@ pub(crate) fn run<G: Grid>(
                         info: info(h, run, layer),
                     };
                     s.heap
-                        .push(ng.saturating_add(heur(step.col, step.row, layer)), ns);
+                        .push(ng.saturating_add(heur(step.col, step.row, layer, nh)), ns);
                     stats.pushes += 1;
                 }
             }
@@ -923,7 +967,7 @@ pub(crate) fn run<G: Grid>(
                             gen: sgen,
                             info: info(h, run, layer),
                         };
-                        s.heap.push(ng.saturating_add(heur(col, row, l2)), ns);
+                        s.heap.push(ng.saturating_add(heur(col, row, l2, none)), ns);
                         stats.pushes += 1;
                     }
                 }

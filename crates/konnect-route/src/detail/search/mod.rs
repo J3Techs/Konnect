@@ -43,11 +43,13 @@
 //!   entered or left even when its own raster cell is Blocked; such edges
 //!   count as `Near`.
 
+pub mod cache;
 pub mod heap;
 mod kernel;
 pub mod lattice;
 pub mod lookahead;
 
+pub use cache::{CacheStats, CheckCache};
 pub use lattice::{
     derive_masks_in_lattice, derive_masks_on_lattice, derive_masks_uniform, paint_on_lattice,
     Lattice, LatticeSpec, ViaGeometry, VIA_CHECK, VIA_FREE, VIA_NO,
