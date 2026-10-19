@@ -1645,7 +1645,12 @@ fn run_negotiation(
                 }
             }
             report.failed += 1;
-            let last = !fill && it + 1 >= settings.max_iterations;
+            // The last iteration: the schedule's, or one a stall stop may
+            // end on (if this iteration then improves, the restored copper
+            // is simply queued again).
+            let last = !fill
+                && (it + 1 >= settings.max_iterations
+                    || (tuning.stall_iterations > 0 && stalled + 1 >= tuning.stall_iterations));
             if let Some(old) = previous.remove(&(t as u32)).filter(|_| last) {
                 routed[t] = Some(old);
                 failure[t] = None;

@@ -1294,6 +1294,59 @@ fn congestion_losers_a_fill_cannot_route_still_report_congestion() {
     assert_clean_and_connected(&board, &result);
 }
 
+fn bare_task(i: u32) -> Task {
+    Task {
+        conn: Connection {
+            id: ConnectionId(i),
+            net: NetId(i),
+            from: ItemRef::Pad(PadId(0)),
+            to: ItemRef::Pad(PadId(0)),
+        },
+        rank: i,
+        a: Point::default(),
+        b: Point::default(),
+        layers: LayerMask::EMPTY,
+        line: Vec::new(),
+        hints: Vec::new(),
+        profile: 0,
+        from_island: Vec::new(),
+        to_island: Vec::new(),
+    }
+}
+
+#[test]
+fn keep_greedily_keeps_fewest_conflicts_and_drops_self_conflicts() {
+    // 0 clashes with 1, 2 and 3; 2 also clashes with itself. Commit order
+    // would keep 0 and drop the other three; fewest live conflicts keeps
+    // 1 and 3 instead.
+    let tasks: Vec<Task> = (0..4).map(bare_task).collect();
+    let mut against: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for (a, b) in [(0, 1), (0, 2), (0, 3), (2, 2)] {
+        against.entry(a).or_default().insert(b);
+        against.entry(b).or_default().insert(a);
+    }
+    let mut routed: Vec<Option<Vec<Arc<PieceCopper>>>> = vec![Some(Vec::new()); 4];
+    let mut failure: Vec<Option<DetailFailure>> = vec![None; 4];
+    keep_greedily(&tasks, &against, &mut routed, &mut failure, 5);
+    let kept: Vec<usize> = (0..4).filter(|&t| routed[t].is_some()).collect();
+    assert_eq!(kept, vec![1, 3]);
+    assert_eq!(
+        failure[0],
+        Some(DetailFailure::Congestion {
+            iterations: 5,
+            against: vec![ConnectionId(1), ConnectionId(2), ConnectionId(3)],
+        })
+    );
+    assert_eq!(
+        failure[2],
+        Some(DetailFailure::Congestion {
+            iterations: 5,
+            against: vec![ConnectionId(0), ConnectionId(2)],
+        })
+    );
+    assert!(failure[1].is_none() && failure[3].is_none());
+}
+
 /// [`UniformRules`] with a smaller minimum track width than the preferred.
 struct NeckRules(UniformRules, Coord);
 
