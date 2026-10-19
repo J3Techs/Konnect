@@ -243,8 +243,7 @@ impl SearchBackend for CpuCompute {
         stacks: &[TileStack],
         params: &CostParams,
     ) -> Vec<SearchOutcome> {
-        let _ = (batch, pool, stacks, params);
-        todo!("WS-D1: run detail::search over each job of the batch")
+        crate::detail::search::search_batch_default(batch, pool, stacks, params)
     }
 
     fn cost_field(
@@ -253,8 +252,7 @@ impl SearchBackend for CpuCompute {
         sources: &[JobNode],
         params: &CostParams,
     ) -> CostField {
-        let _ = (stack, sources, params);
-        todo!("WS-D1/WS-G: Dijkstra distance map, the oracle for the GPU sweep")
+        crate::detail::search::cost_field_on(stack, None, sources, params)
     }
 }
 
@@ -273,8 +271,7 @@ impl RouteCompute for CpuCompute {
     }
 
     fn derive_masks(&mut self, raster: &mut TileRaster) {
-        let _ = raster;
-        todo!("WS-D1: heading legality from neighbour occupancy; via sites from CORE")
+        crate::detail::search::derive_masks_uniform(raster, None);
     }
 
     fn update_costs(&mut self, raster: &mut TileRaster, params: &CostParams) {
