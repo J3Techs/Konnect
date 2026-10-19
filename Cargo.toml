@@ -8,6 +8,7 @@ members = [
     "crates/konnect-schematic-editor",
     "crates/konnect-render",
     "crates/konnect-vcs",
+    "crates/konnect-route-gpu",
     "xtask",
 ]
 exclude = [
@@ -94,6 +95,21 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # used once the API surface is settled (default-features=false breaks
 # gix-hash's backend selection).
 gix = { version = "0.87", features = ["status", "worktree-mutation"] }
+
+# Data-parallel CPU work (the router's reference raster and search backends).
+rayon = "1"
+
+# Optional GPU compute for the native router (konnect-route-gpu, `gpu`
+# feature, off by default). wgpu is pinned EXACTLY like resvg: kernel parity
+# is checked bit-for-bit against the CPU twin, so a backend bump must be a
+# deliberate decision. default-features=false drops DX12 (FXC/DXC shader
+# compilers) and GLES; `std` must then be named explicitly. naga is the
+# shader front end wgpu itself uses, here only to validate WGSL in tests on
+# machines without a GPU.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "vulkan", "metal", "wgsl"] }
+naga = { version = "30.0", features = ["wgsl-in"] }
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }

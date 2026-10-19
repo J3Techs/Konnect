@@ -1,0 +1,33 @@
+[package]
+name = "konnect-route-gpu"
+description = "Raster compute for Konnect's native router: a rayon reference backend and an optional wgpu twin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Off by default: the konnect binary never links wgpu until a GPU kernel has
+# a measured, parity-verified win (see the crate docs). Default builds and CI
+# exercise only the CPU path and the naga validation of the WGSL.
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[dev-dependencies]
+naga.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "gpu_microbench"
+required-features = ["gpu"]
