@@ -10,7 +10,7 @@
 //! by KiCad.
 
 use crate::api::{FootprintId, ItemKind, LayerId, LayerMask, NetId};
-use crate::board::{PadKind, RouteBoard};
+use crate::board::{CopperLayerKind, PadKind, RouteBoard};
 use crate::rules::{RuleSubject, RuleTable};
 use konnect_geom::{
     gap_cmp, touches, ArcPolicy, BBox, Circle, Coord, IndexEntry, LayerIndex, Segment, Shape,
@@ -197,8 +197,15 @@ impl Obstacles {
             // An unfilled zone's outline only bounds what a refill could pour,
             // and a refill clears around new copper; only real fills on layers
             // the router uses block. Plane pieces elsewhere are refilled around
-            // new vias, so they constrain nothing here.
-            if z.filled && board.routable.contains(z.layer) {
+            // new vias, so they constrain nothing here, and neither do the
+            // fills of a plane layer opened to routing (KiCad's layer type
+            // `power`): the plane is poured around whatever is routed on it.
+            let plane_layer = board
+                .layers
+                .copper
+                .get(z.layer.index())
+                .is_some_and(|l| l.kind == CopperLayerKind::Power);
+            if z.filled && board.routable.contains(z.layer) && !plane_layer {
                 push(
                     Shape::Polygon(z.region.clone()),
                     LayerMask::single(z.layer),

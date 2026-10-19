@@ -1647,3 +1647,30 @@ fn connections_in_conflict_on_some_pieces_reroute_only_those() {
     let (one, _) = route_with(&board, settings(1), tuning);
     assert_eq!(one, result);
 }
+
+#[test]
+fn fills_of_a_plane_layer_opened_to_routing_do_not_block_vias() {
+    let mut b = BoardBuilder::new(12.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+    b.net("A");
+    b.zone("GND", "In1.Cu", (1.0, 1.0, 11.0, 9.0));
+    let mut board = b.build();
+    let filled = board.zones.iter().all(|z| z.filled);
+    assert!(filled, "the synthetic zone is a fill");
+    let net_a = board.net_by_name("A").unwrap();
+    let at = Point::new(6_000_000, 5_000_000);
+    let disc = Circle::from_diameter(at, 450_000);
+    let hole = Circle::from_diameter(at, 200_000);
+    let rules = hole_rules();
+    // A routable signal layer: the fill is copper the via must clear.
+    assert!(board.routable.contains(LayerId(1)));
+    let obstacles = Obstacles::build(&board, &rules);
+    assert!(obstacles
+        .check_via(&rules, net_a, &disc, &hole, &[])
+        .is_some());
+    // The same layer typed as a plane: a refill pours around the via.
+    board.layers.copper[1].kind = crate::board::CopperLayerKind::Power;
+    let obstacles = Obstacles::build(&board, &rules);
+    assert!(obstacles
+        .check_via(&rules, net_a, &disc, &hole, &[])
+        .is_none());
+}

@@ -646,3 +646,77 @@ fn no_routable_layer_reports_no_access_and_no_convergence() {
     }
     assert!(!r.stats.converged);
 }
+
+#[test]
+fn a_track_region_removes_track_capacity_outside_its_box_only() {
+    let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+    let f = b.footprint("U1", (5.0, 5.0));
+    b.smd_pad(f, "1", "A", (9.0, 9.0), (0.4, 0.4), "F.Cu");
+    let board = b.build();
+    let rules = UniformRules::default();
+    let open = build_grid(&board, &rules, &GlobalSettings::default());
+    let settings = GlobalSettings {
+        track_region: Some(TrackRegion {
+            layer: LayerId(1),
+            bbox: BBox::new(
+                Point::from_mm(3.0, 3.0).unwrap(),
+                Point::from_mm(7.0, 7.0).unwrap(),
+            ),
+        }),
+        ..Default::default()
+    };
+    let grid = build_grid(&board, &rules, &settings);
+    assert_eq!((grid.cols, grid.rows), (open.cols, open.rows));
+    let t = Topology::new(&grid);
+    let edge = |a: u32, b: u32| t.edge_between(a, b).unwrap();
+    let cell = |c: u32, r: u32| r * grid.cols + c;
+    // Outside the box: no track capacity on B.Cu, F.Cu untouched.
+    let e = edge(cell(1, 1), cell(2, 1));
+    assert_eq!(grid.capacity[t.planar_res(1, e) as usize], 0);
+    assert_eq!(
+        grid.capacity[t.planar_res(0, e) as usize],
+        open.capacity[t.planar_res(0, e) as usize]
+    );
+    // Inside it: as without the region.
+    let e = edge(cell(4, 5), cell(5, 5));
+    assert!(grid.capacity[t.planar_res(1, e) as usize] >= 2);
+    assert_eq!(
+        grid.capacity[t.planar_res(1, e) as usize],
+        open.capacity[t.planar_res(1, e) as usize]
+    );
+    // Via sites everywhere are unchanged.
+    for c in 0..grid.cols * grid.rows {
+        assert_eq!(
+            grid.capacity[t.via_res(c) as usize],
+            open.capacity[t.via_res(c) as usize]
+        );
+    }
+}
+
+#[test]
+fn track_region_outside_boxes_tile_the_rest() {
+    let r = TrackRegion {
+        layer: LayerId(0),
+        bbox: BBox::new(Point::new(30, 40), Point::new(60, 70)),
+    };
+    let within = BBox::new(Point::new(0, 0), Point::new(100, 100));
+    let parts = r.outside(within);
+    assert_eq!(parts.len(), 4);
+    let area = |b: &BBox| i64::from(b.max.x - b.min.x) * i64::from(b.max.y - b.min.y);
+    let total: i64 = parts.iter().map(area).sum();
+    assert_eq!(total, 100 * 100 - 30 * 30);
+    for p in &parts {
+        assert!(within.contains_bbox(p));
+        let ix = p.max.x.min(r.bbox.max.x) - p.min.x.max(r.bbox.min.x);
+        let iy = p.max.y.min(r.bbox.max.y) - p.min.y.max(r.bbox.min.y);
+        assert!(ix <= 0 || iy <= 0, "{p:?} overlaps the box");
+    }
+    // A box reaching past `within` leaves only what is outside it.
+    let wide = TrackRegion {
+        layer: LayerId(0),
+        bbox: BBox::new(Point::new(-10, 40), Point::new(110, 70)),
+    };
+    let parts = wide.outside(within);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts.iter().map(area).sum::<i64>(), 100 * 100 - 100 * 30);
+}

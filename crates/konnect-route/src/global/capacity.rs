@@ -113,6 +113,27 @@ fn collect(
         track.push((Shape::Segment(*e), Kind::Edge));
         via.push((Shape::Segment(*e), Kind::Edge));
     }
+    // A layer open to tracks only inside a box: no track capacity outside
+    // it (vias still cross the layer there).
+    if let Some(tr) = settings.track_region.filter(|t| t.layer == layer) {
+        let within = board
+            .outline
+            .bbox
+            .unwrap_or(tr.bbox)
+            .union(tr.bbox)
+            .inflate(1_000_000);
+        for b in tr.outside(within) {
+            let ring = vec![
+                b.min,
+                Point::new(b.max.x, b.min.y),
+                b.max,
+                Point::new(b.min.x, b.max.y),
+            ];
+            if let Some(poly) = konnect_geom::Polygon::new(ring, Vec::new()) {
+                track.push((Shape::Polygon(poly), Kind::Keepout));
+            }
+        }
+    }
     SlotObstacles { track, via }
 }
 

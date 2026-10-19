@@ -495,6 +495,26 @@ and part of the plan.
 - **`GlobalStats.best_iteration`** (serde default): the result is the best
   iteration, not the last. `converged` also requires no failures; a
   terminal off the grid fails as `NoAccess`.
+- **Track regions (WS-C4, capacity experiments).** New
+  `global::TrackRegion { layer, bbox }`: new track copper on `layer` stays
+  inside `bbox`, while vias still cross the layer anywhere.
+  `TrackRegion::outside(within)` gives up to four boxes covering the rest
+  of `within`. It is consumed in two places, and the caller sets both:
+  - `GlobalSettings::track_region: Option<TrackRegion>` (serde default
+    `None`): the layer has no track capacity outside the box. Via sites are
+    unchanged.
+  - `SearchConfig::track_region: Option<TrackRegion>` (serde default
+    `None`): the kernel takes no track step on the layer to a node outside
+    the box, and lands a via on the layer outside the box only at a
+    target. The relaxed cost-to-go field honours the same limit.
+
+  `GlobalSettings` and `SearchConfig` struct literals need the new field
+  (or `..Default::default()`). The caller is expected to make the layer
+  routable and to take the plane's fill out of the box.
+- **Plane-layer fills never block negotiation.** `Obstacles::build` skips
+  the fills on a layer that KiCad types `power`, even when that layer is in
+  `RouteBoard::routable`, because a refill pours around whatever is routed
+  there. Nothing changes while plane layers stay unroutable (the default).
 
 ### Checker and geometry (WS-A)
 
@@ -636,7 +656,15 @@ and part of the plan.
   `crates/konnect-route/tests/real_board_fixture.rs`.
 - `tests/pipeline_real_fixture.rs` reads its knobs from
   `KONNECT_PIPELINE_*` variables (listed in its module docs, including
-  `KONNECT_PIPELINE_GRID_CORE_MM` and `KONNECT_PIPELINE_CLEAR=0|1`).
+  `KONNECT_PIPELINE_GRID_CORE_MM` and `KONNECT_PIPELINE_CLEAR=0|1`). The
+  capacity experiments change only the loaded board in memory:
+  `KONNECT_PIPELINE_OPEN_LAYER` opens a plane layer to routing inside a
+  box (a footprint's courtyard plus a margin), and
+  `KONNECT_PIPELINE_VIA_IN_PAD` replaces a footprint's dog-bones with vias
+  centred in its pads. `KONNECT_PIPELINE_VERTICAL`,
+  `KONNECT_PIPELINE_REPORT_CLASS` and `KONNECT_PIPELINE_REPORT_FP` set
+  global routing's vertical layers and choose the class and footprint
+  that the summary reports on.
   `tests/pipeline_tail_fixture.rs` re-runs
   S6–S8 on copper a previous run saved. `tests/search_replay.rs` is a gated
   capture/replay pair; the capture refuses a directory inside any git work

@@ -286,6 +286,12 @@ pub struct SearchConfig {
     /// default) never restarts.
     #[serde(default)]
     pub field_after: u64,
+    /// Track steps on [`TrackRegion::layer`] only between lattice nodes
+    /// inside [`TrackRegion::bbox`]; vias may still cross the layer
+    /// anywhere, but land on it outside the box only at a target. `None`
+    /// (the default): no such limit.
+    #[serde(default)]
+    pub track_region: Option<crate::global::TrackRegion>,
 }
 
 impl Default for SearchConfig {
@@ -308,6 +314,7 @@ impl Default for SearchConfig {
             dead_end_check_after: 20_000,
             via_congestion_reach_nm: None,
             field_after: 0,
+            track_region: None,
         }
     }
 }

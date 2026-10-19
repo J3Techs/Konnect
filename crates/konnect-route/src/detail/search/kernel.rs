@@ -520,6 +520,42 @@ impl Layout {
     }
 }
 
+/// The lattice nodes inside `b` as an inclusive (col, col, row, row) box;
+/// an empty box (first > last) when no node lies inside.
+fn node_box<G: Grid>(grid: &G, b: konnect_geom::BBox) -> (u32, u32, u32, u32) {
+    let (ca, cb) = (
+        grid.col_at_or_after(b.min.x),
+        grid.col_at_or_before(b.max.x),
+    );
+    let (ra, rb) = (
+        grid.row_at_or_after(b.min.y),
+        grid.row_at_or_before(b.max.y),
+    );
+    let inside = grid.x(ca) >= b.min.x
+        && grid.x(cb) <= b.max.x
+        && grid.y(ra) >= b.min.y
+        && grid.y(rb) <= b.max.y;
+    if inside && ca <= cb && ra <= rb {
+        (ca, cb, ra, rb)
+    } else {
+        (1, 0, 1, 0)
+    }
+}
+
+/// Track steps on stack layer `layer` may end at node `(c, r)`.
+#[inline]
+fn in_track_box(
+    track_box: &[Option<(u32, u32, u32, u32)>; MAX_LAYERS],
+    layer: usize,
+    c: u32,
+    r: u32,
+) -> bool {
+    match track_box[layer] {
+        None => true,
+        Some((ca, cb, ra, rb)) => c >= ca && c <= cb && r >= ra && r <= rb,
+    }
+}
+
 /// The parent state of `st` from its record, or `None` for a seed.
 #[inline]
 fn parent_of<G: Grid>(grid: &G, lay: &Layout, st: u32, rec: StateRec) -> Option<u32> {
@@ -589,6 +625,17 @@ pub(crate) fn run<G: Grid>(
         let bit = r.layer.0;
         layer_ok[i] = p.job.layer_mask == 0 || (bit < 32 && p.job.layer_mask & (1 << bit) != 0);
     }
+    // Per stack layer: the node box track steps must stay inside
+    // ([`SearchConfig::track_region`]); `None` everywhere without one.
+    let mut track_box: [Option<(u32, u32, u32, u32)>; MAX_LAYERS] = [None; MAX_LAYERS];
+    if let Some(tr) = cfg.track_region {
+        for (i, r) in stack.layers.iter().enumerate() {
+            if r.layer == tr.layer {
+                track_box[i] = Some(node_box(grid, tr.bbox));
+            }
+        }
+    }
+    let track_ok = |layer: u32, c: u32, r: u32| in_track_box(&track_box, layer as usize, c, r);
     let allow_via = p.job.has_flag(JOB_ALLOW_VIA) && lcount > 1;
     let pitch = grid.pitch().max(1);
     let run_buckets: u32 = if p.job.has_flag(JOB_MIN_RUN) && cfg.min_run_nm > 0 {
@@ -810,6 +857,7 @@ pub(crate) fn run<G: Grid>(
             &lay,
             &views,
             &layer_ok,
+            &track_box,
             allow_via,
             params,
             &vp,
@@ -1133,6 +1181,9 @@ pub(crate) fn run<G: Grid>(
                 if !in_region(step.col, step.row) {
                     continue;
                 }
+                if !track_ok(layer, step.col, step.row) {
+                    continue;
+                }
                 let vi8 = step.row as usize * v.s8 + step.col as usize;
                 let vnode = lay.local(step.col, step.row);
                 let mut near = u_halo > 0 || v.halo[vi8] > 0;
@@ -1237,7 +1288,9 @@ pub(crate) fn run<G: Grid>(
                     if l2 == layer {
                         continue;
                     }
-                    if !layer_ok[l2 as usize] && s.flags_of(nl_index(node, l2)) & DST == 0 {
+                    if (!layer_ok[l2 as usize] || !track_ok(l2, col, row))
+                        && s.flags_of(nl_index(node, l2)) & DST == 0
+                    {
                         continue;
                     }
                     let ns = lay.enc(node, l2, none, 0);
@@ -1410,6 +1463,7 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
     lay: &Layout,
     views: &[View<'_>; MAX_LAYERS],
     layer_ok: &[bool; MAX_LAYERS],
+    track_box: &[Option<(u32, u32, u32, u32)>; MAX_LAYERS],
     allow_via: bool,
     params: &CostParams,
     vp: &ViaPricing,
@@ -1566,7 +1620,8 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
         }
         // Track steps into this node from its neighbours on this layer.
         let blocked = v.core[i8] > 0;
-        if layer_ok[layer] && (!blocked || flags & (SRC | DST) != 0) {
+        let open = layer_ok[layer] && in_track_box(track_box, layer, c, r);
+        if open && (!blocked || flags & (SRC | DST) != 0) {
             // A step into a blocked terminal, or touching a HALO node, pays
             // `near_step` on top (the predecessor's HALO is read below).
             let v_near = blocked || v.halo[i8] > 0;
@@ -1627,7 +1682,7 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
         }
         // A via landing on this node-layer, from any other layer (a via
         // landing on a target ends there, so a through state has none).
-        if allow_via && !is_through && (layer_ok[layer] || flags & DST != 0) {
+        if allow_via && !is_through && (open || flags & DST != 0) {
             let vcost = vp.cached(s, &views[..nl_layers], node, c, r);
             if vcost != u32::MAX {
                 let nd = d.saturating_add(vcost);

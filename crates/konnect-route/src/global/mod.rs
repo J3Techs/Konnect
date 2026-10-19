@@ -220,6 +220,43 @@ pub struct GlobalSettings {
     pub threads: u32,
     /// Jobs per batch (rayon chunk now, GPU dispatch later).
     pub batch_max_jobs: u32,
+    /// Track capacity on one layer only inside a box ([`TrackRegion`]);
+    /// via sites are unaffected. `None`: no such limit.
+    pub track_region: Option<TrackRegion>,
+}
+
+/// New track copper on [`Self::layer`] stays inside [`Self::bbox`]; vias
+/// still cross the layer anywhere. Opens a plane layer to routing in one
+/// region only (the caller makes the layer routable and takes the plane's
+/// fill out of the box). Global routing gives the layer no track capacity
+/// outside the box and the detailed search takes no track step there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackRegion {
+    pub layer: LayerId,
+    pub bbox: BBox,
+}
+
+impl TrackRegion {
+    /// Up to four boxes that cover `within` outside [`Self::bbox`]: full
+    /// height left and right of it, then above and below it between those.
+    pub fn outside(&self, within: BBox) -> Vec<BBox> {
+        let (r, w) = (self.bbox, within);
+        let mut out = Vec::new();
+        let mut push = |x0: Coord, y0: Coord, x1: Coord, y1: Coord| {
+            if x1 > x0 && y1 > y0 {
+                out.push(BBox::new(Point::new(x0, y0), Point::new(x1, y1)));
+            }
+        };
+        let (lx, hx) = (
+            r.min.x.clamp(w.min.x, w.max.x),
+            r.max.x.clamp(w.min.x, w.max.x),
+        );
+        push(w.min.x, w.min.y, lx, w.max.y);
+        push(hx, w.min.y, w.max.x, w.max.y);
+        push(lx, w.min.y, hx, r.min.y.min(w.max.y));
+        push(lx, r.max.y.max(w.min.y), hx, w.max.y);
+        out
+    }
 }
 
 impl Default for GlobalSettings {
@@ -240,6 +277,7 @@ impl Default for GlobalSettings {
             vertical_layers: None,
             threads: 0,
             batch_max_jobs: 256,
+            track_region: None,
         }
     }
 }

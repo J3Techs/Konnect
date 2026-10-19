@@ -1559,3 +1559,42 @@ fn runs_of_target(nodes: &[JobNode]) -> usize {
         .filter(|n| (n.col, n.row, n.layer) == (t.col, t.row, t.layer))
         .count()
 }
+
+#[test]
+fn a_track_region_keeps_one_layer_s_runs_inside_its_box() {
+    let mut st = stack(30, 20, 2);
+    block(&mut st, 0, 15..=15, 0..=19);
+    rederive(&mut st);
+    let region = |c0: i32, c1: i32| crate::global::TrackRegion {
+        layer: LayerId(1),
+        bbox: BBox::new(
+            Point::new(c0 * PITCH, 0),
+            Point::new(c1 * PITCH, 19 * PITCH),
+        ),
+    };
+    // The box spans the wall: the detour on layer 1 stays inside it.
+    let cfg = SearchConfig {
+        track_region: Some(region(12, 18)),
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(5, 10, 0)], &[node(25, 10, 0)]);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    let p = found(&o);
+    assert!(p.nodes.iter().any(|n| n.layer == 1));
+    assert!(p
+        .nodes
+        .iter()
+        .filter(|n| n.layer == 1)
+        .all(|n| (12..=18).contains(&n.col)));
+    // A box away from the wall: layer 1 cannot carry the detour.
+    let cfg = SearchConfig {
+        track_region: Some(region(2, 8)),
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    assert!(matches!(
+        run_ctx(&ctx, &pool, i).0,
+        SearchOutcome::Unreachable { .. }
+    ));
+}
