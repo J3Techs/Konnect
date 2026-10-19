@@ -1,0 +1,15 @@
+[package]
+name = "konnect-route"
+description = "Native CPU-first autorouter for Konnect: board model, rules, and routing stages"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+konnect-geom.workspace = true
+konnect-sexp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

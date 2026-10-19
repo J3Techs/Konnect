@@ -8,6 +8,8 @@ members = [
     "crates/konnect-schematic-editor",
     "crates/konnect-render",
     "crates/konnect-vcs",
+    "crates/konnect-geom",
+    "crates/konnect-route",
     "xtask",
 ]
 exclude = [
@@ -95,6 +97,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # gix-hash's backend selection).
 gix = { version = "0.87", features = ["status", "worktree-mutation"] }
 
+# Native router (konnect-geom, konnect-route): the per-layer R-tree. 0.12 is
+# already in the lock through geo-types, so this adds no new crate.
+rstar = "0.12"
+
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }
 konnect-ipc = { path = "crates/konnect-ipc" }
@@ -102,6 +108,8 @@ konnect-core = { path = "crates/konnect-core" }
 konnect-schematic-editor = { path = "crates/konnect-schematic-editor" }
 konnect-render = { path = "crates/konnect-render" }
 konnect-vcs = { path = "crates/konnect-vcs" }
+konnect-geom = { path = "crates/konnect-geom" }
+konnect-route = { path = "crates/konnect-route" }
 
 # The S-expression parser is ~25x slower unoptimized. The installed-demo
 # tests parse 185 MB of KiCad boards, and debug servers parse real boards.

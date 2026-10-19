@@ -2662,6 +2662,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "konnect-geom"
+version = "0.13.0"
+dependencies = [
+ "rstar 0.12.2",
+ "serde",
+]
+
+[[package]]
 name = "konnect-ipc"
 version = "0.13.0"
 dependencies = [
@@ -2688,6 +2696,17 @@ dependencies = [
  "anyhow",
  "image",
  "resvg",
+]
+
+[[package]]
+name = "konnect-route"
+version = "0.13.0"
+dependencies = [
+ "konnect-geom",
+ "konnect-sexp",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
