@@ -65,6 +65,8 @@ pub struct OptimizeReport {
     pub pad_entries_trimmed: u32,
     /// Short jogs redrawn as a slant under the lint's bend threshold.
     pub jogs_smoothed: u32,
+    /// Sharp Y junctions turned into right-angle T junctions.
+    pub junctions_squared: u32,
     /// Exact checks run (one per candidate segment).
     pub exact_checks: u64,
     /// Nets whose copper changed.
@@ -96,6 +98,8 @@ pub struct OptimizeOptions {
     pub trim_pad_entries: bool,
     /// Redraw a short jog between parallel runs as one gentle slant.
     pub smooth_jogs: bool,
+    /// Move a branch meeting a run at a sharp angle to a right-angle T.
+    pub square_junctions: bool,
     /// Keep every new segment at a multiple of 45°.
     pub octilinear: bool,
     /// The geometry gate's minimum interior bend angle. The rule table's
@@ -127,6 +131,7 @@ impl Default for OptimizeOptions {
             corner_cuts: true,
             trim_pad_entries: true,
             smooth_jogs: true,
+            square_junctions: true,
             octilinear: true,
             min_bend_angle_deg: 89.0,
             jog_length_nm: 250_000,
@@ -323,6 +328,7 @@ pub fn optimize_checked(
             report.junctions_split += outcome.stats.split;
             report.pad_entries_trimmed += outcome.stats.trimmed;
             report.jogs_smoothed += outcome.stats.jogs_smoothed;
+            report.junctions_squared += outcome.stats.squared;
             changed.insert(net);
             current.insert(net, (outcome.tracks, outcome.vias));
         }
@@ -408,6 +414,7 @@ struct NetStats {
     split: u32,
     trimmed: u32,
     jogs_smoothed: u32,
+    squared: u32,
     exact_checks: u64,
 }
 
@@ -548,6 +555,9 @@ impl<'c, 'b> NetWork<'c, 'b> {
             }
             if self.opts.smooth_jogs {
                 self.smooth_jogs();
+            }
+            if self.opts.square_junctions {
+                self.square_junctions();
             }
             if self.opts.trim_pad_entries {
                 self.trim_pad_entries();
@@ -1219,6 +1229,84 @@ impl<'c, 'b> NetWork<'c, 'b> {
         }
         self.require_fewer_defects = false;
         self.compact();
+    }
+
+    // ─── Junctions ───────────────────────────────────────────────────────
+
+    /// A branch meeting a straight run at a sharp angle (a Y) is moved to
+    /// the foot of its perpendicular on the run (a T): two right angles
+    /// instead of one acute one, and a shorter branch.
+    fn square_junctions(&mut self) {
+        let joints = self.joints();
+        let mut touched: BTreeSet<usize> = BTreeSet::new();
+        for ((layer, p), ends) in &joints {
+            if ends.len() < 3 || ends.iter().any(|(s, _)| touched.contains(s)) {
+                continue;
+            }
+            let limits = self.limits(*layer);
+            let live: Vec<(usize, Point)> = ends
+                .iter()
+                .filter_map(|&(s, at_a)| {
+                    let t = self.tracks[s]?;
+                    (t.seg.a != t.seg.b).then(|| (s, self.other_end(s, at_a)))
+                })
+                .collect();
+            'pairs: for x in 0..live.len() {
+                for y in 0..live.len() {
+                    if x == y
+                        || lint::interior_angle_deg(*p, live[x].1, live[y].1)
+                            >= limits.min_bend_angle_deg - 1e-9
+                    {
+                        continue;
+                    }
+                    let ((bs, b), (rs, far)) = (live[x], live[y]);
+                    let run = far - *p;
+                    if !is_octilinear(run) {
+                        continue;
+                    }
+                    let e = Vector::new(run.x.signum(), run.y.signum());
+                    let n = run.x.abs().max(run.y.abs());
+                    let l2 = run.length2();
+                    let t = (b - *p).dot(run) as f64 / l2 as f64;
+                    let k = (t * n as f64).round() as i64;
+                    if k <= 0 || k >= n {
+                        continue;
+                    }
+                    let foot = add(*p, Vector::new(e.x * k, e.y * k));
+                    let (bt, rt) = (
+                        self.tracks[bs].expect("live"),
+                        self.tracks[rs].expect("live"),
+                    );
+                    let added = [
+                        Segment::new(b, foot, bt.seg.width),
+                        Segment::new(*p, foot, rt.seg.width),
+                        Segment::new(foot, far, rt.seg.width),
+                    ];
+                    if added.iter().any(|s| s.a == s.b)
+                        || len_f(b, foot) >= len_f(b, *p)
+                        || !self.accept(*layer, &[bs, rs], &added)
+                    {
+                        continue;
+                    }
+                    self.tracks[bs] = Some(RoutedTrack {
+                        seg: added[0],
+                        ..bt
+                    });
+                    self.tracks[rs] = Some(RoutedTrack {
+                        seg: added[1],
+                        ..rt
+                    });
+                    self.tracks.push(Some(RoutedTrack {
+                        seg: added[2],
+                        ..rt
+                    }));
+                    touched.insert(bs);
+                    touched.insert(rs);
+                    self.stats.squared += 1;
+                    break 'pairs;
+                }
+            }
+        }
     }
 
     // ─── Pad entries ─────────────────────────────────────────────────────

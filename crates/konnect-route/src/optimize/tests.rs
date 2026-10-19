@@ -343,3 +343,104 @@ fn the_report_and_telemetry_are_recorded() {
     assert_eq!(r.tracks_after as usize, copper.tracks.len());
     assert!(r.defects_before > 0, "staircases are jogs");
 }
+
+fn pads_board(pads: &[(&str, (f64, f64), (f64, f64))]) -> RouteBoard {
+    let mut b = BoardBuilder::new(30.0, 30.0, &["F.Cu", "B.Cu"]);
+    for (i, (net, at, size)) in pads.iter().enumerate() {
+        let u = b.footprint(&format!("U{i}"), *at);
+        b.smd_pad(u, "1", net, *at, *size, "F.Cu");
+    }
+    b.build()
+}
+
+#[test]
+fn a_short_step_between_parallel_runs_becomes_a_gentle_slant() {
+    let board = pads_board(&[
+        ("SIG", (5.0, 10.0), (0.5, 0.5)),
+        ("SIG", (20.0, 10.15), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 10.0), p(12.0, 10.0)),
+            track(net, 0, p(12.0, 10.0), p(12.15, 10.15)),
+            track(net, 0, p(12.15, 10.15), p(20.0, 10.15)),
+        ],
+        vias: vec![],
+    };
+    assert_eq!(report_defects(&rules, &copper), 1, "a jog to start with");
+    let opts = OptimizeOptions {
+        pull_tight: false,
+        ..OptimizeOptions::default()
+    };
+    let r = optimize_with(
+        &board,
+        &rules,
+        &mut copper,
+        &opts,
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.jogs_smoothed, 1, "{r:?}");
+    assert_eq!(r.defects_after, 0, "{r:?}");
+    assert_eq!(islands(&board, &copper), 0);
+    assert!(clean(&board, &rules, &copper));
+}
+
+fn report_defects(rules: &UniformRules, copper: &RoutedCopper) -> usize {
+    geometry_defects(rules, &OptimizeOptions::default(), copper).len()
+}
+
+#[test]
+fn two_tracks_meeting_sharply_in_a_pad_are_pulled_apart_inside_it() {
+    let board = pads_board(&[
+        ("SIG", (10.0, 10.0), (1.0, 1.0)),
+        ("SIG", (4.0, 10.0), (0.5, 0.5)),
+        ("SIG", (5.0, 15.0), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(4.0, 10.0), p(10.0, 10.0)),
+            track(net, 0, p(5.0, 15.0), p(10.0, 10.0)),
+        ],
+        vias: vec![],
+    };
+    assert_eq!(report_defects(&rules, &copper), 1, "a 45 degree joint");
+    let r = optimize(&board, &rules, &mut copper);
+    assert_eq!(r.pad_entries_trimmed, 1, "{r:?}");
+    assert_eq!(r.defects_after, 0, "{r:?}");
+    assert_eq!(islands(&board, &copper), 0, "both still reach the pad");
+    assert!(clean(&board, &rules, &copper));
+}
+
+#[test]
+fn a_sharp_y_junction_becomes_a_right_angle_t() {
+    let board = pads_board(&[
+        ("SIG", (5.0, 10.0), (0.5, 0.5)),
+        ("SIG", (15.0, 10.0), (0.5, 0.5)),
+        ("SIG", (8.0, 12.0), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 10.0), p(10.0, 10.0)),
+            track(net, 0, p(10.0, 10.0), p(15.0, 10.0)),
+            track(net, 0, p(8.0, 12.0), p(10.0, 10.0)),
+        ],
+        vias: vec![],
+    };
+    assert_eq!(report_defects(&rules, &copper), 1);
+    let r = optimize(&board, &rules, &mut copper);
+    assert_eq!(r.junctions_squared, 1, "{r:?}");
+    assert_eq!(r.defects_after, 0, "{r:?}");
+    assert_eq!(islands(&board, &copper), 0);
+    assert!(clean(&board, &rules, &copper));
+    // The branch now drops straight onto the run.
+    assert!(copper
+        .tracks
+        .iter()
+        .any(|t| t.seg == Segment::new(p(8.0, 12.0), p(8.0, 10.0), W)));
+}
