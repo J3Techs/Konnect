@@ -248,9 +248,18 @@ async fn route_native_region_optimizes_a_plan_inside_its_region() {
     none.as_object_mut().unwrap().remove("region");
     let r = handle_route_native_region(&none, &ctx()).await.unwrap();
     assert!(r.is_error && text(&r).contains("region"));
+    // Native routing sees only the region's connections: none in this box,
+    // so nothing is routed (and no unbuilt stage is reached) ...
     let mut native = args.clone();
     native["output_plan"] = json!(f.path("native.json"));
     native["source"] = json!("native");
+    let r = handle_route_native_region(&native, &ctx()).await.unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    assert_eq!(body(&r)["work_tracks"], 0);
+    assert!(body(&r)["output_plan"].is_null());
+    // ... while a box holding the open connection reaches the stub.
+    native["output_plan"] = json!(f.path("native2.json"));
+    native["region"] = json!({ "x1": 15.0, "y1": 5.0, "x2": 40.0, "y2": 30.0 });
     let r = handle_route_native_region(&native, &ctx()).await.unwrap();
     assert!(
         r.is_error && text(&r).contains("not available"),

@@ -16,7 +16,9 @@
 //! | `start/get/stop_native_route_job` | the pipeline in a runner process |
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
-use crate::native_route_job::{self, guarded, CopperSource, NativeJobSpec, Quiet};
+use crate::native_route_job::{
+    self, guarded, CopperSource, NativeJobSpec, Quiet, StageError, StopKind,
+};
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_route::api::Generation;
@@ -352,12 +354,58 @@ fn unavailable(capability: &str, error: &anyhow::Error) -> CallToolResult {
     )
 }
 
+/// A stage that could not give a result: unavailable when it is the
+/// unbuilt stub, an error naming the panic when it is built and failed.
+fn stage_failure(capability: &str, error: StageError) -> CallToolResult {
+    match error {
+        StageError::Unavailable { .. } => unavailable(capability, &anyhow::Error::new(error)),
+        StageError::Panicked { .. } => CallToolResult::error(format!(
+            "{capability} failed: {error}. No result was produced."
+        )),
+    }
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────
+
+/// Run a handler that loads the board and checks it (half a second or
+/// more) on the blocking pool, off the server's async workers.
+async fn blocking(
+    args: &Value,
+    f: fn(&Value) -> anyhow::Result<CallToolResult>,
+) -> anyhow::Result<CallToolResult> {
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || f(&args)).await?
+}
 
 async fn handle_connectivity_report(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    blocking(args, connectivity_report_blocking).await
+}
+
+async fn handle_audit_terminal_access(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    blocking(args, audit_terminal_access_blocking).await
+}
+
+async fn handle_plan_plane_vias(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    blocking(args, plan_plane_vias_blocking).await
+}
+
+async fn handle_check_route_rules(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    blocking(args, check_route_rules_blocking).await
+}
+
+fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let spec = match base_spec(args, PathBuf::new())? {
         Ok(s) => s,
         Err(r) => return Ok(r),
@@ -400,10 +448,7 @@ async fn handle_connectivity_report(
     })))
 }
 
-async fn handle_audit_terminal_access(
-    args: &Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
+fn audit_terminal_access_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let spec = match base_spec(args, PathBuf::new())? {
         Ok(s) => s,
         Err(r) => return Ok(r),
@@ -435,7 +480,7 @@ async fn handle_audit_terminal_access(
         konnect_route::audit::audit_terminal_access(&board, &rules, &footprints)
     }) {
         Ok(a) => a,
-        Err(e) => return Ok(unavailable("audit_terminal_access", &e)),
+        Err(e) => return Ok(stage_failure("audit_terminal_access", e)),
     };
     let layer_names = |m: konnect_route::api::LayerMask| {
         m.iter()
@@ -467,11 +512,14 @@ async fn handle_audit_terminal_access(
     })))
 }
 
-async fn handle_plan_plane_vias(
-    args: &Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
+fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output_plan")?;
+    // Absolute, as the job tools keep it, so the reply names the file.
+    let output = if output.is_absolute() {
+        output
+    } else {
+        std::env::current_dir()?.join(output)
+    };
     let spec = match base_spec(args, output.clone())? {
         Ok(s) => s,
         Err(r) => return Ok(r),
@@ -498,7 +546,7 @@ async fn handle_plan_plane_vias(
         )
     }) {
         Ok(p) => p,
-        Err(e) => return Ok(unavailable("plan_plane_vias", &e)),
+        Err(e) => return Ok(stage_failure("plan_plane_vias", e)),
     };
     let mm = |v: i32| konnect_geom::nm_to_mm(i64::from(v));
     let mut routing = RoutePlan::default();
@@ -534,7 +582,19 @@ async fn handle_plan_plane_vias(
         .collect();
     let written = routing.item_count() > 0;
     if written {
-        std::fs::write(&output, routing.to_routing_file_json())?;
+        if let Err(e) =
+            native_route_job::write_new_atomic(&output, routing.to_routing_file_json().as_bytes())
+        {
+            if !output.exists() {
+                return Ok(CallToolResult::error(format!("plan not written: {e:#}")));
+            }
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![output.display().to_string()],
+                },
+                format!("{e:#}"),
+            ));
+        }
     }
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
@@ -547,10 +607,7 @@ async fn handle_plan_plane_vias(
     })))
 }
 
-async fn handle_check_route_rules(
-    args: &Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
+fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let spec = match base_spec(args, PathBuf::new())? {
         Ok(s) => s,
         Err(r) => return Ok(r),
@@ -592,7 +649,8 @@ async fn handle_check_route_rules(
         konnect_route::check::check_routed(&board, &rules, &copper)
     }) {
         Ok(r) => (r, "check_routed", true),
-        Err(_) => {
+        Err(e @ StageError::Panicked { .. }) => return Ok(stage_failure("check_routed", e)),
+        Err(StageError::Unavailable { .. }) => {
             let ck = ExactChecker::new(
                 &board,
                 &rules,
@@ -679,10 +737,14 @@ async fn handle_route_native_region(
             .await??;
     if let Some(why) = &report.stopped {
         if report.plan_path.is_none() {
-            return Ok(unavailable(
-                "route_native_region",
-                &anyhow::anyhow!("{why}"),
-            ));
+            return Ok(match report.stop_kind {
+                Some(StopKind::StageUnavailable) => {
+                    unavailable("route_native_region", &anyhow::anyhow!("{why}"))
+                }
+                _ => CallToolResult::error(format!(
+                    "route_native_region failed: {why}. No plan was written."
+                )),
+            });
         }
     }
     Ok(CallToolResult::json(&json!({

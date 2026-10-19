@@ -146,7 +146,9 @@ impl RoutedCopper {
     /// Move `board`'s unlocked, netted tracks and through vias into routed
     /// copper (generation `gen`), keeping locked copper and everything
     /// outside `region` as board copper. Ids of what stays are renumbered so
-    /// they still equal their index. This is how existing routing (an
+    /// they still equal their index, so a `TrackId`, `ViaId` or
+    /// [`crate::connectivity::ConnectivityReport`] taken from the board
+    /// before the call is stale after it: rebuild it. This is how existing routing (an
     /// imported Specctra session, a previous run) is handed to the
     /// optimizer.
     pub fn take_unlocked(

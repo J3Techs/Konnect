@@ -202,11 +202,17 @@ pub fn optimize_with(
     telemetry.add_stage_time(Stage::Optimize, start.elapsed().as_micros() as u64);
     telemetry.threads = telemetry.threads.max(rayon::current_num_threads() as u32);
     telemetry.count("optimize_index_us", index_us);
+    record_counters(&report, telemetry);
+    report
+}
+
+/// The `optimize_*` counters of a run, as [`optimize_with`] records them
+/// (for callers that drive [`optimize_checked`] themselves).
+pub fn record_counters(report: &OptimizeReport, telemetry: &mut Telemetry) {
     telemetry.count("optimize_exact_checks", report.exact_checks);
     telemetry.count("optimize_edits_rejected", u64::from(report.edits_rejected));
     telemetry.count("optimize_nets_changed", u64::from(report.nets_changed));
     telemetry.count("optimize_nets_reverted", u64::from(report.nets_reverted));
-    report
 }
 
 /// The geometry limits for routed copper of `net` on `layer`.

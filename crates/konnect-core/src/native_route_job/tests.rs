@@ -282,3 +282,100 @@ fn a_silent_runner_is_reported_lost() {
     assert_eq!(body["state"], "RUNNER_LOST");
     assert_eq!(body["runner_alive"], false);
 }
+
+#[test]
+fn a_source_plan_naming_a_missing_net_fails_as_an_input_error() {
+    let f = fixture();
+    let plan = RoutePlan {
+        tracks: vec![PlanTrack {
+            net: "NO_SUCH_NET".into(),
+            layer: "B.Cu".into(),
+            width: 0.2,
+            x1: 5.0,
+            y1: 5.0,
+            x2: 6.0,
+            y2: 5.0,
+        }],
+        vias: vec![],
+    };
+    let seed = f.root.join("bad-seed.json");
+    std::fs::write(&seed, plan.to_routing_file_json()).unwrap();
+    let s = spec(&f.root, "bad.json", CopperSource::Plan { path: seed });
+    let dir = prepare(&s, false).unwrap();
+    let status = run_job_dir(&dir).unwrap();
+    assert_eq!(status.state, "FAILED", "{status:?}");
+    assert!(status.error.unwrap().contains("source plan"));
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    assert_eq!(report.stop_kind, Some(StopKind::InputError));
+    assert!(!s.output_plan.exists());
+}
+
+#[test]
+fn only_an_unbuilt_stub_reads_as_unavailable() {
+    let todo = guarded("x", || -> u32 { todo!("WS-X: later") }).unwrap_err();
+    assert!(matches!(todo, StageError::Unavailable { .. }), "{todo}");
+    let unimpl = guarded("x", || -> u32 { unimplemented!() }).unwrap_err();
+    assert!(matches!(unimpl, StageError::Unavailable { .. }), "{unimpl}");
+    let bug = guarded("x", || -> u32 { panic!("index out of bounds") }).unwrap_err();
+    assert!(matches!(bug, StageError::Panicked { .. }), "{bug}");
+    assert!(bug.to_string().contains("index out of bounds"));
+    let as_anyhow = anyhow::Error::new(bug);
+    assert_eq!(StopKind::of(&as_anyhow), StopKind::StageFailed);
+    assert_eq!(StopKind::of(&as_anyhow).job_state(), "FAILED");
+    assert_eq!(
+        StopKind::of(&anyhow::Error::new(todo)).job_state(),
+        "STAGE_UNAVAILABLE"
+    );
+    assert_eq!(
+        StopKind::of(&anyhow::anyhow!("source plan: bad")).job_state(),
+        "FAILED"
+    );
+}
+
+#[test]
+fn native_routing_sees_only_the_selected_nets_and_region() {
+    use konnect_route::synthetic::BoardBuilder;
+    let mut b = BoardBuilder::new(40.0, 20.0, &["F.Cu", "B.Cu"]);
+    let u = b.footprint("U1", (5.0, 5.0));
+    b.smd_pad(u, "1", "ALPHA", (5.0, 5.0), (0.5, 0.5), "F.Cu");
+    b.smd_pad(u, "2", "BETA", (5.0, 8.0), (0.5, 0.5), "F.Cu");
+    let v = b.footprint("U2", (10.0, 5.0));
+    b.smd_pad(v, "1", "ALPHA", (10.0, 5.0), (0.5, 0.5), "F.Cu");
+    b.smd_pad(v, "2", "BETA", (10.0, 8.0), (0.5, 0.5), "F.Cu");
+    let w = b.footprint("U3", (35.0, 5.0));
+    b.smd_pad(w, "1", "ALPHA", (35.0, 5.0), (0.5, 0.5), "F.Cu");
+    let board = b.build();
+    let all = || {
+        ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default()).connections(&board)
+    };
+    assert_eq!(all().len(), 3);
+    assert_eq!(select_connections(&board, all(), None, None).len(), 3);
+    let alpha: BTreeSet<NetId> = [board.net_by_name("ALPHA").unwrap()].into();
+    let picked = select_connections(&board, all(), Some(&alpha), None);
+    assert_eq!(picked.len(), 2);
+    assert!(picked.iter().all(|c| alpha.contains(&c.net)));
+    // A box round the two left footprints drops the long ALPHA link.
+    let region = konnect_geom::BBox::new(
+        konnect_geom::Point::from_mm(2.0, 2.0).unwrap(),
+        konnect_geom::Point::from_mm(15.0, 12.0).unwrap(),
+    );
+    let picked = select_connections(&board, all(), None, Some(region));
+    assert_eq!(picked.len(), 2);
+    let picked = select_connections(&board, all(), Some(&alpha), Some(region));
+    assert_eq!(picked.len(), 1);
+    assert_eq!(picked[0].id.0, 0, "ids are renumbered");
+}
+
+#[test]
+fn a_native_run_with_nothing_selected_routes_nothing_and_completes() {
+    let f = fixture();
+    let mut s = spec(&f.root, "nothing.json", CopperSource::Native);
+    // A corner of the board no connection lies inside.
+    s.region_mm = Some([0.0, 0.0, 0.5, 0.5]);
+    let dir = prepare(&s, false).unwrap();
+    let status = run_job_dir(&dir).unwrap();
+    assert_eq!(status.state, "COMPLETED", "{status:?}");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    assert_eq!((report.work_tracks, report.work_vias), (0, 0));
+    assert!(!s.output_plan.exists());
+}

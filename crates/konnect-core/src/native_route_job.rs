@@ -236,6 +236,10 @@ pub struct CheckSummary {
     pub authoritative: bool,
     pub violations: usize,
     pub by_kind: BTreeMap<String, usize>,
+    /// Set when `check_routed` is built and panicked: the interim result
+    /// is reported beside it, and the run stops as FAILED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_routed_error: Option<String>,
 }
 
 /// The pipeline's whole account of a run.
@@ -253,7 +257,20 @@ pub struct PipelineReport {
     /// Set when the run stopped early (a stage failed, a stop was asked, the
     /// time limit passed).
     pub stopped: Option<String>,
+    /// Why, typed; set whenever `stopped` is.
+    #[serde(default)]
+    pub stop_kind: Option<StopKind>,
+    /// Whether the run continued from a checkpoint of the same spec.
+    #[serde(default)]
+    pub resumed: bool,
     pub telemetry: Telemetry,
+}
+
+impl PipelineReport {
+    fn stop(&mut self, kind: StopKind, why: String) {
+        self.stop_kind = Some(kind);
+        self.stopped = Some(why);
+    }
 }
 
 /// The copper after each completed stage, keyed to the spec it came from.
@@ -289,16 +306,85 @@ impl PipelineObserver for Quiet {
     fn checkpoint(&mut self, _: &Checkpoint) {}
 }
 
-/// Run `f`, turning a panic (an unbuilt stage's `todo!`) into an error.
-pub(crate) fn guarded<T>(stage: &str, f: impl FnOnce() -> T) -> Result<T> {
+/// A stage that panicked, told apart by why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StageError {
+    /// The stage is a stub not built yet (its `todo!` or `unimplemented!`).
+    Unavailable { stage: String, message: String },
+    /// The stage is built and panicked: a bug, never hidden as unavailable.
+    Panicked { stage: String, message: String },
+}
+
+impl std::fmt::Display for StageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageError::Unavailable { stage, message } => {
+                write!(f, "stage {stage} is not available: {message}")
+            }
+            StageError::Panicked { stage, message } => {
+                write!(f, "stage {stage} panicked: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StageError {}
+
+/// Run `f`, turning a panic into a [`StageError`]: an unbuilt stage's
+/// `todo!` ("not yet implemented") or `unimplemented!` ("not implemented")
+/// is [`StageError::Unavailable`]; any other panic is
+/// [`StageError::Panicked`].
+pub(crate) fn guarded<T>(stage: &str, f: impl FnOnce() -> T) -> Result<T, StageError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
-        let msg = payload
+        let message = payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_else(|| "panicked".to_string());
-        anyhow::anyhow!("stage {stage} is not available: {msg}")
+        let stage = stage.to_string();
+        if message.starts_with("not yet implemented") || message.starts_with("not implemented") {
+            StageError::Unavailable { stage, message }
+        } else {
+            StageError::Panicked { stage, message }
+        }
     })
+}
+
+/// Why a run ended before planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopKind {
+    /// A stage is not built yet (job state STAGE_UNAVAILABLE).
+    StageUnavailable,
+    /// A built stage failed or panicked (FAILED).
+    StageFailed,
+    /// The input cannot be used, e.g. a source plan naming a net the board
+    /// lacks (FAILED).
+    InputError,
+    /// A stop was requested (STOPPED_ON_REQUEST).
+    StopRequested,
+    /// The time limit passed (STOPPED_AT_TIME_LIMIT).
+    TimeLimit,
+}
+
+impl StopKind {
+    fn of(error: &anyhow::Error) -> StopKind {
+        match error.downcast_ref::<StageError>() {
+            Some(StageError::Unavailable { .. }) => StopKind::StageUnavailable,
+            Some(StageError::Panicked { .. }) => StopKind::StageFailed,
+            None => StopKind::InputError,
+        }
+    }
+
+    /// The job state a run that stopped this way ends in.
+    pub fn job_state(self) -> &'static str {
+        match self {
+            StopKind::StageUnavailable => "STAGE_UNAVAILABLE",
+            StopKind::StageFailed | StopKind::InputError => "FAILED",
+            StopKind::StopRequested => "STOPPED_ON_REQUEST",
+            StopKind::TimeLimit => "STOPPED_AT_TIME_LIMIT",
+        }
+    }
 }
 
 fn by_kind(report: &CheckReport) -> BTreeMap<String, usize> {
@@ -315,12 +401,56 @@ fn by_kind(report: &CheckReport) -> BTreeMap<String, usize> {
     m
 }
 
-/// The native S2–S5 route of the board's open connections.
-fn route_native(board: &RouteBoard, rules: &dyn RuleTable) -> Result<RoutedCopper> {
+/// The open connections a run works on: those of `nets` (all when `None`)
+/// whose two terminals both lie inside `region` (anywhere when `None`).
+/// Ids are renumbered to stay equal to their index.
+pub(crate) fn select_connections(
+    board: &RouteBoard,
+    connections: Vec<konnect_route::api::Connection>,
+    nets: Option<&BTreeSet<NetId>>,
+    region: Option<konnect_geom::BBox>,
+) -> Vec<konnect_route::api::Connection> {
+    use konnect_route::api::{ConnectionId, ItemRef};
+    let inside = |item: ItemRef| {
+        let Some(r) = region else { return true };
+        let bbox = match item {
+            ItemRef::Pad(id) => board.pads[id.index()].bbox(),
+            ItemRef::Via(id) => Some(board.vias[id.index()].shape().bbox()),
+            ItemRef::Track(id) => Some(board.tracks[id.index()].seg.bbox()),
+            ItemRef::Arc(id) => {
+                let a = &board.arcs[id.index()];
+                konnect_geom::BBox::from_points([a.start, a.mid, a.end])
+            }
+            ItemRef::Zone(_) => None,
+        };
+        bbox.is_some_and(|b| r.contains_bbox(&b))
+    };
+    connections
+        .into_iter()
+        .filter(|c| nets.is_none_or(|s| s.contains(&c.net)) && inside(c.from) && inside(c.to))
+        .enumerate()
+        .map(|(i, c)| konnect_route::api::Connection {
+            id: ConnectionId(i as u32),
+            ..c
+        })
+        .collect()
+}
+
+/// The native S2–S5 route of the board's open connections, limited to
+/// `nets` and `region`: the stages only ever see the selected connections.
+fn route_native(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    nets: Option<&BTreeSet<NetId>>,
+    region: Option<konnect_geom::BBox>,
+) -> Result<RoutedCopper> {
     use konnect_route::detail::negotiate::{negotiate, NegotiationSettings};
     use konnect_route::global::{build_grid, route_global, GlobalSettings};
     let conn = ConnectivityReport::build(board, &konnect_geom::ArcPolicy::default());
-    let connections = conn.connections(board);
+    let connections = select_connections(board, conn.connections(board), nets, region);
+    if connections.is_empty() {
+        return Ok(RoutedCopper::default());
+    }
     let settings = GlobalSettings::default();
     let grid = guarded("global", || build_grid(board, rules, &settings))?;
     let global = guarded("global", || {
@@ -352,6 +482,7 @@ pub fn run_pipeline(
     let mut report = PipelineReport::default();
     let spec_hash = spec.hash();
     let resume = resume.filter(|c| c.spec_hash == spec_hash);
+    report.resumed = resume.is_some();
     let done = |name: &str| {
         resume
             .as_ref()
@@ -371,13 +502,13 @@ pub fn run_pipeline(
             detail,
         });
     };
-    let stop_check = |observer: &mut dyn PipelineObserver| -> Option<String> {
+    let stop_check = |observer: &mut dyn PipelineObserver| -> Option<(StopKind, String)> {
         if let Some(why) = observer.should_stop() {
-            return Some(why);
+            return Some((StopKind::StopRequested, why));
         }
         spec.time_limit_seconds
             .filter(|&s| started.elapsed() >= Duration::from_secs(s))
-            .map(|s| format!("time limit of {s} s reached"))
+            .map(|s| (StopKind::TimeLimit, format!("time limit of {s} s reached")))
     };
 
     // S0: ingest and rules.
@@ -483,13 +614,20 @@ pub fn run_pipeline(
                 plan.to_routed(&board, Generation(0))
                     .map_err(|e| anyhow::anyhow!("source plan: {e}"))
             }
-            CopperSource::Native => pool.install(|| route_native(&board, &rules)),
+            CopperSource::Native => {
+                pool.install(|| route_native(&board, &rules, nets.as_ref(), region))
+            }
         };
         match routed {
             Ok(c) => {
+                // Routing is S2–S5 time; taking existing copper is ingest.
+                let stage = match spec.source {
+                    CopperSource::Native => Stage::Detail,
+                    _ => Stage::Ingest,
+                };
                 report
                     .telemetry
-                    .add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
+                    .add_stage_time(stage, t.elapsed().as_micros() as u64);
                 checkpoint.completed.push("route".to_string());
                 record(
                     &mut report,
@@ -512,7 +650,7 @@ pub fn run_pipeline(
                     t,
                     json!({ "error": format!("{e:#}") }),
                 );
-                report.stopped = Some(format!("{e:#}"));
+                report.stop(StopKind::of(&e), format!("{e:#}"));
                 return Ok(report);
             }
         }
@@ -524,8 +662,8 @@ pub fn run_pipeline(
     checkpoint.frozen = frozen;
     checkpoint.written_unix = now_unix();
     observer.checkpoint(&checkpoint);
-    if let Some(why) = stop_check(observer) {
-        report.stopped = Some(why);
+    if let Some((kind, why)) = stop_check(observer) {
+        report.stop(kind, why);
         return Ok(report);
     }
 
@@ -533,7 +671,9 @@ pub fn run_pipeline(
         zones_are_obstacles: spec.zones_are_obstacles,
         ..CheckerOptions::default()
     };
+    let indexed = Instant::now();
     let checker = ExactChecker::new(&board, &rules, checker_opts);
+    let index_us = indexed.elapsed().as_micros() as u64;
 
     // S6: optimize.
     let t = Instant::now();
@@ -554,9 +694,8 @@ pub fn run_pipeline(
         report
             .telemetry
             .add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
-        report
-            .telemetry
-            .count("optimize_exact_checks", r.exact_checks);
+        report.telemetry.count("optimize_index_us", index_us);
+        konnect_route::optimize::record_counters(&r, &mut report.telemetry);
         report.optimize = Some(r);
         checkpoint.optimize = Some(r);
         checkpoint.copper = work.clone();
@@ -572,32 +711,40 @@ pub fn run_pipeline(
             serde_json::to_value(r).unwrap_or_default(),
         );
     }
-    if let Some(why) = stop_check(observer) {
-        report.stopped = Some(why);
+    if let Some((kind, why)) = stop_check(observer) {
+        report.stop(kind, why);
         return Ok(report);
     }
 
     // S7: check.
     let t = Instant::now();
     observer.event("check", "start", &json!({}));
-    let summary = match guarded("check", || {
-        konnect_route::check::check_routed(&board, &rules, &work)
-    }) {
-        Ok(r) => CheckSummary {
-            checker: "check_routed".to_string(),
-            authoritative: true,
+    let interim = |error: Option<String>| {
+        let r = pool.install(|| checker.check_copper(&work));
+        CheckSummary {
+            checker: "interim_exact".to_string(),
+            authoritative: false,
             violations: r.violations.len(),
             by_kind: by_kind(&r),
-        },
-        Err(_) => {
-            let r = pool.install(|| checker.check_copper(&work));
+            check_routed_error: error,
+        }
+    };
+    let (summary, failure) = match guarded("check", || {
+        konnect_route::check::check_routed(&board, &rules, &work)
+    }) {
+        Ok(r) => (
             CheckSummary {
-                checker: "interim_exact".to_string(),
-                authoritative: false,
+                checker: "check_routed".to_string(),
+                authoritative: true,
                 violations: r.violations.len(),
                 by_kind: by_kind(&r),
-            }
-        }
+                check_routed_error: None,
+            },
+            None,
+        ),
+        // Only the unbuilt stub falls back silently.
+        Err(StageError::Unavailable { .. }) => (interim(None), None),
+        Err(e @ StageError::Panicked { .. }) => (interim(Some(e.to_string())), Some(e)),
     };
     report
         .telemetry
@@ -606,10 +753,15 @@ pub fn run_pipeline(
         &mut report,
         observer,
         "check",
-        "done",
+        if failure.is_some() { "failed" } else { "done" },
         t,
         serde_json::to_value(&summary).unwrap_or_default(),
     );
+    if let Some(e) = failure {
+        report.check = Some(summary);
+        report.stop(StopKind::StageFailed, e.to_string());
+        return Ok(report);
+    }
     checkpoint.check = Some(summary.clone());
     report.check = Some(summary);
     checkpoint.completed.push("check".to_string());
@@ -694,7 +846,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Write a file that must not exist yet (never replaces one).
-fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         bail!("{} already exists; it is never replaced", path.display());
     }
@@ -725,14 +877,31 @@ struct DirObserver {
 }
 
 impl DirObserver {
-    fn write_status(dir: &Path, status: &Mutex<JobStatus>, started: Instant) {
+    fn write_status(dir: &Path, status: &Mutex<JobStatus>, started: Instant) -> bool {
         let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
         s.heartbeat_unix = now_unix();
         s.elapsed_seconds = started.elapsed().as_secs_f64();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&*s) {
-            if let Err(e) = write_atomic(&dir.join(STATUS_FILE), &bytes) {
-                eprintln!("status not written: {e:#}");
+        match serde_json::to_vec_pretty(&*s) {
+            Ok(bytes) => match write_atomic(&dir.join(STATUS_FILE), &bytes) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("status not written: {e:#}");
+                    false
+                }
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// The last status must land: on Windows the rename fails while a
+    /// reader holds `status.json` open without delete sharing, and a
+    /// finished job left showing RUNNING would later read as RUNNER_LOST.
+    fn write_final_status(dir: &Path, status: &Mutex<JobStatus>, started: Instant) {
+        for _ in 0..50 {
+            if Self::write_status(dir, status, started) {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -790,7 +959,7 @@ pub fn run_job_dir(dir: &Path) -> Result<JobStatus> {
         state: "STARTING".to_string(),
         runner_pid: std::process::id(),
         started_unix: now_unix(),
-        resumed: resume.is_some(),
+        resumed: resume.as_ref().is_some_and(|c| c.spec_hash == spec.hash()),
         output_plan: spec.output_plan.clone(),
         ..JobStatus::default()
     }));
@@ -820,15 +989,12 @@ pub fn run_job_dir(dir: &Path) -> Result<JobStatus> {
         match &result {
             Ok(report) => {
                 s.plan_items = report.plan_items;
-                s.state = match &report.stopped {
-                    None => "COMPLETED".to_string(),
-                    Some(why) if why.starts_with("stopped on request") => {
-                        "STOPPED_ON_REQUEST".to_string()
-                    }
-                    Some(why) if why.starts_with("time limit") => {
-                        "STOPPED_AT_TIME_LIMIT".to_string()
-                    }
-                    Some(_) => "STAGE_UNAVAILABLE".to_string(),
+                s.resumed = report.resumed;
+                s.state = match (report.stop_kind, &report.stopped) {
+                    (Some(kind), _) => kind.job_state().to_string(),
+                    (None, None) => "COMPLETED".to_string(),
+                    // Not expected: every stop carries its kind.
+                    (None, Some(_)) => "FAILED".to_string(),
                 };
                 s.error = report.stopped.clone();
                 if let Ok(bytes) = serde_json::to_vec_pretty(report) {
@@ -843,7 +1009,7 @@ pub fn run_job_dir(dir: &Path) -> Result<JobStatus> {
             }
         }
     }
-    DirObserver::write_status(dir, &status, started);
+    DirObserver::write_final_status(dir, &status, started);
     let s = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(s)
 }
