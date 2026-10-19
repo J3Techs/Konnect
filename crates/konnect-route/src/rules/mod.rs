@@ -13,22 +13,28 @@
 //! | board minimums: clearance, track width, via diameter/annulus/drill | `.kicad_pro` `board.design_settings.rules` |
 //! | edge clearance, hole clearance, hole-to-hole | the same `rules` block |
 //! | custom clearance overrides by net class, net name, type, reference, courtyard, area | `.kicad_dru` `clearance` constraints |
-//! | via floor | `.kicad_dru` `via_diameter` / `hole_size` / `annular_width` |
-//! | track width floor | `.kicad_dru` `track_width` |
-//! | minimum segment length | `.kicad_dru` `track_segment_length` |
-//! | track angle minimum | `.kicad_dru` `track_angle` |
+//! | via size: floor, preferred, ceiling | `.kicad_dru` `via_diameter` / `hole_size` (`min`/`opt`/`max`), `annular_width` (`min`) |
+//! | track width: floor, preferred, ceiling | `.kicad_dru` `track_width` (`min`/`opt`/`max`) |
+//! | minimum segment length | `.kicad_dru` `track_segment_length` (`min`) |
+//! | track angle minimum | `.kicad_dru` `track_angle` (`min`) |
 //!
-//! Anything else — another constraint type, an unsupported condition, a
-//! condition naming an area or footprint the board does not have — is
-//! reported in [`RulesReport::inert`] and never half-applied.
+//! Anything else — another constraint type, a limit the table does not
+//! apply (a `max` on a clearance, say), an unsupported condition, a
+//! condition naming an area or footprint the board does not have, a length
+//! too large for a [`Coord`], a rule with `(severity ignore)`, a via
+//! constraint scoped to one layer — is reported in [`RulesReport::inert`]
+//! and never half-applied.
 //!
 //! # Precedence (a hypothesis until the oracle confirms it)
 //!
-//! Per constraint: the last matching custom rule wins (KiCad processes rules
-//! bottom-up, first match wins); two-item conditions are tried as (A, B) and
-//! (B, A). Otherwise local pad overrides, then the net class (the larger of
-//! the two items' values for clearance). Board minimums are a floor under
-//! every result.
+//! Clearance follows KiCad's `DRC_ENGINE::EvalRules`: a local override on
+//! either item (the pad's `(clearance …)`, or its footprint's) beats every
+//! rule, the larger of the two winning. Without one, the last matching
+//! custom rule wins (KiCad processes rules bottom-up, first match wins);
+//! two-item conditions are tried as (A, B) and (B, A). Otherwise the net
+//! class, the larger of the two items' values. Other constraints: the last
+//! matching custom rule, then the net class. Board minimums are a floor
+//! under every result, and a floor beats a conflicting `max`.
 
 mod condition;
 
@@ -201,12 +207,50 @@ enum ConstraintKind {
     TrackAngle,
 }
 
-/// One supported constraint; lengths in nm, angles in degrees.
+impl ConstraintKind {
+    fn dru_name(self) -> &'static str {
+        match self {
+            ConstraintKind::Clearance => "clearance",
+            ConstraintKind::TrackWidth => "track_width",
+            ConstraintKind::ViaDiameter => "via_diameter",
+            ConstraintKind::HoleSize => "hole_size",
+            ConstraintKind::AnnularWidth => "annular_width",
+            ConstraintKind::TrackSegmentLength => "track_segment_length",
+            ConstraintKind::TrackAngle => "track_angle",
+        }
+    }
+
+    fn is_via(self) -> bool {
+        matches!(
+            self,
+            ConstraintKind::ViaDiameter | ConstraintKind::HoleSize | ConstraintKind::AnnularWidth
+        )
+    }
+
+    /// Whether the table applies an `opt` and a `max` of this kind.
+    fn takes_opt_and_max(self) -> bool {
+        matches!(
+            self,
+            ConstraintKind::TrackWidth | ConstraintKind::ViaDiameter | ConstraintKind::HoleSize
+        )
+    }
+}
+
+/// One supported constraint; angles in degrees, lengths in nm. A length is
+/// checked into [`Coord`] range when the rule is compiled, so [`to_nm`] on it
+/// is exact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Constraint {
     kind: ConstraintKind,
     min: Option<f64>,
     opt: Option<f64>,
+    max: Option<f64>,
+}
+
+/// A compiled length back to nm. Exact: [`parse_length_nm`] only returns
+/// whole nanometres within [`konnect_geom::MAX_COORD`].
+fn to_nm(v: f64) -> Coord {
+    v as Coord
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +305,7 @@ impl ProjectRuleTable {
                 .filter(|c| c.kind == ConstraintKind::Clearance)
             {
                 if let Some(v) = c.min {
-                    max_clearance = max_clearance.max(v.round() as Coord);
+                    max_clearance = max_clearance.max(to_nm(v));
                 }
             }
         }
@@ -411,15 +455,17 @@ impl RuleTable for ProjectRuleTable {
     }
 
     fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, layer: LayerId) -> Coord {
-        let resolved = match self.last_match(ConstraintKind::Clearance, Some(layer), a, Some(b)) {
-            Some(Constraint { min: Some(v), .. }) => v.round() as Coord,
-            _ => match (a.local_clearance, b.local_clearance) {
-                (None, None) => self
-                    .class_rules(a.net)
-                    .clearance
-                    .max(self.class_rules(b.net).clearance),
-                (la, lb) => la.unwrap_or(0).max(lb.unwrap_or(0)),
-            },
+        let resolved = match (a.local_clearance, b.local_clearance) {
+            (None, None) => {
+                match self.last_match(ConstraintKind::Clearance, Some(layer), a, Some(b)) {
+                    Some(Constraint { min: Some(v), .. }) => to_nm(v),
+                    _ => self
+                        .class_rules(a.net)
+                        .clearance
+                        .max(self.class_rules(b.net).clearance),
+                }
+            }
+            (la, lb) => la.unwrap_or(0).max(lb.unwrap_or(0)),
         };
         resolved.max(self.board.min_clearance)
     }
@@ -429,30 +475,35 @@ impl RuleTable for ProjectRuleTable {
         let rule = self.last_match(ConstraintKind::TrackWidth, Some(layer), subject, None);
         let min = rule
             .and_then(|c| c.min)
-            .map_or(0, |v| v.round() as Coord)
+            .map_or(0, to_nm)
             .max(self.board.min_track_width);
-        let preferred = rule
-            .and_then(|c| c.opt)
-            .map_or(class.track_width, |v| v.round() as Coord);
         WidthRule {
             min,
-            preferred: preferred.max(min),
+            preferred: preferred(rule, class.track_width, min),
         }
     }
 
     fn via(&self, subject: &RuleSubject<'_>) -> ViaRule {
         let class = self.class_rules(subject.net);
-        let floor = |kind: ConstraintKind| {
-            self.last_match(kind, None, subject, None)
-                .and_then(|c| c.min)
-                .map_or(0, |v| v.round() as Coord)
-        };
-        let min_diameter = floor(ConstraintKind::ViaDiameter).max(self.board.min_via_diameter);
-        let min_drill = floor(ConstraintKind::HoleSize).max(self.board.min_through_hole_diameter);
-        let min_annular = floor(ConstraintKind::AnnularWidth).max(self.board.min_via_annular_width);
+        let rule = |kind: ConstraintKind| self.last_match(kind, None, subject, None);
+        let floor = |c: Option<Constraint>| c.and_then(|c| c.min).map_or(0, to_nm);
+        let (diameter_rule, drill_rule) = (
+            rule(ConstraintKind::ViaDiameter),
+            rule(ConstraintKind::HoleSize),
+        );
+        let min_annular =
+            floor(rule(ConstraintKind::AnnularWidth)).max(self.board.min_via_annular_width);
+        let min_drill = floor(drill_rule).max(self.board.min_through_hole_diameter);
+        // A via that meets the drill floor must still meet the annular one.
+        let min_diameter = floor(diameter_rule)
+            .max(self.board.min_via_diameter)
+            .max(min_drill + 2 * min_annular);
+        let drill = preferred(drill_rule, class.via_drill, min_drill);
+        let diameter =
+            preferred(diameter_rule, class.via_diameter, min_diameter).max(drill + 2 * min_annular);
         ViaRule {
-            diameter: class.via_diameter.max(min_diameter),
-            drill: class.via_drill.max(min_drill),
+            diameter,
+            drill,
             min_diameter,
             min_drill,
             min_annular,
@@ -472,7 +523,7 @@ impl RuleTable for ProjectRuleTable {
             None,
         )
         .and_then(|c| c.min)
-        .map(|v| v.round() as Coord)
+        .map(to_nm)
     }
 
     fn edge_clearance(&self) -> Coord {
@@ -494,6 +545,17 @@ impl RuleTable for ProjectRuleTable {
     fn inert_rules(&self) -> &[InertRule] {
         &self.inert
     }
+}
+
+/// What to draw: the rule's `opt` (else the class value), capped by the
+/// rule's `max`, never below `min`.
+fn preferred(rule: Option<Constraint>, class: Coord, min: Coord) -> Coord {
+    let opt = rule.and_then(|c| c.opt).map_or(class, to_nm);
+    let capped = match rule.and_then(|c| c.max) {
+        Some(max) => opt.min(to_nm(max)),
+        None => opt,
+    };
+    capped.max(min)
 }
 
 // ─── Project file readers ────────────────────────────────────────────────────
@@ -711,10 +773,36 @@ fn compile_rule(
                     reason,
                 }),
             },
-            Some("severity") => {}
+            Some("severity") => match child.get(1).and_then(|n| n.as_str()) {
+                Some("error" | "warning") => {}
+                Some("ignore") => {
+                    return Err("severity 'ignore': KiCad does not enforce the rule".to_string())
+                }
+                other => {
+                    return Err(format!(
+                        "severity '{}' is not understood",
+                        other.unwrap_or("")
+                    ))
+                }
+            },
             Some(other) => return Err(format!("clause '{other}' is not supported")),
             None => return Err("malformed rule clause".to_string()),
         }
+    }
+    if layer.is_some() {
+        // Vias span layers, and `via()` is asked without one.
+        constraints.retain(|c| {
+            if c.kind.is_via() {
+                inert.push(InertRule {
+                    rule: name.to_string(),
+                    reason: format!(
+                        "constraint '{}' scoped to one layer is not supported",
+                        c.kind.dru_name()
+                    ),
+                });
+            }
+            !c.kind.is_via()
+        });
     }
     if constraints.is_empty() {
         return Err("no supported constraint".to_string());
@@ -743,6 +831,7 @@ fn compile_constraint(node: &konnect_sexp::SexpNode) -> Result<Constraint, Strin
         kind,
         min: None,
         opt: None,
+        max: None,
     };
     for child in node.children().unwrap_or(&[]).iter().skip(2) {
         let head = child
@@ -757,12 +846,16 @@ fn compile_constraint(node: &konnect_sexp::SexpNode) -> Result<Constraint, Strin
         } else {
             parse_length_nm(raw)
         }
-        .ok_or_else(|| format!("constraint '{ty}' {head} value '{raw}' is not understood"))?;
+        .ok_or_else(|| {
+            format!("constraint '{ty}' {head} value '{raw}' is not understood or out of range")
+        })?;
         match head {
             "min" => c.min = Some(value),
+            "opt" | "max" if !kind.takes_opt_and_max() => {
+                return Err(format!("constraint '{ty}' {head} is not supported"))
+            }
             "opt" => c.opt = Some(value),
-            // A maximum never makes the router's copper illegal in week 1.
-            "max" => {}
+            "max" => c.max = Some(value),
             other => {
                 return Err(format!(
                     "constraint '{ty}' option '{other}' is not supported"
@@ -770,11 +863,17 @@ fn compile_constraint(node: &konnect_sexp::SexpNode) -> Result<Constraint, Strin
             }
         }
     }
+    if let (Some(min), Some(max)) = (c.min, c.max) {
+        if min > max {
+            return Err(format!("constraint '{ty}' has min above max"));
+        }
+    }
     Ok(c)
 }
 
 /// A DRU length with its unit (`0.25mm`, `6mil`, `0.006in`, `150um`); a bare
-/// number is millimetres. Returns nm.
+/// number is millimetres. Returns whole nm, or `None` when the value is not
+/// a number or does not fit a [`Coord`] (beyond [`konnect_geom::MAX_COORD`]).
 fn parse_length_nm(raw: &str) -> Option<f64> {
     let units: [(&str, f64); 5] = [
         ("mm", 1.0),
@@ -788,8 +887,7 @@ fn parse_length_nm(raw: &str) -> Option<f64> {
         .find_map(|(suffix, f)| raw.strip_suffix(suffix).map(|n| (n, *f)))
         .unwrap_or((raw, 1.0));
     let v: f64 = number.trim().parse().ok()?;
-    v.is_finite()
-        .then(|| (v * mm_per_unit * 1_000_000.0).round())
+    mm_to_nm(v * mm_per_unit).map(f64::from)
 }
 
 fn parse_angle_deg(raw: &str) -> Option<f64> {
@@ -825,6 +923,7 @@ mod tests {
                 { "netclass": "Fast", "pattern": "IO_*" },
                 { "netclass": "Pair", "pattern": "LVDS_*" },
                 { "netclass": "Power", "pattern": "IO_PWR" },
+                { "netclass": "Power", "pattern": "PWR_*" },
                 { "netclass": "Missing", "pattern": "X" }
             ],
             "netclass_assignments": null
@@ -854,11 +953,26 @@ mod tests {
   (constraint length (max 50mm)))
 (rule "Angles"
   (constraint track_angle (min 80)))
+(rule "Power caps"
+  (condition "A.NetClass == 'Power'")
+  (constraint track_width (max 0.2mm))
+  (constraint via_diameter (opt 0.65mm) (max 0.65mm)))
+(rule "Ignored"
+  (severity ignore)
+  (constraint clearance (min 1mm)))
+(rule "Clearance cap"
+  (constraint clearance (max 0.5mm)))
+(rule "Layer vias"
+  (layer "B.Cu")
+  (constraint hole_size (min 0.4mm))
+  (constraint track_width (min 0.1mm)))
+(rule "Huge"
+  (constraint clearance (min 5000mm)))
 "#;
 
     fn board() -> RouteBoard {
         let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
-        for net in ["IO_A", "IO_PWR", "LVDS_N", "LVDS_P", "GND"] {
+        for net in ["IO_A", "IO_PWR", "LVDS_N", "LVDS_P", "GND", "PWR_MAIN"] {
             b.net(net);
         }
         b.footprint("IC7", (5.0, 5.0));
@@ -899,15 +1013,27 @@ mod tests {
             .iter()
             .any(|r| r.rule == "Short segments" && r.reason.contains("'length'")));
         assert!(inert.iter().any(|r| r.reason.contains("'Missing'")));
-        // The rule with one unsupported constraint still applies the other.
-        assert!(t
-            .report()
-            .applied_rules
-            .contains(&"Short segments".to_string()));
+        let has = |rule: &str, reason: &str| {
+            inert
+                .iter()
+                .any(|r| r.rule == rule && r.reason.contains(reason))
+        };
+        assert!(has("Ignored", "severity 'ignore'"));
+        assert!(has("Clearance cap", "max is not supported"));
+        assert!(has("Layer vias", "'hole_size' scoped to one layer"));
+        assert!(has("Huge", "out of range"));
+        // A rule with one unsupported constraint still applies the others.
+        let applied = t.report().applied_rules;
+        for rule in ["Short segments", "Layer vias", "Power caps"] {
+            assert!(applied.contains(&rule.to_string()), "{rule}");
+        }
+        for rule in ["Ignored", "Clearance cap", "Huge"] {
+            assert!(!applied.contains(&rule.to_string()), "{rule}");
+        }
     }
 
     #[test]
-    fn clearance_precedence_custom_then_class_then_floor() {
+    fn clearance_precedence_local_then_custom_then_class_then_floor() {
         let b = board();
         let t = table(&b);
         let f = LayerId(0);
@@ -926,10 +1052,18 @@ mod tests {
         let n = RuleSubject::new(ItemKind::Track, b.net_by_name("LVDS_N"));
         let p = RuleSubject::new(ItemKind::Track, b.net_by_name("LVDS_P"));
         assert_eq!(t.clearance(&n, &p, f), 130_000);
-        // Pad-local overrides beat the class.
+        // Local overrides beat the class...
         let pad = RuleSubject::new(ItemKind::Pad, b.net_by_name("GND"))
             .with_local_clearance(Some(300_000));
         assert_eq!(t.clearance(&pad, &gnd, f), 300_000);
+        // ...and every custom rule, even when lower, with the board minimum
+        // still a floor.
+        let pad_ic7 = RuleSubject::new(ItemKind::Pad, b.net_by_name("IO_A"))
+            .with_courtyards(&in_ic7)
+            .with_local_clearance(Some(150_000));
+        assert_eq!(t.clearance(&pad_ic7, &io_ic7, f), 150_000);
+        let tiny = pad_ic7.with_local_clearance(Some(50_000));
+        assert_eq!(t.clearance(&tiny, &io_ic7, f), 120_000);
     }
 
     #[test]
@@ -943,7 +1077,8 @@ mod tests {
         // Class size is below the floor, so the floor is what gets drawn.
         assert_eq!((v.diameter, v.drill), (600_000, 300_000));
         let v = t.via(&via.with_courtyards(&ic9));
-        assert_eq!((v.min_diameter, v.min_drill), (300_000, 180_000));
+        // Drill floor 0.18 plus twice the 0.07 annulus beats the 0.3 diameter floor.
+        assert_eq!((v.min_diameter, v.min_drill), (320_000, 180_000));
         assert_eq!((v.diameter, v.drill), (550_000, 280_000));
 
         let pair = RuleSubject::new(ItemKind::Track, b.net_by_name("LVDS_P"));
@@ -958,12 +1093,31 @@ mod tests {
     }
 
     #[test]
+    fn opt_and_max_shape_what_gets_drawn() {
+        let b = board();
+        let t = table(&b);
+        let power = b.net_by_name("PWR_MAIN");
+        assert_eq!(t.class(t.class_of(power)).name, "Power");
+        // Class width 0.35 capped at 0.2; the 0.09 floor still holds.
+        let w = t.track_width(&RuleSubject::new(ItemKind::Track, power), LayerId(0));
+        assert_eq!((w.min, w.preferred), (90_000, 200_000));
+        // The diameter rule's opt replaces the class 0.7; the drill keeps
+        // the class 0.35 over the 0.3 floor of the earlier rule.
+        let v = t.via(&RuleSubject::new(ItemKind::Via, power));
+        assert_eq!((v.diameter, v.drill), (650_000, 350_000));
+        assert_eq!(v.min_diameter, 440_000);
+        assert!(v.diameter >= v.drill + 2 * v.min_annular);
+    }
+
+    #[test]
     fn units_parse() {
         assert_eq!(parse_length_nm("0.25mm"), Some(250_000.0));
         assert_eq!(parse_length_nm("6mil"), Some(152_400.0));
         assert_eq!(parse_length_nm("0.1"), Some(100_000.0));
         assert_eq!(parse_length_nm("150um"), Some(150_000.0));
         assert_eq!(parse_length_nm("fast"), None);
+        assert_eq!(parse_length_nm("5000mm"), None);
+        assert_eq!(parse_length_nm("1e400"), None);
         assert_eq!(parse_angle_deg("75"), Some(75.0));
         assert_eq!(parse_angle_deg("45deg"), Some(45.0));
     }
