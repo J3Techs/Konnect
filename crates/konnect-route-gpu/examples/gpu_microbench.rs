@@ -3,9 +3,10 @@
 //! Measures, on the machine it runs on:
 //! - submit + `map_async` round-trip latency,
 //! - empty-dispatch overhead (one per submit, and many per submit),
-//! - the raster paint kernel against its rayon twin, end to end (upload,
-//!   kernel, readback) and resident (kernel and a 4-byte readback only),
-//!   with a bit-exact parity check of every result.
+//! - the raster paint kernel against the rayon span fill (G1's baseline)
+//!   and the rayon per-cell fill, end to end (upload, kernel, readback) and
+//!   resident (kernel and the per-dispatch clamp counters only), with a
+//!   bit-exact parity check of every result.
 //!
 //! Workloads are synthetic; nothing comes from a real board.
 //!
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use konnect_route_gpu::gpu::{bench, GpuContext, GpuRaster};
 use konnect_route_gpu::synthetic::synthetic_stamps;
 use konnect_route_gpu::{
-    prepare_stamps, CounterGrid, CpuRaster, PaintOp, RasterCompute, RasterDims,
+    prepare_stamps, CounterGrid, CpuFill, CpuRaster, PaintOp, RasterCompute, RasterDims,
 };
 use serde_json::{json, Value};
 
@@ -200,6 +201,7 @@ fn run(quick: bool) -> Result<Value, Box<dyn std::error::Error>> {
             "round_trip_median_us": round_trip_median_us,
             "round_trip_pass": g1_round_trip,
             "raster_workload": G1_WORKLOAD,
+            "raster_baseline": "rayon scanline span fill (CpuFill::Span), gpu.md's planned CPU raster",
             "raster_end_to_end_speedup": g1_speedup,
             "raster_pass": g1_raster,
             "pass": g1_round_trip && g1_raster == Some(true),
@@ -217,20 +219,29 @@ fn bench_raster(
     let stamps = synthetic_stamps(dims, workload.stamps, 0xB0A2D ^ workload.stamps as u64);
     let prepared = prepare_stamps(dims, &stamps)?;
     let base = CounterGrid::new(dims);
-    let mut cpu = CpuRaster::new();
+    // The span fill is the production CPU path and G1's baseline; the
+    // per-cell fill (what the GPU kernel does) is reported for reference.
+    let mut cpu = CpuRaster::with_fill(CpuFill::Span);
+    let mut cpu_cells = CpuRaster::with_fill(CpuFill::BoundingBox);
 
-    // CPU twin, including stamp preparation, as a caller would run it.
-    let mut cpu_times = Vec::with_capacity(iterations);
-    let mut cpu_grid = base.clone();
-    let mut cpu_report = Default::default();
-    for _ in 0..=iterations {
-        let mut grid = base.clone();
-        let t = Instant::now();
-        cpu_report = cpu.paint(&mut grid, &stamps, PaintOp::Paint)?;
-        cpu_times.push(t.elapsed());
-        cpu_grid = grid;
-    }
-    cpu_times.remove(0); // warm-up
+    // CPU, including stamp preparation, as a caller would run it.
+    let time_cpu = |raster: &mut CpuRaster| -> Result<_, Box<dyn std::error::Error>> {
+        let mut times = Vec::with_capacity(iterations);
+        let mut painted = base.clone();
+        let mut report = Default::default();
+        for _ in 0..=iterations {
+            let mut grid = base.clone();
+            let t = Instant::now();
+            report = raster.paint(&mut grid, &stamps, PaintOp::Paint)?;
+            times.push(t.elapsed());
+            painted = grid;
+        }
+        times.remove(0); // warm-up
+        Ok((times, painted, report))
+    };
+    let (cpu_times, mut cpu_grid, cpu_report) = time_cpu(&mut cpu)?;
+    let (cpu_cell_times, cpu_cell_grid, cpu_cell_report) = time_cpu(&mut cpu_cells)?;
+    let fills_agree = cpu_cell_grid == cpu_grid && cpu_cell_report == cpu_report;
 
     // GPU end to end: prepare, upload, kernel, readback, one submission.
     let mut gpu_times = Vec::with_capacity(iterations);
@@ -286,6 +297,7 @@ fn bench_raster(
     let resident_exact = downloaded == base;
 
     let cpu_median = median(&cpu_times).as_secs_f64();
+    let cpu_cell_median = median(&cpu_cell_times).as_secs_f64();
     let gpu_median = median(&gpu_times).as_secs_f64();
     let resident_median = median(&resident_paint).as_secs_f64();
     Ok(json!({
@@ -297,7 +309,8 @@ fn bench_raster(
         "work_words": prepared.iter().map(|s| s.work_words()).sum::<u64>(),
         "occupied_cells": occupied_cells,
         "clamped_events": cpu_report.clamped_events,
-        "cpu_rayon_paint": summary(&cpu_times),
+        "cpu_rayon_span_fill_paint": summary(&cpu_times),
+        "cpu_rayon_cell_fill_paint": summary(&cpu_cell_times),
         "gpu_end_to_end_paint": summary(&gpu_times),
         "gpu_resident_paint": summary(&resident_paint),
         "gpu_resident_unpaint": summary(&resident_unpaint),
@@ -306,11 +319,15 @@ fn bench_raster(
         "gpu_dispatches_per_paint": dispatch_count,
         "gpu_mean_ms_per_dispatch": resident_median * 1e3 / f64::from(dispatch_count.max(1)),
         "speedup": {
+            "baseline": "cpu_rayon_span_fill_paint",
             "end_to_end": cpu_median / gpu_median,
             "resident": cpu_median / resident_median,
+            "span_fill_over_cell_fill": cpu_cell_median / cpu_median,
+            "end_to_end_vs_cell_fill": cpu_cell_median / gpu_median,
         },
         "parity": {
-            "bit_exact": paint_exact && unpaint_exact && resident_exact,
+            "bit_exact": paint_exact && unpaint_exact && resident_exact && fills_agree,
+            "cpu_span_fill_equals_cell_fill": fills_agree,
             "paint": paint_exact,
             "paint_differing_words": differing_words,
             "unpaint": unpaint_exact,

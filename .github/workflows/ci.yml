@@ -120,6 +120,12 @@ jobs:
       # `MutexGuard` held across an await, a dropped coordinate that left half
       # of a transform assertion unwritten, and a handful of style lints (#121).
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      # The wgpu raster twin is behind the off-by-default `gpu` feature, so
+      # the workspace lint never compiles it. Linting it needs no adapter
+      # (ash loads Vulkan at run time), and without it the GPU code, its
+      # parity tests and the microbenchmark could rot unnoticed.
+      - name: Clippy (konnect-route-gpu, gpu feature)
+        run: cargo clippy -p konnect-route-gpu --locked --all-targets --features gpu -- -D warnings
 
   # Dependency license gate (deny.toml). Dual licensing (AGPL + commercial)
   # means every dependency must be acceptable under BOTH — this job stops an

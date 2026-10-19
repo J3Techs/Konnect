@@ -9,7 +9,7 @@
 pub mod bench;
 mod raster;
 
-pub use raster::{GpuPaintStats, GpuRaster};
+pub use raster::{GpuPaintStats, GpuRaster, SMOKE_BUDGET};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -216,29 +216,55 @@ pub(crate) fn read_mapped<T>(
             });
     }
     drop(sender);
-    context.wait(submission)?;
+    let waited = context.wait(submission);
 
-    let mut mapped = 0;
+    // Per buffer: None while its map is still pending, then the callback's
+    // outcome. Callbacks only run inside a poll on this thread, so nothing
+    // changes between this drain and the cleanup below.
+    let mut outcomes: Vec<Option<bool>> = vec![None; buffers.len()];
+    let mut map_error = None;
     while let Ok((index, result)) = receiver.try_recv() {
-        result.map_err(|e| ComputeError::Gpu(format!("readback {index} did not map: {e}")))?;
-        mapped += 1;
+        outcomes[index] = Some(result.is_ok());
+        if let Err(e) = result {
+            map_error.get_or_insert_with(|| {
+                ComputeError::Gpu(format!("readback {index} did not map: {e}"))
+            });
+        }
     }
-    if mapped != buffers.len() {
-        return Err(ComputeError::Gpu(format!(
+    let mapped = outcomes.iter().filter(|o| **o == Some(true)).count();
+    let failure = match (waited, map_error) {
+        (Err(e), _) | (Ok(()), Some(e)) => Some(e),
+        (Ok(()), None) if mapped != buffers.len() => Some(ComputeError::Gpu(format!(
             "{} of {} readbacks mapped before the wait returned",
             mapped,
             buffers.len()
-        )));
+        ))),
+        (Ok(()), None) => None,
+    };
+    if let Some(error) = failure {
+        // Leave every buffer unmapped so the next copy into it is valid:
+        // unmap the ones that mapped and abort the ones still pending. One
+        // whose map failed is already idle, and unmapping it would itself
+        // be a validation error.
+        for ((buffer, _), outcome) in buffers.iter().zip(&outcomes) {
+            if *outcome != Some(false) {
+                buffer.unmap();
+            }
+        }
+        return Err(error);
     }
 
     let mut out = Vec::with_capacity(buffers.len());
     for (index, (buffer, size)) in buffers.iter().enumerate() {
-        let slice = buffer.slice(..*size);
-        let value = {
-            let view = slice
-                .get_mapped_range()
-                .map_err(|e| ComputeError::Gpu(format!("readback {index} range: {e}")))?;
-            read(index, &view)
+        let value = match buffer.slice(..*size).get_mapped_range() {
+            Ok(view) => read(index, &view),
+            Err(e) => {
+                // This buffer and every later one are still mapped.
+                for (buffer, _) in &buffers[index..] {
+                    buffer.unmap();
+                }
+                return Err(ComputeError::Gpu(format!("readback {index} range: {e}")));
+            }
         };
         buffer.unmap();
         out.push(value);

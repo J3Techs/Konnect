@@ -135,7 +135,10 @@ impl CounterGrid {
         &self.words
     }
 
-    pub fn words_mut(&mut self) -> &mut [u32] {
+    /// Crate-private: a caller writing padding bytes would break the
+    /// "padding cells are always zero" invariant that [`Self::occupied_cells`]
+    /// and grid equality rely on.
+    pub(crate) fn words_mut(&mut self) -> &mut [u32] {
         &mut self.words
     }
 

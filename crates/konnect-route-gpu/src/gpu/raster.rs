@@ -12,12 +12,15 @@ use crate::shaders::{PAINT_ENTRY, PAINT_PARAMS_BYTES, PAINT_WGSL};
 use crate::synthetic::synthetic_stamps;
 use crate::{ComputeError, PaintReport, RasterCompute};
 
-/// The smoke kernel must finish (including device warm-up of the pipeline,
-/// upload and readback) inside this budget, or the GPU is not selected.
+/// The smoke kernel must finish (its first-use buffer allocation, upload,
+/// dispatches and readback, plus the CPU check) inside this budget, or the
+/// GPU is not selected. Device creation and pipeline compilation happen
+/// before it, in [`GpuContext::new`] and [`GpuRaster::new`].
 pub const SMOKE_BUDGET: Duration = Duration::from_millis(500);
 
 const SMOKE_SEED: u64 = 0x5_3A0E;
 const MIN_STAMP_CAPACITY: usize = 1024;
+const MIN_CLAMP_SLOTS: usize = 16;
 const STAMP_BYTES: u64 = std::mem::size_of::<PreparedStamp>() as u64;
 
 /// A paint's report plus what it cost in dispatches.
@@ -33,8 +36,16 @@ struct Resident {
     grid_bytes: u64,
     grid: wgpu::Buffer,
     grid_readback: wgpu::Buffer,
-    clamped: wgpu::Buffer,
-    clamped_readback: wgpu::Buffer,
+}
+
+/// One u32 clamp counter per dispatch chunk, summed in u64 on the host.
+/// A chunk visits at most [`crate::MAX_WORK_WORDS_PER_DISPATCH`] words of
+/// four cells, so its counter cannot wrap; one counter for a whole paint
+/// could, past 2^32 events, and would then disagree with the CPU's u64.
+struct ClampSlots {
+    capacity: usize,
+    counters: wgpu::Buffer,
+    readback: wgpu::Buffer,
 }
 
 /// The GPU raster backend. The grid can be kept resident on the device
@@ -47,6 +58,14 @@ pub struct GpuRaster {
     bind_group_layout: wgpu::BindGroupLayout,
     resident: Option<Resident>,
     stamps: Option<(wgpu::Buffer, usize)>,
+    clamp_slots: Option<ClampSlots>,
+}
+
+/// What [`GpuRaster::encode_paint`] recorded.
+struct EncodedPaint {
+    dispatch_count: u32,
+    /// Bytes of clamp counters copied to the readback buffer.
+    clamp_bytes: u64,
 }
 
 impl GpuRaster {
@@ -79,6 +98,7 @@ impl GpuRaster {
             bind_group_layout,
             resident: None,
             stamps: None,
+            clamp_slots: None,
         })
     }
 
@@ -142,29 +162,30 @@ impl GpuRaster {
     }
 
     /// Paint into the resident raster and wait for completion. Only the
-    /// 4-byte clamp counter comes back.
+    /// per-chunk clamp counters (4 bytes per dispatch) come back.
     pub fn paint_resident(
         &mut self,
         prepared: &[PreparedStamp],
         op: PaintOp,
     ) -> Result<GpuPaintStats, ComputeError> {
         self.context.check_health()?;
+        self.resident()?;
         self.write_stamps(prepared)?;
-        let resident = self.resident()?;
         let mut encoder = self.encoder();
-        let dispatch_count = self.encode_paint(&mut encoder, resident, prepared, op)?;
+        let encoded = self.encode_paint(&mut encoder, prepared, op)?;
         let submission = self.context.queue().submit([encoder.finish()]);
+        let slots = self.clamp_slots()?;
         let clamped = read_mapped(
             &self.context,
             submission,
-            &[(&resident.clamped_readback, 4)],
-            |_, bytes| le_u32(bytes),
+            &[(&slots.readback, encoded.clamp_bytes)],
+            |_, bytes| sum_counters(bytes),
         )?;
         Ok(GpuPaintStats {
             report: PaintReport {
-                clamped_events: u64::from(clamped[0]),
+                clamped_events: clamped[0],
             },
-            dispatch_count,
+            dispatch_count: encoded.dispatch_count,
         })
     }
 
@@ -207,9 +228,9 @@ impl GpuRaster {
     ) -> Result<GpuPaintStats, ComputeError> {
         self.upload(grid)?;
         self.write_stamps(prepared)?;
-        let resident = self.resident()?;
         let mut encoder = self.encoder();
-        let dispatch_count = self.encode_paint(&mut encoder, resident, prepared, op)?;
+        let encoded = self.encode_paint(&mut encoder, prepared, op)?;
+        let resident = self.resident()?;
         encoder.copy_buffer_to_buffer(
             &resident.grid,
             0,
@@ -218,18 +239,19 @@ impl GpuRaster {
             resident.grid_bytes,
         );
         let submission = self.context.queue().submit([encoder.finish()]);
+        let slots = self.clamp_slots()?;
         let mut clamped = 0;
-        // The counter is read first so the grid copy is the last step.
+        // The counters are read first so the grid copy is the last step.
         read_mapped(
             &self.context,
             submission,
             &[
-                (&resident.clamped_readback, 4),
+                (&slots.readback, encoded.clamp_bytes),
                 (&resident.grid_readback, resident.grid_bytes),
             ],
             |index, bytes| {
                 if index == 0 {
-                    clamped = le_u32(bytes);
+                    clamped = sum_counters(bytes);
                 } else {
                     copy_words(grid.words_mut(), bytes);
                 }
@@ -237,9 +259,9 @@ impl GpuRaster {
         )?;
         Ok(GpuPaintStats {
             report: PaintReport {
-                clamped_events: u64::from(clamped),
+                clamped_events: clamped,
             },
-            dispatch_count,
+            dispatch_count: encoded.dispatch_count,
         })
     }
 
@@ -257,6 +279,46 @@ impl GpuRaster {
             .ok_or_else(|| ComputeError::InvalidInput("no raster is resident on the GPU".into()))
     }
 
+    fn clamp_slots(&self) -> Result<&ClampSlots, ComputeError> {
+        self.clamp_slots
+            .as_ref()
+            .ok_or_else(|| ComputeError::InvalidInput("no clamp counters on the GPU".into()))
+    }
+
+    /// Grow the clamp counters to at least `count` slots.
+    fn ensure_clamp_slots(&mut self, count: usize) -> Result<(), ComputeError> {
+        if matches!(&self.clamp_slots, Some(slots) if slots.capacity >= count) {
+            return Ok(());
+        }
+        let capacity = count.next_power_of_two().max(MIN_CLAMP_SLOTS);
+        let bytes = capacity as u64 * 4;
+        let limits = self.context.device().limits();
+        if bytes > limits.max_storage_buffer_binding_size {
+            return Err(ComputeError::Unsupported(format!(
+                "{count} dispatch chunks exceed the device's storage binding"
+            )));
+        }
+        let device = self.context.device();
+        let buffer = |label, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        use wgpu::BufferUsages as U;
+        self.clamp_slots = Some(ClampSlots {
+            capacity,
+            counters: buffer(
+                "raster clamp counters",
+                U::STORAGE | U::COPY_DST | U::COPY_SRC,
+            ),
+            readback: buffer("raster clamp counters readback", U::MAP_READ | U::COPY_DST),
+        });
+        Ok(())
+    }
+
     fn ensure_resident(&mut self, dims: RasterDims) -> Result<(), ComputeError> {
         if matches!(&self.resident, Some(resident) if resident.dims == dims) {
             return Ok(());
@@ -267,7 +329,7 @@ impl GpuRaster {
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size);
         if grid_bytes > max_bytes {
-            return Err(ComputeError::Gpu(format!(
+            return Err(ComputeError::Unsupported(format!(
                 "a {grid_bytes}-byte raster exceeds the device's {max_bytes}-byte storage binding"
             )));
         }
@@ -294,16 +356,6 @@ impl GpuRaster {
                 grid_bytes,
                 U::MAP_READ | U::COPY_DST,
             ),
-            clamped: buffer(
-                "raster clamp counter",
-                4,
-                U::STORAGE | U::COPY_DST | U::COPY_SRC,
-            ),
-            clamped_readback: buffer(
-                "raster clamp counter readback",
-                4,
-                U::MAP_READ | U::COPY_DST,
-            ),
         });
         Ok(())
     }
@@ -320,7 +372,7 @@ impl GpuRaster {
                     .limits()
                     .max_storage_buffer_binding_size
             {
-                return Err(ComputeError::Gpu(format!(
+                return Err(ComputeError::Unsupported(format!(
                     "{} stamps exceed the device's storage binding",
                     prepared.len()
                 )));
@@ -347,25 +399,36 @@ impl GpuRaster {
     }
 
     /// Record the clamp-counter reset, the paint dispatches and the counter
-    /// readback copy. Returns the number of dispatches.
+    /// readback copy into the resident raster.
     fn encode_paint(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        resident: &Resident,
         prepared: &[PreparedStamp],
         op: PaintOp,
-    ) -> Result<u32, ComputeError> {
+    ) -> Result<EncodedPaint, ComputeError> {
+        let max_groups = self
+            .context
+            .device()
+            .limits()
+            .max_compute_workgroups_per_dimension;
+        let chunks = plan_dispatch_chunks(prepared, max_groups);
+        // At least one slot, so an empty paint still reads back a zero.
+        let slot_count = chunks.len().max(1);
+        self.ensure_clamp_slots(slot_count)?;
+        let clamp_bytes = slot_count as u64 * 4;
+
+        let resident = self.resident()?;
+        let slots = self.clamp_slots()?;
         let Some((stamps, _)) = &self.stamps else {
             return Err(ComputeError::InvalidInput("no stamp buffer".into()));
         };
         let device = self.context.device();
         let queue = self.context.queue();
-        let max_groups = device.limits().max_compute_workgroups_per_dimension;
-        let chunks = plan_dispatch_chunks(prepared, max_groups);
         let dims = resident.dims;
         let bind_groups: Vec<wgpu::BindGroup> = chunks
             .iter()
-            .map(|range| {
+            .enumerate()
+            .map(|(chunk, range)| {
                 let params: [u32; 8] = [
                     dims.width,
                     dims.height,
@@ -374,7 +437,7 @@ impl GpuRaster {
                     range.start,
                     range.end - range.start,
                     op.code(),
-                    0,
+                    chunk as u32,
                 ];
                 // Not `create_buffer_init`: it maps at creation and panics
                 // on a lost device instead of reporting it.
@@ -404,14 +467,14 @@ impl GpuRaster {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: resident.clamped.as_entire_binding(),
+                            resource: slots.counters.as_entire_binding(),
                         },
                     ],
                 })
             })
             .collect();
 
-        encoder.clear_buffer(&resident.clamped, 0, None);
+        encoder.clear_buffer(&slots.counters, 0, Some(clamp_bytes));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("raster paint"),
@@ -423,8 +486,11 @@ impl GpuRaster {
                 pass.dispatch_workgroups(range.end - range.start, 1, 1);
             }
         }
-        encoder.copy_buffer_to_buffer(&resident.clamped, 0, &resident.clamped_readback, 0, 4);
-        Ok(chunks.len() as u32)
+        encoder.copy_buffer_to_buffer(&slots.counters, 0, &slots.readback, 0, clamp_bytes);
+        Ok(EncodedPaint {
+            dispatch_count: chunks.len() as u32,
+            clamp_bytes,
+        })
     }
 }
 
@@ -448,6 +514,14 @@ fn le_u32(bytes: &[u8]) -> u32 {
     let mut word = [0; 4];
     word.copy_from_slice(&bytes[..4]);
     u32::from_le_bytes(word)
+}
+
+/// Sum little-endian u32 per-chunk counters without wrapping.
+fn sum_counters(bytes: &[u8]) -> u64 {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u64::from(le_u32(chunk)))
+        .sum()
 }
 
 /// Copy little-endian device words into host words. Mapped ranges are

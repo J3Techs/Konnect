@@ -124,14 +124,50 @@ fn device_loss_reruns_on_the_cpu_and_latches() {
 }
 
 #[test]
-fn auto_selection_picks_the_gpu_and_records_its_evidence() {
-    if gpu_or_skip("auto_selection_picks_the_gpu_and_records_its_evidence").is_none() {
+fn auto_selection_picks_a_hardware_gpu_and_records_its_evidence() {
+    let Some(gpu) = gpu_or_skip("auto_selection_picks_a_hardware_gpu_and_records_its_evidence")
+    else {
         return;
-    }
+    };
+    let software = gpu.context().probe().is_software();
+    drop(gpu);
     let selection =
         konnect_route_gpu::select_raster_backend(konnect_route_gpu::GpuPreference::Auto).unwrap();
+    let adapter = selection.report.adapter.clone().unwrap();
+    assert!(!adapter.name.is_empty());
+    if software {
+        // lavapipe and friends are slower than rayon: auto must refuse them.
+        assert_eq!(selection.report.selected, "cpu");
+        assert!(selection.report.reason.contains("software"));
+        return;
+    }
     assert_eq!(selection.report.selected, "wgpu");
     assert_eq!(selection.backend.backend_name(), "wgpu");
     assert!(selection.report.smoke_ms.is_some());
-    assert!(!selection.report.adapter.unwrap().name.is_empty());
+}
+
+#[test]
+fn clamp_counts_sum_across_dispatch_chunks() {
+    let Some(mut gpu) = gpu_or_skip("clamp_counts_sum_across_dispatch_chunks") else {
+        return;
+    };
+    // More stamps than one dispatch takes, all on one cell: every chunk
+    // saturates it and counts clamps into its own slot.
+    let dims = RasterDims::new(8, 4, 1).unwrap();
+    let stamps = vec![Stamp::circle([8, 8], 0, 0, 0); 140_000];
+    let prepared = prepare_stamps(dims, &stamps).unwrap();
+    let mut gpu_grid = CounterGrid::new(dims);
+    let stats = gpu
+        .paint_round_trip(&mut gpu_grid, &prepared, PaintOp::Paint)
+        .unwrap();
+    assert!(
+        stats.dispatch_count >= 3,
+        "{} dispatches",
+        stats.dispatch_count
+    );
+    let mut cpu_grid = CounterGrid::new(dims);
+    let cpu = CpuRaster::new().paint_prepared(&mut cpu_grid, &prepared, PaintOp::Paint);
+    assert_eq!(cpu.clamped_events, 140_000 - 255);
+    assert_eq!(stats.report, cpu);
+    assert_eq!(gpu_grid, cpu_grid);
 }

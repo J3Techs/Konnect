@@ -124,6 +124,15 @@ fn select_gpu(
     let attempt = (|| {
         let context = crate::gpu::GpuContext::new()?;
         adapter = Some(context.probe().clone());
+        // A software rasterizer (lavapipe, llvmpipe, WARP) is slower than
+        // rayon on the same cores. Only an explicit `wgpu` request, as the
+        // lavapipe parity job makes, may select one.
+        if preference == GpuPreference::Auto && context.probe().is_software() {
+            return Err(ComputeError::Gpu(format!(
+                "adapter '{}' is a software rasterizer",
+                context.probe().name
+            )));
+        }
         let mut raster = crate::gpu::GpuRaster::new(context)?;
         let smoke = raster.smoke()?;
         Ok::<_, ComputeError>((raster, smoke))
@@ -208,10 +217,15 @@ impl RasterCompute for LatchingRaster {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu.as_mut() {
             match gpu.paint(grid, stamps, op) {
-                Err(e) if e.is_gpu_failure() => {
+                Err(e) if e.poisons_gpu() => {
                     tracing::warn!(error = %e, "GPU raster failed; rerunning on the CPU and latching to it");
-                    self.gpu = None;
+                    if let Some(gpu) = self.gpu.take() {
+                        retire_off_thread(gpu);
+                    }
                     self.latch_reason = Some(e.to_string());
+                }
+                Err(e) if e.is_gpu_failure() => {
+                    tracing::debug!(error = %e, "batch too big for the GPU; running it on the CPU");
                 }
                 result => return result,
             }
@@ -220,9 +234,66 @@ impl RasterCompute for LatchingRaster {
     }
 }
 
+/// Drop a failed backend on a detached thread.
+///
+/// Dropping a `GpuRaster` drops its wgpu `Queue`, and wgpu-core's
+/// `Queue::drop` waits for the device to go idle with no timeout (and
+/// panics on any error but a lost device). After a wait timeout that
+/// would stall the routing thread until the GPU finishes or the TDR
+/// watchdog fires, so the latch hands it to a thread that may block or
+/// panic on its own. If no thread can be spawned the backend is leaked
+/// instead: a stuck device is never waited on by the caller.
+#[cfg(any(feature = "gpu", test))]
+fn retire_off_thread<T: Send + 'static>(retired: T) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(retired)));
+    let for_thread = std::sync::Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("konnect-gpu-retire".to_string())
+        .spawn(move || {
+            let retired = for_thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(retired);
+        });
+    if spawned.is_err() {
+        let retired = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        std::mem::forget(retired);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value whose drop blocks until released, like a queue waiting on a
+    /// hung device.
+    struct SlowDrop {
+        release: std::sync::mpsc::Receiver<()>,
+        dropped: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            let _ = self.release.recv();
+            let _ = self.dropped.send(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn retiring_a_backend_never_blocks_the_caller() {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
+        retire_off_thread(SlowDrop {
+            release: release_rx,
+            dropped: dropped_tx,
+        });
+        // Reaching this line at all means the caller did not wait on the
+        // drop; it is still blocked until released.
+        assert!(dropped.try_recv().is_err());
+        release.send(()).unwrap();
+        let dropped_on = dropped
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(dropped_on, std::thread::current().id());
+    }
 
     #[test]
     fn preference_parses_the_documented_values() {

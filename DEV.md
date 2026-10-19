@@ -419,6 +419,24 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `konnect-schematic-editor` tests | Typed schematic model + round-tripping |
 | `konnect-ipc` unit tests | Protobuf builders, client message construction, rigid-body child transform |
 | `crates/konnect/tests/` | Protocol over stdio, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCAD tests |
+| `konnect-route-gpu` tests | Raster layout, the rayon span and per-cell fills against a brute-force oracle, WGSL validation (naga); with `--features gpu`, GPU-vs-CPU bit parity on a real adapter |
+
+`konnect-route-gpu` is the native router's raster compute. Its wgpu twin is behind the
+off-by-default `gpu` feature; the `konnect` binary does not link it. Two environment
+variables control it:
+
+- `KONNECT_GPU=auto|off|wgpu` picks the raster backend at run time. `auto` (the default,
+  also used when unset) takes a hardware Vulkan adapter (Metal on Apple) that passes a
+  500 ms smoke kernel checked against the CPU, and otherwise the CPU; it never picks a
+  software rasterizer such as lavapipe. `off` always uses the CPU. `wgpu` requires the GPU
+  and fails when it is unusable. A GPU failure mid-run reruns the batch on the CPU and
+  stays on the CPU.
+- `KONNECT_REQUIRE_GPU=1` makes the `--features gpu` parity tests fail instead of skipping
+  when no adapter is usable (for a GPU or lavapipe CI job).
+
+CI lints the `gpu` feature (`cargo clippy -p konnect-route-gpu --all-targets --features gpu`)
+but runs no GPU tests. Run them locally with
+`KONNECT_REQUIRE_GPU=1 cargo test -p konnect-route-gpu --features gpu`.
 
 `schematic-viewer` is **excluded from the workspace** (`Cargo.toml`'s `[workspace] exclude`) since
 it's a Tauri app built separately, so `cargo test --workspace` never touches it. **CI does**: the

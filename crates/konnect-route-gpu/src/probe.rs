@@ -30,3 +30,29 @@ pub struct AdapterProbe {
     pub max_compute_invocations_per_workgroup: u32,
     pub max_compute_workgroups_per_dimension: u32,
 }
+
+impl AdapterProbe {
+    /// True for a CPU-emulated adapter (wgpu's `DeviceType::Cpu`, which is
+    /// how lavapipe and llvmpipe report themselves).
+    pub fn is_software(&self) -> bool {
+        self.device_type == "Cpu"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_cpu_device_type_counts_as_software() {
+        let mut probe = AdapterProbe {
+            device_type: "Cpu".to_string(),
+            ..Default::default()
+        };
+        assert!(probe.is_software());
+        for hardware in ["DiscreteGpu", "IntegratedGpu", "VirtualGpu", "Other"] {
+            probe.device_type = hardware.to_string();
+            assert!(!probe.is_software(), "{hardware}");
+        }
+    }
+}

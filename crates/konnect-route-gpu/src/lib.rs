@@ -5,12 +5,13 @@
 //! decremented when it is ripped up. This crate owns that one kernel in two
 //! implementations that must agree **bit for bit**:
 //!
-//! - [`CpuRaster`], the rayon reference. It is always built and is the
-//!   oracle every other backend is checked against.
+//! - [`CpuRaster`], the rayon backend. It is always built, its default
+//!   scanline span fill is the production CPU path, and it is the oracle
+//!   every other backend is checked against.
 //! - `GpuRaster` (feature `gpu`), a wgpu/WGSL compute twin on the Vulkan
 //!   backend (Metal on Apple). It exists to measure whether GPU raster
-//!   maintenance can pay at all on DB1's scale; nothing in the router
-//!   depends on it.
+//!   maintenance can pay at all on a large, dense board; nothing in the
+//!   router depends on it.
 //!
 //! # Layout
 //!
@@ -60,7 +61,7 @@ pub mod synthetic;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
-pub use cpu::CpuRaster;
+pub use cpu::{CpuFill, CpuRaster};
 pub use layout::{
     plan_dispatch_chunks, prepare_stamps, CounterGrid, PaintOp, PreparedStamp, RasterDims, Stamp,
     COST_DIAGONAL, COST_STRAIGHT, MAX_GRID_SIDE_CELLS, MAX_LAYERS, MAX_RADIUS_Q4,
@@ -94,6 +95,11 @@ pub enum ComputeError {
     /// parity mismatch). The caller may rerun the batch on the CPU.
     #[error("GPU raster backend failed: {0}")]
     Gpu(String),
+    /// The batch is valid but exceeds what this device can hold (a raster
+    /// or stamp list larger than its storage binding). The device is
+    /// healthy: the caller runs this batch on the CPU and keeps the GPU.
+    #[error("batch exceeds the GPU's limits: {0}")]
+    Unsupported(String),
     /// The device was lost (TDR, driver reset or destroy). The caller must
     /// rerun the batch on the CPU and must not use the GPU again.
     #[error("GPU device lost: {0}")]
@@ -104,6 +110,15 @@ impl ComputeError {
     /// True when the batch may be rerun on the CPU: the failure was the
     /// GPU's, not the input's.
     pub fn is_gpu_failure(&self) -> bool {
+        matches!(
+            self,
+            ComputeError::Gpu(_) | ComputeError::DeviceLost(_) | ComputeError::Unsupported(_)
+        )
+    }
+
+    /// True when the GPU must not be used again: a real failure, not a
+    /// batch that was merely too big for it.
+    pub fn poisons_gpu(&self) -> bool {
         matches!(self, ComputeError::Gpu(_) | ComputeError::DeviceLost(_))
     }
 }

@@ -20,7 +20,10 @@ struct Params {
     stamp_base: u32,
     stamp_count: u32,
     op: u32, // 0 = paint, 1 = unpaint
-    pad0: u32,
+    // This dispatch's slot in `clamped`. One u32 per dispatch cannot wrap
+    // (a dispatch visits at most 4M words of 4 cells); the host sums the
+    // slots in u64, as the CPU counts.
+    chunk: u32,
 }
 
 // Mirrors layout::PreparedStamp (48 bytes).
@@ -42,7 +45,7 @@ struct Stamp {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> stamps: array<Stamp>;
 @group(0) @binding(2) var<storage, read_write> grid: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> clamped: atomic<u32>;
+@group(0) @binding(3) var<storage, read_write> clamped: array<atomic<u32>>;
 
 const WORKGROUP_SIZE: u32 = 256u;
 const Q4_PER_CELL: i32 = 16;
@@ -117,7 +120,7 @@ fn apply_word(index: u32, mask: u32) {
         }
         if (done) {
             if (clamped_here != 0u) {
-                atomicAdd(&clamped, clamped_here);
+                atomicAdd(&clamped[params.chunk], clamped_here);
             }
             return;
         }
