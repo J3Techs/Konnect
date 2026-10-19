@@ -62,6 +62,9 @@ pub struct KernelBackend {
     /// With [`Self::min_run`], the nets (by `NetId` index) whose jobs get
     /// the minimum run; `None` flags every job. See [`min_run_nets`].
     pub min_run_nets: Option<Arc<Vec<bool>>>,
+    /// With [`Self::min_run`], search a job that found no path under its
+    /// minimum run again without it (default on).
+    pub min_run_retry: bool,
 }
 
 impl KernelBackend {
@@ -70,6 +73,7 @@ impl KernelBackend {
             config,
             min_run: false,
             min_run_nets: None,
+            min_run_retry: true,
         }
     }
 
@@ -115,15 +119,38 @@ impl SearchBackend for KernelBackend {
             None => true,
             Some(nets) => nets.get(net as usize).copied().unwrap_or(false),
         };
-        let flag = self.min_run && pool.jobs.iter().any(|j| wants(j.net));
+        let flag = self.min_run && batch.jobs.iter().any(|&j| wants(pool.jobs[j as usize].net));
         let outcomes = if flag {
             let mut flagged = pool.clone();
-            for j in &mut flagged.jobs {
-                if wants(j.net) {
-                    j.flags |= JOB_MIN_RUN;
+            for &j in &batch.jobs {
+                let job = &mut flagged.jobs[j as usize];
+                if wants(job.net) {
+                    job.flags |= JOB_MIN_RUN;
                 }
             }
-            search_batch_with(batch, &flagged, &ctx, params).outcomes
+            let mut outcomes = search_batch_with(batch, &flagged, &ctx, params).outcomes;
+            if self.min_run_retry {
+                // A minimum run can wall in a tight escape: search those
+                // jobs again without it, so the rule costs no connection
+                // (S6 then merges what short segments remain).
+                let retry: Vec<usize> = (0..batch.jobs.len())
+                    .filter(|&k| {
+                        !matches!(outcomes[k], SearchOutcome::Found(_))
+                            && wants(pool.jobs[batch.jobs[k] as usize].net)
+                    })
+                    .collect();
+                if !retry.is_empty() {
+                    let again = Batch {
+                        index: batch.index,
+                        jobs: retry.iter().map(|&k| batch.jobs[k]).collect(),
+                    };
+                    let redo = search_batch_with(&again, pool, &ctx, params).outcomes;
+                    for (k, o) in retry.into_iter().zip(redo) {
+                        outcomes[k] = o;
+                    }
+                }
+            }
+            outcomes
         } else {
             search_batch_with(batch, pool, &ctx, params).outcomes
         };
@@ -274,6 +301,53 @@ mod tests {
         assert_eq!(longest, 100_000);
         assert_eq!(nets.len(), board.nets.len());
         assert!(nets.iter().all(|&n| n));
+    }
+
+    #[test]
+    fn a_search_its_minimum_run_walls_in_is_tried_again_without_it() {
+        use crate::api::{LayerId, ProfileId, TileId};
+        use crate::compute::JobDescriptor;
+        let w = Window::new(Point::new(0, 0), 50_000, 60, 60).unwrap();
+        let mut r = TileRaster::new(TileId(0), LayerId(0), ProfileId(0), w);
+        derive_masks_uniform(&mut r, None);
+        let stacks = [TileStack {
+            tile: TileId(0),
+            profile: ProfileId(0),
+            window: w,
+            layers: vec![r],
+        }];
+        let open = |col, row| JobNode {
+            heading_mask: 0xff,
+            ..node(col, row, 0)
+        };
+        let mut pool = JobPool::default();
+        let job = JobDescriptor {
+            cost_bound: u32::MAX,
+            ..Default::default()
+        };
+        let i = pool.push(job, &[open(5, 5)], &[open(50, 40)], &[]);
+        let batch = Batch {
+            index: 0,
+            jobs: vec![i],
+        };
+        // Longer than the kernel's run field counts: no path keeps it.
+        let mut b = KernelBackend::new(SearchConfig {
+            min_run_nm: 800_000,
+            ..SearchConfig::default()
+        });
+        b.min_run = true;
+        b.min_run_retry = false;
+        let params = CostParams::default();
+        let o = b.search_batch(&batch, &pool, &stacks, &params);
+        assert!(matches!(o[0], SearchOutcome::Unreachable { .. }), "{o:?}");
+        b.min_run_retry = true;
+        let o = b.search_batch(&batch, &pool, &stacks, &params);
+        assert!(matches!(o[0], SearchOutcome::Found(_)), "{o:?}");
+        // A net the rule does not cover is never flagged at all.
+        b.min_run_retry = false;
+        b.min_run_nets = Some(Arc::new(vec![false]));
+        let o = b.search_batch(&batch, &pool, &stacks, &params);
+        assert!(matches!(o[0], SearchOutcome::Found(_)), "{o:?}");
     }
 
     #[test]

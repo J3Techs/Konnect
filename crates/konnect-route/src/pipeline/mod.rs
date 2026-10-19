@@ -112,8 +112,12 @@ pub struct PipelineSettings {
     /// of nets with a `track_segment_length` rule, at the longest such
     /// minimum ([`backend::min_run_nets`]), so detail draws no segment the
     /// rule refuses. When any net has such a rule, that longest minimum
-    /// replaces any `min_run_nm` set in [`Self::search`]. Off: S6 merges and
-    /// straightens short segments instead.
+    /// replaces any `min_run_nm` set in [`Self::search`]. A search that
+    /// finds no path under it is tried again without it
+    /// ([`KernelBackend::min_run_retry`]). On by default: on a dense real
+    /// board it left no short segment and no S7 finding after S6, against a
+    /// few of each with it off, for about as many routed connections. Off:
+    /// S6 merges and straightens short segments instead.
     pub search_min_run: bool,
     /// S6; `None` keeps the routed copper as negotiation drew it.
     pub optimize: Option<OptimizeOptions>,
@@ -145,7 +149,7 @@ impl Default for PipelineSettings {
             },
             tuning: NegotiationTuning::default(),
             search: KernelBackend::negotiation_config(),
-            search_min_run: false,
+            search_min_run: true,
             optimize: Some(OptimizeOptions::default()),
             guard_optimize: true,
             threads: 0,

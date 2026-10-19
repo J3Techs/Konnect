@@ -21,7 +21,7 @@
 //!   `KONNECT_PIPELINE_NO_OPTIMIZE=1`;
 //! - `KONNECT_PIPELINE_REFERENCE=1`: negotiation's reference search instead
 //!   of the kernel, for comparison;
-//! - `KONNECT_PIPELINE_MIN_RUN=1`: ask the kernel for minimum runs;
+//! - `KONNECT_PIPELINE_MIN_RUN=0|1`: minimum runs on rule nets (default on);
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
 //! - `KONNECT_PIPELINE_GRID_CORE_MM=w,h`: negotiation's grid tile core size;
@@ -142,7 +142,9 @@ fn pipeline_real_board_fixture() {
         "KONNECT_PIPELINE_ASTAR",
         u64::from(settings.search.astar_factor),
     ) as u32;
-    settings.search_min_run = env_on("KONNECT_PIPELINE_MIN_RUN");
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_MIN_RUN") {
+        settings.search_min_run = v.trim() == "1";
+    }
     if let Ok(v) = std::env::var("KONNECT_PIPELINE_GRID_CORE_MM") {
         let mm: Vec<f64> = v
             .split(',')
