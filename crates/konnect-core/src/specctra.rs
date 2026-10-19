@@ -45,6 +45,10 @@ pub(crate) struct ExportBundle {
     pub keepout_count: usize,
     pub plane_count: usize,
     pub plane_piece_count: usize,
+    /// The courtyard clearance rules the DSN carries, and what they became.
+    pub courtyard_clearances: Vec<CourtyardClearanceReport>,
+    /// `class_class` scopes written for them.
+    pub class_pair_rule_count: usize,
 }
 
 /// Caller-supplied acknowledgements that widen the exported profile.
@@ -54,6 +58,31 @@ pub(crate) struct ExportOptions {
     /// that the router sees only net-class rules and KiCad DRC stays the
     /// authority for the custom ones.
     pub custom_rules_sha256: Option<String>,
+    /// Custom rules raising the clearance between items in one footprint's
+    /// courtyard, to lower into the DSN (see [`courtyard_clearance_rules`]).
+    pub courtyard_clearances: Vec<CourtyardClearance>,
+}
+
+/// A custom rule `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')`
+/// with `(constraint clearance (min X))`: copper inside footprint REF's
+/// courtyard keeps at least X from other copper there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CourtyardClearance {
+    pub rule_name: String,
+    pub reference: String,
+    pub clearance_um: i64,
+}
+
+/// One represented courtyard rule in the export answer.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CourtyardClearanceReport {
+    #[serde(flatten)]
+    pub rule: CourtyardClearance,
+    /// Nets with a pad on the footprint whose class clearance is below the
+    /// rule's: the nets the DSN gives the field clearance.
+    pub raised_net_count: usize,
+    /// False when the board has no footprint with that reference.
+    pub footprint_found: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -177,13 +206,49 @@ struct LockedRouting {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RuleKey {
     track_width_um: i64,
+    /// The net-class clearance KiCad reports.
     clearance_um: i64,
     via_diameter_um: i64,
     via_drill_um: i64,
+    /// Courtyard fields (reference, clearance) that raise this class's
+    /// clearance against the other classes in the same field. Empty for a
+    /// board without courtyard rules, so its classes are unchanged.
+    fields: Vec<(String, i64)>,
+}
+
+impl RuleKey {
+    /// The clearance the DSN class carries: against itself, its own nets
+    /// share every field.
+    fn dsn_clearance_um(&self) -> i64 {
+        self.fields
+            .iter()
+            .map(|(_, clearance)| *clearance)
+            .fold(self.clearance_um, i64::max)
+    }
+
+    /// The key of the via padstack, which fields do not change.
+    fn via_key(&self) -> RuleKey {
+        RuleKey {
+            fields: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// The clearance two classes need between them: the larger class
+    /// clearance, raised by every field both are in.
+    fn pair_clearance_um(&self, other: &RuleKey) -> i64 {
+        self.fields
+            .iter()
+            .filter(|field| other.fields.contains(field))
+            .map(|(_, clearance)| *clearance)
+            .fold(self.clearance_um.max(other.clearance_um), i64::max)
+    }
 }
 
 type RuleGroups = BTreeMap<RuleKey, Vec<String>>;
 type NetClassNames = BTreeMap<String, String>;
+/// Each net's courtyard fields, as (reference, clearance) pairs.
+type NetFields = BTreeMap<String, Vec<(String, i64)>>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
@@ -340,7 +405,17 @@ pub(crate) fn export_dsn_with(
         pins.dedup();
     }
 
-    let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
+    let (net_fields, mut courtyard_clearances) =
+        courtyard_fields(&footprints, &options.courtyard_clearances);
+    let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules, &net_fields)?;
+    for report in &mut courtyard_clearances {
+        let field = (report.rule.reference.clone(), report.rule.clearance_um);
+        report.raised_net_count = class_nets
+            .iter()
+            .filter(|(rule, _)| rule.fields.contains(&field))
+            .map(|(_, nets)| nets.len())
+            .sum();
+    }
 
     let mut padstack_keys = BTreeSet::new();
     for footprint in &footprints {
@@ -354,7 +429,7 @@ pub(crate) fn export_dsn_with(
         .map(|(index, key)| (key, format!("konnect_pad_{:04}", index + 1)))
         .collect();
 
-    let via_keys: BTreeSet<RuleKey> = class_nets.keys().cloned().collect();
+    let via_keys: BTreeSet<RuleKey> = class_nets.keys().map(RuleKey::via_key).collect();
     let via_names: BTreeMap<RuleKey, String> = via_keys
         .into_iter()
         .enumerate()
@@ -384,7 +459,8 @@ pub(crate) fn export_dsn_with(
         &locked_routing,
         &planes,
     )?;
-    let dsn = serialize_and_validate(pcb)?;
+    let class_pairs = class_pair_rules(&class_nets);
+    let dsn = add_class_pair_rules(serialize_and_validate(pcb)?, &class_pairs)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
     let manifest = build_manifest(
         board_path,
@@ -427,6 +503,8 @@ pub(crate) fn export_dsn_with(
             .sum(),
         plane_count: planes.len(),
         plane_piece_count: planes.iter().map(|plane| plane.pieces.len()).sum(),
+        courtyard_clearances,
+        class_pair_rule_count: class_pairs.len(),
     })
 }
 
@@ -487,6 +565,13 @@ pub(crate) fn adopt_native_dsn(
     native_dsn: String,
 ) -> Result<ExportBundle> {
     validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
+    if baseline.class_pair_rule_count > 0 {
+        bail!(
+            "KiCad's native DSN cannot carry the courtyard clearance rules in Konnect's DSN \
+             ({} class_class rules)",
+            baseline.class_pair_rule_count
+        );
+    }
     let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Konnect baseline DSN")?;
     let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
     let baseline_identity = dsn_identity(&baseline_tree)?;
@@ -1952,20 +2037,67 @@ fn enclosing_diameter_um(geometry: &PadGeometry) -> i64 {
     (2.0 * tenths_radius / DSN_RESOLUTION as f64).ceil() as i64
 }
 
+/// The courtyard fields each net is in: a net with a pad on the rule's
+/// footprint is in that footprint's field. Items of other nets inside the
+/// courtyard are not seen; that is the approximation a net-based DSN rule
+/// allows, and KiCad DRC remains the authority for it.
+fn courtyard_fields(
+    footprints: &[FootprintModel],
+    rules: &[CourtyardClearance],
+) -> (NetFields, Vec<CourtyardClearanceReport>) {
+    let mut net_fields = NetFields::new();
+    let mut reports = Vec::new();
+    for rule in rules {
+        let footprint = footprints
+            .iter()
+            .find(|footprint| footprint.reference == rule.reference);
+        for net in footprint
+            .into_iter()
+            .flat_map(|footprint| &footprint.pads)
+            .filter_map(|pad| pad.net.as_ref())
+        {
+            let fields = net_fields.entry(net.clone()).or_default();
+            let field = (rule.reference.clone(), rule.clearance_um);
+            if !fields.contains(&field) {
+                fields.push(field);
+            }
+        }
+        reports.push(CourtyardClearanceReport {
+            rule: rule.clone(),
+            raised_net_count: 0,
+            footprint_found: footprint.is_some(),
+        });
+    }
+    for fields in net_fields.values_mut() {
+        fields.sort();
+    }
+    (net_fields, reports)
+}
+
 fn normalize_rules(
     net_pins: &BTreeMap<String, Vec<String>>,
     effective_rules: &IpcEffectiveRoutingRules,
+    net_fields: &NetFields,
 ) -> Result<(RuleGroups, NetClassNames)> {
     let mut class_nets: BTreeMap<RuleKey, Vec<String>> = BTreeMap::new();
     for net in net_pins.keys() {
         let rules = effective_rules.get(net).with_context(|| {
             format!("KiCad returned no effective routing rules for net '{net}'")
         })?;
+        let clearance_um = non_negative_um(rules.clearance_mm, "clearance")?;
         let key = RuleKey {
             track_width_um: positive_um(rules.track_width_mm, "track width")?,
-            clearance_um: non_negative_um(rules.clearance_mm, "clearance")?,
+            clearance_um,
             via_diameter_um: positive_um(rules.via_diameter_mm, "via diameter")?,
             via_drill_um: positive_um(rules.via_drill_mm, "via drill")?,
+            // A field at or below the net's own clearance changes nothing.
+            fields: net_fields
+                .get(net)
+                .into_iter()
+                .flatten()
+                .filter(|(_, field_um)| *field_um > clearance_um)
+                .cloned()
+                .collect(),
         };
         if key.via_drill_um >= key.via_diameter_um {
             bail!(
@@ -1987,6 +2119,187 @@ fn normalize_rules(
         }
     }
     Ok((class_nets, net_classes))
+}
+
+/// `class_class` clearances for every pair of classes where one is in a
+/// courtyard field: Specctra's targeted class-to-class rule. A field class
+/// carries the raised clearance itself (so it also holds within the class),
+/// and Freerouting widens a class's clearance against every other class
+/// too; each pair is therefore set to exactly what it needs, which lowers a
+/// field class back to the ordinary clearance against classes outside its
+/// field and keeps the raise inside it. Names follow the classes' order.
+fn class_pair_rules(class_nets: &RuleGroups) -> Vec<(String, String, i64)> {
+    let classes = class_nets.keys().enumerate().collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for (position, (first_index, first)) in classes.iter().enumerate() {
+        for (second_index, second) in &classes[position + 1..] {
+            if first.fields.is_empty() && second.fields.is_empty() {
+                continue;
+            }
+            pairs.push((
+                format!("konnect_class_{:04}", first_index + 1),
+                format!("konnect_class_{:04}", second_index + 1),
+                first.pair_clearance_um(second),
+            ));
+        }
+    }
+    pairs
+}
+
+/// Insert the `class_class` scopes at the end of the DSN's network scope.
+/// Topola's model has no class_class, so they are added to the text it
+/// wrote and validated, and the result is checked structurally.
+fn add_class_pair_rules(dsn: String, pairs: &[(String, String, i64)]) -> Result<String> {
+    if pairs.is_empty() {
+        return Ok(dsn);
+    }
+    let start = dsn
+        .find("(network")
+        .context("generated DSN has no network scope")?;
+    let end = matching_close(&dsn, start).context("generated DSN network scope is not closed")?;
+    let mut scopes = String::new();
+    for (first, second, clearance_um) in pairs {
+        scopes.push_str(&format!(
+            "    (class_class (classes {first} {second}) (rule (clearance {clearance_um})))\n"
+        ));
+    }
+    let before = dsn[..end].trim_end_matches([' ', '\t']);
+    let separator = if before.ends_with('\n') { "" } else { "\n" };
+    let text = format!("{before}{separator}{scopes}  {}", &dsn[end..]);
+
+    let tree = parse_dsn_sexp(&text).context("parse DSN with class_class rules")?;
+    let written = tree
+        .find("network")
+        .map_or(0, |network| network.find_all("class_class").len());
+    if written != pairs.len() {
+        bail!(
+            "DSN holds {written} class_class rules after insertion, expected {}",
+            pairs.len()
+        );
+    }
+    Ok(text)
+}
+
+/// The byte index of the `)` closing the list that opens at `open`.
+/// Specctra quotes with `"` and has no escapes inside a quoted token.
+fn matching_close(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (index, byte) in text.bytes().enumerate().skip(open) {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The custom rules in a `.kicad_dru` that a DSN can carry as courtyard
+/// fields: no layer clause, the condition exactly
+/// `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')` (either
+/// order, either quote, one literal reference) and a minimum clearance.
+/// Every other rule is left to KiCad DRC, as before.
+pub(crate) fn courtyard_clearance_rules(dru: &str) -> Result<Vec<CourtyardClearance>> {
+    // KiCad allows `#` comment lines, which the S-expression parser does not.
+    let text = dru
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tree = parse_sexp(&format!("(kicad_dru\n{text}\n)")).context("parse .kicad_dru rules")?;
+    let mut rules = Vec::new();
+    for rule in tree.find_all("rule") {
+        if rule.find("layer").is_some() {
+            continue;
+        }
+        let Some(reference) = rule
+            .find("condition")
+            .and_then(|condition| condition.get(1))
+            .and_then(SexpNode::as_str)
+            .and_then(courtyard_pair_reference)
+        else {
+            continue;
+        };
+        let clearance = rule
+            .find_all("constraint")
+            .into_iter()
+            .filter(|constraint| constraint.get(1).and_then(SexpNode::as_str) == Some("clearance"))
+            .filter_map(|constraint| constraint.find("min"))
+            .filter_map(|min| min.get(1).and_then(SexpNode::as_str))
+            .filter_map(dru_length_um)
+            .max();
+        let Some(clearance_um) = clearance else {
+            continue;
+        };
+        rules.push(CourtyardClearance {
+            rule_name: rule
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            reference,
+            clearance_um,
+        });
+    }
+    Ok(rules)
+}
+
+/// REF when `condition` is `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')`.
+fn courtyard_pair_reference(condition: &str) -> Option<String> {
+    let mut compact = condition
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    while compact.starts_with('(')
+        && compact.ends_with(')')
+        && matching_close(&compact, 0) == Some(compact.len() - 1)
+    {
+        compact = compact[1..compact.len() - 1].to_string();
+    }
+    let parts = compact.split("&&").collect::<Vec<_>>();
+    let [first, second] = parts.as_slice() else {
+        return None;
+    };
+    let side = |part: &str| -> Option<(char, String)> {
+        let part = part.trim_start_matches('(').trim_end_matches(')');
+        let (item, call) = part.split_once(".intersectsCourtyard(")?;
+        let item = match item {
+            "A" => 'A',
+            "B" => 'B',
+            _ => return None,
+        };
+        let quote = call.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+        let reference = call.strip_prefix(quote)?.strip_suffix(quote)?;
+        // Wildcards name several footprints; a literal names one.
+        if reference.is_empty() || reference.contains(['*', '?', quote]) {
+            return None;
+        }
+        Some((item, reference.to_string()))
+    };
+    let (first_item, first_reference) = side(first)?;
+    let (second_item, second_reference) = side(second)?;
+    (first_item != second_item && first_reference == second_reference).then_some(first_reference)
+}
+
+/// A DRU length such as `0.15mm`, `6mil` or `0.006in`, in micrometres.
+fn dru_length_um(value: &str) -> Option<i64> {
+    let (number, um_per_unit) = [
+        ("mm", 1_000.0),
+        ("mil", 25.4),
+        ("in", 25_400.0),
+        ("um", 1.0),
+    ]
+    .into_iter()
+    .find_map(|(unit, scale)| value.strip_suffix(unit).map(|number| (number, scale)))?;
+    let um = number.trim().parse::<f64>().ok()? * um_per_unit;
+    (um.is_finite() && um >= 0.0).then(|| um.round() as i64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2137,12 +2450,12 @@ fn build_pcb(
             name: format!("konnect_class_{:04}", index + 1),
             nets: nets.clone(),
             circuit: dsn::Circuit {
-                use_via: via_names[rule].clone(),
+                use_via: via_names[&rule.via_key()].clone(),
             },
             rule: dsn::Rule {
                 width: rule.track_width_um as f32,
                 clearances: vec![dsn::Clearance {
-                    value: rule.clearance_um as f32,
+                    value: rule.dsn_clearance_um() as f32,
                     r#type: None,
                 }],
             },
@@ -2184,7 +2497,7 @@ fn build_pcb(
                 .with_context(|| format!("locked via uses unknown routing net '{}'", via.net))?;
             let name =
                 if via.diameter_um == rule.via_diameter_um && via.drill_um == rule.via_drill_um {
-                    via_names[*rule].clone()
+                    via_names[&rule.via_key()].clone()
                 } else {
                     fixed_via_names[&(via.diameter_um, via.drill_um)].clone()
                 };
@@ -3319,6 +3632,7 @@ mod tests {
         std::fs::write(&board, MULTILAYER).unwrap();
         let options = ExportOptions {
             custom_rules_sha256: Some("ab".repeat(32)),
+            ..Default::default()
         };
         let export = export_dsn_with(&board, MULTILAYER, &multilayer_rules(), &options).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
@@ -3339,5 +3653,311 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("supported routing profile"), "{error}");
+    }
+
+    #[test]
+    fn only_literal_courtyard_pair_clearance_rules_are_read_from_the_dru() {
+        let dru = r#"(version 1)
+# A field around one part.
+(rule "Field"
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.15mm)))
+(rule "Field, reversed and bracketed"
+  (condition "( B.intersectsCourtyard('Q2') )&&(A.intersectsCourtyard('Q2'))")
+  (constraint clearance (min 6mil)))
+(rule "Layer scoped" (layer "F.Cu")
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.2mm)))
+(rule "Wildcard"
+  (condition "A.intersectsCourtyard('U*') && B.intersectsCourtyard('U*')")
+  (constraint clearance (min 0.2mm)))
+(rule "One side"
+  (condition "A.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.2mm)))
+(rule "Two parts"
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U8')")
+  (constraint clearance (min 0.2mm)))
+(rule "Negated"
+  (condition "A.intersectsCourtyard('U7') && !B.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.2mm)))
+(rule "Width only"
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
+  (constraint track_width (min 0.2mm)))
+(rule "No unit"
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.2)))
+"#;
+        assert_eq!(
+            courtyard_clearance_rules(dru).unwrap(),
+            vec![
+                CourtyardClearance {
+                    rule_name: "Field".to_string(),
+                    reference: "U7".to_string(),
+                    clearance_um: 150,
+                },
+                CourtyardClearance {
+                    rule_name: "Field, reversed and bracketed".to_string(),
+                    reference: "Q2".to_string(),
+                    clearance_um: 152,
+                },
+            ]
+        );
+        assert_eq!(
+            courtyard_pair_reference(
+                r#"A.intersectsCourtyard("U1") && B.intersectsCourtyard("U1")"#
+            ),
+            Some("U1".to_string())
+        );
+        assert_eq!(
+            courtyard_pair_reference("A.intersectsCourtyard('U1') || B.intersectsCourtyard('U1')"),
+            None
+        );
+        assert_eq!(dru_length_um("0.006in"), Some(152));
+        assert_eq!(dru_length_um("-0.1mm"), None);
+    }
+
+    /// The two-resistor board with R2 moved onto two nets of its own, one of
+    /// them in a wider class.
+    fn field_board() -> (String, IpcEffectiveRoutingRules) {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let split = source.find("\"Reference\" \"R2\"").unwrap();
+        let (r1, r2) = source.split_at(split);
+        let board = format!(
+            "{r1}{}",
+            r2.replace("(net \"GND\")", "(net \"SIG_A\")")
+                .replace("(net \"VCC\")", "(net \"SIG_B\")")
+        );
+        let mut rules = rules();
+        rules.insert("SIG_A".to_string(), rules["GND"].clone());
+        let mut wide = rules["GND"].clone();
+        wide.track_width_mm = Some(0.3);
+        rules.insert("SIG_B".to_string(), wide);
+        (board, rules)
+    }
+
+    fn field_options(rules: &[(&str, i64)]) -> ExportOptions {
+        ExportOptions {
+            courtyard_clearances: rules
+                .iter()
+                .map(|(reference, clearance_um)| CourtyardClearance {
+                    rule_name: format!("{reference} field"),
+                    reference: reference.to_string(),
+                    clearance_um: *clearance_um,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Every `(class_class (classes A B) (rule (clearance X)))`, by pair.
+    fn class_pairs(dsn: &str) -> BTreeMap<(String, String), i64> {
+        let tree = parse_dsn_sexp(dsn).unwrap();
+        tree.find("network")
+            .unwrap()
+            .find_all("class_class")
+            .into_iter()
+            .map(|rule| {
+                let classes = rule.find("classes").unwrap();
+                let clearance = rule.find("rule").unwrap().find("clearance").unwrap();
+                (
+                    (
+                        dsn_atom(classes, 1, "class").unwrap().to_string(),
+                        dsn_atom(classes, 2, "class").unwrap().to_string(),
+                    ),
+                    dsn_integer(clearance, 1, "clearance").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn class_clearances(dsn: &str) -> BTreeMap<String, (BTreeSet<String>, i64)> {
+        let tree = parse_dsn_sexp(dsn).unwrap();
+        dsn_identity(&tree)
+            .unwrap()
+            .classes
+            .into_iter()
+            .map(|(name, class)| (name, (class.nets, class.clearance)))
+            .collect()
+    }
+
+    #[test]
+    fn a_courtyard_rule_raises_clearance_only_between_the_footprints_nets() {
+        let (board, rules) = field_board();
+        let path = Path::new("board.kicad_pcb");
+        let export = export_dsn_with(path, &board, &rules, &field_options(&[("R2", 300)])).unwrap();
+
+        // R2's nets get the field clearance in classes of their own; the
+        // board default and R1's nets keep 0.2 mm.
+        let nets = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            class_clearances(&export.dsn),
+            BTreeMap::from([
+                (
+                    "konnect_class_0001".to_string(),
+                    (nets(&["GND", "VCC"]), 200)
+                ),
+                ("konnect_class_0002".to_string(), (nets(&["SIG_A"]), 300)),
+                ("konnect_class_0003".to_string(), (nets(&["SIG_B"]), 300)),
+            ])
+        );
+        let pcb = parse_dsn_sexp(&export.dsn).unwrap();
+        let structure_rule = pcb.find("structure").unwrap().find("rule").unwrap();
+        assert_eq!(
+            dsn_integer(structure_rule.find("clearance").unwrap(), 1, "clearance").unwrap(),
+            200
+        );
+        // Each pair is set to what it needs: the field inside, 0.2 across.
+        let pair = |a: &str, b: &str| (format!("konnect_class_{a}"), format!("konnect_class_{b}"));
+        assert_eq!(
+            class_pairs(&export.dsn),
+            BTreeMap::from([
+                (pair("0001", "0002"), 200),
+                (pair("0001", "0003"), 200),
+                (pair("0002", "0003"), 300),
+            ])
+        );
+        assert_eq!(export.class_pair_rule_count, 3);
+        assert_eq!(export.courtyard_clearances.len(), 1);
+        assert_eq!(export.courtyard_clearances[0].raised_net_count, 2);
+        assert!(export.courtyard_clearances[0].footprint_found);
+        // The field classes still use the class via; the manifest names
+        // each net's class.
+        assert_eq!(
+            pcb.find("structure")
+                .unwrap()
+                .find("via")
+                .unwrap()
+                .children()
+                .unwrap()
+                .len(),
+            3
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        let class_of = |net: &str| {
+            manifest["nets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == net)
+                .unwrap()["class_name"]
+                .clone()
+        };
+        assert_eq!(class_of("SIG_A"), "konnect_class_0002");
+        assert_eq!(class_of("GND"), "konnect_class_0001");
+    }
+
+    #[test]
+    fn courtyard_rules_that_change_nothing_leave_the_dsn_unchanged() {
+        let (board, rules) = field_board();
+        let path = Path::new("board.kicad_pcb");
+        let plain = export_dsn(path, &board, &rules).unwrap();
+        assert!(!plain.dsn.contains("class_class"));
+        assert!(plain.courtyard_clearances.is_empty());
+
+        // A missing footprint, and a field no tighter than the net classes.
+        let inert = export_dsn_with(
+            path,
+            &board,
+            &rules,
+            &field_options(&[("U99", 300), ("R2", 200)]),
+        )
+        .unwrap();
+        assert_eq!(inert.dsn, plain.dsn);
+        assert_eq!(inert.manifest, plain.manifest);
+        assert_eq!(inert.class_pair_rule_count, 0);
+        assert!(!inert.courtyard_clearances[0].footprint_found);
+        assert_eq!(inert.courtyard_clearances[1].raised_net_count, 0);
+    }
+
+    /// The courtyard rules of a real board, read from a fixture directory
+    /// outside the repository (`KONNECT_DB1_FIXTURE_DIR`, holding one
+    /// `.kicad_pcb` and its `.kicad_dru`). The saved board gives no
+    /// effective rules, so every net gets one uniform class here: the test
+    /// proves the lowering on a full-size board, not its clearances.
+    #[test]
+    fn a_real_boards_courtyard_rules_lower_into_its_dsn() {
+        let Some(dir) = std::env::var_os("KONNECT_DB1_FIXTURE_DIR").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: KONNECT_DB1_FIXTURE_DIR is not set");
+            return;
+        };
+        let find = |extension: &str| {
+            std::fs::read_dir(&dir).ok()?.find_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == extension).then_some(path)
+            })
+        };
+        let (Some(board), Some(dru)) = (find("kicad_pcb"), find("kicad_dru")) else {
+            eprintln!("skipped: no .kicad_pcb and .kicad_dru in {}", dir.display());
+            return;
+        };
+        let source = std::fs::read_to_string(&board).unwrap();
+        let rules = courtyard_clearance_rules(&std::fs::read_to_string(&dru).unwrap()).unwrap();
+        assert!(!rules.is_empty(), "the fixture board has a courtyard rule");
+
+        let tree = parse_sexp(&source).unwrap();
+        let net_table = top_level_net_table(&tree);
+        let uniform = IpcRoutingRules {
+            class_name: "Default".to_string(),
+            constituents: vec!["Default".to_string()],
+            track_width_mm: Some(0.1),
+            clearance_mm: Some(0.1),
+            via_diameter_mm: Some(0.45),
+            via_drill_mm: Some(0.2),
+        };
+        let mut effective = IpcEffectiveRoutingRules::new();
+        for footprint in tree.find_all("footprint") {
+            for pad in footprint.find_all("pad") {
+                if let Some(net) = pad.find("net").and_then(|net| resolve_net(net, &net_table)) {
+                    effective.insert(net, uniform.clone());
+                }
+            }
+        }
+        let options = ExportOptions {
+            custom_rules_sha256: Some("00".repeat(32)),
+            courtyard_clearances: rules,
+        };
+        let export = match export_dsn_with(&board, &source, &effective, &options) {
+            Ok(export) => export,
+            Err(error) => {
+                eprintln!("skipped: the fixture board is outside the export profile: {error:#}");
+                return;
+            }
+        };
+        for report in &export.courtyard_clearances {
+            eprintln!(
+                "{}: {} um, footprint found {}, {} nets raised",
+                report.rule.reference,
+                report.rule.clearance_um,
+                report.footprint_found,
+                report.raised_net_count
+            );
+        }
+        assert!(export
+            .courtyard_clearances
+            .iter()
+            .any(|report| report.footprint_found && report.raised_net_count > 0));
+        assert!(export.class_pair_rule_count > 0);
+        // A field class against the rest keeps the uniform clearance.
+        let pairs = class_pairs(&export.dsn);
+        assert_eq!(pairs.len(), export.class_pair_rule_count);
+        assert!(pairs.values().any(|clearance| *clearance == 100));
+    }
+
+    #[test]
+    fn a_dsn_with_courtyard_rules_is_not_replaced_by_the_native_one() {
+        let (board, rules) = field_board();
+        let export = export_dsn_with(
+            Path::new("board.kicad_pcb"),
+            &board,
+            &rules,
+            &field_options(&[("R2", 300)]),
+        )
+        .unwrap();
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let error = adopt_native_dsn(export, native.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("courtyard clearance"), "{error}");
     }
 }

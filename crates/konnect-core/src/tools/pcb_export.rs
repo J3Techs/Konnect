@@ -253,7 +253,8 @@ pub fn tools() -> Vec<ToolDef> {
              outline. Refused: unlocked or arc routing, blind/buried vias, zones on routing \
              layers, rule areas, chamfered pads and incomplete effective routing rules. A \
              .kicad_dru file is refused unless acknowledge_custom_rules is set, because the \
-             router sees only net-class rules. Writes a revision-bound reverse manifest \
+             router sees only net-class rules; courtyard clearance rules are the exception, \
+             carried as targeted class-to-class clearances. Writes a revision-bound reverse manifest \
              beside the DSN for later SES import.",
             json!({
                 "type": "object",
@@ -279,7 +280,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "acknowledge_custom_rules": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Export although the board has a .kicad_dru file. The router then sees only net-class rules; run KiCad DRC after import. The rules file hash is recorded in the manifest."
+                        "description": "Export although the board has a .kicad_dru file. The router then sees only net-class rules, except courtyard clearance rules (see represent_courtyard_clearances); run KiCad DRC after import. The rules file hash is recorded in the manifest."
+                    },
+                    "represent_courtyard_clearances": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "With acknowledge_custom_rules: carry each rule of the form `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')` with a minimum clearance (no layer clause) into the DSN. Nets with a pad on REF get that clearance against each other through their own classes and Specctra class_class rules, while every other class pair keeps its net-class clearance, so the clearance is not raised board-wide. Items of other nets inside the courtyard are not covered. Such a DSN cannot use the native bridge, and Topola's DSN reader does not read class_class."
                     }
                 },
                 "required": ["board", "output"]
@@ -751,6 +757,7 @@ async fn handle_export_specctra_dsn(
         .with_context(|| format!("resolve board {}", board_path.display()))?;
     let custom_rules_path = board_path.with_extension("kicad_dru");
     let mut options = crate::specctra::ExportOptions::default();
+    let mut courtyard_clearance_error = None;
     if custom_rules_path.is_file() {
         if args["acknowledge_custom_rules"].as_bool() != Some(true) {
             return Ok(CallToolResult::error_kind(
@@ -773,6 +780,14 @@ async fn handle_export_specctra_dsn(
             .with_context(|| format!("read {}", custom_rules_path.display()))?;
         use sha2::Digest;
         options.custom_rules_sha256 = Some(format!("{:x}", sha2::Sha256::digest(&bytes)));
+        if args["represent_courtyard_clearances"].as_bool() != Some(false) {
+            match crate::specctra::courtyard_clearance_rules(&String::from_utf8_lossy(&bytes)) {
+                Ok(rules) => options.courtyard_clearances = rules,
+                // Representation is extra: the export stays the acknowledged
+                // net-class-only one, and the answer says why.
+                Err(error) => courtyard_clearance_error = Some(format!("{error:#}")),
+            }
+        }
     }
     let custom_rules_acknowledged = options.custom_rules_sha256.is_some();
     let board_for_ipc = board_path.clone();
@@ -907,6 +922,9 @@ async fn handle_export_specctra_dsn(
             "plane_count": export.plane_count,
             "plane_piece_count": export.plane_piece_count,
             "custom_rules_acknowledged": custom_rules_acknowledged,
+            "courtyard_clearances": export.courtyard_clearances,
+            "class_pair_rule_count": export.class_pair_rule_count,
+            "courtyard_clearance_error": courtyard_clearance_error,
             "capabilities": {
                 "dsn_export_available": true,
                 "ses_import_available": true,
