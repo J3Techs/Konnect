@@ -36,7 +36,10 @@
 //! There is no profile table yet. Until the integrator publishes one,
 //! `ProfileId(n)` means net class `n`: its track width, never below the
 //! rules' floor for the pad's net. Clearance is always resolved for the
-//! pad's own net, so custom rules and courtyard fields apply.
+//! pad's own net, so custom rules and courtyard fields apply. A profile
+//! that names neither the default class nor the class of any net on the
+//! board is refused: every pad comes back without points and
+//! [`AccessStats::unknown_profile`] is set.
 
 use crate::api::{
     ItemKind, ItemRef, LayerId, PadId, ProfileId, LATTICE_FINE_PITCH_NM, LATTICE_PITCH_NM,
@@ -109,6 +112,19 @@ pub struct AccessStats {
     pub no_access: usize,
     pub escape_points: usize,
     pub wall_ms: u64,
+    /// The profile names no net class the board uses; no pad was solved.
+    #[serde(default)]
+    pub unknown_profile: bool,
+}
+
+/// Whether `ProfileId(n)` names a class that is safe to look up: the
+/// default class or the class of some net on the board. (The rule table
+/// exposes no class count, and `class()` does not bound-check.)
+fn profile_is_known(board: &RouteBoard, rules: &dyn RuleTable, profile: ProfileId) -> bool {
+    let wanted = crate::api::ClassId(profile.0);
+    rules.class_of(None) == wanted
+        || (0..board.nets.len())
+            .any(|n| rules.class_of(Some(crate::api::NetId(n as u32))) == wanted)
 }
 
 /// The eight headings as unit vectors in the board's Y-down frame
@@ -146,6 +162,26 @@ pub fn compute_pin_access_with(
     settings: &AccessSettings,
 ) -> (Vec<PadAccess>, AccessStats) {
     let start = std::time::Instant::now();
+    if !profile_is_known(board, rules, profile) {
+        // `RuleTable::class` has no bounds check; an unknown class would
+        // panic there. Report every pad without points instead.
+        let stats = AccessStats {
+            pads: pads.len(),
+            no_access: pads.len(),
+            unknown_profile: true,
+            wall_ms: start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+        let out = pads
+            .iter()
+            .map(|&p| PadAccess {
+                pad: p,
+                profile,
+                points: Vec::new(),
+            })
+            .collect();
+        return (out, stats);
+    }
     let policy = ArcPolicy::default();
     let space = Space::new(board, rules, &policy, false);
     let conn = settings
@@ -380,7 +416,22 @@ fn class_key(
         neighbours.push((rel, same, clr));
     }
     // Deterministic order regardless of pad order in the footprint.
-    neighbours.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    // An integer key settles almost every pair; the Debug text breaks the
+    // rare tie of two neighbours with the same box, kind and clearance.
+    let int_key = |n: &(Vec<Shape>, bool, Coord)| {
+        let bb = n.0.iter().map(Shape::bbox).reduce(BBox::union);
+        (
+            bb.map(|b| (b.min.x, b.min.y, b.max.x, b.max.y)),
+            n.1,
+            n.2,
+            n.0.len(),
+        )
+    };
+    neighbours.sort_by(|a, b| {
+        int_key(a)
+            .cmp(&int_key(b))
+            .then_with(|| format!("{a:?}").cmp(&format!("{b:?}")))
+    });
     Some(ClassKey {
         layer,
         width,
@@ -454,6 +505,22 @@ fn class_access(ctx: &Ctx<'_>, k: &ClassKey) -> (Vec<(Point, u8)>, usize) {
         }
     }
     pts.retain(|&p| inside(p));
+    if pts.is_empty() {
+        // Copper offset from its anchor on both axes: use the lattice lines
+        // through the lattice point nearest the copper's centre instead.
+        let c = bb.center();
+        let snap = |v: Coord| ((f64::from(v) / pitch as f64).round() as i64 * pitch) as Coord;
+        let (cx, cy) = (snap(c.x), snap(c.y));
+        for i in x0..=x1 {
+            pts.push(Point::new((i * pitch) as Coord, cy));
+        }
+        for j in y0..=y1 {
+            if (j * pitch) as Coord != cy {
+                pts.push(Point::new(cx, (j * pitch) as Coord));
+            }
+        }
+        pts.retain(|&p| inside(p));
+    }
     pts.sort_by_key(|p| (i64::from(p.x).abs() + i64::from(p.y).abs(), p.x, p.y));
     // Solve more than we keep: the instance check may close some.
     pts.truncate(4 * ctx.settings.max_points.max(1));
@@ -547,6 +614,31 @@ fn escape_ends(
     if width == 0 {
         return Vec::new();
     }
+    // A track end is free only when no other track of the island ends
+    // there and no via of the island covers it (a joint, not an end).
+    let mut track_ends: Vec<(LayerId, Point)> = Vec::new();
+    let mut island_vias: Vec<&crate::board::Via> = Vec::new();
+    for item in &island.items {
+        match *item {
+            ItemRef::Track(t) => {
+                let tr = &board.tracks[t.index()];
+                track_ends.push((tr.layer, tr.seg.a));
+                track_ends.push((tr.layer, tr.seg.b));
+            }
+            ItemRef::Via(v) => island_vias.push(&board.vias[v.index()]),
+            _ => {}
+        }
+    }
+    track_ends.sort_unstable();
+    let joint = |layer: LayerId, e: Point| {
+        let lo = track_ends.partition_point(|&k| k < (layer, e));
+        let hi = track_ends.partition_point(|&k| k <= (layer, e));
+        let dot = Shape::Circle(Circle::new(e, 0));
+        hi - lo > 1
+            || island_vias
+                .iter()
+                .any(|v| v.layers.contains(layer) && touches(&dot, &v.shape()))
+    };
     let mut ends: Vec<(LayerId, Point, Coord)> = Vec::new();
     for item in &island.items {
         match *item {
@@ -562,7 +654,7 @@ fn escape_ends(
                     continue;
                 }
                 for e in [tr.seg.a, tr.seg.b] {
-                    if !in_pad(e, tr.layer) {
+                    if !in_pad(e, tr.layer) && !joint(tr.layer, e) {
                         ends.push((tr.layer, e, radius_of(tr.seg.width)));
                     }
                 }
@@ -688,6 +780,117 @@ mod tests {
                 .unwrap();
             assert_eq!(first.point, via.center);
         }
+    }
+
+    /// One class, looked up the way a project table does: by index, with
+    /// no bounds check.
+    struct OneClass(UniformRules);
+
+    impl RuleTable for OneClass {
+        fn class_of(&self, _net: Option<crate::api::NetId>) -> crate::api::ClassId {
+            crate::api::ClassId(0)
+        }
+        fn class(&self, class: crate::api::ClassId) -> &crate::rules::NetClassRules {
+            &std::slice::from_ref(&self.0.class)[class.index()]
+        }
+        fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, l: LayerId) -> Coord {
+            self.0.clearance(a, b, l)
+        }
+        fn track_width(&self, s: &RuleSubject<'_>, l: LayerId) -> crate::rules::WidthRule {
+            self.0.track_width(s, l)
+        }
+        fn via(&self, s: &RuleSubject<'_>) -> crate::rules::ViaRule {
+            self.0.via(s)
+        }
+        fn min_track_angle_deg(&self, s: &RuleSubject<'_>, l: LayerId) -> Option<f64> {
+            self.0.min_track_angle_deg(s, l)
+        }
+        fn min_segment_length(&self, s: &RuleSubject<'_>, l: LayerId) -> Option<Coord> {
+            self.0.min_segment_length(s, l)
+        }
+        fn edge_clearance(&self) -> Coord {
+            self.0.edge_clearance()
+        }
+        fn hole_clearance(&self) -> Coord {
+            self.0.hole_clearance()
+        }
+        fn hole_to_hole(&self) -> Coord {
+            self.0.hole_to_hole()
+        }
+        fn max_clearance(&self) -> Coord {
+            self.0.max_clearance()
+        }
+        fn inert_rules(&self) -> &[crate::rules::InertRule] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn an_unknown_profile_is_refused_without_panicking() {
+        let board = synthetic::two_pin_nets(2, false);
+        let rules = OneClass(UniformRules::default());
+        let pads = all_pads(&board);
+        let (out, stats) = compute_pin_access_with(
+            &board,
+            &rules,
+            &pads,
+            ProfileId(7),
+            &AccessSettings::default(),
+        );
+        assert!(stats.unknown_profile);
+        assert_eq!(out.len(), pads.len());
+        assert!(out.iter().all(|a| a.points.is_empty()));
+        assert_eq!(stats.no_access, pads.len());
+        // The known class still works.
+        let (ok, stats) = compute_pin_access_with(
+            &board,
+            &rules,
+            &pads,
+            ProfileId(0),
+            &AccessSettings::default(),
+        );
+        assert!(!stats.unknown_profile);
+        assert!(ok.iter().all(|a| !a.points.is_empty()));
+    }
+
+    #[test]
+    fn copper_offset_from_its_anchor_still_gets_points() {
+        // The pad's anchor sits 0.4 mm off its copper on both axes, so
+        // neither lattice line through the anchor crosses the copper.
+        let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+        let f = b.footprint("R1", (5.0, 5.0));
+        b.smd_pad(f, "1", "A", (5.0, 5.0), (0.3, 0.3), "F.Cu");
+        let mut board = b.build();
+        board.pads[0].center = Point::new(5_400_000, 5_400_000);
+        let rules = UniformRules::default();
+        let out = compute_pin_access(&board, &rules, &[PadId(0)], ProfileId(0));
+        assert!(!out[0].points.is_empty());
+        for ap in &out[0].points {
+            let dot = Shape::Circle(Circle::new(ap.point, 0));
+            assert!(board.pads[0].shapes.iter().any(|s| touches(&dot, s)));
+            let d = ap.point - board.pads[0].center;
+            assert_eq!(d.x % i64::from(LATTICE_FINE_PITCH_NM), 0);
+            assert_eq!(d.y % i64::from(LATTICE_FINE_PITCH_NM), 0);
+        }
+    }
+
+    #[test]
+    fn a_joint_between_neck_segments_is_not_an_escape_end() {
+        // A pad with a two-segment neck: only the far end is free.
+        let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+        let f = b.footprint("R1", (3.0, 5.0));
+        b.smd_pad(f, "1", "A", (3.0, 5.0), (0.6, 0.6), "F.Cu");
+        b.smd_pad(f, "2", "A", (8.0, 5.0), (0.6, 0.6), "F.Cu");
+        b.track("A", "F.Cu", (3.0, 5.0), (4.0, 5.0), 0.15, true)
+            .track("A", "F.Cu", (4.0, 5.0), (5.0, 6.0), 0.15, true);
+        let board = b.build();
+        let rules = UniformRules::default();
+        let out = compute_pin_access(&board, &rules, &[PadId(0)], ProfileId(0));
+        let far = Point::new(5_000_000, 6_000_000);
+        let joint = Point::new(4_000_000, 5_000_000);
+        let pts: Vec<Point> = out[0].points.iter().map(|a| a.point).collect();
+        assert_eq!(pts[0], far, "{pts:?}");
+        assert!(!pts.contains(&joint), "{pts:?}");
     }
 
     #[test]
