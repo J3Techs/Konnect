@@ -175,20 +175,63 @@ fn nm(v: f64) -> i64 {
     (v * 1_000_000.0).round() as i64
 }
 
-type ItemKey = (&'static str, String, Vec<(i64, i64)>);
+/// What a created item is matched to its plan item on: kind, net, layer
+/// (KiCad's layer enum; 0 for a through via), width (nm; 0 for a via) and
+/// the sorted end points (nm). Two same-net tracks with the same ends on
+/// different layers, or of different widths, never swap KIIDs.
+type ItemKey = (&'static str, String, i32, i64, Vec<(i64, i64)>);
 
 fn plan_key(chunk: &PlanChunk, k: usize) -> Option<ItemKey> {
     match chunk.plan.tracks.get(k) {
         Some(t) => {
             let mut pts = vec![(nm(t.x1), nm(t.y1)), (nm(t.x2), nm(t.y2))];
             pts.sort_unstable();
-            Some(("track", t.net.clone(), pts))
+            let layer = konnect_ipc::builders::layer_from_name(&t.layer) as i32;
+            Some(("track", t.net.clone(), layer, nm(t.width), pts))
         }
         None => {
             let v = chunk.plan.vias.get(k - chunk.plan.tracks.len())?;
-            Some(("via", v.net.clone(), vec![(nm(v.x), nm(v.y))]))
+            Some(("via", v.net.clone(), 0, 0, vec![(nm(v.x), nm(v.y))]))
         }
     }
+}
+
+/// The KIID and match key of every track and via KiCad echoed back, read
+/// exactly (nm) from the messages. A message that does not decode, or an
+/// item without a KIID, is left out (and counted as unmapped).
+fn created_keys(created: &[prost_types::Any]) -> Vec<(String, ItemKey)> {
+    use konnect_ipc::builders;
+    use konnect_ipc::gen::kiapi::board::types as b;
+    use prost::Message;
+    let pt = |v: &Option<konnect_ipc::gen::kiapi::common::types::Vector2>| {
+        v.as_ref().map(|v| (v.x_nm, v.y_nm))
+    };
+    let mut out = Vec::with_capacity(created.len());
+    for any in created {
+        if builders::any_is(any, "kiapi.board.types.Track") {
+            let Ok(m) = b::Track::decode(any.value.as_slice()) else {
+                continue;
+            };
+            let (Some(a), Some(z), Some(id)) = (pt(&m.start), pt(&m.end), m.id) else {
+                continue;
+            };
+            let mut pts = vec![a, z];
+            pts.sort_unstable();
+            let net = m.net.map(|n| n.name).unwrap_or_default();
+            let width = m.width.map_or(0, |w| w.value_nm);
+            out.push((id.value, ("track", net, m.layer, width, pts)));
+        } else if builders::any_is(any, "kiapi.board.types.Via") {
+            let Ok(m) = b::Via::decode(any.value.as_slice()) else {
+                continue;
+            };
+            let (Some(at), Some(id)) = (pt(&m.position), m.id) else {
+                continue;
+            };
+            let net = m.net.map(|n| n.name).unwrap_or_default();
+            out.push((id.value, ("via", net, 0, 0, vec![at])));
+        }
+    }
+    out
 }
 
 /// Create `plan` through `sink`, chunk by chunk, after a full preflight.
@@ -250,28 +293,23 @@ pub(crate) fn apply_plan(
             }
         }
         let mut mapped = 0usize;
-        // A reply that does not decode leaves its items unmapped (counted
-        // below), never unreported.
-        if let Ok(copper) = routing_batch::decode_copper(&created) {
-            for c in copper {
-                let mut pts: Vec<(i64, i64)> =
-                    c.points.iter().map(|&(x, y)| (nm(x), nm(y))).collect();
-                pts.sort_unstable();
-                let key = (c.kind, c.net.clone(), pts);
-                let Some(k) = wanted.get_mut(&key).and_then(Vec::pop) else {
-                    continue;
-                };
-                let (Some(item), false) = (chunk.item(k), c.id.is_empty()) else {
-                    continue;
-                };
-                ledger.items.push(AppliedItem {
-                    kiid: c.id,
-                    chunk: ci as u32,
-                    item,
-                    net: c.net,
-                });
-                mapped += 1;
+        // An item that does not decode stays unmapped (counted below),
+        // never unreported.
+        for (kiid, key) in created_keys(&created) {
+            if kiid.is_empty() {
+                continue;
             }
+            let Some(k) = wanted.get_mut(&key).and_then(Vec::pop) else {
+                continue;
+            };
+            let Some(item) = chunk.item(k) else { continue };
+            ledger.items.push(AppliedItem {
+                kiid,
+                chunk: ci as u32,
+                item,
+                net: key.1,
+            });
+            mapped += 1;
         }
         ledger.items_unmapped += sent.saturating_sub(mapped);
     }
@@ -432,6 +470,8 @@ mod tests {
         calls: Vec<usize>,
         next: u32,
         fail_on_call: Option<usize>,
+        /// Echo each call's items in reverse order.
+        reverse: bool,
     }
 
     impl ItemSink for FakeKiCad {
@@ -458,6 +498,9 @@ mod tests {
                     v.id = id;
                     out.push(builders::pack_any(&v, "kiapi.board.types.Via"));
                 }
+            }
+            if self.reverse {
+                out.reverse();
             }
             Ok(out)
         }
@@ -528,6 +571,56 @@ mod tests {
         assert_eq!((via.net.as_str(), via.item.index), ("B", 0));
         let kiids: BTreeSet<&String> = ledger.items.iter().map(|a| &a.kiid).collect();
         assert_eq!(kiids.len(), 5);
+    }
+
+    #[test]
+    fn kiids_follow_layer_and_width_when_two_tracks_share_their_ends() {
+        // One net, the same two ends, three tracks: F.Cu, B.Cu and a wider
+        // F.Cu one. KiCad echoing them in another order must not swap them.
+        let plan = RoutePlan {
+            tracks: vec![
+                track("A", 0.0, 2.0, 1.0),
+                PlanTrack {
+                    layer: "B.Cu".into(),
+                    ..track("A", 0.0, 2.0, 1.0)
+                },
+                PlanTrack {
+                    layer: "In1.Cu".into(),
+                    width: 0.3,
+                    ..track("A", 0.0, 2.0, 1.0)
+                },
+            ],
+            vias: vec![],
+        };
+        let mut kicad = FakeKiCad {
+            reverse: true,
+            ..FakeKiCad::default()
+        };
+        let outcome = apply_plan(&plan, false, &limits(), 100, &codes(), &mut kicad).unwrap();
+        let ApplyOutcome::Complete(ledger) = outcome else {
+            panic!("expected a complete apply")
+        };
+        assert_eq!(ledger.items.len(), 3);
+        assert_eq!(ledger.items_unmapped, 0);
+        // The fake numbers KIIDs in send order: plan track k gets k + 1.
+        for a in &ledger.items {
+            let n = u32::from_str_radix(a.kiid.rsplit('-').next().unwrap(), 16).unwrap();
+            assert_eq!(a.item.index + 1, n, "{a:?}");
+        }
+
+        // The width alone also tells two tracks apart.
+        let plan = RoutePlan {
+            tracks: vec![
+                track("A", 0.0, 2.0, 1.0),
+                PlanTrack {
+                    width: 0.3,
+                    ..track("A", 0.0, 2.0, 1.0)
+                },
+            ],
+            vias: vec![],
+        };
+        let key = |k| plan_key(&plan.chunks_by_net(100)[0], k).unwrap();
+        assert_ne!(key(0), key(1));
     }
 
     #[test]
