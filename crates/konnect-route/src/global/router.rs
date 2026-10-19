@@ -27,7 +27,10 @@ use std::time::Instant;
 /// One connection, prepared.
 struct Task {
     net: u32,
+    /// Demand on a planar edge, in default track pitches.
     weight: u16,
+    /// Demand on a via site, in default via sites.
+    via_weight: u16,
     /// Allowed slots.
     slots: u32,
     /// Terminal cells with their slots, ascending by cell.
@@ -141,6 +144,8 @@ fn nodes_box(t: &Topology, nodes: &[u32]) -> Win {
 const SECTION_PAD: usize = 3;
 
 struct State {
+    /// Resources from here on are via sites.
+    via_from: u32,
     occ: Vec<u16>,
     hist: Vec<f32>,
     /// Per net: resource → number of the net's connections using it.
@@ -163,11 +168,11 @@ impl State {
     ) {
         path_resources(t, &path, buf);
         let task = &tasks[i];
-        let map = &mut self.net_res[task.net as usize];
         for &r in buf.iter() {
-            let n = map.entry(r).or_insert(0);
+            let w = self.demand(task, r);
+            let n = self.net_res[task.net as usize].entry(r).or_insert(0);
             if *n == 0 {
-                self.occ[r as usize] = self.occ[r as usize].saturating_add(task.weight);
+                self.occ[r as usize] = self.occ[r as usize].saturating_add(w);
             }
             *n += 1;
         }
@@ -187,11 +192,11 @@ impl State {
         all.sort_unstable();
         all.dedup();
         let task = &tasks[i];
-        let map = &mut self.net_res[task.net as usize];
         for &r in &all {
-            let n = map.entry(r).or_insert(0);
+            let w = self.demand(task, r);
+            let n = self.net_res[task.net as usize].entry(r).or_insert(0);
             if *n == 0 {
-                self.occ[r as usize] = self.occ[r as usize].saturating_add(task.weight);
+                self.occ[r as usize] = self.occ[r as usize].saturating_add(w);
             }
             *n += 1;
         }
@@ -236,19 +241,31 @@ impl State {
             return;
         }
         let task = &tasks[i];
-        let map = &mut self.net_res[task.net as usize];
-        for &r in &self.res[i] {
+        let res = std::mem::take(&mut self.res[i]);
+        for &r in &res {
+            let w = self.demand(task, r);
+            let map = &mut self.net_res[task.net as usize];
             if let Some(n) = map.get_mut(&r) {
                 *n -= 1;
                 if *n == 0 {
                     map.remove(&r);
-                    self.occ[r as usize] = self.occ[r as usize].saturating_sub(task.weight);
+                    self.occ[r as usize] = self.occ[r as usize].saturating_sub(w);
                 }
             }
         }
+        self.res[i] = res;
         self.res[i].clear();
         self.path[i].clear();
         self.routed[i] = false;
+    }
+
+    /// The demand `task` puts on resource `r`.
+    fn demand(&self, task: &Task, r: u32) -> u16 {
+        if r >= self.via_from {
+            task.via_weight
+        } else {
+            task.weight
+        }
     }
 
     fn overused(&self, cap: &[u16], r: u32) -> bool {
@@ -381,6 +398,13 @@ fn prepare(
     let all = (1u32 << topo.slots) - 1;
     let layer0 = grid.slot_layer(0);
     let default_pitch = layer0.map_or(1, |l| slot_rules(rules, l).pitch());
+    let via_pitch = |net: Option<NetId>| {
+        let s = RuleSubject::new(ItemKind::Via, net);
+        let v = rules.via(&s);
+        let c = layer0.map_or(0, |l| i64::from(rules.clearance(&s, &s, l)));
+        (i64::from(v.diameter) + c).max(1) as f64
+    };
+    let default_via = via_pitch(None);
     connections
         .par_iter()
         .map(|c| {
@@ -397,12 +421,16 @@ fn prepare(
                     + i64::from(rules.clearance(&s, &s, l));
                 ((need + default_pitch - 1) / default_pitch).clamp(1, 255) as u16
             });
+            // A via site holds vias by the area they keep clear.
+            let via_weight =
+                ((via_pitch(Some(c.net)) / default_via).powi(2).round() as u16).clamp(1, 16);
             let from = terminals(board, grid, topo, &islands, &conn, c.from, allowed);
             let to = terminals(board, grid, topo, &islands, &conn, c.to, allowed);
             let (Some((src, sc, ss)), Some((dst, dc, ds))) = (from, to) else {
                 return Task {
                     net: c.net.0,
                     weight,
+                    via_weight,
                     slots: allowed,
                     src: Vec::new(),
                     dst: Vec::new(),
@@ -441,6 +469,7 @@ fn prepare(
             Task {
                 net: c.net.0,
                 weight,
+                via_weight,
                 slots: allowed,
                 access,
                 src,
@@ -508,6 +537,7 @@ fn route_one(
             slots: task.slots,
             win,
             weight: task.weight,
+            via_weight: task.via_weight,
             owned: &owned,
             term_cells,
         };
@@ -585,6 +615,7 @@ fn route_one(
         win,
         slots: task.slots,
         weight: task.weight,
+        via_weight: task.via_weight,
         owned: &owned,
         tbox,
         tslots,
@@ -905,6 +936,7 @@ pub(super) fn run(
     let n = tasks.len();
     let res_count = topo.resources();
     let mut state = State {
+        via_from: topo.via_res(0),
         occ: vec![0; res_count],
         hist: vec![0.0; res_count],
         net_res: vec![

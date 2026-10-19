@@ -15,6 +15,7 @@ pub(crate) struct PatternReq<'a> {
     pub slots: u32,
     pub win: Win,
     pub weight: u16,
+    pub via_weight: u16,
     pub owned: &'a [u32],
     pub term_cells: &'a [u32],
 }
@@ -263,7 +264,7 @@ pub(crate) fn best_pattern(
         // Via cost per hop at a cell, `None` for a wall.
         let via_at = |cell: u32| -> Option<f32> {
             let r = t.via_res(cell);
-            res_cost(c, s, ep, r, c.via, req.weight, s.is_term(cell, ep))
+            res_cost(c, s, ep, r, c.via, req.via_weight, s.is_term(cell, ep))
         };
         let hop = |cell: u32, a: usize, b: usize| -> Option<f32> {
             if a == b {
@@ -393,7 +394,7 @@ fn same_cell(
         return Some((vec![t.node(slot, req.src_cell)], 0.0));
     }
     let r = t.via_res(req.src_cell);
-    let v = res_cost(c, s, ep, r, c.via, req.weight, true)?;
+    let v = res_cost(c, s, ep, r, c.via, req.via_weight, true)?;
     let mut best = (u32::MAX, 0usize, 0usize);
     for a in 0..t.slots as usize {
         for b in 0..t.slots as usize {

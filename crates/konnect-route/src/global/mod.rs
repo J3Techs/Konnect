@@ -75,7 +75,10 @@
 //!
 //! Connections of one net share resources: demand counts once per net, and
 //! a resource the net already holds costs [`GlobalCosts::same_net`] of its
-//! base cost, which grows Steiner-like trees.
+//! base cost, which grows Steiner-like trees. A net's demand on an edge is
+//! its track width plus clearance in default track pitches, rounded up; on
+//! a via site, the square of its via diameter plus clearance over the
+//! default via's, rounded (at least 1 each).
 //!
 //! A cell edge or via site with no capacity is a wall, except within one
 //! cell of a connection's own terminal cells: a 1 mm grid cannot resolve pin

@@ -86,6 +86,7 @@ pub(crate) struct Request<'a> {
     /// Allowed slots, bit per slot.
     pub slots: u32,
     pub weight: u16,
+    pub via_weight: u16,
     /// Resources the net already holds through its other connections.
     pub owned: &'a [u32],
     /// Bounding box of the target cell centres and their slots, for the
@@ -235,7 +236,7 @@ pub(crate) fn astar(c: &Costs, req: &Request, s: &mut Scratch) -> (Option<Found>
         if c.cap[r as usize] == 0 && !owned && !cell_term {
             continue;
         }
-        let vc = c.resource(r as usize, via_base, w, owned);
+        let vc = c.resource(r as usize, via_base, req.via_weight, owned);
         for ns in [slot.wrapping_sub(1), slot + 1] {
             if ns < topo.slots && req.slots & (1 << ns) != 0 {
                 relax(c, req, s, ep, n, topo.node(ns, cell), g + vc);
