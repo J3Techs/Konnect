@@ -1227,6 +1227,14 @@ impl TileRun {
                     for layer in &mut stack.layers {
                         layer.via_site.set(c, r, 0);
                     }
+                    // Sites saved while the net is lifted would put the
+                    // site back on repaint: veto it there too.
+                    for saved in self.saved_sites.iter_mut().filter(|s| s.stack == k) {
+                        let (c0, r0, c1, r1) = saved.range;
+                        if (c0..=c1).contains(&c) && (r0..=r1).contains(&r) {
+                            saved.values[((r - r0) * (c1 - c0 + 1) + (c - c0)) as usize] = 0;
+                        }
+                    }
                     vetoes += 1;
                 }
             }
