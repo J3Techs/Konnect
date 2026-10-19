@@ -1610,10 +1610,12 @@ fn run_negotiation(
             }
         }
 
-        // Assemble the queued connections. One that fails to reroute keeps
-        // its old copper (a failure in one tiling must not undo a route the
-        // other tiling found); it counts as new, so its conflicts with the
-        // copper around it now are detected again.
+        // Assemble the queued connections. One that fails to reroute on the
+        // last negotiation iteration keeps its old copper (a last failure
+        // must not undo a route an earlier iteration found); it counts as
+        // new, so its conflicts are detected again and resolved greedily.
+        // Earlier, a failure drops the copper: kept, it would block the
+        // reroutes around it.
         let mut is_new = vec![false; n];
         for &t in &queue {
             let t = t as usize;
@@ -1630,7 +1632,8 @@ fn run_negotiation(
                 }
             }
             report.failed += 1;
-            if let Some(old) = previous.remove(&(t as u32)) {
+            let last = !fill && it + 1 >= settings.max_iterations;
+            if let Some(old) = previous.remove(&(t as u32)).filter(|_| last) {
                 routed[t] = Some(old);
                 failure[t] = None;
                 is_new[t] = true;
