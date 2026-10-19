@@ -624,8 +624,10 @@ fn second_chance(
     rescued_total
 }
 
-/// The filled copper pieces of `plane`, outlines only (their own small
-/// holes are clearances around holes and pads, not splits).
+/// The filled copper pieces of `plane`. KiCad's fills are fractured (each
+/// void joined to the outline by a zero-width slit), so an outline already
+/// excludes antipads, pad clearances and voids: a track over any of them
+/// counts as off the reference, which is stricter than "over the pour".
 fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<Polygon> {
     board
         .zones
