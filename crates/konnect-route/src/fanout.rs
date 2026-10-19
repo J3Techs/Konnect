@@ -1445,7 +1445,10 @@ fn compatible(
         return false;
     }
     if an == bn {
-        return true;
+        // Two stubs of one net on one layer may not touch: KiCad measures
+        // the angle wherever same-net tracks meet, and a crossing is
+        // rarely square.
+        return a.layer != b.layer || !touches(&Shape::Segment(a.stub), &Shape::Segment(b.stub));
     }
     let (da, db) = (
         Shape::Circle(Circle::from_diameter(a.via, a.diameter)),

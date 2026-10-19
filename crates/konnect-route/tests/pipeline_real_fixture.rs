@@ -442,6 +442,57 @@ fn pipeline_real_board_fixture() {
     );
     let by_kind = r.check.counts();
     println!("check: {} findings {:?}", r.check.violations.len(), by_kind);
+    if env_on("KONNECT_PIPELINE_DIAG") {
+        let all = r.all_copper();
+        let nf = r.fanout_copper.tracks.len() as u32;
+        let nfv = r.fanout_copper.vias.len() as u32;
+        let name = |i: konnect_route::check::CheckedItem| match i {
+            konnect_route::check::CheckedItem::RoutedTrack { index } => format!(
+                "{} track {} on {}",
+                if index < nf { "fanout" } else { "routed" },
+                board.nets[all.tracks[index as usize].net.index()].name,
+                board.layers.name(all.tracks[index as usize].layer)
+            ),
+            konnect_route::check::CheckedItem::RoutedVia { index } => format!(
+                "{} via {}",
+                if index < nfv { "fanout" } else { "routed" },
+                board.nets[all.vias[index as usize].net.index()].name
+            ),
+            other => format!("{other:?}"),
+        };
+        for v in &r.check.violations {
+            println!(
+                "  finding {:?} at ({:.3},{:.3}): {} / {}",
+                v.kind,
+                v.at.x as f64 / 1e6,
+                v.at.y as f64 / 1e6,
+                name(v.a),
+                v.b.map(name).unwrap_or_default()
+            );
+        }
+    }
+    // The reference planes hold for the plan: checking it again changes
+    // nothing.
+    if settings
+        .class_fallback
+        .values()
+        .any(|f| f.reference.is_some())
+    {
+        let mut copy = r.routed.clone();
+        let again = konnect_route::pipeline::enforce_reference(
+            &board,
+            &rules,
+            &settings.class_fallback,
+            None,
+            &mut copy,
+        );
+        println!(
+            "reference: {} tracks checked again, {} nets off it",
+            again.tracks_checked,
+            again.dropped_nets.len()
+        );
+        assert!(again.dropped_nets.is_empty(), "tracks off the reference");
+    }
     println!(
         "plan: {} tracks, {} vias; connections open {} -> {}",
         r.plan.tracks.len(),

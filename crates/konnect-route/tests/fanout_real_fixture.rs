@@ -118,6 +118,33 @@ fn fanout_on_the_real_board() {
     );
     assert_eq!(single.failed, plan.failed);
     assert_eq!(plan.failed.len(), plan.details.len());
+    // The fanout alone is S7-clean.
+    let mut copper = plan.routed();
+    for v in &mut copper.vias {
+        v.layers = board.layers.all();
+    }
+    let report = konnect_route::check::check_routed(&board, &rules, &copper);
+    for v in &report.violations {
+        let name = |i: konnect_route::check::CheckedItem| match i {
+            konnect_route::check::CheckedItem::RoutedTrack { index } => {
+                let t = &copper.tracks[index as usize];
+                format!("stub {} {:?}", board.net(t.net).name, t.seg)
+            }
+            konnect_route::check::CheckedItem::RoutedVia { index } => {
+                format!("via {:?}", copper.vias[index as usize].center)
+            }
+            other => format!("{other:?}"),
+        };
+        println!(
+            "  finding {:?} at ({:.3},{:.3}): {} / {}",
+            v.kind,
+            v.at.x as f64 / 1e6,
+            v.at.y as f64 / 1e6,
+            name(v.a),
+            v.b.map(name).unwrap_or_default()
+        );
+    }
+    assert!(report.violations.is_empty(), "the fanout has S7 findings");
     for d in &plan.details {
         assert!(d.candidates > 0 || d.rejections.is_empty());
     }
