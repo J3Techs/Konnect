@@ -26,6 +26,9 @@ use konnect_route::check::{CheckReport, ViolationKind};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
 use konnect_route::optimize::{OptimizeOptions, OptimizeReport};
+use konnect_route::pipeline::{
+    AllowanceReport, ClassFallback, PipelineSettings, ReferenceReport, RoutingAllowances,
+};
 use konnect_route::plan::{RoutedCopper, ADD_ROUTING_MAX_ITEMS};
 use konnect_route::telemetry::Telemetry;
 use konnect_route::{LoadOptions, ProjectRuleTable, RouteBoard, RoutePlan, RuleTable};
@@ -107,10 +110,86 @@ pub struct NativeJobSpec {
     /// Stop at the next stage boundary after this long.
     #[serde(default)]
     pub time_limit_seconds: Option<u64>,
+    /// Owner routing allowances and the class policy, by name (class
+    /// layers, layer fallbacks, neck-down, excluded classes). Native
+    /// routing only. Default: none, and wide-copper classes excluded
+    /// ([`konnect_route::pipeline::default_excluded_classes`]).
+    #[serde(default, skip_serializing_if = "RoutingAllowances::is_default")]
+    pub allowances: RoutingAllowances,
+    /// Each net's effective class as KiCad reported it over IPC when the
+    /// job was started: KiCad's class name, then its constituents (highest
+    /// precedence first). Overrides the project's patterns; unset, the
+    /// patterns are resolved offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_classes: Option<BTreeMap<String, Vec<String>>>,
+    /// Write a native run's plane fanout (S2) to this new routing_file, to
+    /// apply locked, and leave it out of `output_plan`. Unset, the fanout
+    /// leads `output_plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_plan: Option<PathBuf>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// Where a run's net classes came from, and how KiCad's differed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetClassSource {
+    /// `kicad_ipc` or `project_patterns`.
+    pub source: String,
+    /// Board nets given KiCad's class.
+    #[serde(default)]
+    pub nets: usize,
+    /// Of those, nets whose class differs from the project's patterns.
+    #[serde(default)]
+    pub changed: usize,
+    /// Board nets KiCad did not report (they keep the patterns' class).
+    #[serde(default)]
+    pub missing: usize,
+    /// KiCad class names the project does not define (their nets keep the
+    /// patterns' class).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_classes: Vec<String>,
+}
+
+/// Put every board net KiCad named in the first of its names the project
+/// defines (KiCad's effective class, else its constituents in order).
+fn pin_kicad_classes(
+    board: &RouteBoard,
+    rules: &mut ProjectRuleTable,
+    map: &BTreeMap<String, Vec<String>>,
+) -> NetClassSource {
+    let mut out = NetClassSource {
+        source: "kicad_ipc".to_string(),
+        ..NetClassSource::default()
+    };
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    for net in &board.nets {
+        if net.name.is_empty() {
+            continue;
+        }
+        let Some(names) = map.get(&net.name) else {
+            out.missing += 1;
+            continue;
+        };
+        let Some(class) = names
+            .iter()
+            .find(|n| rules.classes().iter().any(|c| &c.name == *n))
+        else {
+            if let Some(n) = names.first() {
+                unknown.insert(n.clone());
+            }
+            continue;
+        };
+        let before = rules.class(rules.class_of(Some(net.id))).name.clone();
+        if rules.pin_net_class(net.id, class) {
+            out.nets += 1;
+            out.changed += usize::from(&before != class);
+        }
+    }
+    out.unknown_classes = unknown.into_iter().collect();
+    out
 }
 
 impl NativeJobSpec {
@@ -160,10 +239,24 @@ impl NativeJobSpec {
         Ok(Some(konnect_geom::BBox::new(a, b)))
     }
 
-    /// Read the board and compile its project rules (classes assigned).
+    /// Read the board and compile its project rules (classes assigned:
+    /// KiCad's own when [`Self::net_classes`] holds them, else the
+    /// project's patterns).
     pub(crate) fn load_inputs(
         &self,
     ) -> Result<(RouteBoard, konnect_route::LoadReport, ProjectRuleTable)> {
+        self.load_inputs_reported().map(|(b, l, r, _)| (b, l, r))
+    }
+
+    /// [`Self::load_inputs`], with where the classes came from.
+    pub(crate) fn load_inputs_reported(
+        &self,
+    ) -> Result<(
+        RouteBoard,
+        konnect_route::LoadReport,
+        ProjectRuleTable,
+        NetClassSource,
+    )> {
         let (mut board, load) =
             konnect_route::load_board_file(&self.board, &LoadOptions::default())
                 .with_context(|| format!("load {}", self.board.display()))?;
@@ -176,10 +269,17 @@ impl NativeJobSpec {
             }
             None => None,
         };
-        let rules = ProjectRuleTable::from_project(&pro_text, dru_text.as_deref(), &board)
+        let mut rules = ProjectRuleTable::from_project(&pro_text, dru_text.as_deref(), &board)
             .context("compile the project rules")?;
+        let source = match &self.net_classes {
+            None => NetClassSource {
+                source: "project_patterns".to_string(),
+                ..NetClassSource::default()
+            },
+            Some(map) => pin_kicad_classes(&board, &mut rules, map),
+        };
         rules.assign_classes(&mut board);
-        Ok((board, load, rules))
+        Ok((board, load, rules, source))
     }
 
     fn hash(&self) -> String {
@@ -212,6 +312,18 @@ impl NativeJobSpec {
                 "output_plan's directory does not exist: {}",
                 parent.display()
             );
+        }
+        if let Some(f) = &self.fanout_plan {
+            if *f == self.output_plan {
+                bail!("fanout_plan must differ from output_plan");
+            }
+            let parent = f.parent().unwrap_or(Path::new("."));
+            if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                bail!(
+                    "fanout_plan's directory does not exist: {}",
+                    parent.display()
+                );
+            }
         }
         self.region()?;
         if self.threads == Some(0) {
@@ -280,6 +392,22 @@ pub struct PipelineReport {
     /// Whether the run continued from a checkpoint of the same spec.
     #[serde(default)]
     pub resumed: bool,
+    /// Where the net classes came from (KiCad over IPC, or the patterns).
+    #[serde(default)]
+    pub net_classes: Option<NetClassSource>,
+    /// The allowances and class policy a native run used, by name.
+    #[serde(default)]
+    pub allowances: Option<AllowanceReport>,
+    /// Open connections left unrouted by the class policy, per class (not
+    /// failures).
+    #[serde(default)]
+    pub excluded_by_policy: BTreeMap<String, usize>,
+    /// The reference-plane check after S6 (when a fallback names one).
+    #[serde(default)]
+    pub reference: Option<ReferenceReport>,
+    /// The separate fanout plan, when one was asked for and written.
+    #[serde(default)]
+    pub fanout_plan_path: Option<PathBuf>,
     pub telemetry: Telemetry,
 }
 
@@ -408,6 +536,10 @@ impl StopKind {
     }
 }
 
+fn has_reference(fallback: &BTreeMap<konnect_route::api::ClassId, ClassFallback>) -> bool {
+    fallback.values().any(|f| f.reference.is_some())
+}
+
 fn by_kind(report: &CheckReport) -> BTreeMap<String, usize> {
     let name = |k: ViolationKind| {
         serde_json::to_value(k)
@@ -428,6 +560,8 @@ struct NativeRoute {
     fanout: RoutedCopper,
     /// S5 copper, not yet optimized (the job's own S6 does that).
     routed: RoutedCopper,
+    /// Open connections the class policy left out, per class.
+    excluded: BTreeMap<String, usize>,
     /// Counts for the `route` stage record.
     detail: Value,
     telemetry: Telemetry,
@@ -439,6 +573,7 @@ impl NativeRoute {
         NativeRoute {
             fanout: RoutedCopper::default(),
             routed,
+            excluded: BTreeMap::new(),
             detail: json!({}),
             telemetry: Telemetry::default(),
         }
@@ -454,23 +589,24 @@ fn route_native(
     rules: &dyn RuleTable,
     nets: Option<&BTreeSet<NetId>>,
     region: Option<konnect_geom::BBox>,
+    settings: &PipelineSettings,
 ) -> Result<NativeRoute> {
-    use konnect_route::pipeline::{route_board, PipelineScope, PipelineSettings};
+    use konnect_route::pipeline::{route_board, PipelineScope};
     let scope = PipelineScope {
         nets: nets.cloned(),
         region,
     };
-    // The job runs S6, the clear stage and S7 itself.
-    let settings = PipelineSettings {
-        optimize: None,
-        clear_findings: false,
-        ..PipelineSettings::default()
-    };
-    let r = guarded("route", || route_board(board, rules, &scope, &settings))?
+    let r = guarded("route", || route_board(board, rules, &scope, settings))?
         .map_err(|e| anyhow::anyhow!("route: {e}"))?;
     let mut failed: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, d) in &r.detail.failure_details {
         *failed.entry(d.name()).or_default() += 1;
+    }
+    let mut excluded: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &r.excluded {
+        *excluded
+            .entry(rules.class(rules.class_of(Some(c.net))).name.clone())
+            .or_default() += 1;
     }
     let detail = json!({
         "connections_before_fanout": r.connections_before_fanout,
@@ -483,10 +619,13 @@ fn route_native(
         "failed": failed,
         "iterations": r.detail.iterations,
         "connections_after": r.connections_after,
+        "excluded_by_policy": excluded,
+        "fallback_routed": r.telemetry.counters.get("pipeline_fallback_routed").copied().unwrap_or(0),
     });
     Ok(NativeRoute {
         fanout: r.fanout_copper,
         routed: r.routed,
+        excluded,
         detail,
         telemetry: r.telemetry,
     })
@@ -537,7 +676,7 @@ pub fn run_pipeline(
     // S0: ingest and rules.
     let t = Instant::now();
     observer.event("ingest", "start", &json!({}));
-    let (mut board, load, rules) = spec.load_inputs()?;
+    let (mut board, load, rules, classes) = spec.load_inputs_reported()?;
     report
         .telemetry
         .add_stage_time(Stage::Ingest, t.elapsed().as_micros() as u64);
@@ -552,8 +691,10 @@ pub fn run_pipeline(
             "tracks": board.tracks.len(), "vias": board.vias.len(),
             "zones": board.zones.len(), "skipped": load.skipped_total(),
             "inert_rules": rules.inert_rules().len(),
+            "net_classes": classes,
         }),
     );
+    report.net_classes = Some(classes);
 
     // S1: connectivity.
     let t = Instant::now();
@@ -607,6 +748,26 @@ pub fn run_pipeline(
     };
     report.telemetry.threads = pool.current_num_threads() as u32;
 
+    // The route stage's settings: the job runs S6, the clear stage and S7
+    // itself. The allowances also drive the reference check after S6.
+    let mut settings = PipelineSettings {
+        optimize: None,
+        clear_findings: false,
+        ..PipelineSettings::default()
+    };
+    if spec.source == CopperSource::Native {
+        match spec
+            .allowances
+            .resolve(&board, rules.classes(), &mut settings)
+        {
+            Ok(a) => report.allowances = Some(a),
+            Err(e) => {
+                report.stop(StopKind::InputError, format!("allowances: {e}"));
+                return Ok(report);
+            }
+        }
+    }
+
     let t = Instant::now();
     let (mut work, frozen, fanout) = if let Some(cp) = resume.as_ref().filter(|_| done("route")) {
         // The board still holds the copper the source took; take it off
@@ -643,7 +804,7 @@ pub fn run_pipeline(
                     .map_err(|e| anyhow::anyhow!("source plan: {e}"))
             }
             CopperSource::Native => {
-                pool.install(|| route_native(&board, &rules, nets.as_ref(), region))
+                pool.install(|| route_native(&board, &rules, nets.as_ref(), region, &settings))
             }
         };
         match routed {
@@ -658,6 +819,7 @@ pub fn run_pipeline(
                         .add_stage_time(Stage::Ingest, t.elapsed().as_micros() as u64);
                 }
                 checkpoint.completed.push("route".to_string());
+                report.excluded_by_policy = r.excluded.clone();
                 let mut detail = json!({ "tracks": r.routed.tracks.len(), "vias": r.routed.vias.len(),
                                          "fanout_tracks": r.fanout.tracks.len(),
                                          "fanout_vias": r.fanout.vias.len() });
@@ -727,6 +889,7 @@ pub fn run_pipeline(
         };
         // S6 then the pipeline's guard: a net the optimizer left with more
         // S7 findings goes back to the copper it was routed with.
+        let negotiated = has_reference(&settings.class_fallback).then(|| work.clone());
         let (r, reverted) = pool.install(|| {
             konnect_route::pipeline::optimize_guarded(
                 &board,
@@ -738,6 +901,19 @@ pub fn run_pipeline(
             )
         });
         report.telemetry.count("optimize_index_us", index_us);
+        // Then the reference planes: a fallback class's track S6 moved off
+        // its reference goes back, or its net's copper goes.
+        if let Some(before) = &negotiated {
+            let rr = konnect_route::pipeline::enforce_reference(
+                &board,
+                &rules,
+                &settings.class_fallback,
+                Some(before),
+                &mut work,
+            );
+            rr.record(&mut report.telemetry);
+            report.reference = Some(rr);
+        }
         report.optimize_reverted = reverted.len();
         report.optimize = Some(r);
         checkpoint.optimize = Some(r);
@@ -846,11 +1022,27 @@ pub fn run_pipeline(
     checkpoint.written_unix = now_unix();
     observer.checkpoint(&checkpoint);
 
-    // S8: plan.
+    // S8: plan (the fanout in its own file when asked).
     let t = Instant::now();
-    let planned = RoutedCopper {
-        tracks: fanout.tracks.iter().chain(&work.tracks).copied().collect(),
-        vias: fanout.vias.iter().chain(&work.vias).copied().collect(),
+    let separate = spec
+        .fanout_plan
+        .as_ref()
+        .filter(|_| spec.source == CopperSource::Native);
+    if let Some(path) = separate {
+        if !fanout.tracks.is_empty() || !fanout.vias.is_empty() {
+            let plan = RoutePlan::from_routed(&board, &fanout)
+                .map_err(|e| anyhow::anyhow!("fanout plan: {e}"))?;
+            write_new_atomic(path, plan.to_routing_file_json().as_bytes())?;
+            report.fanout_plan_path = Some(path.clone());
+        }
+    }
+    let planned = if separate.is_some() {
+        work.clone()
+    } else {
+        RoutedCopper {
+            tracks: fanout.tracks.iter().chain(&work.tracks).copied().collect(),
+            vias: fanout.vias.iter().chain(&work.vias).copied().collect(),
+        }
     };
     if planned.tracks.is_empty() && planned.vias.is_empty() {
         record(
@@ -873,15 +1065,9 @@ pub fn run_pipeline(
     report.plan_items = Some(plan.item_count());
     report.plan_chunks = Some(chunks);
     report.plan_path = Some(spec.output_plan.clone());
-    record(
-        &mut report,
-        observer,
-        "plan",
-        "done",
-        t,
-        json!({ "items": plan.item_count(), "add_routing_calls": chunks,
-                "path": spec.output_plan }),
-    );
+    let detail = json!({ "items": plan.item_count(), "add_routing_calls": chunks,
+                         "path": spec.output_plan, "fanout_plan": report.fanout_plan_path });
+    record(&mut report, observer, "plan", "done", t, detail);
     Ok(report)
 }
 
@@ -1134,7 +1320,9 @@ fn report(dir: &Path, status: &JobStatus) -> Value {
             "stages": r["stages"], "optimize": r["optimize"], "check": r["check"],
             "optimize_reverted": r["optimize_reverted"], "cleared": r["cleared"],
             "plan_items": r["plan_items"], "plan_chunks": r["plan_chunks"],
-            "stopped": r["stopped"],
+            "stopped": r["stopped"], "fanout_plan": r["fanout_plan_path"],
+            "net_classes": r["net_classes"], "allowances": r["allowances"],
+            "excluded_by_policy": r["excluded_by_policy"], "reference": r["reference"],
             "stage_wall_us": r["telemetry"]["stages"], "threads": r["telemetry"]["threads"],
         });
     }
@@ -1149,6 +1337,12 @@ fn prepare(spec: &NativeJobSpec, resume: bool) -> Result<PathBuf> {
         bail!(
             "{} already exists; choose a new output_plan (plans are never replaced)",
             spec.output_plan.display()
+        );
+    }
+    if let Some(f) = spec.fanout_plan.as_ref().filter(|f| f.exists()) {
+        bail!(
+            "{} already exists; choose a new fanout_plan (plans are never replaced)",
+            f.display()
         );
     }
     if dir.exists() {

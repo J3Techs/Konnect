@@ -420,3 +420,55 @@ async fn map_route_plan_drc_follows_drc_items_to_plan_items() {
         .unwrap();
     assert!(r.is_error && text(&r).contains("drc_report"));
 }
+
+#[test]
+fn allowance_arguments_reach_the_spec_and_typos_are_refused() {
+    let f = files();
+    let args = json!({
+        "board": f.board(), "output_plan": f.path("p.json"), "fanout_plan": f.path("fan.json"),
+        "class_layers": { "Default": ["F.Cu"] },
+        "layer_fallback": [ { "class": "Default", "layers": ["F.Cu", "B.Cu"], "nets": ["G*"],
+                              "reference": { "plane": "B.Cu", "margin_mm": 0.3 } } ],
+        "neck_down": { "exclude_classes": ["Default"] },
+        "exclude_classes": []
+    });
+    let spec = job_spec(&args).unwrap().unwrap();
+    let a = &spec.allowances;
+    assert_eq!(a.class_layers["Default"], vec!["F.Cu".to_string()]);
+    assert_eq!(
+        a.layer_fallback[0].reference.as_ref().unwrap().margin_mm,
+        0.3
+    );
+    assert_eq!(a.neck_down.as_ref().unwrap().width_mm, 0.1);
+    assert_eq!(a.exclude_classes, Some(Vec::new()));
+    assert!(spec.fanout_plan.as_ref().unwrap().is_absolute());
+    // Nothing named: the default policy, serialised as nothing.
+    let plain = job_spec(&json!({ "board": f.board(), "output_plan": f.path("q.json") }))
+        .unwrap()
+        .unwrap();
+    assert!(plain.allowances.is_default());
+    let typo = json!({ "board": f.board(), "output_plan": f.path("r.json"),
+                       "neck_down": { "widht_mm": 0.1 } });
+    assert!(job_spec(&typo).unwrap().is_err());
+    assert!(class_mode(&json!({ "net_classes": "maybe" })).is_err());
+    assert_eq!(class_mode(&json!({})).unwrap(), ClassMode::Auto);
+}
+
+#[tokio::test]
+async fn project_classes_need_no_kicad() {
+    let f = files();
+    let args = json!({ "board": f.board(), "output_plan": f.path("p.json") });
+    let mut spec = job_spec(&args).unwrap().unwrap();
+    // No IPC address configured: auto falls back to the patterns, kicad
+    // refuses.
+    let auto = kicad_classes(&ctx(), &mut spec, ClassMode::Auto)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(auto["source"], "project_patterns");
+    assert!(spec.net_classes.is_none());
+    assert!(kicad_classes(&ctx(), &mut spec, ClassMode::Kicad)
+        .await
+        .unwrap()
+        .is_err());
+}

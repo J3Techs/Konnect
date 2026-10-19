@@ -47,6 +47,9 @@ fn spec(root: &Path, out: &str, source: CopperSource) -> NativeJobSpec {
         zones_are_obstacles: true,
         clear_findings: None,
         time_limit_seconds: None,
+        allowances: Default::default(),
+        net_classes: None,
+        fanout_plan: None,
     }
 }
 
@@ -407,4 +410,62 @@ fn a_native_run_with_nothing_selected_routes_nothing_and_completes() {
     let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
     assert_eq!((report.work_tracks, report.work_vias), (0, 0));
     assert!(!s.output_plan.exists());
+}
+
+#[test]
+fn excluded_classes_are_reported_by_policy_and_kicad_classes_pin_nets() {
+    let f = fixture();
+    let mut s = spec(&f.root, "policy.json", CopperSource::Native);
+    s.allowances.exclude_classes = Some(vec!["Default".to_string()]);
+    // KiCad's classes: one net named in a class the project lacks.
+    s.net_classes = Some(BTreeMap::from([(
+        "GND".to_string(),
+        vec!["Elsewhere".to_string()],
+    )]));
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    let classes = report.net_classes.as_ref().unwrap();
+    assert_eq!(classes.source, "kicad_ipc");
+    assert_eq!(classes.unknown_classes, vec!["Elsewhere".to_string()]);
+    let allowances = report.allowances.as_ref().unwrap();
+    assert_eq!(allowances.excluded_classes, vec!["Default".to_string()]);
+    assert!(!allowances.exclusion_is_default);
+    let route = report.stages.iter().find(|r| r.stage == "route").unwrap();
+    // Nothing of an excluded class is routed or failed (the pipeline's own
+    // tests cover the split; this board's one connection is fanout's).
+    assert_eq!(route.detail["tasks"], 0, "{:?}", route.detail);
+    assert_eq!(route.detail["failed"], json!({}));
+    assert!(route.detail.get("excluded_by_policy").is_some());
+}
+
+#[test]
+fn unknown_allowance_names_stop_the_run_as_an_input_error() {
+    let f = fixture();
+    let mut s = spec(&f.root, "bad.json", CopperSource::Native);
+    s.allowances.class_layers = BTreeMap::from([("Nope".to_string(), vec!["F.Cu".to_string()])]);
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert_eq!(report.stop_kind, Some(StopKind::InputError));
+    assert!(report.stopped.as_deref().unwrap().contains("Nope"));
+    assert!(!s.output_plan.exists());
+}
+
+#[test]
+fn a_fanout_plan_must_be_a_new_file_of_its_own() {
+    let f = fixture();
+    let mut s = spec(&f.root, "main.json", CopperSource::Native);
+    s.fanout_plan = Some(s.output_plan.clone());
+    assert!(prepare(&s, false)
+        .unwrap_err()
+        .to_string()
+        .contains("differ"));
+    s.fanout_plan = Some(f.root.join("demo.kicad_pro"));
+    assert!(prepare(&s, false)
+        .unwrap_err()
+        .to_string()
+        .contains("never replaced"));
+    // A default spec keeps its old serialised form (and so its hash).
+    let plain = serde_json::to_value(spec(&f.root, "main.json", CopperSource::Native)).unwrap();
+    for key in ["allowances", "net_classes", "fanout_plan"] {
+        assert!(plain.get(key).is_none(), "{key} in {plain}");
+    }
 }

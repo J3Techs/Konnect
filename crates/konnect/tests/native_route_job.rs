@@ -83,6 +83,9 @@ async fn several_runner_processes_route_at_once() {
             zones_are_obstacles: true,
             clear_findings: None,
             time_limit_seconds: None,
+            allowances: Default::default(),
+            net_classes: None,
+            fanout_plan: None,
         })
         .collect();
     let mut pids = Vec::new();
