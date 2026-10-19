@@ -3,6 +3,48 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: Freerouting 2.5, per-run ports and logs, courtyard clearances in the DSN (minor release)
+
+**Freerouting 2.5.** 2.5 reads the pass limit as `autorouter.max_passes`, so
+`route_specctra_dsn` and `start_specctra_route_job` refused every 2.5 job that
+set `max_passes`. The settings request now carries both the 2.3 (flat) and the
+2.5 (nested) shape; each release ignores the other's key, and the echo check
+accepts the answer only when every setting took in one shape.
+`native_mcp.settings_shape` (and the job status's `settings_shape`) names it.
+2.3 works as before. `jar_path` selects a specific JAR.
+
+**Per-run ports and isolation.** Both tools accept `api_port` (default 0: a
+system-chosen free port) and `max_heap_mb` (256 to 262144, passed as `-Xmx`;
+there is no free-text JVM option). The MCP endpoint always takes a
+system-chosen port, and each run gets its own `--user_data_path` (the job
+directory's `freerouting-data/`, or a temporary directory). Freerouting no
+longer binds the fixed ports 37864 and 37964, so runs, and `check_freerouting`
+during a run, can overlap.
+
+**Logs.** The router's whole stderr is written as it arrives, where only the
+last 64 KiB was kept before: beside the SES as `<name>.freerouting.log` for
+`route_specctra_dsn` (as before, but complete), and as `freerouting.log` in the
+job directory for a route job. The job directory also gains `progress.jsonl`,
+one JSON line per poll, checkpoint and finish (`event`, `unix`,
+`elapsed_seconds`, `poll`, `state`, `pass`, `nets`, `traces`, `vias`), and
+`get_specctra_route_job` reports `progress_log` and `freerouting_log`.
+
+**Courtyard clearances in the DSN.** With `acknowledge_custom_rules`,
+`export_specctra_dsn` now lowers each `.kicad_dru` rule whose condition is
+exactly `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')`, with no
+layer clause and a `(constraint clearance (min X))`, into the DSN. Nets with a
+pad on REF whose class clearance is below X move into classes of their own
+carrying X, and Specctra `class_class` rules set every pair of classes
+involving them to exactly what it needs: X between nets in the same field, the
+ordinary class clearance otherwise. The board-wide clearance is not raised.
+Items of other nets inside the courtyard are not covered; KiCad DRC stays the
+authority. The answer gains `courtyard_clearances` (each rule, whether its
+footprint was found, and how many nets it raised), `class_pair_rule_count` and
+`courtyard_clearance_error`. `represent_courtyard_clearances: false` restores
+the previous DSN. A DSN carrying these rules is never replaced by the native
+bridge's DSN (`prefer` falls back to the Rust exporter, `require` fails), and
+Topola's DSN reader cannot read `class_class`.
+
 ## Unreleased: pad clearance and mask/paste margins, DRC rule filters
 
 **Pad clearance and mask/paste margins.** A footprint pad's `(clearance mm)`,

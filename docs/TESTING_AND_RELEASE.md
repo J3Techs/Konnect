@@ -32,6 +32,11 @@ cargo fmt --all -- --check
 The viewer is outside the Cargo workspace. Build or test it from
 `crates/schematic-viewer`; workspace commands do not cover it.
 
+A few tests exercise a full-size private board that is never committed. They
+read its directory (one `.kicad_pcb` with its `.kicad_dru`) from
+`KONNECT_DB1_FIXTURE_DIR` and pass with a `skipped:` message when it is unset
+or holds no such files.
+
 ## Evidence-Focused Regression Tests
 
 When a tool returns a count, success state, or verdict, test the evidence behind
@@ -61,8 +66,10 @@ create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of
 `crates/konnect-core/tests/fixtures/specctra_two_resistors_locked.kicad_pcb`,
 set `KONNECT_LIVE_SPECCTRA_BOARD`, `KICAD_API_SOCKET`, and (when it is not on
-`PATH`) `KICAD_CLI_PATH`, set `FREEROUTING_JAR` to the local Freerouting 2.3.0
-JAR, then run:
+`PATH`) `KICAD_CLI_PATH`, set `FREEROUTING_JAR` to a local Freerouting 2.3.0 or
+2.5.0 JAR (the PCM plugin ships 2.3.0; for 2.5.0 point `FREEROUTING_JAR`, or
+`jar_path`, at the release JAR, since discovery finds the PCM one first), then
+run:
 
 ```text
 cargo test -p konnect-core --locked one_undo_restores_the_exact_pre_import_board_snapshot -- --ignored --nocapture
