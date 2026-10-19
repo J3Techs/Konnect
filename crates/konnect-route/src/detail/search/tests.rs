@@ -562,6 +562,8 @@ fn cost_field_with(
         gcells: None,
         mode: Mode::Field,
         spent: 0,
+        cap: u64::MAX,
+        use_field: false,
     };
     let g = UniformGrid::new(st.window);
     let region = Region::full(&g);
@@ -1089,4 +1091,146 @@ fn via_congestion_prices_vias_by_the_routed_copper_around_them() {
     let congested_via =
         u64::from(params.via.0) * (1000 + 5 * u64::from(params.present_factor)) / 1000;
     assert!(u64::from(p.cost.0) < 20_000 + 2 * congested_via);
+}
+
+#[test]
+fn the_relaxed_field_keeps_path_costs_and_cuts_floods() {
+    // Walls, routed copper (present), history and HALO bands on three
+    // layers, with priced vias: the field restart must find paths of the
+    // same cost (or the same failure) as plain A*, with fewer expansions.
+    let (cols, rows) = (64u32, 48u32);
+    let mut st = stack(cols, rows, 3);
+    let mut x: u64 = 11;
+    let mut next = || {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        x
+    };
+    for l in 0..3 {
+        for _ in 0..30 {
+            let v = next();
+            let c = (v >> 33) as u32 % (cols - 4);
+            let r = (v >> 45) as u32 % (rows - 4);
+            let len = 2 + (v >> 20) as u32 % 10;
+            if v & 1 == 0 {
+                block(&mut st, l, c..=(c + len).min(cols - 1), r..=r);
+            } else {
+                block(&mut st, l, c..=c, r..=(r + len).min(rows - 1));
+            }
+        }
+    }
+    rederive(&mut st);
+    for (l, r) in st.layers.iter_mut().enumerate() {
+        for row in 0..rows {
+            for col in 0..cols {
+                let v = next();
+                if r.core.get(col, row) == 0 && v % 5 == 0 {
+                    r.halo.set(col, row, 1);
+                }
+                // Long lines of routed copper and some history.
+                if (l == 0 && row % 9 == 4) || (l == 1 && col % 11 == 5) || v % 13 == 0 {
+                    r.present.set(col, row, 1 + (v >> 40) as u16 % 3);
+                }
+                if v % 17 == 0 {
+                    r.history.set(col, row, 1 + (v >> 50) as u16 % 4);
+                }
+                r.via_site.set(
+                    col,
+                    row,
+                    match v % 7 {
+                        0 => VIA_NO,
+                        1 => VIA_CHECK,
+                        _ => VIA_FREE,
+                    },
+                );
+            }
+        }
+    }
+    let params = CostParams {
+        present_factor: 4_000,
+        history_factor: 1_000,
+        ..CostParams::default()
+    };
+    let plain = SearchConfig {
+        use_heading_mask: false,
+        via_congestion_reach_nm: Some(100_000),
+        ..SearchConfig::default()
+    };
+    let with_field = SearchConfig {
+        field_after: 1,
+        ..plain.clone()
+    };
+    let (mut exp_plain, mut exp_field, mut checked, mut field_runs) = (0, 0, 0, 0);
+    for k in 0..60u32 {
+        let v = next();
+        let s = node((v >> 33) as u16 % 64, (v >> 40) as u16 % 48, (k % 3) as u8);
+        let t = node(
+            (v >> 17) as u16 % 64,
+            (v >> 24) as u16 % 48,
+            ((k / 3) % 3) as u8,
+        );
+        let mut pool = JobPool::default();
+        let i = pool.push(job(JOB_ALLOW_VIA), &[s], &[t], &[]);
+        let mut outs = Vec::new();
+        for (cfg, exp) in [(&plain, &mut exp_plain), (&with_field, &mut exp_field)] {
+            let ctx = SearchContext::new(&st, cfg);
+            let mut stats = SearchStats::default();
+            let o = search_with(&ctx, &pool, &pool.jobs[0], i, &params, &mut stats);
+            *exp += stats.expansions;
+            field_runs += stats.field_runs;
+            outs.push(o);
+        }
+        match (&outs[0], &outs[1]) {
+            (SearchOutcome::Found(a), SearchOutcome::Found(b)) => {
+                assert_eq!(a.cost, b.cost, "{s:?} -> {t:?}");
+                // The field path is a real path: it ends where asked.
+                assert_eq!(
+                    b.nodes.first().map(|n| (n.col, n.row)),
+                    Some((s.col, s.row))
+                );
+                assert_eq!(b.nodes.last().map(|n| (n.col, n.row)), Some((t.col, t.row)));
+            }
+            (SearchOutcome::Unreachable { .. }, SearchOutcome::Unreachable { .. }) => {}
+            (a, b) => panic!("{s:?} -> {t:?}: {a:?} vs {b:?}"),
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 60);
+    assert!(field_runs > 30, "{field_runs} field runs");
+    assert!(
+        exp_field < exp_plain,
+        "field {exp_field} vs plain {exp_plain}"
+    );
+}
+
+#[test]
+fn the_relaxed_field_proves_sealed_targets_unreachable() {
+    let mut st = stack(60, 60, 2);
+    // A ring around the target on both layers, with no via sites inside.
+    for l in 0..2 {
+        block(&mut st, l, 20..=40, 20..=20);
+        block(&mut st, l, 20..=40, 40..=40);
+        block(&mut st, l, 20..=20, 20..=40);
+        block(&mut st, l, 40..=40, 20..=40);
+    }
+    rederive(&mut st);
+    let cfg = SearchConfig {
+        field_after: 1,
+        dead_end_check_after: 0,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(2, 2, 0)], &[node(30, 30, 1)]);
+    let (o, stats) = run_ctx(&ctx, &pool, i);
+    assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
+    assert_eq!(stats.field_runs, 1);
+    // The field ran dry inside the ring (and on it); the forward search
+    // never started.
+    assert!(
+        stats.field_settled <= 2 * 21 * 21,
+        "{}",
+        stats.field_settled
+    );
+    assert!(stats.expansions <= 2, "{}", stats.expansions);
 }

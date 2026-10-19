@@ -38,6 +38,12 @@ use crate::detail::search::{
 /// reference search's default).
 pub const VIA_CONGESTION_REACH_NM: konnect_geom::Coord = 250_000;
 
+/// Expansions after which a negotiation search restarts with the relaxed
+/// cost-to-go field ([`SearchConfig::field_after`]): searches that flood
+/// their window around routed copper then expand little beyond their path,
+/// at the same path cost.
+pub const FIELD_AFTER: u64 = 5_000;
+
 /// WS-D1's kernel as a [`RouteCompute`] backend for negotiation.
 #[derive(Debug, Clone)]
 pub struct KernelBackend {
@@ -68,6 +74,7 @@ impl KernelBackend {
         SearchConfig {
             use_heading_mask: false,
             via_congestion_reach_nm: Some(VIA_CONGESTION_REACH_NM),
+            field_after: FIELD_AFTER,
             ..SearchConfig::default()
         }
     }
