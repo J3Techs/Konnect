@@ -2953,6 +2953,7 @@ mod specctra_live_undo_test {
                 job_timeout_seconds: Some(120),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
+                launch: crate::freerouting_mcp::LaunchOptions::default(),
             },
         )
         .await

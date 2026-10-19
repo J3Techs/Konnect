@@ -12,13 +12,18 @@
 //! - `spec.json`: what to route and how, written once by the starter;
 //! - `status.json`: the runner's state and heartbeat, rewritten every poll;
 //! - `checkpoint.ses`: the board routed so far, saved at an interval;
+//! - `progress.jsonl`: one JSON line per poll, checkpoint and finish,
+//!   appended, so the run's progress over time survives the status rewrites;
 //! - `stop`: created by `stop_specctra_route_job`; the runner then ends the
 //!   job and writes the routed-so-far board to the SES output;
+//! - `freerouting.log`: every byte of the router's own stderr;
+//! - `freerouting-data/`: the router's `--user_data_path`, private to the
+//!   job so concurrent jobs share no settings or log files;
 //! - `runner.log`: the runner's own stderr.
 
 use crate::freerouting_mcp::{
-    find_value, route_local_monitored, validate_inputs, JobMonitor, PollAction, PollReport,
-    RouteSettings,
+    find_value, route_local_monitored, validate_inputs, JobMonitor, LaunchOptions, PollAction,
+    PollReport, RouteSettings,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,6 +36,9 @@ pub const RUNNER_SUBCOMMAND: &str = "freerouting-runner";
 
 const SPEC_FILE: &str = "spec.json";
 const STATUS_FILE: &str = "status.json";
+const PROGRESS_FILE: &str = "progress.jsonl";
+const FREEROUTING_LOG: &str = "freerouting.log";
+const FREEROUTING_DATA: &str = "freerouting-data";
 const STOP_FILE: &str = "stop";
 const CHECKPOINT_FILE: &str = "checkpoint.ses";
 const CHECKPOINT_TEMPORARY: &str = "checkpoint.tmp.ses";
@@ -53,6 +61,11 @@ pub(crate) struct JobSpec {
     pub fanout_enabled: Option<bool>,
     pub job_timeout_seconds: Option<u64>,
     pub checkpoint_interval_seconds: u64,
+    /// Freerouting's REST API port; 0 (the default) lets the system pick.
+    #[serde(default)]
+    pub api_port: u16,
+    #[serde(default)]
+    pub max_heap_mb: Option<u32>,
 }
 
 impl JobSpec {
@@ -62,6 +75,7 @@ impl JobSpec {
         let overall = self
             .job_timeout_seconds
             .map_or(86_400, |seconds| (seconds + 600).min(86_400));
+        let dir = job_dir_for(&self.ses_output);
         RouteSettings {
             max_passes: self.max_passes,
             optimizer_enabled: self.optimizer_enabled,
@@ -69,6 +83,12 @@ impl JobSpec {
             job_timeout_seconds: self.job_timeout_seconds,
             poll_interval: POLL_INTERVAL,
             overall_timeout: Duration::from_secs(overall),
+            launch: LaunchOptions {
+                api_port: self.api_port,
+                user_data_path: Some(dir.join(FREEROUTING_DATA)),
+                max_heap_mb: self.max_heap_mb,
+                stderr_log: Some(dir.join(FREEROUTING_LOG)),
+            },
         }
     }
 }
@@ -108,6 +128,8 @@ pub(crate) struct JobStatus {
     pub ses_output: PathBuf,
     pub ses_bytes: Option<u64>,
     pub diagnostics_path: Option<String>,
+    #[serde(default)]
+    pub settings_shape: Option<String>,
     pub error: Option<String>,
 }
 
@@ -131,6 +153,21 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)
         .with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
+}
+
+/// Append one JSON line to `progress.jsonl`.
+fn append_progress(dir: &Path, line: &Value) -> Result<()> {
+    use std::io::Write;
+    let path = dir.join(PROGRESS_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut bytes = serde_json::to_vec(line)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+        .with_context(|| format!("append to {}", path.display()))
 }
 
 fn read_status_file(dir: &Path) -> Result<JobStatus> {
@@ -180,6 +217,29 @@ impl FileMonitor {
             eprintln!("status not written: {error:#}");
         }
     }
+
+    /// Append one progress line: the event, the time and the router's
+    /// figures as the status holds them now, plus `extra`'s fields.
+    fn record(&self, event: &str, extra: Value) {
+        let status = &self.status;
+        let mut line = json!({
+            "event": event,
+            "unix": now_unix(),
+            "elapsed_seconds": status.elapsed_seconds,
+            "poll": status.poll_count,
+            "state": status.freerouting_state.as_deref().unwrap_or(&status.state),
+            "pass": status.current_pass,
+            "nets": status.output_nets,
+            "traces": status.output_traces,
+            "vias": status.output_vias,
+        });
+        if let (Some(line), Value::Object(extra)) = (line.as_object_mut(), extra) {
+            line.extend(extra);
+        }
+        if let Err(error) = append_progress(&self.dir, &line) {
+            eprintln!("progress not recorded: {error:#}");
+        }
+    }
 }
 
 impl JobMonitor for FileMonitor {
@@ -198,6 +258,7 @@ impl JobMonitor for FileMonitor {
         status.output_traces = count_at(output, "/statistics/traces/total_count");
         status.output_vias = count_at(output, "/statistics/vias/total_count");
         self.write();
+        self.record("poll", Value::Null);
 
         let stop = self.dir.join(STOP_FILE).exists();
         let checkpoint = (!stop && self.last_checkpoint.elapsed() >= self.interval).then(|| {
@@ -230,10 +291,13 @@ impl JobMonitor for FileMonitor {
                     output_nets: self.status.output_nets,
                 });
                 self.status.checkpoint_error = None;
+                self.record("checkpoint", json!({ "checkpoint_bytes": bytes }));
             }
             Err(error) => {
                 let _ = std::fs::remove_file(path);
-                self.status.checkpoint_error = Some(format!("{error:#}"));
+                let error = format!("{error:#}");
+                self.record("checkpoint_failed", json!({ "error": error }));
+                self.status.checkpoint_error = Some(error);
             }
         }
         self.write();
@@ -283,6 +347,7 @@ pub async fn run_runner(args: &[String]) -> Result<()> {
             status.last_status = Some(evidence.last_status);
             status.ses_bytes = Some(evidence.ses_bytes);
             status.diagnostics_path = evidence.diagnostics_path;
+            status.settings_shape = evidence.settings_shape.map(str::to_string);
         }
         Err(error) => {
             status.state = "FAILED".to_string();
@@ -290,6 +355,12 @@ pub async fn run_runner(args: &[String]) -> Result<()> {
         }
     }
     monitor.write();
+    let finished = json!({
+        "final_state": monitor.status.state,
+        "partial": monitor.status.partial,
+        "ses_bytes": monitor.status.ses_bytes,
+    });
+    monitor.record("finished", finished);
     Ok(())
 }
 
@@ -352,6 +423,8 @@ fn report(dir: &Path, status: &JobStatus) -> Value {
         ));
     }
     body["job_dir"] = json!(dir);
+    body["progress_log"] = json!(dir.join(PROGRESS_FILE));
+    body["freerouting_log"] = json!(dir.join(FREEROUTING_LOG));
     body["heartbeat_age_seconds"] = json!(heartbeat_age);
     body["runner_alive"] = json!(!status.finished && !lost);
     body["stop_requested"] = json!(dir.join(STOP_FILE).exists());
@@ -598,9 +671,83 @@ mod tests {
             fanout_enabled: Some(false),
             job_timeout_seconds: Some(36_000),
             checkpoint_interval_seconds: 600,
+            api_port: 0,
+            max_heap_mb: None,
         };
         let settings = spec.settings();
         assert_eq!(settings.overall_timeout, Duration::from_secs(36_600));
         assert_eq!(settings.job_timeout_seconds, Some(36_000));
+    }
+
+    #[test]
+    fn each_job_keeps_its_router_log_and_data_in_its_own_directory() {
+        let spec = |output: &str, api_port: u16| JobSpec {
+            jar: PathBuf::new(),
+            dsn: PathBuf::new(),
+            ses_output: PathBuf::from(output),
+            max_passes: None,
+            optimizer_enabled: None,
+            fanout_enabled: None,
+            job_timeout_seconds: None,
+            checkpoint_interval_seconds: 600,
+            api_port,
+            max_heap_mb: Some(4096),
+        };
+        let first = spec("fr/region-1.ses", 0).settings().launch;
+        let second = spec("fr/region-2.ses", 41_002).settings().launch;
+        let dir = Path::new("fr/region-1.ses.konnect-job");
+        assert_eq!(
+            first.stderr_log.as_deref(),
+            Some(dir.join(FREEROUTING_LOG).as_path())
+        );
+        assert_eq!(
+            first.user_data_path.as_deref(),
+            Some(dir.join(FREEROUTING_DATA).as_path())
+        );
+        assert_ne!(first.user_data_path, second.user_data_path);
+        assert_eq!((first.api_port, second.api_port), (0, 41_002));
+        assert_eq!(first.max_heap_mb, Some(4096));
+
+        // A spec written before ports and heap existed still reads.
+        let old: JobSpec = serde_json::from_value(json!({
+            "jar": "fr.jar", "dsn": "b.dsn", "ses_output": "b.ses", "max_passes": 4,
+            "optimizer_enabled": false, "fanout_enabled": false,
+            "job_timeout_seconds": 36000, "checkpoint_interval_seconds": 600
+        }))
+        .unwrap();
+        assert_eq!((old.api_port, old.max_heap_mb), (0, None));
+    }
+
+    #[test]
+    fn every_poll_and_checkpoint_appends_a_progress_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(temp.path(), Duration::ZERO);
+        let path = poll(&mut monitor, &details(1, 148)).checkpoint.unwrap();
+        std::fs::write(&path, "(session board (routes))").unwrap();
+        monitor.checkpoint_downloaded(&path, &Ok(()));
+        poll(&mut monitor, &details(2, 300));
+
+        let lines = std::fs::read_to_string(temp.path().join(PROGRESS_FILE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["event"], "poll");
+        assert_eq!(lines[0]["pass"], 1);
+        assert_eq!(lines[0]["nets"], 148);
+        assert_eq!(lines[0]["traces"], 310);
+        assert_eq!(lines[0]["vias"], 132);
+        assert_eq!(lines[0]["state"], "RUNNING");
+        assert!(lines[0]["unix"].as_u64().unwrap() > 0);
+        assert_eq!(lines[1]["event"], "checkpoint");
+        assert_eq!(lines[1]["checkpoint_bytes"], 24);
+        assert_eq!(lines[2]["pass"], 2);
+        assert_eq!(lines[2]["nets"], 300);
+        // The status file still holds only the latest poll.
+        assert_eq!(
+            read_status_file(temp.path()).unwrap().output_nets,
+            Some(300)
+        );
     }
 }

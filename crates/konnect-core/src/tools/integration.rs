@@ -149,7 +149,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. Job settings are proven applied from Freerouting's answer before the job starts. Progress notifications report the job state while it runs. Konnect enforces the time limit itself (job_timeout_seconds, else overall_timeout_seconds less a margin to download): a job still running then is stopped and its board routed so far is written, marked partial: true.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. Job settings are proven applied from Freerouting's answer before the job starts. Progress notifications report the job state while it runs. Konnect enforces the time limit itself (job_timeout_seconds, else overall_timeout_seconds less a margin to download): a job still running then is stopped and its board routed so far is written, marked partial: true. Works with Freerouting 2.3 and 2.5 (settings_shape reports which settings model answered). Each run has its own ports and data directory, so runs can overlap; the router's whole stderr is written to '<ses_output_path without .ses>.freerouting.log'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -160,7 +160,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "optimizer_enabled": { "type": "boolean" },
                     "fanout_enabled": { "type": "boolean", "description": "Freerouting's fanout stage, which escapes every SMD pin with a via before routing starts. Freerouting turns it on by default; on a large board whose escapes are already placed it can take hours. Omit to keep Freerouting's default." },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop routing after this long and keep what is routed (partial: true). Enforced by Konnect, not sent to Freerouting, whose own timeout discards the result." },
-                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
+                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 },
+                    "api_port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0, "description": API_PORT_DESCRIPTION },
+                    "max_heap_mb": { "type": "integer", "minimum": 256, "maximum": 262144, "description": MAX_HEAP_DESCRIPTION }
                 },
                 "required": ["dsn_path", "ses_output_path"]
             }),
@@ -168,7 +170,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "start_specctra_route_job",
-            "Start a long Freerouting run that outlives this MCP session, and return once Freerouting has the job running. A separate Konnect runner process, started outside the client's process tree, owns Freerouting; it keeps a status file current, saves the board routed so far as a checkpoint SES at an interval, and writes ses_output_path when the job completes, reaches job_timeout_seconds (partial: true) or is stopped. State lives in '<ses_output_path>.konnect-job/'. Follow with get_specctra_route_job; end early with stop_specctra_route_job. Same settings and checks as route_specctra_dsn.",
+            "Start a long Freerouting run that outlives this MCP session, and return once Freerouting has the job running. A separate Konnect runner process, started outside the client's process tree, owns Freerouting; it keeps a status file current, saves the board routed so far as a checkpoint SES at an interval, and writes ses_output_path when the job completes, reaches job_timeout_seconds (partial: true) or is stopped. State lives in '<ses_output_path>.konnect-job/': status.json (latest), progress.jsonl (one line per poll and checkpoint: time, pass, nets, traces, vias), freerouting.log (the router's whole stderr) and the router's own data directory. Jobs for different outputs run side by side. Follow with get_specctra_route_job; end early with stop_specctra_route_job. Same settings and checks as route_specctra_dsn.",
             json!({
                 "type": "object",
                 "properties": {
@@ -179,7 +181,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "optimizer_enabled": { "type": "boolean" },
                     "fanout_enabled": { "type": "boolean", "description": "Freerouting's fanout stage; see route_specctra_dsn." },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop routing after this long and keep what is routed (partial: true). Without it the run may last up to 24 h." },
-                    "checkpoint_interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 600, "description": "How often the board routed so far is saved to checkpoint.ses in the job directory" }
+                    "checkpoint_interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 600, "description": "How often the board routed so far is saved to checkpoint.ses in the job directory" },
+                    "api_port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0, "description": API_PORT_DESCRIPTION },
+                    "max_heap_mb": { "type": "integer", "minimum": 256, "maximum": 262144, "description": MAX_HEAP_DESCRIPTION }
                 },
                 "required": ["dsn_path", "ses_output_path"]
             }),
@@ -2361,6 +2365,26 @@ async fn handle_check_freerouting(
     }
 }
 
+const API_PORT_DESCRIPTION: &str = "Port of this run's Freerouting REST API on 127.0.0.1. 0 (the default) lets the system pick a free port, so concurrent runs never clash; the MCP endpoint always takes a system-chosen port.";
+const MAX_HEAP_DESCRIPTION: &str = "Java heap limit for this run's Freerouting process, in MiB (passed as -Xmx). Omit for Java's default.";
+
+/// `api_port` and `max_heap_mb`, range-checked; the heap bounds are
+/// checked again with the other settings.
+fn freerouting_launch_args(args: &serde_json::Value) -> anyhow::Result<(u16, Option<u32>)> {
+    let api_port = match args["api_port"].as_u64() {
+        Some(port) => {
+            u16::try_from(port).map_err(|_| anyhow::anyhow!("api_port must be 0..=65535"))?
+        }
+        None => 0,
+    };
+    let max_heap_mb = args["max_heap_mb"]
+        .as_u64()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("max_heap_mb is too large"))?;
+    Ok((api_port, max_heap_mb))
+}
+
 async fn handle_route_specctra_dsn(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2392,6 +2416,7 @@ async fn handle_route_specctra_dsn(
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
     let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    let (api_port, max_heap_mb) = freerouting_launch_args(args)?;
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
@@ -2399,6 +2424,11 @@ async fn handle_route_specctra_dsn(
         job_timeout_seconds,
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
+        launch: crate::freerouting_mcp::LaunchOptions {
+            api_port,
+            max_heap_mb,
+            ..Default::default()
+        },
     };
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
@@ -2413,7 +2443,8 @@ async fn handle_route_specctra_dsn(
         },
         "native_mcp": {
             "used": true,
-            "server_protocol_version": evidence.server_protocol_version
+            "server_protocol_version": evidence.server_protocol_version,
+            "settings_shape": evidence.settings_shape
         },
         "bridge": {
             "mode": "dsn_ses_file_round_trip",
@@ -2472,6 +2503,7 @@ async fn handle_start_route_job(
             std::env::current_dir()?.join(path)
         })
     };
+    let (api_port, max_heap_mb) = freerouting_launch_args(args)?;
     let spec = crate::freerouting_job::JobSpec {
         jar: absolute(jar)?,
         dsn: absolute(dsn)?,
@@ -2481,6 +2513,8 @@ async fn handle_start_route_job(
         fanout_enabled: args["fanout_enabled"].as_bool(),
         job_timeout_seconds: args["job_timeout_seconds"].as_u64(),
         checkpoint_interval_seconds: args["checkpoint_interval_seconds"].as_u64().unwrap_or(600),
+        api_port,
+        max_heap_mb,
     };
     let body = crate::freerouting_job::start(spec)
         .await

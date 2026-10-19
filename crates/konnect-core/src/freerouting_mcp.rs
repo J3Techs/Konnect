@@ -26,20 +26,65 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How much of the router's stderr is kept in memory for error messages;
+/// the whole stream goes to the stderr log.
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
+/// Bounds for [`LaunchOptions::max_heap_mb`].
+const MIN_HEAP_MB: u32 = 256;
+const MAX_HEAP_MB: u32 = 256 * 1024;
 
-fn server_arguments() -> &'static [&'static str] {
-    &[
-        "--api_server.enabled=true",
-        "--api_server.authentication.enabled=false",
-        "--api_server-endpoints=http://127.0.0.1:37864",
-        "--mcp_server.enabled=true",
-        "--mcp_server.authentication.enabled=false",
-        "--mcp_server-endpoints=http://127.0.0.1:37964",
-        "--mcp_server.stdio=true",
-        "--gui.enabled=false",
-    ]
+/// How one Freerouting process is started. Every process gets its own
+/// ports and data directory, so several jobs (and `check_freerouting`) can
+/// run at once.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaunchOptions {
+    /// Port of Freerouting's REST API on 127.0.0.1. 0 lets the system pick
+    /// a free one; Freerouting then points its MCP tools at the port it
+    /// bound (2.3 and 2.5 both read it back with `getLocalPort`).
+    pub api_port: u16,
+    /// Freerouting's `--user_data_path`: its settings file and its own log.
+    /// None uses a temporary directory removed when the process ends.
+    pub user_data_path: Option<PathBuf>,
+    /// Java heap limit (`-Xmx`, MiB). The only JVM option Konnect passes:
+    /// there is no free-text JVM argument.
+    pub max_heap_mb: Option<u32>,
+    /// Every byte of the router's stderr is written here. In stdio mode
+    /// Freerouting sends its console output to stderr, so this is the whole
+    /// log; stdout carries only the MCP protocol.
+    pub stderr_log: Option<PathBuf>,
+}
+
+/// The server's MCP endpoint always takes a system-chosen port: the stdio
+/// bridge inside Freerouting reads back the port it bound.
+fn server_arguments(launch: &LaunchOptions, user_data_path: &Path) -> Vec<String> {
+    let api_port = launch.api_port;
+    let mut arguments = vec![
+        "--api_server.enabled=true".to_string(),
+        "--api_server.authentication.enabled=false".to_string(),
+        format!("--api_server-endpoints=http://127.0.0.1:{api_port}"),
+        "--mcp_server.enabled=true".to_string(),
+        "--mcp_server.authentication.enabled=false".to_string(),
+        "--mcp_server-endpoints=http://127.0.0.1:0".to_string(),
+        "--mcp_server.stdio=true".to_string(),
+        "--gui.enabled=false".to_string(),
+        format!("--user_data_path={}", user_data_path.display()),
+    ];
+    if api_port != 0 {
+        arguments.push(format!(
+            "--mcp_server.target_api_base_url=http://127.0.0.1:{api_port}"
+        ));
+    }
+    arguments
+}
+
+/// The JVM options before `-jar`: only the allowlisted heap limit.
+fn jvm_arguments(launch: &LaunchOptions) -> Vec<String> {
+    launch
+        .max_heap_mb
+        .map(|megabytes| format!("-Xmx{megabytes}m"))
+        .into_iter()
+        .collect()
 }
 
 const REQUIRED_TOOLS: &[&str] = &[
@@ -59,6 +104,7 @@ pub(crate) struct RouteSettings {
     pub job_timeout_seconds: Option<u64>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
+    pub launch: LaunchOptions,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,7 +121,11 @@ pub(crate) struct RouteEvidence {
     pub elapsed_seconds: f64,
     pub ses_bytes: u64,
     pub server_protocol_version: String,
+    /// The router's complete stderr, when it wrote any.
     pub diagnostics_path: Option<String>,
+    /// Which settings shape Freerouting echoed back, when the shapes
+    /// differ (see [`SettingsShape`]).
+    pub settings_shape: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,8 +138,10 @@ pub(crate) struct BridgeProbe {
     pub error: Option<String>,
 }
 
+/// Probe with a system-chosen port and a temporary data directory, so a
+/// probe never meets a running job's ports or files.
 pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
-    let mut client = match LocalMcpClient::start(jar).await {
+    let mut client = match LocalMcpClient::start(jar, &LaunchOptions::default()).await {
         Ok(client) => client,
         Err(error) => {
             return BridgeProbe {
@@ -209,8 +261,25 @@ pub(crate) async fn route_local_monitored(
             temporary.display()
         );
     }
+    let mut launch = settings.launch.clone();
+    let stderr_log = launch
+        .stderr_log
+        .get_or_insert_with(|| default_stderr_log(ses_output))
+        .clone();
+    if stderr_log.exists() {
+        bail!(
+            "Freerouting diagnostics output already exists: {}",
+            stderr_log.display()
+        );
+    }
 
-    let mut client = LocalMcpClient::start(jar).await?;
+    let mut client = match LocalMcpClient::start(jar, &launch).await {
+        Ok(client) => client,
+        Err(error) => {
+            finish_stderr_log(&stderr_log).await;
+            return Err(error);
+        }
+    };
     let started = Instant::now();
     let route_result = match timeout(
         settings.overall_timeout,
@@ -225,7 +294,7 @@ pub(crate) async fn route_local_monitored(
         )),
     };
     let diagnostics = client.close().await;
-    let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
+    let diagnostics_path = finish_stderr_log(&stderr_log).await;
 
     let result = match route_result {
         Ok(evidence) => Ok(evidence),
@@ -275,20 +344,22 @@ pub(crate) async fn route_local_monitored(
     })
 }
 
-async fn write_diagnostics(output: &Path, diagnostics: &str) -> Result<Option<String>> {
-    if diagnostics.is_empty() {
-        return Ok(None);
+/// The stderr log beside an SES output when the caller names none.
+fn default_stderr_log(output: &Path) -> PathBuf {
+    output.with_extension("freerouting.log")
+}
+
+/// The stderr log's path once the process has ended, or None (and no file)
+/// when the router wrote nothing.
+async fn finish_stderr_log(path: &Path) -> Option<String> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.len() > 0 => Some(path.display().to_string()),
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            None
+        }
+        Err(_) => None,
     }
-    let path = output.with_extension("freerouting.log");
-    if path.exists() {
-        bail!(
-            "Freerouting diagnostics output already exists: {}",
-            path.display()
-        );
-    }
-    konnect_sexp::write_new_atomic(&path, diagnostics)
-        .with_context(|| format!("create Freerouting diagnostics {}", path.display()))?;
-    Ok(Some(path.display().to_string()))
 }
 
 pub(crate) fn validate_inputs(
@@ -335,6 +406,13 @@ pub(crate) fn validate_inputs(
     {
         bail!("job_timeout_seconds must be between 1 and 86400");
     }
+    if settings
+        .launch
+        .max_heap_mb
+        .is_some_and(|megabytes| !(MIN_HEAP_MB..=MAX_HEAP_MB).contains(&megabytes))
+    {
+        bail!("max_heap_mb must be between {MIN_HEAP_MB} and {MAX_HEAP_MB}");
+    }
     Ok(())
 }
 
@@ -376,28 +454,32 @@ async fn run_state_machine(
         )
         .await?;
 
-    let job_settings = job_settings(settings);
-    if !job_settings.is_empty() {
+    let body = job_settings_body(settings);
+    let mut settings_shape = None;
+    if !body.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
         }
         let updated = client
             .call_tool(
                 "update_job_settings",
-                json!({ "path": { "jobId": job_id }, "body": job_settings }),
+                json!({ "path": { "jobId": job_id }, "body": body }),
             )
             .await?;
         // Freerouting ignores a key it does not know without a word, so
-        // prove from its answer that every setting took.
+        // prove from its answer that every setting took, in the shape of
+        // one release.
         let applied = find_value(&updated, "router_settings");
-        let unapplied = unapplied_settings(&job_settings, applied, "");
-        if !unapplied.is_empty() {
-            bail!(
-                "Freerouting did not apply job setting(s) {}; its router_settings: {}",
-                unapplied.join(", "),
-                applied.map(compact).unwrap_or_else(|| "absent".to_string())
-            );
-        }
+        settings_shape = applied_settings_shape(settings, applied)
+            .map_err(|unapplied| {
+                anyhow::anyhow!(
+                    "Freerouting did not apply job setting(s) {} in the shape of any supported \
+                     release (2.3 or 2.5); its router_settings: {}",
+                    unapplied.join(", "),
+                    applied.map(compact).unwrap_or_else(|| "absent".to_string())
+                )
+            })?
+            .map(SettingsShape::label);
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
@@ -500,16 +582,48 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        settings_shape,
     })
 }
 
-/// The job-settings body, in the names Freerouting's Gson model reads
-/// (`max_passes`, `optimizer.enabled`, `fanout.enabled`). The time limit is
-/// not sent: Konnect enforces it, so the partial result survives.
-fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
+/// Where a Freerouting release reads its router settings. Only the pass
+/// limit moved: 2.3 reads `max_passes` at the top of `router_settings`,
+/// 2.5 reads it as `autorouter.max_passes` (its `AutorouterSettings`).
+/// `optimizer.enabled` and `fanout.enabled` are the same in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsShape {
+    Flat,
+    Nested,
+}
+
+impl SettingsShape {
+    /// Newest first, so a tie reports the current release.
+    const ALL: [Self; 2] = [Self::Nested, Self::Flat];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat (Freerouting 2.3)",
+            Self::Nested => "nested (Freerouting 2.5)",
+        }
+    }
+}
+
+/// The settings in one release's Gson names. The time limit is not sent:
+/// Konnect enforces it, so the partial result survives.
+fn job_settings(settings: &RouteSettings, shape: SettingsShape) -> Map<String, Value> {
     let mut body = Map::new();
     if let Some(max_passes) = settings.max_passes {
-        body.insert("max_passes".to_string(), json!(max_passes));
+        match shape {
+            SettingsShape::Flat => {
+                body.insert("max_passes".to_string(), json!(max_passes));
+            }
+            SettingsShape::Nested => {
+                body.insert(
+                    "autorouter".to_string(),
+                    json!({ "max_passes": max_passes }),
+                );
+            }
+        }
     }
     if let Some(enabled) = settings.optimizer_enabled {
         body.insert("optimizer".to_string(), json!({ "enabled": enabled }));
@@ -518,6 +632,43 @@ fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
         body.insert("fanout".to_string(), json!({ "enabled": enabled }));
     }
     body
+}
+
+/// The body sent: both shapes at once. Each release's Gson model skips the
+/// other's key (2.3 has no `autorouter`; 2.5 has no top-level `max_passes`
+/// and, if it maps the flat name, lets the nested value win), so one
+/// request serves either release and the answer shows which one ran.
+fn job_settings_body(settings: &RouteSettings) -> Map<String, Value> {
+    let mut body = Map::new();
+    for shape in SettingsShape::ALL {
+        body.extend(job_settings(settings, shape));
+    }
+    body
+}
+
+/// The shape in which `applied` holds every setting: Some when the shapes
+/// differ, None when they are the same. Otherwise the settings missing
+/// from the closest shape.
+fn applied_settings_shape(
+    settings: &RouteSettings,
+    applied: Option<&Value>,
+) -> std::result::Result<Option<SettingsShape>, Vec<String>> {
+    let shapes_differ = job_settings(settings, SettingsShape::Flat)
+        != job_settings(settings, SettingsShape::Nested);
+    let mut closest: Option<Vec<String>> = None;
+    for shape in SettingsShape::ALL {
+        let missing = unapplied_settings(&job_settings(settings, shape), applied, "");
+        if missing.is_empty() {
+            return Ok(shapes_differ.then_some(shape));
+        }
+        if closest
+            .as_ref()
+            .is_none_or(|closest| missing.len() < closest.len())
+        {
+            closest = Some(missing);
+        }
+    }
+    Err(closest.unwrap_or_default())
 }
 
 /// The first value under `key` anywhere in `value`.
@@ -671,11 +822,14 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// The temporary data directory of a process given none; removed with
+    /// the client, after the process has ended.
+    _user_data: Option<tempfile::TempDir>,
 }
 
 impl LocalMcpClient {
-    async fn start(jar: &Path) -> Result<Self> {
-        let mut client = Self::spawn(jar)?;
+    async fn start(jar: &Path, launch: &LaunchOptions) -> Result<Self> {
+        let mut client = Self::spawn(jar, launch)?;
         if let Err(error) = client.initialize().await {
             let diagnostics = client.close().await;
             return if diagnostics.is_empty() {
@@ -687,12 +841,38 @@ impl LocalMcpClient {
         Ok(client)
     }
 
-    fn spawn(jar: &Path) -> Result<Self> {
+    fn spawn(jar: &Path, launch: &LaunchOptions) -> Result<Self> {
+        let (user_data_path, user_data) = match &launch.user_data_path {
+            Some(path) => {
+                std::fs::create_dir_all(path).with_context(|| {
+                    format!("create Freerouting data directory {}", path.display())
+                })?;
+                (path.clone(), None)
+            }
+            None => {
+                let directory = tempfile::Builder::new()
+                    .prefix("konnect-freerouting-")
+                    .tempdir()
+                    .context("create a temporary Freerouting data directory")?;
+                (directory.path().to_path_buf(), Some(directory))
+            }
+        };
+        let log = match &launch.stderr_log {
+            Some(path) => Some(tokio::fs::File::from_std(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .with_context(|| format!("create Freerouting stderr log {}", path.display()))?,
+            )),
+            None => None,
+        };
         let mut command = Command::new("java");
         command
+            .args(jvm_arguments(launch))
             .arg("-jar")
             .arg(jar)
-            .args(server_arguments())
+            .args(server_arguments(launch, &user_data_path))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -713,26 +893,7 @@ impl LocalMcpClient {
             .stderr
             .take()
             .context("Freerouting MCP has no stderr")?;
-        // Keep the end of the log: Freerouting's startup alone can fill the
-        // budget, and the routing summary comes last.
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut tail = Vec::new();
-            let mut dropped = 0usize;
-            let mut chunk = vec![0u8; 8192];
-            while let Ok(read) = reader.read(&mut chunk).await {
-                if read == 0 {
-                    break;
-                }
-                dropped += keep_tail(&mut tail, &chunk[..read], MAX_STDERR_BYTES);
-            }
-            let text = String::from_utf8_lossy(&tail).trim().to_string();
-            if dropped > 0 {
-                format!("[{dropped} earlier bytes of Freerouting stderr dropped]\n{text}")
-            } else {
-                text
-            }
-        });
+        let stderr_task = tokio::spawn(drain_stderr(stderr, log, MAX_STDERR_BYTES));
         Ok(Self {
             child: Some(child),
             stdin,
@@ -740,6 +901,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            _user_data: user_data,
         })
     }
 
@@ -898,6 +1060,48 @@ impl Drop for LocalMcpClient {
             task.abort();
         }
     }
+}
+
+/// Read the router's stderr to its end: every byte goes to `log`, and the
+/// last `max` bytes come back for error messages. Freerouting's startup
+/// alone can fill that budget, and the routing summary comes last, so the
+/// tail is the end of the stream.
+async fn drain_stderr(
+    stderr: impl tokio::io::AsyncRead + Unpin,
+    mut log: Option<tokio::fs::File>,
+    max: usize,
+) -> String {
+    let mut reader = BufReader::new(stderr);
+    let mut tail = Vec::new();
+    let mut dropped = 0usize;
+    let mut log_error = None;
+    let mut chunk = vec![0u8; 8192];
+    while let Ok(read) = reader.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
+        if let Some(file) = log.as_mut() {
+            if let Err(error) = file.write_all(&chunk[..read]).await {
+                // Keep reading: a full disk must not stall the router.
+                log_error = Some(error);
+                log = None;
+            }
+        }
+        dropped += keep_tail(&mut tail, &chunk[..read], max);
+    }
+    if let Some(file) = log.as_mut() {
+        if let Err(error) = file.flush().await {
+            log_error = Some(error);
+        }
+    }
+    let mut text = String::from_utf8_lossy(&tail).trim().to_string();
+    if dropped > 0 {
+        text = format!("[{dropped} earlier bytes of Freerouting stderr dropped]\n{text}");
+    }
+    if let Some(error) = log_error {
+        text = format!("[Freerouting stderr log incomplete: {error}]\n{text}");
+    }
+    text
 }
 
 /// Append `chunk` to `tail`, then drop the oldest bytes beyond `max`;
@@ -1061,20 +1265,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn job_settings_use_freeroutings_names_and_are_checked_in_its_answer() {
-        let body = job_settings(&RouteSettings {
-            max_passes: Some(8),
+    fn settings(max_passes: Option<u32>) -> RouteSettings {
+        RouteSettings {
+            max_passes,
             optimizer_enabled: Some(false),
             fanout_enabled: Some(false),
             job_timeout_seconds: Some(3600),
             poll_interval: Duration::from_secs(2),
             overall_timeout: Duration::from_secs(4000),
-        });
+            launch: LaunchOptions::default(),
+        }
+    }
+
+    #[test]
+    fn job_settings_use_freeroutings_names_and_are_checked_in_its_answer() {
+        let settings = settings(Some(8));
         assert_eq!(
-            Value::Object(body.clone()),
+            Value::Object(job_settings(&settings, SettingsShape::Flat)),
             json!({
                 "max_passes": 8,
+                "optimizer": { "enabled": false },
+                "fanout": { "enabled": false }
+            })
+        );
+        assert_eq!(
+            Value::Object(job_settings(&settings, SettingsShape::Nested)),
+            json!({
+                "autorouter": { "max_passes": 8 },
+                "optimizer": { "enabled": false },
+                "fanout": { "enabled": false }
+            })
+        );
+        // One request carries both shapes.
+        assert_eq!(
+            Value::Object(job_settings_body(&settings)),
+            json!({
+                "max_passes": 8,
+                "autorouter": { "max_passes": 8 },
                 "optimizer": { "enabled": false },
                 "fanout": { "enabled": false }
             })
@@ -1085,13 +1312,50 @@ mod tests {
             "optimizer": { "enabled": false }, "fanout": {}, "scoring": {}
         } } });
         assert_eq!(
-            unapplied_settings(&body, find_value(&answer, "router_settings"), ""),
-            vec!["fanout.enabled".to_string()]
+            applied_settings_shape(&settings, find_value(&answer, "router_settings")),
+            Err(vec!["fanout.enabled".to_string()])
         );
         assert_eq!(
-            unapplied_settings(&body, None, "").len(),
+            applied_settings_shape(&settings, None).unwrap_err().len(),
             3,
             "no echo proves nothing"
+        );
+    }
+
+    #[test]
+    fn both_releases_settings_echoes_are_accepted_and_named() {
+        let four = settings(Some(4));
+        // 2.3: the pass limit at the top; `autorouter` is not in its model.
+        let flat = json!({ "router_settings": {
+            "max_passes": 4,
+            "optimizer": { "enabled": false }, "fanout": { "enabled": false }
+        } });
+        assert_eq!(
+            applied_settings_shape(&four, find_value(&flat, "router_settings")),
+            Ok(Some(SettingsShape::Flat))
+        );
+        // 2.5: the whole job comes back, its router settings nested.
+        let nested = json!({ "id": "j", "state": "QUEUED", "router_settings": {
+            "autorouter": { "enabled": true, "max_passes": 4 },
+            "optimizer": { "enabled": false }, "fanout": { "enabled": false }
+        } });
+        assert_eq!(
+            applied_settings_shape(&four, find_value(&nested, "router_settings")),
+            Ok(Some(SettingsShape::Nested))
+        );
+        // 2.5 dropping the pass limit is refused, not taken for 2.3.
+        let lost = json!({ "router_settings": {
+            "autorouter": { "enabled": true },
+            "optimizer": { "enabled": false }, "fanout": { "enabled": false }
+        } });
+        assert_eq!(
+            applied_settings_shape(&four, find_value(&lost, "router_settings")),
+            Err(vec!["autorouter.max_passes".to_string()])
+        );
+        // Without a pass limit the shapes agree and none is named.
+        assert_eq!(
+            applied_settings_shape(&settings(None), find_value(&nested, "router_settings")),
+            Ok(None)
         );
     }
 
@@ -1115,14 +1379,49 @@ mod tests {
 
     #[test]
     fn unauthenticated_servers_are_forced_to_loopback() {
-        let arguments = server_arguments();
-        assert!(arguments.contains(&"--api_server.authentication.enabled=false"));
-        assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:37864"));
-        assert!(arguments.contains(&"--mcp_server.authentication.enabled=false"));
-        assert!(arguments.contains(&"--mcp_server-endpoints=http://127.0.0.1:37964"));
+        let data = Path::new("job/freerouting-data");
+        let arguments = server_arguments(&LaunchOptions::default(), data);
+        let has = |wanted: &str| arguments.iter().any(|argument| argument == wanted);
+        assert!(has("--api_server.authentication.enabled=false"));
+        assert!(has("--api_server-endpoints=http://127.0.0.1:0"));
+        assert!(has("--mcp_server.authentication.enabled=false"));
+        assert!(has("--mcp_server-endpoints=http://127.0.0.1:0"));
+        assert!(has(&format!("--user_data_path={}", data.display())));
         assert!(!arguments
             .iter()
-            .any(|argument| argument.contains("0.0.0.0")));
+            .any(|argument| argument.contains("0.0.0.0") || argument.contains("target_api")));
+    }
+
+    #[test]
+    fn each_process_gets_its_own_ports_and_only_an_allowlisted_heap_option() {
+        let launch = LaunchOptions {
+            api_port: 41_001,
+            max_heap_mb: Some(6144),
+            ..Default::default()
+        };
+        let arguments = server_arguments(&launch, Path::new("data"));
+        assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:41001".to_string()));
+        assert!(arguments
+            .contains(&"--mcp_server.target_api_base_url=http://127.0.0.1:41001".to_string()));
+        assert!(
+            arguments.contains(&"--mcp_server-endpoints=http://127.0.0.1:0".to_string()),
+            "the MCP endpoint is never a fixed port"
+        );
+        assert_eq!(jvm_arguments(&launch), vec!["-Xmx6144m".to_string()]);
+        assert!(jvm_arguments(&LaunchOptions::default()).is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("freerouting.jar");
+        let dsn = temp.path().join("board.dsn");
+        std::fs::write(&jar, b"").unwrap();
+        std::fs::write(&dsn, b"").unwrap();
+        let mut routed = settings(Some(2));
+        routed.poll_interval = Duration::from_secs(3);
+        for (heap, valid) in [(Some(MIN_HEAP_MB - 1), false), (Some(MAX_HEAP_MB), true)] {
+            routed.launch.max_heap_mb = heap;
+            let result = validate_inputs(&jar, &dsn, &temp.path().join("out.ses"), &routed);
+            assert_eq!(result.is_ok(), valid, "{heap:?}: {result:?}");
+        }
     }
 
     #[test]
@@ -1160,17 +1459,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stderr_diagnostics_are_preserved_beside_the_requested_output() {
+    async fn the_whole_stderr_is_logged_and_only_its_tail_kept_in_memory() {
         let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("board.ses");
-        let path = write_diagnostics(&output, "router failed at pass 3")
-            .await
-            .unwrap()
-            .unwrap();
+        let path = default_stderr_log(&temp.path().join("board.ses"));
+        assert_eq!(path, temp.path().join("board.freerouting.log"));
+        let stream = (1..=5000)
+            .map(|item| format!("INFO routed item {item}\n"))
+            .collect::<String>();
+        let log = tokio::fs::File::create(&path).await.unwrap();
+        let tail = drain_stderr(stream.as_bytes(), Some(log), 64).await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), stream);
+        assert!(tail.starts_with('['), "{tail}");
+        assert!(tail.contains("earlier bytes of Freerouting stderr dropped"));
+        assert!(tail.ends_with("INFO routed item 5000"), "{tail}");
         assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            "router failed at pass 3"
+            finish_stderr_log(&path).await,
+            Some(path.display().to_string())
         );
+
+        // A router that wrote nothing leaves no log behind.
+        let empty = temp.path().join("quiet.freerouting.log");
+        let log = tokio::fs::File::create(&empty).await.unwrap();
+        assert_eq!(drain_stderr(&b""[..], Some(log), 64).await, "");
+        assert_eq!(finish_stderr_log(&empty).await, None);
+        assert!(!empty.exists());
     }
 
     /// Optional local parity check for Freerouting's actual stdio MCP state
@@ -1199,6 +1512,7 @@ mod tests {
                 job_timeout_seconds: Some(300),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
+                launch: LaunchOptions::default(),
             },
         )
         .await
@@ -1231,6 +1545,7 @@ mod tests {
                 job_timeout_seconds: Some(75),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(600),
+                launch: LaunchOptions::default(),
             },
         )
         .await
@@ -1268,6 +1583,7 @@ mod tests {
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
+                    launch: LaunchOptions::default(),
                 },
             )
             .await
@@ -1316,6 +1632,7 @@ mod tests {
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
+                    launch: LaunchOptions::default(),
                 },
             )
             .await
