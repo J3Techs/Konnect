@@ -77,6 +77,55 @@ fn info(ph: u32, prun: u32, pl: u32) -> u16 {
 /// the job unreachable rather than under-enforced.
 pub(crate) const MAX_RUN_BUCKET: u32 = 31;
 
+/// The relaxed field's per node-layer records, generation-stamped so a run
+/// never clears them: `d` is valid where `tag >> 1` is the run's
+/// generation, and `tag & 1` marks it closed.
+#[derive(Debug, Default)]
+struct FieldMap {
+    recs: Vec<(u32, u32)>,
+    gen: u32,
+}
+
+impl FieldMap {
+    /// Start a run over `len` node-layers.
+    fn begin(&mut self, len: usize) {
+        if self.recs.len() < len {
+            self.recs.resize(len, (u32::MAX, 0));
+        }
+        self.gen += 1;
+        if self.gen >= 1 << 30 {
+            self.recs.iter_mut().for_each(|r| r.1 = 0);
+            self.gen = 1;
+        }
+    }
+
+    /// The cost so far (`u32::MAX`: not reached).
+    #[inline]
+    fn get(&self, i: usize) -> u32 {
+        let r = self.recs[i];
+        if r.1 >> 1 == self.gen {
+            r.0
+        } else {
+            u32::MAX
+        }
+    }
+
+    #[inline]
+    fn closed(&self, i: usize) -> bool {
+        self.recs[i].1 == self.gen << 1 | 1
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, d: u32) {
+        self.recs[i] = (d, self.gen << 1);
+    }
+
+    #[inline]
+    fn close(&mut self, i: usize) {
+        self.recs[i].1 = self.gen << 1 | 1;
+    }
+}
+
 /// Per node-layer terminal flags and the exact-check cache.
 /// `tag` is `gen << 2 | flags`.
 #[repr(C)]
@@ -115,8 +164,7 @@ pub(crate) struct Scratch {
     flood_queue: Vec<u32>,
     /// The relaxed cost-to-go field per node-layer ([`relaxed_field`]) and
     /// the heap that builds it.
-    fd: Vec<u32>,
-    fclosed: Vec<bool>,
+    field: FieldMap,
     fheap: RadixHeap,
     /// The last [`run`] stopped at its [`Problem::cap`].
     pub capped: bool,
@@ -170,8 +218,7 @@ impl Scratch {
             + 5 * self.via_stamp.capacity()
             + 8 * self.vcost_stamp.capacity()
             + 4 * (self.flood_stamp.capacity()
-                + self.fd.capacity()
-                + self.fclosed.capacity() / 4
+                + 2 * self.field.recs.capacity()
                 + self.flood_queue.capacity()
                 + self.corr_stamp.capacity()
                 + self.gcol.capacity()
@@ -729,8 +776,7 @@ pub(crate) fn run<G: Grid>(
         let dy = axis_gap(i64::from(grid.y(r)), sbox.2, sbox.3);
         octile(dx, dy, inv_pitch)
     };
-    let mut fd = std::mem::take(&mut s.fd);
-    let mut fclosed = std::mem::take(&mut s.fclosed);
+    let mut fmap = std::mem::take(&mut s.field);
     let mut fbound = FieldBound {
         stop: 0,
         complete: false,
@@ -747,19 +793,19 @@ pub(crate) fn run<G: Grid>(
             p.targets,
             &to_sources,
             s,
-            (&mut fd, &mut fclosed),
+            &mut fmap,
         );
         stats.field_settled += settled;
         fbound = b;
     }
-    let (fd, fclosed) = (fd, fclosed);
+    let fmap = fmap;
     // The field's bound at a node-layer: exact where the backward search
     // closed it; elsewhere `stop - octile to the sources` (every unclosed
     // node had `d + octile >= stop`), or unreachable once it ran dry.
     let fd_at = |c: u32, r: u32, l: u32| {
         let i = lay.local(c, r) as usize * nl_layers + l as usize;
-        if fclosed[i] {
-            fd[i]
+        if fmap.closed(i) {
+            fmap.get(i)
         } else if fbound.complete {
             u32::MAX
         } else {
@@ -1179,8 +1225,7 @@ pub(crate) fn run<G: Grid>(
         }
     };
     s.tboxes = tboxes;
-    s.fd = fd;
-    s.fclosed = fclosed;
+    s.field = fmap;
     stats.expansions += expansions;
     outcome
 }
@@ -1305,7 +1350,7 @@ struct FieldBound {
 /// `d >= stop - octile to the sources` ([`FieldBound`]). Both bounds are
 /// consistent, so the forward search's path cost is unchanged.
 #[allow(clippy::too_many_arguments)]
-fn relaxed_field<G: Grid>(
+fn relaxed_field<G: Grid, F: Fn(u32, u32) -> u32>(
     grid: &G,
     lay: &Layout,
     views: &[View<'_>; MAX_LAYERS],
@@ -1314,18 +1359,15 @@ fn relaxed_field<G: Grid>(
     params: &CostParams,
     vp: &ViaPricing,
     targets: &[JobNode],
-    to_sources: &dyn Fn(u32, u32) -> u32,
+    to_sources: &F,
     s: &mut Scratch,
-    (fd, fclosed): (&mut Vec<u32>, &mut Vec<bool>),
+    fd: &mut FieldMap,
 ) -> (u64, FieldBound) {
     let region = lay.region;
     let nl_layers = lay.layers as usize;
     let lcount = lay.layers;
     let total = lay.padded_nodes() * nl_layers;
-    fd.clear();
-    fd.resize(total, u32::MAX);
-    fclosed.clear();
-    fclosed.resize(total, false);
+    fd.begin(total);
     let mut heap = std::mem::take(&mut s.fheap);
     heap.clear();
     let in_region = |c: u32, r: u32| {
@@ -1337,8 +1379,8 @@ fn relaxed_field<G: Grid>(
             continue;
         }
         let nl = lay.local(c, r) as usize * nl_layers + l as usize;
-        if fd[nl] != 0 {
-            fd[nl] = 0;
+        if fd.get(nl) != 0 {
+            fd.set(nl, 0);
             heap.push(to_sources(c, r), nl as u32);
         }
     }
@@ -1384,13 +1426,14 @@ fn relaxed_field<G: Grid>(
     through.sort_unstable();
     through.dedup_by_key(|t| t.0);
     let push = |heap: &mut RadixHeap,
-                fd: &mut [u32],
+                fd: &mut FieldMap,
                 through: &mut [(usize, u32, bool)],
                 pnl: usize,
                 nd: u32,
                 pc: u32,
                 pr: u32| {
-        if fd[pnl] == 0 {
+        let cur = fd.get(pnl);
+        if cur == 0 {
             // A target's end state: the step passes through it instead.
             if let Ok(i) = through.binary_search_by_key(&pnl, |t| t.0) {
                 if nd < through[i].1 {
@@ -1398,8 +1441,8 @@ fn relaxed_field<G: Grid>(
                     heap.push(nd.saturating_add(to_sources(pc, pr)), pnl as u32 | THROUGH);
                 }
             }
-        } else if nd < fd[pnl] {
-            fd[pnl] = nd;
+        } else if nd < cur {
+            fd.set(pnl, nd);
             heap.push(nd.saturating_add(to_sources(pc, pr)), pnl as u32);
         }
     };
@@ -1418,10 +1461,10 @@ fn relaxed_field<G: Grid>(
             }
             through[i].1
         } else {
-            if fclosed[nl] {
+            if fd.closed(nl) {
                 continue;
             }
-            fd[nl]
+            fd.get(nl)
         };
         if key != d.saturating_add(to_sources(c, r)) {
             continue;
@@ -1438,7 +1481,7 @@ fn relaxed_field<G: Grid>(
                 through[i].2 = true;
             }
         } else {
-            fclosed[nl] = true;
+            fd.close(nl);
         }
         settled += 1;
         let v = &views[layer];
