@@ -595,6 +595,80 @@ and part of the plan.
   refuses saves with AS_BUSY, so the DRC sync and `save_project` wait out
   AS_BUSY on the save itself.
 
+### Allowances, net classes, class policy and fanout retry (WS-A4)
+
+- **Net classes as KiCad 10 resolves them** (`rules::netclass`, private).
+  `ProjectRuleTable::from_project` now matches a `netclass_patterns`
+  entry against the **whole** net name as an anchored regular expression
+  or a wildcard pattern, expands bus-notation patterns, collects every
+  matching class (the highest-precedence one, lowest `priority` then
+  name, is taken and the net reported in `ambiguous_nets`; it used to be
+  the first match in file order), and, when nothing matches, gives a net
+  whose name parses as a bus (`D[0..3]`, `PREFIX{A B}`) the class all its
+  members share. A name with an escaped character such as `{slash}` is a
+  one-member bus group, which is how KiCad puts it in a class whose
+  pattern is the escape word. Behaviour change: such nets move out of
+  `Default`. Workspace dependency `regex = "1"` (MIT/Apache-2.0).
+- **`pipeline::allowances`**: `RoutingAllowances { class_layers,
+  layer_fallback: Vec<LayerFallbackSpec>, neck_down: Option<NeckDownSpec>,
+  exclude_classes: Option<Vec<String>>, fanout_share_within_mm }` names
+  classes and layers as the project does (serde, unknown fields refused);
+  `LayerFallbackSpec { class, layers, nets, reference: Option<ReferenceSpec
+  { plane, over, margin_mm }> }`, `NeckDownSpec { width_mm (0.10),
+  reach_mm (1.0), classes (allow list), exclude_classes }`.
+  `resolve(board, classes, &mut PipelineSettings) -> Result<AllowanceReport,
+  AllowanceError>` checks every name and writes the class layers,
+  fallbacks, neck-down, exclusions and fanout sharing. Everything is off
+  unless named, except the class policy: `exclude_classes: None` means
+  `default_excluded_classes(classes)`, every class whose track width is
+  at least `WIDE_CLASS_MIN_WIDTH_NM` (0.5 mm); `Some([])` routes every
+  class.
+- **`PipelineSettings::excluded_classes: BTreeSet<ClassId>`** (default
+  empty): those classes' open connections go to
+  **`PipelineResult::excluded`** (renumbered), never to the task list or
+  the failures; `pipeline::split_excluded`; counter
+  `pipeline_excluded_by_policy`. A struct literal of `PipelineSettings`
+  needs the field.
+- **`ClassFallback::nets: Option<BTreeSet<NetId>>`** (serde default
+  `None`): only those nets of the class get the second chance. A struct
+  literal of `ClassFallback` needs the field.
+- **`pipeline::enforce_reference(work, rules, fallback, before, routed) ->
+  ReferenceReport { tracks_checked, reverted_nets, dropped_nets }`** runs
+  after S6 (in `route_board` and in the job runner) whenever a fallback
+  names a reference: a net of such a class with a track off the reference
+  on the covered layers goes back to its negotiated copper, or loses its
+  copper. `PipelineResult::reference`; counters `pipeline_reference_*`.
+  Reference pieces are edge-indexed (`IndexedPolygon`); the second
+  chance's setup fell from about 35 s to 0.1 s on a dense real board.
+  Counters `pipeline_fallback_tasks`, `pipeline_fallback_us_setup`,
+  `pipeline_fallback_us_negotiate`.
+- **Fanout retry.** `FanoutSettings::{retry_failed (default on), far_gaps
+  (2.0, 2.5, 3.0 mm), far_directions (32)}`: islands the selection leaves
+  without a site get every exit pass plus the far exits and are placed,
+  serially, against every chosen site; first-round sites never move.
+  `FanoutStats::retried_sites`; `FailureDetail::blocked_by` (the pads whose
+  chosen sites block a `Conflict`). Behaviour change: the default fanout
+  places more sites. Via sharing (`share_within`) stays off by default.
+- **Job runner and tools (`konnect-core`).** `NativeJobSpec` gained
+  `allowances: RoutingAllowances`, `net_classes: Option<BTreeMap<String,
+  Vec<String>>>` (KiCad's effective class name, then its constituents) and
+  `fanout_plan: Option<PathBuf>`, all omitted from the serialised spec at
+  their defaults (old spec hashes are unchanged). `PipelineReport` gained
+  `net_classes: Option<NetClassSource>`, `allowances`,
+  `excluded_by_policy` (per class), `reference` and `fanout_plan_path`, also
+  in the job status. `start_native_route_job` and `route_native_region`
+  take `class_layers`, `layer_fallback`, `neck_down`, `exclude_classes`,
+  `fanout_share_within_mm`, `fanout_plan` and `net_classes` (`auto`,
+  `kicad`, `project`). Behaviour change: a native job now leaves
+  wide-copper classes unrouted by default. `plan_plane_vias` takes
+  `share_within_mm` and `retry_failed` and reports each failed pad's
+  reasons and blockers. The recommended live sequence is in
+  [`LIVE-FLOW.md`](LIVE-FLOW.md).
+- **Tests.** `KONNECT_PIPELINE_ALLOWANCES` (JSON or a file) in
+  `pipeline_real_fixture`; gated `netclass_real_fixture` (resolved classes
+  against KiCad's effective classes in a Specctra export) and
+  `fanout_real_fixture` (each failed pad's reason).
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).
