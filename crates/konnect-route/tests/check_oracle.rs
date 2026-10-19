@@ -527,8 +527,7 @@ fn internal_checker_reproduces_the_saved_kicad_drc() {
     let report = checker.check_board_timed(&mut telemetry);
     let check_ms = telemetry.stage_us(konnect_route::api::Stage::Check) as f64 / 1e3;
     println!(
-        "checker: build {build_ms:.0} ms, check {check_ms:.0} ms on {threads} threads; stats {:?}",
-        report.stats
+        "checker: build {build_ms:.0} ms, check {check_ms:.0} ms on {threads} threads"
     );
     println!("telemetry counters: {:?}", telemetry.counters);
 
@@ -826,7 +825,7 @@ fn internal_checker_on_the_project_board() {
     let checker = BoardChecker::new(&board, &rules, options);
     let build_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
-    let report = checker.check_board();
+    let (report, stats) = checker.check_board_with_stats();
     let check_ms = t.elapsed().as_secs_f64() * 1e3;
     let edges: usize = board
         .zones
@@ -837,7 +836,7 @@ fn internal_checker_on_the_project_board() {
         "project board: {} zone pieces ({edges} fill vertices); build {build_ms:.0} ms, check {check_ms:.0} ms; {:?}; stats {:?}",
         board.zones.len(),
         report.counts(),
-        report.stats
+        stats
     );
     for v in report.violations.iter().take(20) {
         println!(

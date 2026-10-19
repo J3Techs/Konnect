@@ -170,7 +170,8 @@ impl Violation {
 }
 
 /// Deterministic counts of what a check did (no timings: those go to
-/// [`Telemetry`], so equal inputs give equal reports).
+/// [`Telemetry`], so equal inputs give equal counts). The `*_timed`
+/// methods also record them as telemetry counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CheckStats {
     /// Per-layer copper objects checked (both sides of every pair).
@@ -185,10 +186,12 @@ pub struct CheckStats {
     pub unfilled_zones_skipped: u64,
 }
 
+/// What a check found. Its shape is frozen (callers build it with a struct
+/// literal); the counts of what a check did come separately as
+/// [`CheckStats`] from the `*_with_stats` methods of [`BoardChecker`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CheckReport {
     pub violations: Vec<Violation>,
-    pub stats: CheckStats,
 }
 
 impl CheckReport {
@@ -477,8 +480,16 @@ struct Area<'b> {
     /// by itself (KiCad skips `area == item`).
     zone_name: Option<&'b str>,
     layers: crate::api::LayerMask,
-    region: IndexedPolygon,
+    region: AreaRegion,
     bbox: BBox,
+}
+
+/// An area's polygon: its own (a keepout's), or a zone piece's, shared with
+/// [`BoardChecker::zone`].
+#[derive(Debug, Clone)]
+enum AreaRegion {
+    Own(IndexedPolygon),
+    Zone(u32),
 }
 
 /// The board side of a check, built once: objects, holes, edges, subjects
@@ -491,7 +502,8 @@ pub struct BoardChecker<'b> {
     holes: Holes,
     edges: Vec<Shape>,
     edge_index: LayerIndex,
-    zones: Vec<IndexedPolygon>,
+    /// Zone pieces by id, indexed when checked or named (see [`Self::zone`]).
+    zones: Vec<Option<IndexedPolygon>>,
     courtyards: Vec<(FootprintId, Shape)>,
     courtyard_index: LayerIndex,
     areas: Vec<Area<'b>>,
@@ -568,6 +580,18 @@ impl<'b> BoardChecker<'b> {
                 .map(|(i, (_, s))| IndexEntry::new(i as u32, s.bbox()))
                 .collect(),
         );
+        // Edge indexes only for the zone pieces something reads: checked
+        // fills, and named zones (rule areas). A routed check leaves fills
+        // to the refill and so indexes only the named ones.
+        let check_fills = options.check_zone_fills;
+        c.zones = board
+            .zones
+            .par_iter()
+            .map(|z| {
+                ((check_fills && z.filled) || z.zone_name.is_some())
+                    .then(|| IndexedPolygon::new(z.region.clone()))
+            })
+            .collect();
         for k in &board.keepouts {
             if let Some(name) = k.name.as_deref() {
                 c.areas.push(Area {
@@ -575,31 +599,41 @@ impl<'b> BoardChecker<'b> {
                     zone_name: None,
                     layers: k.layers,
                     bbox: k.region.bbox(),
-                    region: IndexedPolygon::new(k.region.clone()),
+                    region: AreaRegion::Own(IndexedPolygon::new(k.region.clone())),
                 });
             }
         }
-        for z in &board.zones {
+        for (i, z) in board.zones.iter().enumerate() {
             if let Some(name) = z.zone_name.as_deref() {
                 c.areas.push(Area {
                     name,
                     zone_name: Some(name),
                     layers: crate::api::LayerMask::single(z.layer),
                     bbox: z.region.bbox(),
-                    region: IndexedPolygon::new(z.region.clone()),
+                    region: AreaRegion::Zone(i as u32),
                 });
             }
         }
-        c.zones = board
-            .zones
-            .par_iter()
-            .map(|z| IndexedPolygon::new(z.region.clone()))
-            .collect();
         c.reach = i64::from(rules.max_clearance())
             + i64::from(options.safety_margin_nm)
             + i64::from(options.arc_policy.max_error_nm.max(0));
         c.build_board_objects();
         c
+    }
+
+    /// A zone piece's indexed polygon. Built for every piece that is checked
+    /// as copper or named as a rule area; nothing else asks.
+    fn zone(&self, z: u32) -> &IndexedPolygon {
+        self.zones[z as usize]
+            .as_ref()
+            .expect("zone pieces are indexed when checked or named")
+    }
+
+    fn area_region<'s>(&'s self, a: &'s Area<'b>) -> &'s IndexedPolygon {
+        match &a.region {
+            AreaRegion::Own(p) => p,
+            AreaRegion::Zone(z) => self.zone(*z),
+        }
     }
 
     /// Added to clearance-type requirements: the safety margin less the
@@ -624,7 +658,7 @@ impl<'b> BoardChecker<'b> {
                 continue;
             }
             let hit = match spec.zone {
-                Some(z) => self.zones[z as usize].touches(court),
+                Some(z) => self.zone(z).touches(court),
                 None => spec.shapes.iter().any(|s| konnect_geom::touches(s, court)),
             };
             if hit {
@@ -646,9 +680,12 @@ impl<'b> BoardChecker<'b> {
                 Some(z) => {
                     let own = self.board.zones[z as usize].zone_name.as_deref();
                     (a.zone_name.is_none() || a.zone_name != own)
-                        && a.region.contains_polygon(&self.zones[z as usize])
+                        && self.area_region(a).contains_polygon(self.zone(z))
                 }
-                None => !spec.shapes.is_empty() && spec.shapes.iter().all(|s| a.region.contains(s)),
+                None => {
+                    !spec.shapes.is_empty()
+                        && spec.shapes.iter().all(|s| self.area_region(a).contains(s))
+                }
             };
             if inside {
                 out.push(i as u32);
@@ -659,7 +696,7 @@ impl<'b> BoardChecker<'b> {
 
     fn subject_of(&self, spec: &ItemSpec<'_>) -> (SubjectData<'b>, Vec<u32>) {
         let bbox = match spec.zone {
-            Some(z) => Some(self.zones[z as usize].bbox()),
+            Some(z) => Some(self.zone(z).bbox()),
             None => spec.shapes.iter().map(|s| s.bbox()).reduce(BBox::union),
         };
         let (courtyards, areas) = match bbox {
@@ -871,7 +908,7 @@ impl<'b> BoardChecker<'b> {
                     src: Src::Board(ItemRef::Zone(z.id)),
                     net: z.net,
                     subject: ids[k],
-                    bbox: self.zones[z.id.index()].bbox(),
+                    bbox: self.zone(z.id.0).bbox(),
                     geom: Geom::Zone(z.id.0),
                     extra: 0,
                 });
@@ -994,20 +1031,31 @@ impl<'b> BoardChecker<'b> {
 
     /// Whole-board check of the existing copper.
     pub fn check_board(&self) -> CheckReport {
+        self.run(None).0
+    }
+
+    /// [`Self::check_board`] plus the counts of what it did.
+    pub fn check_board_with_stats(&self) -> (CheckReport, CheckStats) {
         self.run(None)
     }
 
-    /// Whole-board check, timed into `telemetry` as [`crate::api::Stage::Check`].
+    /// Whole-board check, timed into `telemetry` as [`crate::api::Stage::Check`]
+    /// with its [`CheckStats`] as counters.
     pub fn check_board_timed(&self, telemetry: &mut Telemetry) -> CheckReport {
         let start = Instant::now();
-        let report = self.run(None);
-        record(telemetry, start, &report);
+        let (report, stats) = self.run(None);
+        record(telemetry, start, &report, &stats);
         report
     }
 
     /// Check routed copper against the board and itself. Board-to-board
     /// pairs are not re-checked.
     pub fn check_routed(&self, copper: &RoutedCopper) -> CheckReport {
+        self.run(Some(copper)).0
+    }
+
+    /// [`Self::check_routed`] plus the counts of what it did.
+    pub fn check_routed_with_stats(&self, copper: &RoutedCopper) -> (CheckReport, CheckStats) {
         self.run(Some(copper))
     }
 
@@ -1018,12 +1066,12 @@ impl<'b> BoardChecker<'b> {
         telemetry: &mut Telemetry,
     ) -> CheckReport {
         let start = Instant::now();
-        let report = self.run(Some(copper));
-        record(telemetry, start, &report);
+        let (report, stats) = self.run(Some(copper));
+        record(telemetry, start, &report, &stats);
         report
     }
 
-    fn run(&self, copper: Option<&RoutedCopper>) -> CheckReport {
+    fn run(&self, copper: Option<&RoutedCopper>) -> (CheckReport, CheckStats) {
         let empty = RoutedCopper::default();
         let routed = copper.unwrap_or(&empty);
         let (rlayers, rholes, rsubjects, rids) = self.routed_objects(routed);
@@ -1066,16 +1114,16 @@ impl<'b> BoardChecker<'b> {
         // location come first and duplicates are adjacent.
         let mut violations = found;
         violations.dedup_by(|later, first| later.same_finding(first));
-        CheckReport { violations, stats }
+        (CheckReport { violations }, stats)
     }
 }
 
-fn record(telemetry: &mut Telemetry, start: Instant, report: &CheckReport) {
+fn record(telemetry: &mut Telemetry, start: Instant, report: &CheckReport, stats: &CheckStats) {
     telemetry.add_stage_time(crate::api::Stage::Check, start.elapsed().as_micros() as u64);
     telemetry.threads = telemetry.threads.max(rayon::current_num_threads() as u32);
-    telemetry.count("check_objects", report.stats.objects);
-    telemetry.count("check_candidate_pairs", report.stats.candidate_pairs);
-    telemetry.count("check_exact_tests", report.stats.exact_tests);
+    telemetry.count("check_objects", stats.objects);
+    telemetry.count("check_candidate_pairs", stats.candidate_pairs);
+    telemetry.count("check_exact_tests", stats.exact_tests);
     telemetry.count("check_violations", report.violations.len() as u64);
 }
 
@@ -1143,15 +1191,20 @@ impl<'c, 'b> Ctx<'c, 'b> {
         self.subject(id)
     }
 
+    /// The resolved clearance between two subjects, memoized per worker.
+    /// The rule table is always asked in one order (lower subject id first),
+    /// so a table that is not symmetric still gives the same answer however
+    /// rayon split the work.
     fn clearance(&self, cache: &mut ClearanceCache, a: u32, b: u32, layer: LayerId) -> Coord {
-        let key = (a.min(b), a.max(b), layer.0);
+        let (lo, hi) = (a.min(b), a.max(b));
+        let key = (lo, hi, layer.0);
         if let Some(&v) = cache.get(&key) {
             return v;
         }
         let v = self
             .c
             .rules
-            .clearance(&self.subject(a).view(), &self.subject(b).view(), layer);
+            .clearance(&self.subject(lo).view(), &self.subject(hi).view(), layer);
         cache.insert(key, v);
         v
     }
@@ -1160,10 +1213,10 @@ impl<'c, 'b> Ctx<'c, 'b> {
         match (a, b) {
             (Geom::Shape(x), Geom::Shape(y)) => gap_cmp(x, y, clearance),
             (Geom::Zone(z), Geom::Shape(s)) | (Geom::Shape(s), Geom::Zone(z)) => {
-                self.c.zones[*z as usize].gap_cmp(s, clearance)
+                self.c.zone(*z).gap_cmp(s, clearance)
             }
             (Geom::Zone(x), Geom::Zone(y)) => {
-                self.c.zones[*x as usize].gap_cmp_polygon(&self.c.zones[*y as usize], clearance)
+                self.c.zone(*x).gap_cmp_polygon(self.c.zone(*y), clearance)
             }
         }
     }
@@ -1171,7 +1224,7 @@ impl<'c, 'b> Ctx<'c, 'b> {
     /// Where two geometries come closest (only called for violations).
     fn locate(&self, a: &Geom, b: &Geom) -> Point {
         let near = |z: u32, s: &Shape| {
-            let zone = &self.c.zones[z as usize];
+            let zone = self.c.zone(z);
             zone.closest_within(s, self.c.reach.max(1))
                 .map_or_else(|| s.bbox().center(), |c| c.midpoint())
         };
@@ -1179,10 +1232,7 @@ impl<'c, 'b> Ctx<'c, 'b> {
             (Geom::Shape(x), Geom::Shape(y)) => closest(x, y).midpoint(),
             (Geom::Zone(z), Geom::Shape(s)) | (Geom::Shape(s), Geom::Zone(z)) => near(*z, s),
             (Geom::Zone(x), Geom::Zone(y)) => {
-                let (bx, by) = (
-                    self.c.zones[*x as usize].bbox(),
-                    self.c.zones[*y as usize].bbox(),
-                );
+                let (bx, by) = (self.c.zone(*x).bbox(), self.c.zone(*y).bbox());
                 let overlap = BBox::new(
                     Point::new(bx.min.x.max(by.min.x), bx.min.y.max(by.min.y)),
                     Point::new(bx.max.x.min(by.max.x), bx.max.y.min(by.max.y)),
@@ -1216,19 +1266,26 @@ impl<'c, 'b> Ctx<'c, 'b> {
             return None;
         }
         counts.0 += 1;
-        let extra = i64::from(a.extra) + i64::from(b.extra) + self.c.margin();
-        let reach = self.c.reach + i64::from(a.extra) + i64::from(b.extra);
-        if self.geom_gap(&a.geom, &b.geom, reach) != Ordering::Less {
-            return None;
-        }
-        counts.1 += 1;
         let required = self.clearance(cache, a.subject, b.subject, layer);
-        if self.geom_gap(&a.geom, &b.geom, i64::from(required) + extra) != Ordering::Less {
+        // The clearance-type threshold: rule, arc chord errors, margin and
+        // epsilon. At or below zero no gap can be under it.
+        let limit = i64::from(required) + i64::from(a.extra) + i64::from(b.extra) + self.c.margin();
+        let within = limit > 0 && {
+            counts.1 += 1;
+            self.geom_gap(&a.geom, &b.geom, limit) == Ordering::Less
+        };
+        // Copper of two nets that touches is a short whatever the clearance
+        // (KiCad's shorting_items): a limit at or below zero (a zero rule,
+        // or KiCad's epsilon over a tiny one) must not hide it, and two
+        // sharp cores overlapping compare Equal at zero, not Less.
+        let both_nets = a.net.is_some() && b.net.is_some();
+        let short = both_nets && (within || limit <= 0) && {
+            counts.1 += 1;
+            self.geom_gap(&a.geom, &b.geom, 0) != Ordering::Greater
+        };
+        if !within && !short {
             return None;
         }
-        let short = a.net.is_some()
-            && b.net.is_some()
-            && self.geom_gap(&a.geom, &b.geom, 0) != Ordering::Greater;
         let (sa, sb) = Self::orient(a.src, b.src);
         Some(Violation {
             kind: if short {
@@ -1662,10 +1719,14 @@ impl<'c, 'b> Ctx<'c, 'b> {
                                 b: None,
                                 layer: None,
                                 at: center,
+                                // The floor that failed: drill, then
+                                // diameter, then the annular ring.
                                 required: if drill < r.min_drill {
                                     r.min_drill
-                                } else {
+                                } else if diameter < r.min_diameter {
                                     r.min_diameter
+                                } else {
+                                    r.min_annular
                                 },
                             });
                         }
@@ -1855,11 +1916,11 @@ struct End {
     net: Option<NetId>,
     layer: LayerId,
     at: Point,
-    dir: (f64, f64),
+    dir: Dir,
 }
 
 impl End {
-    fn new(src: Src, net: Option<NetId>, layer: LayerId, at: Point, dir: (f64, f64)) -> Self {
+    fn new(src: Src, net: Option<NetId>, layer: LayerId, at: Point, dir: Dir) -> Self {
         End {
             src,
             net,
@@ -1870,44 +1931,92 @@ impl End {
     }
 }
 
-fn dir(from: Point, to: Point) -> (f64, f64) {
-    let v = to - from;
-    (v.x as f64, v.y as f64)
+/// A direction leaving a junction: a segment's exact integer difference,
+/// or an arc's floating-point tangent.
+#[derive(Debug, Clone, Copy)]
+enum Dir {
+    Exact(i64, i64),
+    Tangent(f64, f64),
 }
 
-/// Whether two directions leaving one point coincide. Segment directions
-/// are exact integer differences (well inside `f64`'s 53 bits), so the test
-/// is exact for them.
-fn overlapping(u: (f64, f64), v: (f64, f64)) -> bool {
-    u.0 * v.1 - u.1 * v.0 == 0.0 && u.0 * v.0 + u.1 * v.1 > 0.0
+impl Dir {
+    fn float(self) -> (f64, f64) {
+        match self {
+            Dir::Exact(x, y) => (x as f64, y as f64),
+            Dir::Tangent(x, y) => (x, y),
+        }
+    }
+}
+
+fn dir(from: Point, to: Point) -> Dir {
+    let v = to - from;
+    Dir::Exact(v.x, v.y)
+}
+
+/// Dot and cross products with their signs: exact in `i128` for two segment
+/// directions (the products reach 2^66, past `f64`'s 53 bits), `f64` once an
+/// arc tangent is involved.
+fn dot_cross(u: Dir, v: Dir) -> (f64, f64, Ordering, Ordering) {
+    if let (Dir::Exact(ux, uy), Dir::Exact(vx, vy)) = (u, v) {
+        let (ux, uy, vx, vy) = (
+            i128::from(ux),
+            i128::from(uy),
+            i128::from(vx),
+            i128::from(vy),
+        );
+        let dot = ux * vx + uy * vy;
+        let cross = ux * vy - uy * vx;
+        return (dot as f64, cross as f64, dot.cmp(&0), cross.cmp(&0));
+    }
+    let ((ux, uy), (vx, vy)) = (u.float(), v.float());
+    let dot = ux * vx + uy * vy;
+    let cross = ux * vy - uy * vx;
+    (
+        dot,
+        cross,
+        dot.partial_cmp(&0.0).unwrap_or(Ordering::Equal),
+        cross.partial_cmp(&0.0).unwrap_or(Ordering::Equal),
+    )
+}
+
+/// Whether two directions leaving one point coincide; exact for segments.
+fn overlapping(u: Dir, v: Dir) -> bool {
+    let (_, _, dot, cross) = dot_cross(u, v);
+    cross == Ordering::Equal && dot == Ordering::Greater
 }
 
 /// The angle between two directions leaving one point, degrees in
 /// `[0, 180]`: 180 is straight on, 90 a right-angle bend. Right angles and
-/// straight runs of integer directions come out exact.
-fn inside_angle_deg(u: (f64, f64), v: (f64, f64)) -> f64 {
-    let dot = u.0 * v.0 + u.1 * v.1;
-    let cross = u.0 * v.1 - u.1 * v.0;
-    if dot == 0.0 {
+/// straight runs of segments are decided exactly.
+fn inside_angle_deg(u: Dir, v: Dir) -> f64 {
+    let (dot, cross, dot_sign, cross_sign) = dot_cross(u, v);
+    if dot_sign == Ordering::Equal {
         return 90.0;
     }
-    if cross == 0.0 {
-        return if dot > 0.0 { 0.0 } else { 180.0 };
+    if cross_sign == Ordering::Equal {
+        return if dot_sign == Ordering::Greater {
+            0.0
+        } else {
+            180.0
+        };
     }
     cross.abs().atan2(dot).to_degrees()
 }
 
 /// Directions leaving an arc's start and end along the arc (tangents), or
 /// `None` for a degenerate arc.
-fn arc_tangents(s: Point, m: Point, e: Point) -> Option<((f64, f64), (f64, f64))> {
+fn arc_tangents(s: Point, m: Point, e: Point) -> Option<(Dir, Dir)> {
+    // Collinear points (decided exactly): a straight run from s to e.
+    if (m - s).cross(e - s) == 0 {
+        if s == e {
+            return None;
+        }
+        return Some((dir(s, e), dir(e, s)));
+    }
     let (sx, sy) = (f64::from(s.x), f64::from(s.y));
     let (mx, my) = (f64::from(m.x) - sx, f64::from(m.y) - sy);
     let (ex, ey) = (f64::from(e.x) - sx, f64::from(e.y) - sy);
     let d = 2.0 * (mx * ey - my * ex);
-    if d == 0.0 {
-        let v = dir(s, e);
-        return Some((v, (-v.0, -v.1)));
-    }
     let (qm, qe) = (mx * mx + my * my, ex * ex + ey * ey);
     let cx = (ey * qm - my * qe) / d;
     let cy = (mx * qe - ex * qm) / d;
@@ -1921,7 +2030,8 @@ fn arc_tangents(s: Point, m: Point, e: Point) -> Option<((f64, f64), (f64, f64))
             (-t.0, -t.1)
         }
     };
-    Some((tangent(0.0, 0.0, mx, my), tangent(ex, ey, mx, my)))
+    let (ts, te) = (tangent(0.0, 0.0, mx, my), tangent(ex, ey, mx, my));
+    Some((Dir::Tangent(ts.0, ts.1), Dir::Tangent(te.0, te.1)))
 }
 
 /// Length of a three-point arc, nm.

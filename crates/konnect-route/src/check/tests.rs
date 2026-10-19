@@ -47,7 +47,9 @@ fn a_clean_board_has_no_violations() {
     let b = parallel_tracks(mm(0.5));
     let r = board_check(&b, &rules());
     assert!(r.violations.is_empty(), "{:?}", r.violations);
-    assert!(r.stats.objects >= 2);
+    let (_, stats) =
+        BoardChecker::new(&b, &rules(), CheckOptions::default()).check_board_with_stats();
+    assert!(stats.objects >= 2);
 }
 
 #[test]
@@ -574,4 +576,230 @@ fn via_floor_follows_courtyard_conditions() {
         }
     );
     let _ = LayerMask::EMPTY;
+}
+
+// ─── Review fixes: shorts at zero clearance, rule order, exact sizes ─────────
+
+fn zero_clearance() -> UniformRules {
+    let mut r = UniformRules::default();
+    r.class.clearance = 0;
+    r
+}
+
+#[test]
+fn shorts_survive_a_zero_or_sub_epsilon_clearance() {
+    // Two overlapping fills of different nets: sharp cores, so the overlap
+    // compares Equal at a zero threshold.
+    let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+    b.zone("A", "B.Cu", (1.0, 1.0, 10.0, 10.0));
+    b.zone("B", "B.Cu", (8.0, 8.0, 19.0, 19.0));
+    let zones = b.build();
+    let strict = CheckOptions::default();
+    for (rules, options) in [
+        (rules(), strict),
+        (zero_clearance(), strict),
+        (zero_clearance(), strict.kicad_equivalent()),
+    ] {
+        let r = check_board(&zones, &rules, options);
+        assert_eq!(kinds(&r), vec![ViolationKind::Short], "{options:?}");
+    }
+    // A 300 nm rule under KiCad's 500 nm epsilon still finds the short.
+    let mut tiny = UniformRules::default();
+    tiny.class.clearance = 300;
+    assert_eq!(
+        kinds(&check_board(&zones, &tiny, strict.kicad_equivalent())),
+        vec![ViolationKind::Short]
+    );
+
+    // Sharp pads of two nets: overlapping, then sharing an edge (touching
+    // is a short too), then 1 nm apart (legal at clearance 0).
+    for (dx, want) in [
+        (-1000, vec![ViolationKind::Short]),
+        (0, vec![ViolationKind::Short]),
+        (1, vec![]),
+    ] {
+        let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+        let f = b.footprint("IC2", (5.0, 5.0));
+        b.smd_pad(f, "1", "A", (5.0, 5.0), (1.0, 1.0), "F.Cu");
+        b.smd_pad(f, "2", "B", (6.0, 5.0), (1.0, 1.0), "F.Cu");
+        let mut board = b.build();
+        board.pads[1].shapes[0] = Shape::ConvexPoly(
+            konnect_geom::ConvexPoly::axis_rect(
+                BBox::new(
+                    Point::new(pt(5.5, 4.5).x + dx, pt(5.5, 4.5).y),
+                    pt(6.5, 5.5),
+                ),
+                0,
+            )
+            .unwrap(),
+        );
+        let r = check_board(&board, &zero_clearance(), strict);
+        assert_eq!(kinds(&r), want, "dx {dx}");
+    }
+
+    // Same net overlapping: nothing.
+    let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+    b.zone("A", "B.Cu", (1.0, 1.0, 10.0, 10.0));
+    b.zone("A", "B.Cu", (8.0, 8.0, 19.0, 19.0));
+    assert!(check_board(&b.build(), &zero_clearance(), strict)
+        .violations
+        .is_empty());
+}
+
+/// A table whose clearance depends on argument order (only a misbehaving
+/// table does this): the checker must still be deterministic.
+struct Lopsided(UniformRules);
+
+impl RuleTable for Lopsided {
+    fn class_of(&self, net: Option<NetId>) -> crate::api::ClassId {
+        self.0.class_of(net)
+    }
+    fn class(&self, class: crate::api::ClassId) -> &crate::rules::NetClassRules {
+        self.0.class(class)
+    }
+    fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, _layer: LayerId) -> Coord {
+        if a.net < b.net {
+            mm(0.3)
+        } else {
+            mm(0.1)
+        }
+    }
+    fn track_width(&self, s: &RuleSubject<'_>, layer: LayerId) -> crate::rules::WidthRule {
+        self.0.track_width(s, layer)
+    }
+    fn via(&self, s: &RuleSubject<'_>) -> crate::rules::ViaRule {
+        self.0.via(s)
+    }
+    fn min_track_angle_deg(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<f64> {
+        self.0.min_track_angle_deg(s, layer)
+    }
+    fn min_segment_length(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<Coord> {
+        self.0.min_segment_length(s, layer)
+    }
+    fn edge_clearance(&self) -> Coord {
+        self.0.edge_clearance()
+    }
+    fn hole_clearance(&self) -> Coord {
+        self.0.hole_clearance()
+    }
+    fn hole_to_hole(&self) -> Coord {
+        self.0.hole_to_hole()
+    }
+    fn max_clearance(&self) -> Coord {
+        mm(0.3)
+    }
+    fn inert_rules(&self) -> &[crate::rules::InertRule] {
+        self.0.inert_rules()
+    }
+}
+
+#[test]
+fn an_order_dependent_table_still_gives_one_answer_on_any_thread_count() {
+    // Rows of tracks, 0.2 mm apart edge to edge, nets in mixed order so the
+    // same subject pair is met both ways round.
+    let mut b = BoardBuilder::new(60.0, 60.0, &["F.Cu", "B.Cu"]);
+    for col in 0..6 {
+        let x = 1.0 + 9.5 * f64::from(col);
+        for row in 0..150 {
+            // A, B, B, A, A, B, B, A, ...: neighbours meet both ways round.
+            let net = if ((row + 1) / 2) % 2 == 0 { "A" } else { "B" };
+            let y = 1.0 + 0.35 * f64::from(row);
+            b.track(net, "F.Cu", (x, y), (x + 8.0, y), 0.15, false);
+        }
+    }
+    let board = b.build();
+    let rules = Lopsided(UniformRules::default());
+    let run = |threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| check_board(&board, &rules, CheckOptions::default()))
+    };
+    let one = run(1);
+    for threads in [2, 4, 7, 16] {
+        assert_eq!(one, run(threads), "{threads} threads");
+    }
+    // Every finding names the same rule value: the table is asked one way.
+    let values: std::collections::BTreeSet<Coord> =
+        one.violations.iter().map(|v| v.required).collect();
+    assert!(values.len() <= 1, "{values:?}");
+}
+
+#[test]
+fn via_size_reports_the_floor_that_failed() {
+    // 0.7 / 0.45: diameter and drill pass, the 0.125 ring is under 0.15.
+    let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+    b.via("A", (5.0, 5.0), 0.7, 0.45, false);
+    b.via("B", (10.0, 5.0), 0.5, 0.3, false);
+    b.via("C", (15.0, 5.0), 0.6, 0.2, false);
+    let r = board_check(&b.build(), &rules());
+    let sizes: Vec<Coord> = r
+        .violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::ViaSize)
+        .map(|v| v.required)
+        .collect();
+    assert_eq!(sizes, vec![mm(0.15), mm(0.6), mm(0.3)]);
+}
+
+#[test]
+fn odd_widths_and_diameters_stay_exact() {
+    // Two 150_001 nm tracks: half widths sum to 150_001, so centre lines
+    // 350_001 apart leave exactly the 0.2 mm rule.
+    for (spacing, want) in [(350_001, vec![]), (350_000, vec![ViolationKind::Clearance])] {
+        let mut board = parallel_tracks(mm(0.5));
+        for t in &mut board.tracks {
+            t.seg.width = 150_001;
+        }
+        let y = board.tracks[0].seg.a.y + spacing;
+        board.tracks[1].seg.a.y = y;
+        board.tracks[1].seg.b.y = y;
+        assert_eq!(kinds(&board_check(&board, &rules())), want, "{spacing}");
+    }
+    // A 600_001 nm via (radius rounded up to 300_001) by a 0.15 mm track:
+    // the true gap is 200_000.5 at centre distance 575_001 (legal) and
+    // 199_999.5 at 575_000 (a violation); rounding up never makes a legal
+    // verdict of a real violation.
+    for (dy, want) in [(575_001, vec![]), (575_000, vec![ViolationKind::Clearance])] {
+        let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+        b.via("A", (10.0, 5.0), 0.6, 0.3, false);
+        b.track("B", "F.Cu", (2.0, 8.0), (18.0, 8.0), 0.15, false);
+        let mut board = b.build();
+        board.vias[0].diameter = 600_001;
+        let y = board.vias[0].center.y + dy;
+        board.tracks[0].seg.a.y = y;
+        board.tracks[0].seg.b.y = y;
+        let r = board_check(&board, &rules());
+        let copper: Vec<ViolationKind> = kinds(&r)
+            .into_iter()
+            .filter(|k| *k == ViolationKind::Clearance)
+            .collect();
+        assert_eq!(copper, want, "{dy}");
+    }
+}
+
+#[test]
+fn a_sharp_pad_in_a_plane_cut_out() {
+    // A 1 mm sharp pad inside a 1.4 mm cut-out: 0.2 mm all round, legal.
+    let ring =
+        |x0: f64, y0: f64, x1: f64, y1: f64| vec![pt(x0, y0), pt(x1, y0), pt(x1, y1), pt(x0, y1)];
+    for (cut, want) in [
+        (0.7, vec![]),
+        (0.699_999, vec![ViolationKind::Clearance]),
+        (0.4, vec![ViolationKind::Short]),
+    ] {
+        let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+        b.zone("GND", "F.Cu", (1.0, 1.0, 19.0, 19.0));
+        let f = b.footprint("IC2", (10.0, 10.0));
+        b.smd_pad(f, "1", "A", (10.0, 10.0), (1.0, 1.0), "F.Cu");
+        let mut board = b.build();
+        board.zones[0].region = Polygon::new(
+            ring(1.0, 1.0, 19.0, 19.0),
+            vec![ring(10.0 - cut, 10.0 - cut, 10.0 + cut, 10.0 + cut)],
+        )
+        .unwrap();
+        let r = board_check(&board, &rules());
+        assert_eq!(kinds(&r), want, "cut-out half width {cut}");
+    }
 }

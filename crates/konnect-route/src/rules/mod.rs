@@ -43,9 +43,9 @@ use crate::board::RouteBoard;
 use condition::{parse_condition, Expr, NameResolver, Prop, SubjectView};
 use konnect_geom::{mm_to_nm, Coord};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-pub(crate) use condition::wildcard_matches;
+pub(crate) use condition::wildcard_match_chars;
 
 /// One item as rules see it.
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +166,11 @@ pub struct RulesReport {
 pub trait RuleTable: Send + Sync {
     fn class_of(&self, net: Option<NetId>) -> ClassId;
     fn class(&self, class: ClassId) -> &NetClassRules;
-    /// Minimum edge-to-edge clearance between two items on `layer`.
+    /// Minimum edge-to-edge clearance between two items on `layer`. It
+    /// should not depend on the order of `a` and `b` (KiCad tries a rule's
+    /// A/B conditions both ways); callers that memoize answers ask in one
+    /// fixed order, so a table that breaks this still gives deterministic
+    /// results.
     fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, layer: LayerId) -> Coord;
     fn track_width(&self, subject: &RuleSubject<'_>, layer: LayerId) -> WidthRule;
     fn via(&self, subject: &RuleSubject<'_>) -> ViaRule;
@@ -347,18 +351,20 @@ impl ProjectRuleTable {
     /// Put `net` in the class named `class`, overriding the patterns: for a
     /// caller holding KiCad's own effective netclass (IPC, or a DSN export
     /// made from it) that disagrees with the project-file resolution.
+    /// A pinned net is settled, so it leaves the report's ambiguous list.
     /// Returns `false`, changing nothing, when the class or net is unknown.
     pub fn pin_net_class(&mut self, net: NetId, class: &str) -> bool {
         let Some(id) = self.classes.iter().position(|c| c.name == class) else {
             return false;
         };
-        match self.class_by_net.get_mut(net.index()) {
-            Some(slot) => {
-                *slot = ClassId(id as u16);
-                true
-            }
-            None => false,
+        let Some(slot) = self.class_by_net.get_mut(net.index()) else {
+            return false;
+        };
+        *slot = ClassId(id as u16);
+        if let Some(name) = self.net_names.get(net.index()) {
+            self.ambiguous_nets.retain(|n| n != name);
         }
+        true
     }
 
     pub fn board_rules(&self) -> &BoardRules {
@@ -685,7 +691,14 @@ fn assign_classes(
         }
     }
 
+    // Characters collected once per pattern and per net: this runs for
+    // every pattern-net pair.
+    let pattern_chars: Vec<(Vec<char>, ClassId)> = patterns
+        .iter()
+        .map(|(p, id)| (p.chars().collect(), *id))
+        .collect();
     let mut ambiguous = Vec::new();
+    let mut name: Vec<char> = Vec::new();
     let by_net = board
         .nets
         .iter()
@@ -693,18 +706,23 @@ fn assign_classes(
             if let Some(&id) = explicit.get(net.name.as_str()) {
                 return id;
             }
-            let matches: BTreeSet<ClassId> = patterns
-                .iter()
-                .filter(|(p, _)| wildcard_matches(p, &net.name, true))
-                .map(|(_, id)| *id)
-                .collect();
-            if matches.len() > 1 {
+            name.clear();
+            name.extend(net.name.chars());
+            let mut first = None;
+            let mut other_class = false;
+            for (p, id) in &pattern_chars {
+                if wildcard_match_chars(p, &name) {
+                    match first {
+                        None => first = Some(*id),
+                        Some(f) if f != *id => other_class = true,
+                        Some(_) => {}
+                    }
+                }
+            }
+            if other_class {
                 ambiguous.push(net.name.clone());
             }
-            patterns
-                .iter()
-                .find(|(p, _)| wildcard_matches(p, &net.name, true))
-                .map_or(ClassId(0), |(_, id)| *id)
+            first.unwrap_or(ClassId(0))
         })
         .collect();
     (by_net, ambiguous, inert)
@@ -1137,6 +1155,11 @@ mod tests {
         assert!(!t.pin_net_class(gnd, "Nope"));
         assert!(!t.pin_net_class(NetId(999), "Power"));
         assert_eq!(t.class(t.class_of(Some(gnd))).name, "Power");
+        // Pinning an ambiguous net settles it.
+        let io_pwr = b.net_by_name("IO_PWR").unwrap();
+        assert_eq!(t.report().ambiguous_nets, vec!["IO_PWR".to_string()]);
+        assert!(t.pin_net_class(io_pwr, "Fast"));
+        assert!(t.report().ambiguous_nets.is_empty());
     }
 
     #[test]
