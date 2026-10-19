@@ -37,6 +37,7 @@
 //! under every result, and a floor beats a conflicting `max`.
 
 mod condition;
+mod netclass;
 
 use crate::api::{ClassId, FootprintId, ItemKind, LayerId, NetId};
 use crate::board::RouteBoard;
@@ -156,7 +157,8 @@ pub struct RulesReport {
     pub applied_rules: Vec<String>,
     pub inert: Vec<InertRule>,
     /// Nets whose name matches patterns of more than one class. They take
-    /// the first match; KiCad may composite them differently.
+    /// the highest-precedence class (lowest `priority`, then name); KiCad
+    /// composites them field by field.
     pub ambiguous_nets: Vec<String>,
     pub board: BoardRules,
 }
@@ -649,9 +651,13 @@ fn parse_board_rules(v: &serde_json::Value) -> BoardRules {
     }
 }
 
-/// Each board net's class: an explicit `netclass_assignments` entry first,
-/// then the first matching `netclass_patterns` entry in file order, then
-/// `Default`. Patterns naming an unknown class are reported inert.
+/// Each board net's class, resolved as KiCad 10 resolves it
+/// ([`netclass::NetclassResolver`]): explicit `netclass_assignments`, then
+/// every matching `netclass_patterns` entry (whole-name regex or wildcard,
+/// bus patterns expanded), then a bus-notation name's members, then
+/// `Default`. A net several classes match takes the highest-precedence one
+/// and is reported ambiguous. Patterns naming an unknown class are reported
+/// inert.
 fn assign_classes(
     net_settings: &serde_json::Value,
     classes: &[NetClassRules],
@@ -681,48 +687,44 @@ fn assign_classes(
             }),
         }
     }
-    let mut explicit: BTreeMap<&str, ClassId> = BTreeMap::new();
+    let mut explicit: BTreeMap<String, Vec<ClassId>> = BTreeMap::new();
     if let Some(map) = net_settings["netclass_assignments"].as_object() {
         for (net, v) in map {
-            let class = v.as_str().or_else(|| v.as_array()?.first()?.as_str());
-            if let Some(id) = class.and_then(class_id) {
-                explicit.insert(net.as_str(), id);
+            let names: Vec<&str> = match v {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect(),
+                _ => Vec::new(),
+            };
+            let ids: Vec<ClassId> = names.into_iter().filter_map(class_id).collect();
+            if !ids.is_empty() {
+                explicit.insert(net.clone(), ids);
             }
         }
     }
-
-    // Characters collected once per pattern and per net: this runs for
-    // every pattern-net pair.
-    let pattern_chars: Vec<(Vec<char>, ClassId)> = patterns
+    let listed = net_settings["classes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let priorities: Vec<Option<i64>> = classes
         .iter()
-        .map(|(p, id)| (p.chars().collect(), *id))
+        .map(|c| {
+            listed
+                .iter()
+                .find(|j| j["name"].as_str() == Some(c.name.as_str()))
+                .and_then(|j| j["priority"].as_i64())
+        })
         .collect();
+    let resolver = netclass::NetclassResolver::new(classes, &priorities, &patterns, explicit);
     let mut ambiguous = Vec::new();
-    let mut name: Vec<char> = Vec::new();
     let by_net = board
         .nets
         .iter()
         .map(|net| {
-            if let Some(&id) = explicit.get(net.name.as_str()) {
-                return id;
-            }
-            name.clear();
-            name.extend(net.name.chars());
-            let mut first = None;
-            let mut other_class = false;
-            for (p, id) in &pattern_chars {
-                if wildcard_match_chars(p, &name) {
-                    match first {
-                        None => first = Some(*id),
-                        Some(f) if f != *id => other_class = true,
-                        Some(_) => {}
-                    }
-                }
-            }
-            if other_class {
+            let r = resolver.resolve(&net.name);
+            if r.ambiguous {
                 ambiguous.push(net.name.clone());
             }
-            first.unwrap_or(ClassId(0))
+            r.class
         })
         .collect();
     (by_net, ambiguous, inert)
