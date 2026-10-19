@@ -141,8 +141,8 @@ async fn check_route_rules_finds_a_track_through_another_nets_pad() {
         .unwrap();
     assert!(!r.is_error, "{}", text(&r));
     let b = body(&r);
-    assert_eq!(b["checker"], "interim_exact");
-    assert_eq!(b["authoritative"], false);
+    assert_eq!(b["checker"], "check_routed");
+    assert_eq!(b["authoritative"], true);
     assert!(b["violations"].as_u64().unwrap() >= 1, "{b}");
     assert!(b["by_kind"]["short"].as_u64().unwrap_or(0) >= 1, "{b}");
 
@@ -175,14 +175,18 @@ async fn check_route_rules_finds_a_track_through_another_nets_pad() {
 }
 
 #[tokio::test]
-async fn unbuilt_stages_are_reported_as_unavailable_not_as_empty_results() {
+async fn the_audit_and_plane_vias_run_on_the_saved_board() {
     let f = files();
     let r =
         handle_audit_terminal_access(&json!({ "board": f.board(), "references": ["R1"] }), &ctx())
             .await
             .unwrap();
-    assert!(r.is_error);
-    assert!(text(&r).contains("missing evidence"), "{}", text(&r));
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["source"], "saved_file");
+    assert!(b["terminals"].as_u64().unwrap() >= 1, "{b}");
+    assert!(b["unreachable"].as_u64().unwrap() <= b["terminals"].as_u64().unwrap());
+    assert!(b["reachable_per_layer"].is_object(), "{b}");
     let r = handle_audit_terminal_access(
         &json!({ "board": f.board(), "references": ["U99"] }),
         &ctx(),
@@ -195,12 +199,19 @@ async fn unbuilt_stages_are_reported_as_unavailable_not_as_empty_results() {
     let r = handle_plan_plane_vias(&json!({ "board": f.board(), "output_plan": out }), &ctx())
         .await
         .unwrap();
-    assert!(
-        r.is_error && text(&r).contains("cannot run yet"),
-        "{}",
-        text(&r)
-    );
-    assert!(!Path::new(&out).exists());
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    // Whatever was planned is on disk, and only then.
+    let written = b["plan_written"].as_bool().unwrap();
+    assert_eq!(Path::new(&out).exists(), written, "{b}");
+    assert_eq!(written, b["sites"].as_u64().unwrap() > 0, "{b}");
+    // The same output again is refused, never replaced.
+    if written {
+        let r = handle_plan_plane_vias(&json!({ "board": f.board(), "output_plan": out }), &ctx())
+            .await
+            .unwrap();
+        assert!(r.is_error && text(&r).contains("never replaced"));
+    }
 }
 
 #[tokio::test]
@@ -249,7 +260,7 @@ async fn route_native_region_optimizes_a_plan_inside_its_region() {
     let r = handle_route_native_region(&none, &ctx()).await.unwrap();
     assert!(r.is_error && text(&r).contains("region"));
     // Native routing sees only the region's connections: none in this box,
-    // so nothing is routed (and no unbuilt stage is reached) ...
+    // so nothing is routed ...
     let mut native = args.clone();
     native["output_plan"] = json!(f.path("native.json"));
     native["source"] = json!("native");
@@ -257,15 +268,25 @@ async fn route_native_region_optimizes_a_plan_inside_its_region() {
     assert!(!r.is_error, "{}", text(&r));
     assert_eq!(body(&r)["work_tracks"], 0);
     assert!(body(&r)["output_plan"].is_null());
-    // ... while a box holding the open connection reaches the stub.
+    // ... while a box holding the open connection runs every stage and
+    // plans the copper that joins it.
     native["output_plan"] = json!(f.path("native2.json"));
     native["region"] = json!({ "x1": 15.0, "y1": 5.0, "x2": 40.0, "y2": 30.0 });
     let r = handle_route_native_region(&native, &ctx()).await.unwrap();
-    assert!(
-        r.is_error && text(&r).contains("not available"),
-        "{}",
-        text(&r)
-    );
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    let route = b["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stage"] == "route")
+        .unwrap()
+        .clone();
+    assert_eq!(route["state"], "done", "{b}");
+    assert_eq!(route["detail"]["connections_after"], 0, "{b}");
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert!(b["plan_items"].as_u64().unwrap() >= 1, "{b}");
+    assert!(Path::new(&f.path("native2.json")).is_file());
 }
 
 #[tokio::test]

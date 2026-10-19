@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
-- **239 registered tools** + **7 always-visible meta-tools** = **246 total**
+- **22 toolsets** organized into 10 categories
+- **247 registered tools** + **7 always-visible meta-tools** = **254 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -305,6 +305,21 @@ and Windows servers do not.
 | `delete_routing` | Delete tracks, arcs and vias from the open board by area, nets and kind; locked items kept unless `include_locked`. Dry run by default; apply needs `expected_count` from that dry run and refuses if the selection changed. One undo step; footprints, pads and zones are never touched. |
 | `delete_zones` | Delete zones from the open board by name, net and layer; locked zones kept unless `include_locked`. Dry run by default listing name, net, layers, priority and outline size; apply needs `expected_count`, deletes in one undo step and proves the zones gone. Replacing a zone is `delete_zones` then `add_zone`. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+
+### `native_routing` · 8 tools
+**Purpose:** Konnect's native autorouter on the saved board file: connectivity, terminal-access audit, plane-via fanout, an exact rule check of a routing file, and the whole route pipeline (connectivity, fanout, pin access, global and detailed routing, optimizer, exact check) in-process for one region or as a resumable background job. Every tool reads the saved board and writes at most a new `add_routing` routing file; nothing is written to the board.
+**Source:** [`crates/konnect-core/src/tools/route_native.rs`](crates/konnect-core/src/tools/route_native.rs)
+
+| Tool | Description |
+|------|-------------|
+| `connectivity_report` | Union-find connectivity of the saved board's copper: per net, the islands its pads fall into and the connections still needed to join them. Zone pieces with no fill are left out (their outline only bounds copper) and counted. Reads the saved file only. |
+| `audit_terminal_access` | For each pad of the named footprints, which copper layers can leave it legally (outside its courtyard) under the board's rules. Pads with no exit are listed with the reason. Reads the saved file only. |
+| `plan_plane_vias` | Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only. |
+| `check_route_rules` | Check the copper in a routing_file against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in. KiCad's DRC stays the final authority. |
+| `route_native_region` | Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. Use start_native_route_job for a whole board. |
+| `start_native_route_job` | Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. State lives in `<output_plan>.konnect-native-job/` (status, progress, checkpoint, report). Follow with get_native_route_job; end early with stop_native_route_job; resume continues a stopped or lost job from its checkpoint. |
+| `get_native_route_job` | Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST), the current stage, the report when finished, and whether the plan and a checkpoint exist. Reads the job directory only. |
+| `stop_native_route_job` | Ask a job started by start_native_route_job to stop at its next stage boundary; its checkpoint is kept for resume. Waits up to wait_seconds and reports the job. |
 
 ### `placement` · 6 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.

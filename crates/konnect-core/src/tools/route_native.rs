@@ -1,5 +1,4 @@
-//! Draft MCP tools for the native router (not registered yet: the
-//! integrator adds them to `router/registry.rs` and `tool-directory.md`).
+//! The `native_routing` toolset: MCP tools for the native router.
 //!
 //! Every tool here reads the **saved** board file (`"source": "saved_file"`
 //! in each response) and writes nothing to it. A stage the router has not
@@ -106,7 +105,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_native_region",
-            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. Stages not built yet are reported, not skipped silently. Use start_native_route_job for a whole board.",
+            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. Use start_native_route_job for a whole board.",
             {
                 let mut s = with_props(job_props(), &["board", "output_plan", "region"]);
                 s["properties"]["region"]["description"] = json!("The region to work on, mm (required here)");

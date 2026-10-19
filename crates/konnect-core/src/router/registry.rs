@@ -93,6 +93,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 18,
     },
     ToolsetMeta {
+        name: "native_routing",
+        description: "Native autorouter on the saved board: connectivity, terminal-access audit, plane-via fanout, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan",
+        category: "pcb",
+        tool_count: 8,
+    },
+    ToolsetMeta {
         name: "placement",
         description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
@@ -184,6 +190,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
+        "native_routing" => Some(route_native::tools()),
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
