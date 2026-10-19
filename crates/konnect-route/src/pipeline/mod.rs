@@ -329,6 +329,23 @@ fn run(
             }
             net_ok && scope.region.is_none_or(|reg| reg.contains_bbox(&b))
         });
+        // The class policy: classes left unrouted get no fanout copper either.
+        if !settings.excluded_classes.is_empty() {
+            let excluded = |net: NetId| {
+                settings
+                    .excluded_classes
+                    .contains(&rules.class_of(Some(net)))
+            };
+            let sites = plan.sites.len();
+            plan.sites.retain(|s| !excluded(s.net));
+            plan.failed
+                .retain(|(pad, _)| board.pads[pad.index()].net.is_none_or(|n| !excluded(n)));
+            plan.details.retain(|d| !excluded(d.net));
+            tel.count(
+                "pipeline_fanout_excluded_by_policy",
+                (sites - plan.sites.len()) as u64,
+            );
+        }
         let mut copper = plan.routed();
         let all = board.layers.all();
         for v in &mut copper.vias {

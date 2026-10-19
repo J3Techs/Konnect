@@ -671,3 +671,23 @@ fn connections_whose_copper_the_reference_took_are_failed() {
         vec![(id, DetailFailure::OffReference)]
     );
 }
+
+#[test]
+fn excluded_classes_get_no_fanout_copper() {
+    let board = plane_with_pads();
+    let rules = UniformRules::default();
+    let s = PipelineSettings {
+        excluded_classes: BTreeSet::from([ClassId(0)]),
+        ..settings(1)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &s).unwrap();
+    let fanout = r.fanout.as_ref().expect("fanout ran");
+    assert!(fanout.sites.is_empty() && fanout.failed.is_empty());
+    assert!(r.fanout_copper.vias.is_empty() && r.fanout_copper.tracks.is_empty());
+    assert!(
+        r.telemetry.counters["pipeline_fanout_excluded_by_policy"] > 0,
+        "the plan had sites to drop"
+    );
+    assert!(r.connections.is_empty() && r.failed.is_empty());
+    assert_eq!(r.plan.item_count(), 0);
+}
