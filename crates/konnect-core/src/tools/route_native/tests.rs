@@ -99,10 +99,10 @@ fn t(net: &str, layer: &str, a: (f64, f64), b: (f64, f64)) -> PlanTrack {
 fn every_draft_tool_has_a_valid_schema_and_a_unique_name() {
     let defs = tools();
     let mut names: Vec<&str> = defs.iter().map(|d| d.name).collect();
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 10);
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 10);
 }
 
 #[tokio::test]
@@ -314,4 +314,109 @@ async fn job_tools_refuse_bad_arguments_and_unknown_jobs() {
     .await
     .unwrap();
     assert!(r.is_error && text(&r).contains("threads"));
+}
+
+#[tokio::test]
+async fn apply_route_plan_refuses_before_any_ipc() {
+    let f = files();
+    let plan = write_plan(&f, "p.json", vec![t("SIG", "F.Cu", (1.0, 1.0), (2.0, 1.0))]);
+    let ledger = f.path("ledger.json");
+    let call = |extra: Value| {
+        let mut args = json!({ "board": f.board(), "routing_file": plan, "ledger_output": ledger });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    };
+    for (extra, field) in [
+        (json!({ "geometry_check": "off" }), "geometry_check"),
+        (json!({ "max_items": 0 }), "max_items"),
+        (json!({ "max_items": 20_001 }), "max_items"),
+        (json!({ "locked": "yes" }), "locked"),
+        (
+            json!({ "routing_file": f.path("missing.json") }),
+            "routing_file",
+        ),
+    ] {
+        let r = handle_apply_route_plan(&call(extra), &ctx()).await.unwrap();
+        assert!(
+            r.is_error && text(&r).contains(field),
+            "{field}: {}",
+            text(&r)
+        );
+    }
+    std::fs::write(&ledger, "{}").unwrap();
+    let r = handle_apply_route_plan(&call(json!({})), &ctx())
+        .await
+        .unwrap();
+    assert!(
+        r.is_error && text(&r).contains("never replaced"),
+        "{}",
+        text(&r)
+    );
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), "{}");
+}
+
+#[tokio::test]
+async fn map_route_plan_drc_follows_drc_items_to_plan_items() {
+    let f = files();
+    let plan = write_plan(
+        &f,
+        "p.json",
+        vec![
+            t("SIG", "F.Cu", (1.0, 1.0), (2.0, 1.0)),
+            t("SIG", "F.Cu", (2.0, 1.0), (3.0, 2.0)),
+        ],
+    );
+    let ledger = f.path("ledger.json");
+    std::fs::write(
+        &ledger,
+        json!({
+            "routing_file": plan, "locked": false, "complete": true,
+            "ledger": { "chunks_total": 1, "chunks_applied": 1, "items_created": 2,
+                        "items_unmapped": 0,
+                        "items": [
+                            { "kiid": "AAAA", "chunk": 0, "item": { "kind": "track", "index": 0 }, "net": "SIG" },
+                            { "kiid": "bbbb", "chunk": 0, "item": { "kind": "track", "index": 1 }, "net": "SIG" }
+                        ] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let item =
+        |uuid: &str| json!({ "description": "x", "pos": { "x": 1.0, "y": 1.0 }, "uuid": uuid });
+    let report = f.path("drc.json");
+    std::fs::write(
+        &report,
+        json!({
+            "violations": [
+                { "severity": "error", "description": "Clearance", "rule": "clearance",
+                  "pos": { "x": 1.0, "y": 1.0 }, "items": [item("aaaa"), item("pad-uuid")] },
+                { "severity": "warning", "description": "Silk", "rule": "silk_overlap",
+                  "pos": { "x": 1.0, "y": 1.0 }, "items": [item("other")] }
+            ],
+            "unconnected_items": [],
+            "schematic_parity": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = handle_map_route_plan_drc(
+        &json!({ "routing_file": plan, "ledger": ledger, "drc_report": report }),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["touching_plan"], 1);
+    assert_eq!(b["not_touching_plan"], 1);
+    assert_eq!(b["by_rule"]["clearance/error"]["touching_plan"], 1);
+    assert_eq!(b["nets"], json!(["SIG"]));
+    assert_eq!(b["listed"][0]["items"][0]["plan_item"]["index"], 0);
+
+    let r = handle_map_route_plan_drc(&json!({ "routing_file": plan, "ledger": ledger }), &ctx())
+        .await
+        .unwrap();
+    assert!(r.is_error && text(&r).contains("drc_report"));
 }

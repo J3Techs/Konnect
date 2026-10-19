@@ -18,7 +18,7 @@ use super::cli::DrcReport;
 use super::route_geometry;
 use super::routing_batch::{self, Batch};
 use konnect_route::plan::{PlanChunk, PlanItemKind, PlanItemRef, RoutePlan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,7 +43,7 @@ impl ItemSink for IpcSink<'_> {
 }
 
 /// One created item and where it came from.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AppliedItem {
     pub kiid: String,
     pub chunk: u32,
@@ -52,7 +52,7 @@ pub(crate) struct AppliedItem {
 }
 
 /// What an apply created, chunk by chunk.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ApplyLedger {
     pub chunks_total: usize,
     pub chunks_applied: usize,
@@ -60,6 +60,9 @@ pub(crate) struct ApplyLedger {
     /// Created items KiCad did not echo back with an id that matches a plan
     /// item; they exist on the board but cannot be mapped.
     pub items_unmapped: usize,
+    /// Geometry lint defects in the plan (zero when the lint was strict).
+    #[serde(default)]
+    pub geometry_defects: usize,
     pub items: Vec<AppliedItem>,
 }
 
@@ -144,12 +147,15 @@ pub(crate) fn batch_of(plan: &RoutePlan, locked: bool) -> Batch {
     }
 }
 
-/// Everything that can be checked before the first write.
+/// Everything that can be checked before the first write, with the geometry
+/// lint either refusing (`strict`) or only counted. Returns the chunks and
+/// the lint's defect count.
 pub(crate) fn preflight(
     plan: &RoutePlan,
     limits: &route_geometry::Limits,
+    strict: bool,
     max_items: usize,
-) -> Result<Vec<PlanChunk>, ApplyRefusal> {
+) -> Result<(Vec<PlanChunk>, usize), ApplyRefusal> {
     plan.validate().map_err(|e| match e {
         konnect_route::plan::PlanError::Invalid { field, reason } => {
             ApplyRefusal::Invalid { field, reason }
@@ -161,13 +167,16 @@ pub(crate) fn preflight(
     })?;
     let whole = batch_of(plan, false);
     let report = route_geometry::lint(&whole.segments(), limits);
-    if report.defects() > 0 {
+    if strict && report.defects() > 0 {
         return Err(ApplyRefusal::Geometry {
             defects: report.defects(),
             detail: report.to_json(limits),
         });
     }
-    Ok(plan.chunks_by_net(max_items.clamp(1, routing_batch::MAX_ITEMS)))
+    Ok((
+        plan.chunks_by_net(max_items.clamp(1, routing_batch::MAX_ITEMS)),
+        report.defects(),
+    ))
 }
 
 /// A position key in nm, so a created item matches its plan item exactly.
@@ -236,6 +245,7 @@ fn created_keys(created: &[prost_types::Any]) -> Vec<(String, ItemKey)> {
 
 /// Create `plan` through `sink`, chunk by chunk, after a full preflight.
 /// `codes` is the board's net name → net code map (one `GetNets`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_plan(
     plan: &RoutePlan,
     locked: bool,
@@ -244,7 +254,21 @@ pub(crate) fn apply_plan(
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
 ) -> Result<ApplyOutcome, ApplyRefusal> {
-    let chunks = preflight(plan, limits, max_items)?;
+    apply_plan_with(plan, locked, limits, true, max_items, codes, sink)
+}
+
+/// [`apply_plan`], with the geometry lint refusing (`strict_geometry`) or
+/// only counted in [`ApplyLedger::geometry_defects`].
+pub(crate) fn apply_plan_with(
+    plan: &RoutePlan,
+    locked: bool,
+    limits: &route_geometry::Limits,
+    strict_geometry: bool,
+    max_items: usize,
+    codes: &BTreeMap<String, i32>,
+    sink: &mut dyn ItemSink,
+) -> Result<ApplyOutcome, ApplyRefusal> {
+    let (chunks, geometry_defects) = preflight(plan, limits, strict_geometry, max_items)?;
     // Every chunk's items are built before the first is sent, so a missing
     // net refuses the whole plan.
     let mut built = Vec::with_capacity(chunks.len());
@@ -269,6 +293,7 @@ pub(crate) fn apply_plan(
     }
     let mut ledger = ApplyLedger {
         chunks_total: chunks.len(),
+        geometry_defects,
         ..ApplyLedger::default()
     };
     for (ci, (chunk, items)) in chunks.iter().zip(built).enumerate() {
@@ -451,6 +476,7 @@ pub(crate) fn ledger_summary(ledger: &ApplyLedger) -> serde_json::Value {
         "items_created": ledger.items_created,
         "items_mapped": ledger.items.len(),
         "items_unmapped": ledger.items_unmapped,
+        "geometry_defects": ledger.geometry_defects,
     })
 }
 

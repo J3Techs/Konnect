@@ -42,9 +42,8 @@ mod project_file_writer_tests;
 mod route_geometry;
 mod routing_batch;
 // Native router: the `native_routing` toolset (`route_native`) and the plan
-// apply path (`route_native_apply`), which no tool calls yet.
+// apply path (`route_native_apply`) behind its `apply_route_plan` tool.
 pub(crate) mod route_native;
-#[allow(dead_code)]
 pub(crate) mod route_native_apply;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;

@@ -416,7 +416,9 @@ async fn handle_save_project(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
-    ipc.save_board()?;
+    // KiCad refuses a save with AS_BUSY while a zone fill runs.
+    tokio::task::spawn_blocking(move || ipc.save_board_when_ready(super::drc::BUSY_TIMEOUT))
+        .await??;
     Ok(CallToolResult::text("Board saved successfully."))
 }
 
