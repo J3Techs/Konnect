@@ -18,16 +18,18 @@
 //! - each KiCad error must match a finding of the same category naming the
 //!   same items (by UUID); KiCad reports a bend once from each track, so two
 //!   of its errors may match one finding;
-//! - a finding KiCad did not report is explained when it is a clearance
-//!   error on a track or via KiCad already reported an error for (KiCad
-//!   keeps the first clearance error per track unless "report all track
-//!   errors" is on); anything else counts as a false positive.
+//! - a finding KiCad did not report is explained only when it is a
+//!   clearance error (never a short) on a track or via KiCad already
+//!   reported a clearance error for (KiCad keeps the first clearance error
+//!   per track unless "report all track errors" is on) *and* an independent
+//!   floating-point measurement of the gap confirms it is under the rule
+//!   less KiCad's epsilon; anything else counts as a false positive.
 //!
-//! The gate: zero misses in the gated categories and false positives at
-//! most 5% of everything flagged.
+//! The gate: zero misses in the gated categories and no false positives.
 //!
 //! ```text
-//! KONNECT_DB1_FIXTURE_DIR=/path/to/fixture cargo test --release //!     -p konnect-route --test check_oracle -- --nocapture
+//! KONNECT_DB1_FIXTURE_DIR=/path/to/fixture cargo test --release \
+//!     -p konnect-route --test check_oracle -- --nocapture
 //! ```
 //!
 //! Without the variable, or without the files, the tests print why and
@@ -36,7 +38,9 @@
 use konnect_geom::{closest, Shape};
 use konnect_route::api::ItemRef;
 use konnect_route::board::RouteBoard;
-use konnect_route::check::{BoardChecker, CheckOptions, CheckedItem, ViolationKind};
+use konnect_route::check::{
+    BoardChecker, CheckOptions, CheckedItem, ViolationKind, KICAD_DRC_EPSILON_NM,
+};
 use konnect_route::telemetry::Telemetry;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable, RuleTable};
 use serde_json::Value;
@@ -84,6 +88,13 @@ fn kicad_rule(kind: ViolationKind) -> &'static str {
         ViolationKind::Keepout => "keepout",
     }
 }
+
+/// False positives the gate allows by default: none. Every finding KiCad did
+/// not report must be explained and measured.
+const MAX_FALSE_POSITIVES: usize = 0;
+
+/// Slack for the f64 gap measurement against an integer rule, nm.
+const MEASURE_TOLERANCE_NM: f64 = 1.0;
 
 /// The categories the gate requires with zero misses.
 const GATED: [&str; 4] = [
@@ -364,6 +375,99 @@ fn bend_deg(board: &RouteBoard, v: &konnect_route::check::Violation) -> Option<f
     Some(cross.abs().atan2(dot).to_degrees())
 }
 
+/// `*` and `?` wildcards over the whole name.
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),
+        Some((&p, rest)) => name
+            .split_first()
+            .is_some_and(|(&c, tail)| (p == '?' || p == c) && wildcard(rest, tail)),
+    }
+}
+
+/// Which netclass-pattern semantics reproduce KiCad's effective classes:
+/// anchored wildcards (what the rule table does) against "anchored
+/// wildcard or the pattern anywhere in the name" (an unanchored match, as
+/// an unanchored regex of a literal pattern would give). First matching
+/// pattern in file order wins in both. Prints counts only.
+fn pattern_hypotheses(pro_text: &str, board: &RouteBoard, kicad: &BTreeMap<String, (f64, f64)>) {
+    let pro: Value = serde_json::from_str(pro_text).expect("project is JSON");
+    let ns = &pro["net_settings"];
+    let um = |v: &Value| v.as_f64().map(|mm| (mm * 1000.0 * 1000.0).round() / 1000.0);
+    let classes: BTreeMap<String, (Option<f64>, Option<f64>)> = ns["classes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|c| {
+            Some((
+                c["name"].as_str()?.to_string(),
+                (um(&c["track_width"]), um(&c["clearance"])),
+            ))
+        })
+        .collect();
+    let default = classes.get("Default").copied().unwrap_or((None, None));
+    let rules_of = |class: &str| {
+        let (w, c) = classes.get(class).copied().unwrap_or((None, None));
+        (w.or(default.0), c.or(default.1))
+    };
+    let patterns: Vec<(Vec<char>, String)> = ns["netclass_patterns"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|p| {
+            Some((
+                p["pattern"].as_str()?.chars().collect(),
+                p["netclass"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let mut tally = [(0usize, 0usize); 2];
+    let mut changed = 0usize;
+    for net in &board.nets {
+        let Some(&(w, c)) = kicad.get(&net.name) else {
+            continue;
+        };
+        let name: Vec<char> = net.name.chars().collect();
+        let pick = |unanchored: bool| {
+            patterns
+                .iter()
+                .find(|(p, _)| {
+                    wildcard(p, &name)
+                        || (unanchored && {
+                            let mut wide = vec!['*'];
+                            wide.extend(p.iter().copied());
+                            wide.push('*');
+                            wildcard(&wide, &name)
+                        })
+                })
+                .map_or("Default", |(_, class)| class.as_str())
+        };
+        let (anchored, wide) = (pick(false), pick(true));
+        if anchored != wide {
+            changed += 1;
+        }
+        for (i, class) in [anchored, wide].into_iter().enumerate() {
+            let agree = match rules_of(class) {
+                (Some(cw), Some(cc)) => (cw - w).abs() < 0.5 && (cc - c).abs() < 0.5,
+                _ => false,
+            };
+            if agree {
+                tally[i].0 += 1;
+            } else {
+                tally[i].1 += 1;
+            }
+        }
+    }
+    println!(
+        "netclass pattern semantics against KiCad: anchored wildcard agrees on {} nets, disagrees on {}; \
+         anchored-or-unanchored agrees on {}, disagrees on {} ({changed} nets change class between them)",
+        tally[0].0, tally[0].1, tally[1].0, tally[1].1
+    );
+}
+
 struct KicadViolation {
     rule: String,
     description: String,
@@ -499,6 +603,7 @@ fn internal_checker_reproduces_the_saved_kicad_drc() {
         println!(
             "netclass cross-check against KiCad's effective rules: {disagree} disagree, {pinned} pinned"
         );
+        pattern_hypotheses(&pro_text, &board, &kicad);
     }
     rules.assign_classes(&mut board);
     println!(
@@ -526,9 +631,7 @@ fn internal_checker_reproduces_the_saved_kicad_drc() {
     let mut telemetry = Telemetry::default();
     let report = checker.check_board_timed(&mut telemetry);
     let check_ms = telemetry.stage_us(konnect_route::api::Stage::Check) as f64 / 1e3;
-    println!(
-        "checker: build {build_ms:.0} ms, check {check_ms:.0} ms on {threads} threads"
-    );
+    println!("checker: build {build_ms:.0} ms, check {check_ms:.0} ms on {threads} threads");
     println!("telemetry counters: {:?}", telemetry.counters);
 
     // Determinism: one thread gives the same report.
@@ -649,21 +752,28 @@ fn internal_checker_reproduces_the_saved_kicad_drc() {
             } => uuid_of(&board, c),
             _ => None,
         };
-        let suppressed = matches!(v.kind, ViolationKind::Clearance | ViolationKind::Short)
+        // Suppressed by KiCad's first-error-per-track rule: only clearance
+        // findings (a short is reported whatever came first), and only
+        // when an independent f64 measurement confirms the gap is under
+        // the rule less KiCad's epsilon.
+        let gap = v.b.and_then(|b| gap_between(&board, v.a, b));
+        let suppressed = v.kind == ViolationKind::Clearance
             && [Some(v.a), v.b]
                 .into_iter()
                 .flatten()
                 .filter_map(track_uuid)
                 .any(|u| reported_tracks.contains(&u));
-        if suppressed {
+        let confirmed = gap.is_some_and(|g| {
+            g < f64::from(v.required) - f64::from(KICAD_DRC_EPSILON_NM) + MEASURE_TOLERANCE_NM
+        });
+        if suppressed && confirmed {
             *explained
                 .entry(
-                    "true violation on a track or via KiCad already reported (it keeps the first clearance error per track or via)",
+                    "measured violation on a track or via KiCad already reported (it keeps the first clearance error per track or via)",
                 )
                 .or_default() += 1;
             continue;
         }
-        let gap = v.b.and_then(|b| gap_between(&board, v.a, b));
         let extra = match v.kind {
             ViolationKind::TrackAngle => v
                 .layer
@@ -794,9 +904,15 @@ fn internal_checker_reproduces_the_saved_kicad_drc() {
         gated_misses, 0,
         "checker missed KiCad errors in gated categories"
     );
+    // `KONNECT_ORACLE_MAX_FP` can raise the bound for another fixture.
+    let max_fp = std::env::var("KONNECT_ORACLE_MAX_FP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_FALSE_POSITIVES);
     assert!(
-        fps.len() * 20 <= flagged,
-        "false positives exceed 5% of flagged items"
+        fps.len() <= max_fp,
+        "{} false positives (at most {max_fp} allowed)",
+        fps.len()
     );
 }
 
