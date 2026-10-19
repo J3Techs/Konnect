@@ -447,3 +447,196 @@ fn a_sharp_y_junction_becomes_a_right_angle_t() {
         .iter()
         .any(|t| t.seg == Segment::new(p(8.0, 12.0), p(8.0, 10.0), W)));
 }
+
+/// Whether some track of `copper` joins the pad at `centre` (square, `half`
+/// mm a side from the centre) as KiCad's connectivity does: a track end
+/// inside the pad, or the pad centre on the track's copper.
+fn anchors_pad(copper: &RoutedCopper, centre: Point, half: Coord) -> bool {
+    let inside = |q: Point| (q.x - centre.x).abs() <= half && (q.y - centre.y).abs() <= half;
+    copper.tracks.iter().any(|t| {
+        inside(t.seg.a)
+            || inside(t.seg.b)
+            || konnect_geom::point_segment_distance_cmp(
+                centre,
+                t.seg.a,
+                t.seg.b,
+                i64::from(t.seg.width / 2),
+            ) != std::cmp::Ordering::Greater
+    })
+}
+
+#[test]
+fn a_shortcut_that_only_clips_a_pad_the_chain_ran_through_is_refused() {
+    // The chain runs through the middle pad's centre; the straight
+    // shortcut between the end pads would only graze its top edge.
+    let board = pads_board(&[
+        ("SIG", (5.0, 5.55), (0.5, 0.5)),
+        ("SIG", (15.0, 5.55), (0.5, 0.5)),
+        ("SIG", (10.0, 5.0), (1.0, 1.0)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.55), p(10.0, 5.0)),
+            track(net, 0, p(10.0, 5.0), p(15.0, 5.55)),
+        ],
+        vias: vec![],
+    };
+    let (centre, half) = (p(10.0, 5.0), MM / 2);
+    assert!(anchors_pad(&copper, centre, half));
+    // The shortcut overlaps the pad, so an overlap test alone would pass it.
+    let shortcut = Shape::Segment(Segment::new(p(5.0, 5.55), p(15.0, 5.55), W));
+    assert!(board.pads[2].shapes.iter().any(|s| touches(s, &shortcut)));
+    let r = optimize(&board, &rules, &mut copper);
+    assert!(
+        anchors_pad(&copper, centre, half),
+        "the middle pad lost its anchor: {:?} {r:?}",
+        copper.tracks
+    );
+    assert!(r.edits_rejected > 0, "{r:?}");
+}
+
+#[test]
+fn a_track_end_resting_off_the_centre_line_must_stay_inside_new_copper() {
+    let board = pads_board(&[
+        ("SIG", (5.0, 5.55), (0.5, 0.5)),
+        ("SIG", (15.0, 5.55), (0.5, 0.5)),
+        ("SIG", (7.5, 8.0), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    // The branch ends 25 um off the first track's centre line (inside its
+    // copper, so not a junction to split) and runs up to the third pad.
+    let tracks = vec![
+        track(net, 0, p(5.0, 5.55), p(10.0, 5.0)),
+        track(net, 0, p(10.0, 5.0), p(15.0, 5.55)),
+        track(net, 0, p(7.5, 5.30), p(7.5, 8.0)),
+    ];
+    let ck = ExactChecker::new(&board, &rules, CheckerOptions::default());
+    let copper = RoutedCopper {
+        tracks: tracks.clone(),
+        vias: vec![],
+    };
+    let snapshot = RoutedSet::from_copper(board.layer_count(), &copper);
+    let context = BoardContext::new(&board);
+    let opts = OptimizeOptions::default();
+    let mut work = NetWork::new(&ck, &snapshot, &context, &opts, net, &tracks, &[]);
+    // The straight line crosses the branch's copper but holds neither its
+    // end nor puts an end inside it: KiCad would not connect them.
+    let grazing = [Segment::new(p(5.0, 5.55), p(15.0, 5.55), W)];
+    let branch = Shape::Segment(tracks[2].seg);
+    assert!(touches(&Shape::Segment(grazing[0]), &branch));
+    assert!(!work.connectivity_ok(LayerId(0), &[0, 1], &grazing));
+    // A path through the branch's end keeps it.
+    let through = [
+        Segment::new(p(5.0, 5.55), p(7.5, 5.30), W),
+        Segment::new(p(7.5, 5.30), p(15.0, 5.55), W),
+    ];
+    assert!(work.connectivity_ok(LayerId(0), &[0, 1], &through));
+}
+
+/// Tracks of `after` that `before` did not have.
+fn new_tracks(before: &RoutedCopper, after: &RoutedCopper) -> Vec<RoutedTrack> {
+    after
+        .tracks
+        .iter()
+        .filter(|t| !before.tracks.iter().any(|o| o.seg == t.seg))
+        .copied()
+        .collect()
+}
+
+#[test]
+fn octilinear_with_skew_and_jog_smoothing_off_draws_only_45_degree_copper() {
+    let board = pads_board(&[
+        ("SIG", (5.0, 5.0), (0.5, 0.5)),
+        ("SIG", (20.0, 5.3), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let start = RoutedCopper {
+        tracks: staircase(net, 0, p(5.0, 5.0), p(20.0, 5.3), 50_000),
+        vias: vec![],
+    };
+    // By default the 1.1 degree run is one straight piece off 45 degrees.
+    let mut loose = start.clone();
+    optimize(&board, &rules, &mut loose);
+    assert!(loose
+        .tracks
+        .iter()
+        .any(|t| !is_octilinear(t.seg.b - t.seg.a)));
+    let strict_opts = OptimizeOptions {
+        max_skew_deg: 0.0,
+        smooth_jogs: false,
+        ..OptimizeOptions::default()
+    };
+    let mut strict = start.clone();
+    let r = optimize_with(
+        &board,
+        &rules,
+        &mut strict,
+        &strict_opts,
+        &mut Telemetry::default(),
+    );
+    assert!(r.pull_tight_edits > 0, "{r:?}");
+    for t in &strict.tracks {
+        assert!(is_octilinear(t.seg.b - t.seg.a), "{t:?}");
+    }
+    assert_eq!(islands(&board, &strict), 0);
+    assert!(clean(&board, &rules, &strict));
+}
+
+#[test]
+fn a_junction_on_a_diagonal_run_is_squared_only_when_the_branch_stays_octilinear() {
+    // The branch's perpendicular foot on the 45 degree run falls half a
+    // nanometre off the lattice.
+    let mut far_end = p(13.0, 11.0);
+    far_end.y += 1;
+    let board = pads_board(&[
+        ("SIG", (5.0, 5.0), (0.5, 0.5)),
+        ("SIG", (15.0, 15.0), (0.5, 0.5)),
+        ("SIG", (13.0, 11.0), (0.5, 0.5)),
+    ]);
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let start = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.0), p(10.0, 10.0)),
+            track(net, 0, p(10.0, 10.0), p(15.0, 15.0)),
+            track(net, 0, far_end, p(10.0, 10.0)),
+        ],
+        vias: vec![],
+    };
+    let only_squaring = OptimizeOptions {
+        pull_tight: false,
+        corner_cuts: false,
+        smooth_jogs: false,
+        trim_pad_entries: false,
+        ..OptimizeOptions::default()
+    };
+    let mut strict = start.clone();
+    let r = optimize_with(
+        &board,
+        &rules,
+        &mut strict,
+        &only_squaring,
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.junctions_squared, 0, "{r:?}");
+    for t in new_tracks(&start, &strict) {
+        assert!(is_octilinear(t.seg.b - t.seg.a), "{t:?}");
+    }
+    let mut loose = start.clone();
+    let r = optimize_with(
+        &board,
+        &rules,
+        &mut loose,
+        &OptimizeOptions {
+            octilinear: false,
+            ..only_squaring
+        },
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.junctions_squared, 1, "{r:?}");
+    assert_eq!(islands(&board, &loose), 0);
+}

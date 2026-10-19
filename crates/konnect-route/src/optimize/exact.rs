@@ -956,6 +956,15 @@ impl<'a> ExactChecker<'a> {
         &self.obstacles[id as usize].shape
     }
 
+    /// The board item an obstacle is (a piece of) copper of.
+    pub(crate) fn obstacle_item(&self, id: u32) -> ItemRef {
+        self.obstacles[id as usize].item
+    }
+
+    pub(crate) fn options(&self) -> CheckerOptions {
+        self.opts
+    }
+
     /// Pads and vias: board copper that never moves or refills.
     pub(crate) fn obstacle_is_anchor(&self, id: u32) -> bool {
         matches!(

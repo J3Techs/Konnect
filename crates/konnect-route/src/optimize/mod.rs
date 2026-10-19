@@ -61,13 +61,13 @@ use crate::telemetry::Telemetry;
 use exact::{CheckerOptions, ExactChecker, RoutedSet};
 use konnect_geom::{touches, BBox, Coord, Point, Segment, Shape, Vector};
 use lint::{lint_group, LintLimits, LintSeg, NEAR_JOINT_NM};
-
-/// How far from octilinear (nm, in the shorter leg) a shortcut may be and
-/// still be drawn as one straight piece.
-const SNAP_NM: i64 = 1_000;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// How far from octilinear (nm, in the shorter leg) a shortcut may be and
+/// still be drawn as one straight piece (while `max_skew_deg` is above 0).
+const SNAP_NM: i64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OptimizeReport {
@@ -119,7 +119,14 @@ pub struct OptimizeOptions {
     pub smooth_jogs: bool,
     /// Move a branch meeting a run at a sharp angle to a right-angle T.
     pub square_junctions: bool,
-    /// Keep every new segment at a multiple of 45°.
+    /// Draw new copper octilinear (multiples of 45°). On, a pull-tight
+    /// shortcut is a straight piece or a dogleg of one straight and one 45°
+    /// piece, and junction squaring never adds a branch off 45°; two
+    /// deliberate exceptions keep their own switches: a straight shortcut
+    /// within `max_skew_deg` of octilinear (0 turns it off) and jog
+    /// smoothing's gentle slants (`smooth_jogs`). With both of those off,
+    /// every new segment is octilinear. Off, a shortcut is one straight
+    /// piece at whatever angle.
     pub octilinear: bool,
     /// The geometry gate's minimum interior bend angle. The rule table's
     /// `track_angle` minimum applies too, whichever is larger.
@@ -128,8 +135,9 @@ pub struct OptimizeOptions {
     pub jog_length_nm: Coord,
     /// Most segments one pull-tight replacement spans.
     pub window: usize,
-    /// A shortcut this close to octilinear (degrees) may be one straight
-    /// piece at its own angle rather than a dogleg.
+    /// A shortcut this close to octilinear (degrees), or within 1 µm of it,
+    /// may be one straight piece at its own angle rather than a dogleg.
+    /// 0 allows only exact octilinear pieces.
     pub max_skew_deg: f64,
     /// Passes of the whole edit sequence per net.
     pub max_passes: u32,
@@ -1017,10 +1025,135 @@ impl<'c, 'b> NetWork<'c, 'b> {
         }
     }
 
-    /// Every same-net item the removed copper touched, the added copper
-    /// still reaches: directly, or through a same-net anchor both touch (a
-    /// pad or via never moves or refills, so it is a safe bridge).
+    /// The connectivity gate, judged two ways, both of which must hold:
+    ///
+    /// - **overlap:** every same-net item the removed copper touched, the
+    ///   added copper still touches, directly or through a same-net pad or
+    ///   via both touch (what the union-find of S1 counts);
+    /// - **anchors:** every item the removed copper was *joined* to as
+    ///   KiCad's connectivity judges it (an anchor of one inside the other's
+    ///   copper: a track end inside a pad, via or track, or a pad or via
+    ///   centre on a track) the added copper is still joined to, directly
+    ///   or through a pad or via joined to both ([`Self::anchors_kept`]).
+    ///   Overlap alone is not enough: a shortcut that grazes a pad edge
+    ///   touches it but KiCad leaves the pad unconnected.
     fn connectivity_ok(&mut self, layer: LayerId, removed: &[usize], added: &[Segment]) -> bool {
+        self.overlap_kept(layer, removed, added) && self.anchors_kept(layer, removed, added)
+    }
+
+    /// Same-net copper on `layer` touching any of `shapes`, as KiCad's
+    /// connectivity sees it: board items (pads, vias, tracks, arcs, zones),
+    /// this net's routed vias, and its routed tracks other than `skip`.
+    /// Only pads and vias when `bridges_only`.
+    fn nodes_touching(
+        &mut self,
+        layer: LayerId,
+        shapes: &[Shape],
+        skip: &[usize],
+        bridges_only: bool,
+    ) -> Vec<Node<'c>> {
+        let ck: &'c ExactChecker<'b> = self.ck;
+        let board = ck.board();
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        for s in shapes {
+            self.ck.same_net_touching(self.net, layer, s, &mut scratch);
+        }
+        let mut items: Vec<(crate::api::ItemRef, u32)> = scratch
+            .iter()
+            .map(|&id| (self.ck.obstacle_item(id), id))
+            .collect();
+        self.scratch = scratch;
+        items.sort_unstable();
+        items.dedup_by_key(|(item, _)| *item);
+        let mut out = Vec::with_capacity(items.len());
+        for (item, id) in items {
+            use crate::api::ItemRef as R;
+            let node = match item {
+                R::Pad(pid) => Node::pad(&board.pads[pid.index()]),
+                R::Via(vid) => {
+                    let v = &board.vias[vid.index()];
+                    Node::owned(vec![v.shape()], vec![v.center])
+                }
+                _ if bridges_only => continue,
+                R::Track(tid) => {
+                    let t = &board.tracks[tid.index()];
+                    Node::owned(vec![Shape::Segment(t.seg)], vec![t.seg.a, t.seg.b])
+                }
+                R::Arc(aid) => {
+                    let a = &board.arcs[aid.index()];
+                    let pieces = a
+                        .segments(&self.ck.options().arc_policy)
+                        .into_iter()
+                        .map(Shape::Segment)
+                        .collect();
+                    Node::owned(pieces, vec![a.start, a.end])
+                }
+                // A zone has no anchors of its own: a track joins it by an
+                // end inside the fill, a pad or via by its centre.
+                R::Zone(_) => Node {
+                    shapes: std::borrow::Cow::Borrowed(std::slice::from_ref(ck.obstacle_shape(id))),
+                    anchors: Vec::new(),
+                    maybe: Vec::new(),
+                },
+            };
+            out.push(node);
+        }
+        for v in &self.vias {
+            if !v.layers.contains(layer) {
+                continue;
+            }
+            let disc = Shape::Circle(konnect_geom::Circle::from_diameter(v.center, v.diameter));
+            if shapes.iter().any(|s| touches(s, &disc)) {
+                out.push(Node::owned(vec![disc], vec![v.center]));
+            }
+        }
+        if !bridges_only {
+            for (i, t) in self.tracks.iter().enumerate() {
+                let Some(t) = t else { continue };
+                if t.layer != layer || skip.contains(&i) {
+                    continue;
+                }
+                let ts = Shape::Segment(t.seg);
+                if shapes.iter().any(|s| touches(s, &ts)) {
+                    out.push(Node::owned(vec![ts], vec![t.seg.a, t.seg.b]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The anchor half of [`Self::connectivity_ok`]. An item the removed
+    /// copper may have been joined to (counting a pad's every plausible
+    /// anchor) must be joined to the added copper for certain (a track end
+    /// inside it, or its one sure anchor on a track), directly or through a
+    /// pad or via that is joined to both.
+    fn anchors_kept(&mut self, layer: LayerId, removed: &[usize], added: &[Segment]) -> bool {
+        let old_segs: Vec<Segment> = removed
+            .iter()
+            .filter_map(|&i| self.tracks[i].map(|t| t.seg))
+            .collect();
+        let old = Node::segments(&old_segs);
+        let lost: Vec<Node<'c>> = self
+            .nodes_touching(layer, &old.shapes, removed, false)
+            .into_iter()
+            .filter(|x| old.joins(x, true))
+            .collect();
+        if lost.is_empty() {
+            return true;
+        }
+        let new = Node::segments(added);
+        let bridges: Vec<Node<'c>> = self
+            .nodes_touching(layer, &new.shapes, removed, true)
+            .into_iter()
+            .filter(|b| new.joins(b, false))
+            .collect();
+        lost.iter()
+            .all(|x| new.joins(x, false) || bridges.iter().any(|b| b.joins(x, false)))
+    }
+
+    /// The overlap half of [`Self::connectivity_ok`].
+    fn overlap_kept(&mut self, layer: LayerId, removed: &[usize], added: &[Segment]) -> bool {
         let added: Vec<Shape> = added.iter().map(|s| Shape::Segment(*s)).collect();
         let removed_shapes: Vec<Shape> = removed
             .iter()
@@ -1301,7 +1434,11 @@ impl<'c, 'b> NetWork<'c, 'b> {
                         Segment::new(*p, foot, rt.seg.width),
                         Segment::new(foot, far, rt.seg.width),
                     ];
-                    if added.iter().any(|s| s.a == s.b)
+                    // On a diagonal run whose perpendicular foot falls
+                    // between lattice points the branch is a nanometre off
+                    // 45°: not drawn while new copper must be octilinear.
+                    if (self.opts.octilinear && !is_octilinear(foot - b))
+                        || added.iter().any(|s| s.a == s.b)
                         || len_f(b, foot) >= len_f(b, *p)
                         || !self.accept(*layer, &[bs, rs], &added)
                     {
@@ -1482,6 +1619,69 @@ impl<'c, 'b> NetWork<'c, 'b> {
     }
 }
 
+/// One piece of same-net copper on one layer as KiCad's connectivity sees
+/// it: its copper and its anchor points. Two pieces are joined when an
+/// anchor of one lies in the other's copper.
+struct Node<'b> {
+    shapes: std::borrow::Cow<'b, [Shape]>,
+    /// Anchors KiCad certainly uses: track ends, via centres, a one-shape
+    /// pad's copper centre (`PAD::ShapePos`).
+    anchors: Vec<Point>,
+    /// Points that may also be anchors, used only to ask whether old copper
+    /// *was* joined (so the gate errs towards refusing): a pad's hole
+    /// position and its shapes' centres.
+    maybe: Vec<Point>,
+}
+
+impl<'b> Node<'b> {
+    fn owned(shapes: Vec<Shape>, anchors: Vec<Point>) -> Self {
+        Node {
+            shapes: std::borrow::Cow::Owned(shapes),
+            anchors,
+            maybe: Vec::new(),
+        }
+    }
+
+    fn pad(pad: &'b crate::board::Pad) -> Self {
+        let centres: Vec<Point> = pad.shapes.iter().map(|s| s.bbox().center()).collect();
+        let anchors = if centres.len() == 1 {
+            centres.clone()
+        } else {
+            Vec::new()
+        };
+        let mut maybe = centres;
+        maybe.push(pad.center);
+        Node {
+            shapes: std::borrow::Cow::Borrowed(&pad.shapes),
+            anchors,
+            maybe,
+        }
+    }
+
+    /// A set of joined track segments (the copper an edit removes or adds).
+    fn segments(segs: &[Segment]) -> Node<'static> {
+        Node {
+            shapes: std::borrow::Cow::Owned(segs.iter().map(|s| Shape::Segment(*s)).collect()),
+            anchors: segs.iter().flat_map(|s| [s.a, s.b]).collect(),
+            maybe: Vec::new(),
+        }
+    }
+
+    fn contains(&self, p: Point) -> bool {
+        let dot = Shape::Circle(konnect_geom::Circle::new(p, 0));
+        self.shapes.iter().any(|s| touches(&dot, s))
+    }
+
+    /// Whether the two are joined; `loose` counts `maybe` anchors too.
+    fn joins(&self, other: &Node<'_>, loose: bool) -> bool {
+        let into = |from: &Node<'_>, to: &Node<'_>| {
+            from.anchors.iter().any(|&p| to.contains(p))
+                || (loose && from.maybe.iter().any(|&p| to.contains(p)))
+        };
+        into(self, other) || into(other, self)
+    }
+}
+
 /// Whether `p` lies on the open segment `a`–`b`.
 fn strictly_inside(p: Point, a: Point, b: Point) -> bool {
     let (ab, ap) = (b - a, p - a);
@@ -1533,7 +1733,9 @@ fn shortcuts(
     } else {
         (long - m, m)
     };
-    if off <= SNAP_NM || (off as f64) <= (along as f64) * max_skew_deg.to_radians().tan() {
+    if max_skew_deg > 0.0
+        && (off <= SNAP_NM || (off as f64) <= (along as f64) * max_skew_deg.to_radians().tan())
+    {
         options.insert(0, Vec::new());
     }
     options
