@@ -234,8 +234,13 @@ fn assert_clean_and_connected(board: &RouteBoard, result: &DetailResult) {
 /// `n` nets from the left column to the right column in reverse order on a
 /// two-layer board: every net crosses every other.
 fn crossing_bundle(n: usize) -> RouteBoard {
+    crossing_bundle_on(n, &["F.Cu", "B.Cu"])
+}
+
+/// [`crossing_bundle`] on the given copper layers.
+fn crossing_bundle_on(n: usize, layers: &[&str]) -> RouteBoard {
     let h = 2.0 * n as f64 + 2.0;
-    let mut b = BoardBuilder::new(16.0, h, &["F.Cu", "B.Cu"]);
+    let mut b = BoardBuilder::new(16.0, h, layers);
     let l = b.footprint("J1", (2.0, h / 2.0));
     let r = b.footprint("J2", (14.0, h / 2.0));
     for i in 0..n {
@@ -1239,6 +1244,54 @@ fn fill_passes_route_more_and_stay_legal() {
     assert!(with.reports.iter().any(|r| r.fill));
     // Fill copper never conflicts with what was already kept.
     assert_clean_and_connected(&board, &with);
+}
+
+/// Two nets on one layer whose pads sit in the corners of a narrow strip,
+/// too close to the edges for a track to pass around them: they must
+/// cross, so only one can route.
+fn pinched_crossing() -> RouteBoard {
+    let mut b = BoardBuilder::new(16.0, 4.0, &["F.Cu"]);
+    let l = b.footprint("J1", (0.8, 2.0));
+    let r = b.footprint("J2", (15.2, 2.0));
+    let pad = (0.8, 0.8);
+    b.smd_pad(l, "1", "A", (0.8, 0.8), pad, "F.Cu");
+    b.smd_pad(l, "2", "B", (0.8, 3.2), pad, "F.Cu");
+    b.smd_pad(r, "1", "A", (15.2, 3.2), pad, "F.Cu");
+    b.smd_pad(r, "2", "B", (15.2, 0.8), pad, "F.Cu");
+    b.build()
+}
+
+#[test]
+fn congestion_losers_a_fill_cannot_route_still_report_congestion() {
+    // One blind iteration routes both nets across each other; one loses
+    // the conflict, and the fill passes find no path for it with the
+    // winner as a wall. It lost a negotiation, so it reports congestion.
+    let board = pinched_crossing();
+    let settings = NegotiationSettings {
+        threads: 2,
+        max_iterations: 1,
+        ..NegotiationSettings::default()
+    };
+    let tuning = NegotiationTuning {
+        initial_present_factor: 0,
+        fill_passes: 2,
+        ..NegotiationTuning::default()
+    };
+    let (result, _) = route_with(&board, settings, tuning);
+    assert_eq!(result.reports.iter().filter(|r| r.fill).count(), 2);
+    assert_eq!(result.routed.len(), 1, "{result:?}");
+    assert_eq!(result.congestion_lost.len(), 1);
+    let (c, f) = &result.failure_details[0];
+    assert_eq!(*c, result.congestion_lost[0]);
+    assert!(
+        matches!(f, DetailFailure::Congestion { against, .. } if against == &result.routed),
+        "{f:?}"
+    );
+    assert_eq!(
+        result.failed[0].1,
+        FailureReason::Congestion { iterations: 1 }
+    );
+    assert_clean_and_connected(&board, &result);
 }
 
 /// [`UniformRules`] with a smaller minimum track width than the preferred.

@@ -318,6 +318,9 @@ pub enum DetailFailure {
     /// No legal pin where the connection crosses from one tile to another.
     NoPin { from: TileId, to: TileId },
     /// The search found no path under the hard walls, in both tilings.
+    /// A connection that lost a negotiation keeps its
+    /// [`DetailFailure::Congestion`] even when a fill pass then finds no
+    /// path for it.
     Unreachable,
     /// The search's expansion budget ran out.
     BudgetExhausted,
@@ -1408,14 +1411,24 @@ fn run_negotiation(
             queued: queue.len() as u32,
             ..IterationReport::default()
         };
-        // 1. Rip up, keeping the old copper in case the reroute fails.
+        // 1. Rip up, keeping the old copper in case the reroute fails. A
+        // fill pass also keeps each connection's congestion failure: one
+        // that lost a negotiation and still finds no path with every other
+        // net's copper as a wall is reported as congestion, not as the
+        // fill search's own failure.
         let mut previous: BTreeMap<u32, Vec<Arc<PieceCopper>>> = BTreeMap::new();
+        let mut lost_to: BTreeMap<u32, DetailFailure> = BTreeMap::new();
         for &t in &queue {
             if let Some(old) = routed[t as usize].take() {
                 telemetry.count("rip_ups", 1);
                 previous.insert(t, old);
             }
-            failure[t as usize] = None;
+            match failure[t as usize].take() {
+                Some(f @ DetailFailure::Congestion { .. }) if fill => {
+                    lost_to.insert(t, f);
+                }
+                _ => {}
+            }
         }
         // 2. Cut into pieces, pinning crossings away from routed copper. A
         // connection whose conflicts touch only some of its pieces, cut in
@@ -1693,6 +1706,11 @@ fn run_negotiation(
                     });
                 } else {
                     kept_new.insert(t);
+                }
+            }
+            for (t, f) in lost_to {
+                if routed[t as usize].is_none() {
+                    failure[t as usize] = Some(f);
                 }
             }
             telemetry.count("fill_routed", u64::from(report.routed));
