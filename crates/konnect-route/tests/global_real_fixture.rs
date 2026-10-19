@@ -15,6 +15,8 @@
 //!   normally join through plane fanout, S2);
 //! - `KONNECT_GLOBAL_CLASS_LAYERS="ClassA=F.Cu;ClassB=F.Cu+B.Cu"` restricts
 //!   net classes to layers;
+//! - `KONNECT_GLOBAL_LAYERS="F.Cu,In2.Cu,B.Cu"` sets the routable layers
+//!   (default: the layers KiCad marks signal or mixed);
 //! - `KONNECT_GLOBAL_THREADS=n` sets the parallel run's thread count
 //!   (default: every core);
 //! - `KONNECT_GLOBAL_ITERATIONS=n` caps negotiation iterations;
@@ -152,7 +154,13 @@ fn global_routing_on_the_real_fixture() {
     };
 
     let t = Instant::now();
-    let (mut board, _) = load_board_file(&pcb, &LoadOptions::default()).expect("board loads");
+    let options = LoadOptions {
+        routable_layers: std::env::var("KONNECT_GLOBAL_LAYERS")
+            .ok()
+            .map(|v| v.split(',').map(str::to_string).collect()),
+        ..Default::default()
+    };
+    let (mut board, _) = load_board_file(&pcb, &options).expect("board loads");
     let pro_text = std::fs::read_to_string(&pro).expect("project reads");
     let dru_text =
         only_file(&dir, "kicad_dru").map(|p| std::fs::read_to_string(p).expect("rules read"));
@@ -285,6 +293,31 @@ fn global_routing_on_the_real_fixture() {
                 "  hot cell {id}: {v} on {} at ({x:.2}, {y:.2}) size {} nm",
                 board.layers.name(layer),
                 b.width()
+            );
+        }
+        let pad_name = |item: konnect_route::api::ItemRef| match item {
+            konnect_route::api::ItemRef::Pad(p) => {
+                let pad = &board.pads[p.index()];
+                let fp = &board.footprints[pad.footprint.index()];
+                format!(
+                    "{}.{} on {:?}",
+                    fp.reference.as_deref().unwrap_or("?"),
+                    pad.number,
+                    pad.layers
+                        .iter()
+                        .map(|l| board.layers.name(l))
+                        .collect::<Vec<_>>()
+                )
+            }
+            other => format!("{other:?}"),
+        };
+        for (id, reason) in &r_n.failed {
+            let c = connections.iter().find(|c| c.id == *id).unwrap();
+            println!(
+                "  failed {}: {} -> {} ({reason:?})",
+                board.net(c.net).name,
+                pad_name(c.from),
+                pad_name(c.to)
             );
         }
     }
