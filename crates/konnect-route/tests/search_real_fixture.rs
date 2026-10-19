@@ -717,6 +717,8 @@ struct Tally {
     cache_misses: u64,
     cycles: u64,
     cycle_list: Vec<u64>,
+    fail_cycles: u64,
+    found_max_exp: u64,
 }
 
 impl Tally {
@@ -741,6 +743,8 @@ impl Tally {
         self.tiles += o.tiles;
         self.cache_hits += o.cache_hits;
         self.cycles += o.cycles;
+        self.fail_cycles += o.fail_cycles;
+        self.found_max_exp = self.found_max_exp.max(o.found_max_exp);
         self.cycle_list.extend(&o.cycle_list);
         self.cache_misses += o.cache_misses;
     }
@@ -925,6 +929,7 @@ fn route_tile(
                 match o {
                     SearchOutcome::Found(p) => {
                         tally.found += 1;
+                        tally.found_max_exp = tally.found_max_exp.max(stats.expansions);
                         if std::env::var_os("KONNECT_SEARCH_VERBOSE").is_some()
                             && stats.expansions > 50_000
                         {
@@ -1005,8 +1010,33 @@ fn route_tile(
                         }
                         let _ = (c.from_pad, c.to_pad);
                     }
-                    SearchOutcome::Unreachable { .. } => tally.unreachable += 1,
-                    SearchOutcome::BudgetExhausted { .. } => tally.budget += 1,
+                    ref o @ (SearchOutcome::Unreachable { .. }
+                    | SearchOutcome::BudgetExhausted { .. }) => {
+                        if matches!(o, SearchOutcome::Unreachable { .. }) {
+                            tally.unreachable += 1;
+                        } else {
+                            tally.budget += 1;
+                        }
+                        tally.fail_cycles += cycles;
+                        if std::env::var_os("KONNECT_SEARCH_VERBOSE").is_some() {
+                            let blocked = |n: &JobNode| {
+                                let r = &cs.stack.layers[n.layer as usize];
+                                r.core.get(n.col.into(), n.row.into()) > 0
+                            };
+                            println!(
+                                "  failed: {} after {} exp, {} us, straight {:.2} mm, src {} ({} blocked) dst {} ({} blocked), window {}k",
+                                if matches!(o, SearchOutcome::Unreachable { .. }) { "unreachable" } else { "budget" },
+                                stats.expansions,
+                                us,
+                                dist(c.from_pad, c.to_pad) / 1e6,
+                                src.len(),
+                                src.iter().filter(|n| blocked(n)).count(),
+                                dst.len(),
+                                dst.iter().filter(|n| blocked(n)).count(),
+                                stats.window_nodes / 1000
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1078,7 +1108,7 @@ fn kernel_scaling(b: &Board<'_>, tj: &TileJob, conns: &[Conn], slots: &[LayerId]
             .build()
             .unwrap();
         let ts = Instant::now();
-        let per: Vec<(u64, u64)> = pool.install(|| {
+        let per: Vec<(u64, u64, u64)> = pool.install(|| {
             (0..t)
                 .into_par_iter()
                 .map(|_| {
@@ -1091,6 +1121,7 @@ fn kernel_scaling(b: &Board<'_>, tj: &TileJob, conns: &[Conn], slots: &[LayerId]
                     };
                     let mut us = 0u64;
                     let mut exp = 0u64;
+                    let mut cyc = 0u64;
                     // Pass 0 warms this thread's scratch; pass 1 is timed.
                     for pass in 0..2 {
                         for (net, src, dst) in &jobs {
@@ -1113,35 +1144,39 @@ fn kernel_scaling(b: &Board<'_>, tj: &TileJob, conns: &[Conn], slots: &[LayerId]
                             };
                             let mut stats = SearchStats::default();
                             let t0 = Instant::now();
+                            let c0 = thread_cycles();
                             let _ =
                                 search_with(&ctx, &pool, &pool.jobs[0], 0, &v.params, &mut stats);
                             if pass == 1 {
+                                cyc += thread_cycles() - c0;
                                 us += t0.elapsed().as_micros() as u64;
                                 exp += stats.expansions;
                             }
                             toggle_own(&mut cs, b, &lat, *net, true);
                         }
                     }
-                    (us, exp)
+                    (us, exp, cyc)
                 })
                 .collect()
         });
         let wall = ts.elapsed().as_secs_f64();
         let search_s: f64 = per.iter().map(|p| p.0 as f64 / 1e6).sum();
         let exp: u64 = per.iter().map(|p| p.1).sum();
+        let cyc: u64 = per.iter().map(|p| p.2).sum();
         // Searches per second of summed search time, scaled by threads.
         let rate = (t * jobs.len()) as f64 / (search_s / t as f64);
         if t == 1 {
             base_rate = rate;
         }
         println!(
-            "[{} scaling] threads {t:2}: {} searches, mean {:.3} ms/search, {:.2} M exp/s per thread, {:.0} searches/s aggregate (x{:.1}), wall {:.2} s incl. own-net toggles",
+            "[{} scaling] threads {t:2}: {} searches, mean {:.3} ms/search, {:.2} M exp/s per thread, {:.0} searches/s aggregate (x{:.1}), {:.0} cycles/expansion, wall {:.2} s incl. own-net toggles",
             v.name,
             t * jobs.len(),
             search_s * 1e3 / (t * jobs.len()) as f64,
             exp as f64 / search_s / 1e6,
             rate,
             rate / base_rate.max(1e-9),
+            cyc as f64 / exp.max(1) as f64,
             wall
         );
     }
@@ -1175,7 +1210,7 @@ fn report(name: &str, t: &Tally, wall_ms: f64, threads: usize) {
     if t.cycles > 0 {
         let mut cyc: Vec<f64> = t.cycle_list.iter().map(|&c| c as f64 / 1e6).collect();
         println!(
-            "[{name}]   CPU cycles: {:.3} Mcycles/conn mean, p50 {:.3} p90 {:.3} p99 {:.3} | {:.0} cycles/expansion | at 4.7 GHz: {:.3} ms/conn, {:.2} M exp/s",
+            "[{name}]   CPU cycles: {:.3} Mcycles/conn mean, p50 {:.3} p90 {:.3} p99 {:.3} | {:.0} cycles/expansion | at 4.7 GHz: {:.3} ms/conn, {:.2} M exp/s | failed searches {:.0}% of cycles | most expansions in a found search {}",
             t.cycles as f64 / 1e6 / t.jobs.max(1) as f64,
             pct(&mut cyc, 0.5),
             pct(&mut cyc, 0.9),
@@ -1183,6 +1218,8 @@ fn report(name: &str, t: &Tally, wall_ms: f64, threads: usize) {
             t.cycles as f64 / t.expansions.max(1) as f64,
             t.cycles as f64 / 4.7e9 * 1e3 / t.jobs.max(1) as f64,
             t.expansions as f64 / (t.cycles as f64 / 4.7e9).max(1e-12) / 1e6,
+            100.0 * t.fail_cycles as f64 / t.cycles.max(1) as f64,
+            t.found_max_exp,
         );
     }
     if t.cache_hits + t.cache_misses > 0 {

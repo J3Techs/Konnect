@@ -92,6 +92,9 @@ pub(crate) struct Scratch {
     grow: Vec<u32>,
     chain: Vec<u32>,
     tboxes: Vec<TBox>,
+    /// Reverse-flood visit stamps (per node-layer) and its queue.
+    flood_stamp: Vec<u32>,
+    flood_queue: Vec<u32>,
 }
 
 impl Scratch {
@@ -102,6 +105,7 @@ impl Scratch {
             self.via_stamp.iter_mut().for_each(|s| *s = 0);
             self.corr_stamp.iter_mut().for_each(|s| *s = 0);
             self.st.iter_mut().for_each(|r| r.gen = 0);
+            self.flood_stamp.iter_mut().for_each(|s| *s = 0);
             self.gen = 0;
         }
         self.gen += 1;
@@ -115,6 +119,7 @@ impl Scratch {
         }
         if self.nl.len() < node_layers {
             self.nl.resize(node_layers, NlRec::default());
+            self.flood_stamp.resize(node_layers, 0);
         }
         if self.via_stamp.len() < nodes {
             self.via_stamp.resize(nodes, 0);
@@ -135,7 +140,9 @@ impl Scratch {
         8 * self.st.capacity()
             + 8 * self.nl.capacity()
             + 5 * self.via_stamp.capacity()
-            + 4 * (self.corr_stamp.capacity()
+            + 4 * (self.flood_stamp.capacity()
+                + self.flood_queue.capacity()
+                + self.corr_stamp.capacity()
                 + self.gcol.capacity()
                 + self.grow.capacity()
                 + self.chain.capacity())
@@ -710,6 +717,7 @@ pub(crate) fn run<G: Grid>(
     let pf = u64::from(params.present_factor);
     let hf = u64::from(params.history_factor);
     let max_exp = cfg.max_expansions;
+    let mut dead_end_checked = cfg.dead_end_check_after == 0;
 
     let outcome = loop {
         let Some((key, st)) = s.heap.pop() else {
@@ -804,6 +812,16 @@ pub(crate) fn run<G: Grid>(
                 job: job_no,
                 expansions,
             };
+        }
+
+        if expansions == cfg.dead_end_check_after && !field && !dead_end_checked {
+            dead_end_checked = true;
+            stats.dead_end_checks += 1;
+            let cap = (cfg.dead_end_check_after as usize).saturating_mul(4);
+            if targets_enclosed(grid, &views, &lay, nl_layers, allow_via, p.targets, s, cap) {
+                stats.dead_ends += 1;
+                break unreachable(expansions);
+            }
         }
 
         if uflags & DST != 0 && !field {
@@ -977,6 +995,101 @@ pub(crate) fn run<G: Grid>(
     s.tboxes = tboxes;
     stats.expansions += expansions;
     outcome
+}
+
+/// Whether the targets sit in a pocket no source can reach: a breadth-first
+/// flood from every target over a relaxation of the search graph (any
+/// heading, no turn rule, `Near` edges and vias assumed legal, every layer
+/// open) exhausts without touching a source. Every real move is a move of
+/// the relaxation, so `true` proves the job unreachable. `false` means a
+/// source was reached or the flood passed `cap` node-layers.
+#[allow(clippy::too_many_arguments)]
+fn targets_enclosed<G: Grid>(
+    grid: &G,
+    views: &[View<'_>; MAX_LAYERS],
+    lay: &Layout,
+    nl_layers: usize,
+    allow_via: bool,
+    targets: &[JobNode],
+    s: &mut Scratch,
+    cap: usize,
+) -> bool {
+    let gen = s.gen;
+    let lcount = nl_layers as u32;
+    let region = lay.region;
+    s.flood_queue.clear();
+    for t in targets {
+        let (c, r, l) = (u32::from(t.col), u32::from(t.row), u32::from(t.layer));
+        if l >= lcount
+            || c < region.c0
+            || r < region.r0
+            || c - region.c0 >= region.w
+            || r - region.r0 >= region.h
+        {
+            continue;
+        }
+        let nl = lay.local(c, r) as usize * nl_layers + l as usize;
+        if s.flood_stamp[nl] != gen {
+            s.flood_stamp[nl] = gen;
+            s.flood_queue.push(nl as u32);
+        }
+    }
+    let blocked = |v: &View<'_>, c: u32, r: u32| v.core[r as usize * v.s8 + c as usize] > 0;
+    let mut head = 0;
+    while head < s.flood_queue.len() {
+        if s.flood_queue.len() > cap {
+            return false;
+        }
+        let nl = s.flood_queue[head] as usize;
+        head += 1;
+        if s.flags_of(nl) & SRC != 0 {
+            return false;
+        }
+        let node = (nl / nl_layers) as u32;
+        let layer = (nl % nl_layers) as u32;
+        let (c, r) = lay.col_row(node);
+        let v = &views[layer as usize];
+        let u_open = !blocked(v, c, r) || s.flags_of(nl) & (SRC | DST) != 0;
+        if u_open {
+            for h in 0..8u8 {
+                let Some(st) = grid.step(c, r, h) else {
+                    continue;
+                };
+                if st.col < region.c0
+                    || st.row < region.r0
+                    || st.col - region.c0 >= region.w
+                    || st.row - region.r0 >= region.h
+                {
+                    continue;
+                }
+                let vnl = lay.local(st.col, st.row) as usize * nl_layers + layer as usize;
+                if s.flood_stamp[vnl] == gen {
+                    continue;
+                }
+                if blocked(v, st.col, st.row) && s.flags_of(vnl) & (SRC | DST) == 0 {
+                    continue;
+                }
+                s.flood_stamp[vnl] = gen;
+                s.flood_queue.push(vnl as u32);
+            }
+        }
+        if allow_via {
+            let site_ok = views
+                .iter()
+                .take(nl_layers)
+                .all(|w| w.via[r as usize * w.s8 + c as usize] != VIA_NO);
+            if site_ok {
+                for l2 in 0..lcount {
+                    let vnl = node as usize * nl_layers + l2 as usize;
+                    if s.flood_stamp[vnl] != gen {
+                        s.flood_stamp[vnl] = gen;
+                        s.flood_queue.push(vnl as u32);
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Rebuild the path ending at state `goal` as corner nodes.

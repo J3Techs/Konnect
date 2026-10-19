@@ -87,6 +87,9 @@ pub struct SearchStats {
     pub region_retries: u64,
     /// Lattice nodes in the last region searched.
     pub window_nodes: u64,
+    /// Reverse floods run, and how many proved the job unreachable.
+    pub dead_end_checks: u64,
+    pub dead_ends: u64,
 }
 
 impl SearchStats {
@@ -98,6 +101,8 @@ impl SearchStats {
         self.via_checks += o.via_checks;
         self.lazy_rejects += o.lazy_rejects;
         self.region_retries += o.region_retries;
+        self.dead_end_checks += o.dead_end_checks;
+        self.dead_ends += o.dead_ends;
         self.window_nodes = self.window_nodes.max(o.window_nodes);
     }
 
@@ -111,6 +116,8 @@ impl SearchStats {
         t.count("search_lazy_rejects", self.lazy_rejects);
         t.count("search_pushes", self.pushes);
         t.count("search_region_retries", self.region_retries);
+        t.count("search_dead_end_checks", self.dead_end_checks);
+        t.count("search_dead_ends", self.dead_ends);
         let name = match outcome {
             SearchOutcome::Found(_) => "search_found",
             SearchOutcome::Unreachable { .. } => "search_unreachable",
@@ -227,6 +234,11 @@ pub struct SearchConfig {
     pub use_heading_mask: bool,
     /// With an exact checker, check vias even where `via_site` says free.
     pub check_free_vias: bool,
+    /// After this many expansions, flood backwards from the targets once
+    /// over a relaxed graph and stop with `Unreachable` if they are sealed
+    /// off from every source (0: never). Catches enclosed terminals before
+    /// the search floods the whole window from the open side.
+    pub dead_end_check_after: u64,
 }
 
 impl Default for SearchConfig {
@@ -246,6 +258,7 @@ impl Default for SearchConfig {
             corridor_penalty: Cost(500),
             use_heading_mask: true,
             check_free_vias: true,
+            dead_end_check_after: 20_000,
         }
     }
 }

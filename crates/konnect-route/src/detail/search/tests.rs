@@ -843,3 +843,44 @@ fn bend_costs_and_the_bend_bound_keep_open_searches_narrow() {
         Cost(90 * 1414 + 90 * 1000)
     );
 }
+
+#[test]
+fn sealed_targets_are_found_unreachable_without_flooding_the_window() {
+    // The target sits in a closed ring; the source side is wide open.
+    let mut st = stack(200, 200, 2);
+    for l in 0..2 {
+        block(&mut st, l, 150..=160, 150..=150);
+        block(&mut st, l, 150..=160, 160..=160);
+        block(&mut st, l, 150..=150, 150..=160);
+        block(&mut st, l, 160..=160, 150..=160);
+    }
+    rederive(&mut st);
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(10, 10, 0)], &[node(155, 155, 0)]);
+    let cfg = SearchConfig {
+        dead_end_check_after: 2_000,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (o, stats) = run_ctx(&ctx, &pool, i);
+    assert!(
+        matches!(o, SearchOutcome::Unreachable { expansions, .. } if expansions <= 4_000),
+        "{o:?}"
+    );
+    // One proof per attempt (here the bounded region is the whole window).
+    assert_eq!(stats.dead_ends, stats.region_retries + 1);
+    // Without the check the same search exhausts the window.
+    let off = SearchConfig {
+        dead_end_check_after: 0,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &off);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    assert!(
+        matches!(o, SearchOutcome::Unreachable { expansions, .. } if expansions > 100_000),
+        "{o:?}"
+    );
+    // An open target is never declared sealed.
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(10, 10, 0)], &[node(120, 190, 1)]);
+    let ctx = SearchContext::new(&st, &cfg);
+    assert!(matches!(run_ctx(&ctx, &pool, i).0, SearchOutcome::Found(_)));
+}
