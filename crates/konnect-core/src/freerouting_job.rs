@@ -310,7 +310,7 @@ fn spawn_runner(dir: &Path) -> Result<(u32, bool)> {
 }
 
 #[cfg(windows)]
-fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<(u32, bool)> {
+pub(crate) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<(u32, bool)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -331,7 +331,7 @@ fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<(u32, 
 }
 
 #[cfg(unix)]
-fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<(u32, bool)> {
+pub(crate) fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<(u32, bool)> {
     use std::os::unix::process::CommandExt;
     // Its own process group, so the client's group signals do not reach it.
     command.process_group(0);

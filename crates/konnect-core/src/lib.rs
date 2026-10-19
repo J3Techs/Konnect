@@ -6,6 +6,7 @@ pub mod gates;
 pub mod guidance;
 pub mod kicad_install;
 pub mod mcp;
+pub mod native_route_job;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
