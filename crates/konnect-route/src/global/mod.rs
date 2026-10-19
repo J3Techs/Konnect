@@ -220,6 +220,12 @@ pub struct GlobalSettings {
     pub threads: u32,
     /// Jobs per batch (rayon chunk now, GPU dispatch later).
     pub batch_max_jobs: u32,
+    /// Share of the computed capacity routing may use, ×1000 (1000: all
+    /// of it), on every planar and via resource. Detailed routing reaches
+    /// less than the packed-track capacity (tile pins, octilinear jogs,
+    /// vias between tracks), so a lower share spreads corridors before
+    /// detail finds the congestion.
+    pub capacity_scale: u32,
 }
 
 impl Default for GlobalSettings {
@@ -240,6 +246,7 @@ impl Default for GlobalSettings {
             vertical_layers: None,
             threads: 0,
             batch_max_jobs: 256,
+            capacity_scale: 1000,
         }
     }
 }
@@ -527,6 +534,12 @@ pub fn build_grid_with(
     let grid = with_threads(settings.threads, || {
         let mut grid = grid::lay_out(board, settings);
         grid.capacity = capacity::compute(board, rules, &grid, settings);
+        if settings.capacity_scale < 1000 {
+            let scale = settings.capacity_scale;
+            for c in &mut grid.capacity {
+                *c = (u32::from(*c) * scale / 1000) as u16;
+            }
+        }
         grid
     });
     let us = start.elapsed().as_micros() as u64;

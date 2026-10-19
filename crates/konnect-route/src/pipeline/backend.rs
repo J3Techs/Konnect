@@ -49,6 +49,14 @@ pub const VIA_CONGESTION_REACH_NM: konnect_geom::Coord = 250_000;
 /// at the same path cost.
 pub const FIELD_AFTER: u64 = 2_000;
 
+/// A negotiation search's expansion budget. Measured on a dense real
+/// board: a small share of searches (those that must cross other nets'
+/// copper late in negotiation) took most of the expansions; capping them
+/// cut the expansions and the tile critical path for about as many routed
+/// connections. A capped
+/// search fails as `BudgetExhausted`, which negotiation retries.
+pub const NEGOTIATION_MAX_EXPANSIONS: u64 = 500_000;
+
 /// WS-D1's kernel as a [`RouteCompute`] backend for negotiation.
 #[derive(Debug, Clone)]
 pub struct KernelBackend {
@@ -88,6 +96,7 @@ impl KernelBackend {
             use_heading_mask: false,
             via_congestion_reach_nm: Some(VIA_CONGESTION_REACH_NM),
             field_after: FIELD_AFTER,
+            max_expansions: NEGOTIATION_MAX_EXPANSIONS,
             ..SearchConfig::default()
         }
     }
