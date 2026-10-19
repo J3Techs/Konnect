@@ -106,8 +106,8 @@ pub struct FanoutSettings {
     #[serde(default = "default_snap")]
     pub snap: Coord,
     /// Leave alone every pad of a ball-grid footprint whose escapes are
-    /// drawn by hand: at least [`Self::array_min_pads`] SMD pads, at least
-    /// half of its netted pads already carrying a track or via. Its plane
+    /// drawn by hand: at least [`Self::array_min_pads`] round SMD lands,
+    /// some already carrying a track or via ([`escaped_arrays`]). Its plane
     /// balls are joined through those escapes, never by a new via here.
     #[serde(default = "yes")]
     pub exclude_escaped_arrays: bool,
@@ -500,8 +500,9 @@ pub fn plan_plane_vias_excluding(
 }
 
 /// Ball-grid footprints whose escapes are already drawn: at least
-/// `min_pads` SMD pads, and at least half of the netted ones on an island
-/// that carries a track, arc or via. Sorted.
+/// `min_pads` pads, every one an SMD land of one circle, and some netted
+/// pad on an island that carries a track, arc or via (a hand-drawn escape
+/// pattern; the field's other balls are left to it as well). Sorted.
 pub fn escaped_arrays(
     board: &RouteBoard,
     connectivity: &ConnectivityReport,
@@ -526,10 +527,14 @@ pub fn escaped_arrays(
         .iter()
         .filter(|f| {
             let pads = &board.pads[f.pad_range.0 as usize..f.pad_range.1 as usize];
-            let smd = pads.iter().filter(|p| p.kind == PadKind::Smd).count();
-            let netted: Vec<_> = pads.iter().filter(|p| p.net.is_some()).collect();
-            let done = netted.iter().filter(|p| escaped[p.id.index()]).count();
-            smd >= min_pads as usize && !netted.is_empty() && 2 * done >= netted.len()
+            let balls = pads.iter().all(|p| {
+                p.kind == PadKind::Smd && matches!(p.shapes.as_slice(), [Shape::Circle(_)])
+            });
+            balls
+                && pads.len() >= min_pads as usize
+                && pads
+                    .iter()
+                    .any(|p| p.net.is_some() && escaped[p.id.index()])
         })
         .map(|f| f.id)
         .collect()
