@@ -280,14 +280,22 @@ impl ConnectivityReport {
     }
 
     /// The state of a net with at least two pads; `None` for other nets.
-    pub fn net_status(&self, board: &RouteBoard, net: NetId) -> Option<NetStatus> {
+    ///
+    /// Costs only the net's own islands: every track, arc and via of a net
+    /// is a member of one of them. `board` must be the board the report
+    /// was built from.
+    pub fn net_status(&self, _board: &RouteBoard, net: NetId) -> Option<NetStatus> {
         let n = self.nets.get(net.index())?;
         if n.pad_count < 2 {
             return None;
         }
         Some(if n.pad_island_count() <= 1 {
             NetStatus::Complete
-        } else if net_has_routing_copper(board)[net.index()] {
+        } else if n.islands.iter().any(|i| {
+            i.items
+                .iter()
+                .any(|it| matches!(it, ItemRef::Track(_) | ItemRef::Arc(_) | ItemRef::Via(_)))
+        }) {
             NetStatus::Partial
         } else {
             NetStatus::NoCopper
@@ -399,7 +407,7 @@ fn plane_net_mask(board: &RouteBoard) -> Vec<bool> {
 }
 
 /// Nets with any track, arc or via: the copper a router makes. Zone fills
-/// do not count, matching the HANDOFF definition of "no copper".
+/// do not count: a net joined only by a pour still has "no copper".
 fn net_has_routing_copper(board: &RouteBoard) -> Vec<bool> {
     let mut has = vec![false; board.nets.len()];
     let nets = board
@@ -573,6 +581,41 @@ mod tests {
         assert_eq!(net.pad_island_count(), 3);
         assert_eq!(net.connections_needed(), 2);
         assert_eq!(report.unfilled_zones_skipped, 0);
+    }
+
+    #[test]
+    fn net_status_agrees_with_completeness() {
+        let mut b = synthetic::BoardBuilder::new(20.0, 8.0, &["F.Cu", "B.Cu"]);
+        let left = b.footprint("U1", (2.0, 1.0));
+        let right = b.footprint("U2", (18.0, 1.0));
+        for (i, net) in ["N00", "N01", "N02"].iter().enumerate() {
+            let y = 2.0 + 2.0 * i as f64;
+            b.smd_pad(left, "1", net, (2.0, y), (1.0, 0.6), "F.Cu");
+            b.smd_pad(right, "1", net, (18.0, y), (1.0, 0.6), "F.Cu");
+        }
+        // N00 joined, N01 half-way, N02 bare.
+        b.track("N00", "F.Cu", (2.0, 2.0), (18.0, 2.0), 0.2, false)
+            .track("N01", "F.Cu", (2.0, 4.0), (6.0, 4.0), 0.2, false);
+        let board = b.build();
+        let report = ConnectivityReport::build(&board, &ArcPolicy::default());
+        let status = |n: &str| report.net_status(&board, board.net_by_name(n).unwrap());
+        assert_eq!(status("N00"), Some(NetStatus::Complete));
+        assert_eq!(status("N01"), Some(NetStatus::Partial));
+        assert_eq!(status("N02"), Some(NetStatus::NoCopper));
+        let c = report.completeness(&board);
+        let count = |s: NetStatus| {
+            (0..board.nets.len())
+                .filter(|&n| report.net_status(&board, NetId(n as u32)) == Some(s))
+                .count()
+        };
+        assert_eq!(
+            (c.complete, c.partial, c.no_copper),
+            (
+                count(NetStatus::Complete),
+                count(NetStatus::Partial),
+                count(NetStatus::NoCopper)
+            )
+        );
     }
 
     #[test]
