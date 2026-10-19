@@ -526,11 +526,11 @@ fn validate_library(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Re
     Ok(())
 }
 
-fn parse_network(
-    node: &SexpNode,
-    resolution: f64,
-    manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize)> {
+/// A session network's wires, arcs and vias, and how many single-point
+/// wires were skipped.
+type ParsedNetwork = (Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize);
+
+fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Result<ParsedNetwork> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
