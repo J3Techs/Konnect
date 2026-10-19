@@ -166,6 +166,8 @@ pub(crate) struct Scratch {
     /// the heap that builds it.
     field: FieldMap,
     fheap: RadixHeap,
+    /// Per region column, then row: the gap to the sources' box, nm.
+    gaps: Vec<i64>,
     /// The last [`run`] stopped at its [`Problem::cap`].
     pub capped: bool,
 }
@@ -771,10 +773,20 @@ pub(crate) fn run<G: Grid>(
         );
         sbox = (sbox.0.min(x), sbox.1.max(x), sbox.2.min(y), sbox.3.max(y));
     }
+    // Per region column and row, the gap to the sources' box.
+    let mut gaps = std::mem::take(&mut s.gaps);
+    gaps.clear();
+    if use_field && sbox.0 != i64::MAX {
+        gaps.extend((c0..c0 + rw).map(|c| axis_gap(i64::from(grid.x(c)), sbox.0, sbox.1)));
+        gaps.extend((r0..r0 + rh).map(|r| axis_gap(i64::from(grid.y(r)), sbox.2, sbox.3)));
+    }
+    let gaps = gaps;
     let to_sources = |c: u32, r: u32| {
-        let dx = axis_gap(i64::from(grid.x(c)), sbox.0, sbox.1);
-        let dy = axis_gap(i64::from(grid.y(r)), sbox.2, sbox.3);
-        octile(dx, dy, inv_pitch)
+        octile(
+            gaps[(c - c0) as usize],
+            gaps[(rw + r - r0) as usize],
+            inv_pitch,
+        )
     };
     let mut fmap = std::mem::take(&mut s.field);
     let mut fbound = FieldBound {
@@ -1226,6 +1238,7 @@ pub(crate) fn run<G: Grid>(
     };
     s.tboxes = tboxes;
     s.field = fmap;
+    s.gaps = gaps;
     stats.expansions += expansions;
     outcome
 }
@@ -1466,9 +1479,8 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32) -> u32>(
             }
             fd.get(nl)
         };
-        if key != d.saturating_add(to_sources(c, r)) {
-            continue;
-        }
+        // No freshness test: an improvement pushes a smaller key, which
+        // pops (and closes the record) before any stale entry of it.
         if key > limit {
             bound = FieldBound {
                 stop: key,
