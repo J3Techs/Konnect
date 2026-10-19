@@ -46,15 +46,17 @@ pub use backend::KernelBackend;
 
 use crate::access::{compute_pin_access_with, AccessSettings, AccessStats, PadAccess};
 use crate::api::{
-    ClassId, Connection, ConnectionId, FailureReason, ItemRef, LayerMask, NetId, Ownership, PadId,
-    ProfileId, Stage, TrackId, ViaId,
+    ClassId, Connection, ConnectionId, FailureReason, ItemRef, LayerId, LayerMask, NetId,
+    Ownership, PadId, ProfileId, Stage, TrackId, ViaId,
 };
+use crate::board::{Keepout, KeepoutRules};
 use crate::board::{RouteBoard, Track, Via};
 use crate::check::{BoardChecker, CheckOptions, CheckReport, CheckedItem};
 use crate::compute::RouteCompute;
 use crate::connectivity::ConnectivityReport;
 use crate::detail::negotiate::{
-    negotiate_connections, DetailResult, NegotiationSettings, NegotiationTuning,
+    negotiate_connections_with, DetailResult, NeckDown, NegotiationInputs, NegotiationSettings,
+    NegotiationTuning,
 };
 use crate::detail::search::SearchConfig;
 use crate::fanout::{plan_plane_vias, FanoutSettings, PlaneViaPlan};
@@ -67,7 +69,8 @@ use crate::optimize::{optimize_checked, record_counters, OptimizeOptions, Optimi
 use crate::plan::{PlanError, RoutePlan, RoutedCopper, RoutedTrack, RoutedVia};
 use crate::rules::RuleTable;
 use crate::telemetry::Telemetry;
-use konnect_geom::{ArcPolicy, BBox};
+use konnect_geom::{shape_within_polygon, ArcPolicy, BBox, Coord, Polygon, Segment, Shape};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -87,9 +90,18 @@ pub struct PipelineScope {
 pub struct PipelineSettings {
     /// S2 plane fanout; `None` routes plane pads like any other connection.
     pub fanout: Option<FanoutSettings>,
-    /// S4 pin access (reported; negotiation derives its own terminal
-    /// nodes for now); `None` skips it.
+    /// S4 pin access; `None` skips it. Negotiation enters a pad whose own
+    /// copper offers no open lattice node through a stub from one of its
+    /// access points ([`Self::use_access`]).
     pub access: Option<AccessSettings>,
+    /// Hand S4's access points to negotiation.
+    pub use_access: bool,
+    /// Neck-down at pads for every class not excluded (`None`: never).
+    pub neck_down: Option<NeckDown>,
+    /// A second chance on more layers, per class: connections of the class
+    /// still failed after negotiation are routed again on
+    /// [`ClassFallback::layers`], around all copper routed so far.
+    pub class_fallback: BTreeMap<ClassId, ClassFallback>,
     pub global: GlobalSettings,
     pub layer_policy: LayerPolicy,
     pub negotiation: NegotiationSettings,
@@ -117,9 +129,20 @@ impl Default for PipelineSettings {
         PipelineSettings {
             fanout: Some(FanoutSettings::default()),
             access: Some(AccessSettings::default()),
+            use_access: true,
+            neck_down: None,
+            class_fallback: BTreeMap::new(),
             global: GlobalSettings::default(),
             layer_policy: LayerPolicy::default(),
-            negotiation: NegotiationSettings::default(),
+            // Measured on a dense real board: a 2x present-factor growth
+            // (capped) and a history step of 3 route more than the gentler
+            // stand-alone schedule; 20 iterations add little for twice the time.
+            negotiation: NegotiationSettings {
+                max_iterations: 10,
+                present_growth: 2_000,
+                history_increment: 3,
+                ..NegotiationSettings::default()
+            },
             tuning: NegotiationTuning::default(),
             search: KernelBackend::negotiation_config(),
             search_min_run: false,
@@ -128,6 +151,30 @@ impl Default for PipelineSettings {
             threads: 0,
         }
     }
+}
+
+/// Extra layers a class may use when its own layers cannot route a
+/// connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassFallback {
+    /// The layers of the second chance (the class's own included).
+    pub layers: LayerMask,
+    /// Tracks on some of those layers must run over solid copper of a
+    /// reference plane.
+    #[serde(default)]
+    pub reference: Option<ReferencePlane>,
+}
+
+/// Solid reference copper a class's tracks must stay over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencePlane {
+    /// The plane layer whose filled copper is the reference.
+    pub plane: LayerId,
+    /// The routing layers this applies to.
+    pub over: LayerMask,
+    /// How far inside one filled piece's outline a track's copper must
+    /// stay (its edge, not its centre line).
+    pub margin: Coord,
 }
 
 /// What a run produced, stage by stage.
@@ -330,7 +377,15 @@ fn run(
     if negotiation.threads == 0 && settings.threads > 0 {
         negotiation.threads = settings.threads;
     }
-    let mut detail = negotiate_connections(
+    let inputs = NegotiationInputs {
+        access: if settings.use_access {
+            std::mem::take(&mut out.access)
+        } else {
+            Vec::new()
+        },
+        neck_down: settings.neck_down.clone(),
+    };
+    let mut detail = negotiate_connections_with(
         &work,
         rules,
         &out.connections,
@@ -338,6 +393,7 @@ fn run(
         Some(&grid),
         &negotiation,
         &settings.tuning,
+        &inputs,
         backend,
         tel,
     );
@@ -348,6 +404,25 @@ fn run(
         if v.layers.is_empty() {
             v.layers = all;
         }
+    }
+    if !settings.class_fallback.is_empty() {
+        let t = Instant::now();
+        let rescued = second_chance(
+            &work,
+            rules,
+            &out.connections,
+            &mut detail,
+            &mut routed,
+            settings,
+            &negotiation,
+            &inputs,
+            backend,
+        );
+        tel.count("pipeline_fallback_routed", rescued as u64);
+        tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
+    }
+    if settings.use_access {
+        out.access = inputs.access;
     }
 
     // 7. Optimize, guarded by the S7 checker.
@@ -451,6 +526,253 @@ pub fn optimize_guarded(
         tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
     }
     (report, reverted)
+}
+
+/// Route again, on their class's fallback layers, the connections of
+/// classes with a [`ClassFallback`] that negotiation failed, around every
+/// copper routed so far (made fixed). A rescued connection's copper is
+/// appended to `routed` and it moves from failed to routed in `detail`.
+/// Where the fallback names a reference plane, tracks on the layers it
+/// covers are kept over one filled piece of the plane (a keepout outside
+/// the pieces guides the search; a net whose tracks still leave a piece by
+/// less than the margin is dropped again). Returns how many were rescued.
+#[allow(clippy::too_many_arguments)]
+fn second_chance(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    connections: &[Connection],
+    detail: &mut DetailResult,
+    routed: &mut RoutedCopper,
+    settings: &PipelineSettings,
+    negotiation: &NegotiationSettings,
+    inputs: &NegotiationInputs,
+    backend: &mut (dyn RouteCompute + Send),
+) -> usize {
+    let mut rescued_total = 0;
+    for (&class, fallback) in &settings.class_fallback {
+        let ids: Vec<ConnectionId> = detail
+            .failure_details
+            .iter()
+            .filter(|(id, _)| {
+                connections
+                    .get(id.index())
+                    .is_some_and(|c| rules.class_of(Some(c.net)) == class)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let mut board = work.clone();
+        add_locked(&mut board, routed);
+        let pieces: Vec<Polygon> = fallback
+            .reference
+            .map(|r| reference_pieces(work, r.plane))
+            .unwrap_or_default();
+        if let Some(r) = fallback.reference {
+            let areas: Vec<BBox> = ids
+                .iter()
+                .filter_map(|id| {
+                    let c = &connections[id.index()];
+                    let pts = [c.from, c.to].map(|i| terminal_point(work, i));
+                    BBox::from_points(pts.into_iter().flatten())
+                })
+                .map(|b| b.inflate(REFERENCE_AREA_NM))
+                .collect();
+            let keepouts = outside_keepouts(&pieces, &areas, r.over, REFERENCE_CELL_NM);
+            for mut k in keepouts {
+                k.id = crate::api::KeepoutId(board.keepouts.len() as u32);
+                board.keepouts.push(k);
+            }
+        }
+        let tasks: Vec<Connection> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| Connection {
+                id: ConnectionId(i as u32),
+                ..connections[id.index()]
+            })
+            .collect();
+        let layers = fallback.layers.intersection(board.routable);
+        let global = GlobalResult {
+            corridors: tasks
+                .iter()
+                .map(|c| Corridor {
+                    connection: c.id,
+                    cells: Vec::new(),
+                    layers,
+                    assigned: LayerMask::EMPTY,
+                })
+                .collect(),
+            ..GlobalResult::default()
+        };
+        let mut tel = Telemetry::default();
+        let mut second = negotiate_connections_with(
+            &board,
+            rules,
+            &tasks,
+            &global,
+            None,
+            negotiation,
+            &settings.tuning,
+            inputs,
+            backend,
+            &mut tel,
+        );
+        // Nets whose new tracks leave the reference by less than the margin.
+        let mut dropped: BTreeSet<NetId> = BTreeSet::new();
+        if let Some(r) = fallback.reference {
+            for t in &second.copper.tracks {
+                if r.over.contains(t.layer) && !over_reference(&t.seg, &pieces, r.margin) {
+                    dropped.insert(t.net);
+                }
+            }
+        }
+        second.copper.tracks.retain(|t| !dropped.contains(&t.net));
+        second.copper.vias.retain(|v| !dropped.contains(&v.net));
+        let all = work.layers.all();
+        for t in second.copper.tracks {
+            routed.tracks.push(t);
+        }
+        for mut v in second.copper.vias {
+            if v.layers.is_empty() {
+                v.layers = all;
+            }
+            routed.vias.push(v);
+        }
+        let rescued: BTreeSet<ConnectionId> = second
+            .routed
+            .iter()
+            .map(|c| ids[c.index()])
+            .filter(|id| !dropped.contains(&connections[id.index()].net))
+            .collect();
+        rescued_total += rescued.len();
+        detail.failed.retain(|(id, _)| !rescued.contains(id));
+        detail
+            .failure_details
+            .retain(|(id, _)| !rescued.contains(id));
+        detail.routed.extend(rescued.iter().copied());
+        detail.routed.sort_unstable();
+    }
+    rescued_total
+}
+
+/// The filled copper pieces of `plane`. KiCad's fills are fractured (each
+/// void joined to the outline by a zero-width slit), so an outline already
+/// excludes antipads, pad clearances and voids: a track over any of them
+/// counts as off the reference, which is stricter than "over the pour".
+fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<Polygon> {
+    board
+        .zones
+        .iter()
+        .filter(|z| z.filled && z.layer == plane && z.net.is_some())
+        .filter_map(|z| Polygon::new(z.region.outline().to_vec(), Vec::new()))
+        .collect()
+}
+
+/// How far around a fallback connection's terminals the reference is
+/// enforced as keepouts (beyond it, only the final check applies).
+const REFERENCE_AREA_NM: Coord = 5_000_000;
+/// Cell size of the reference keepouts.
+const REFERENCE_CELL_NM: Coord = 250_000;
+
+fn terminal_point(board: &RouteBoard, item: ItemRef) -> Option<konnect_geom::Point> {
+    match item {
+        ItemRef::Pad(id) => board.pads.get(id.index()).map(|p| p.center),
+        ItemRef::Via(id) => board.vias.get(id.index()).map(|v| v.center),
+        ItemRef::Track(id) => board.tracks.get(id.index()).map(|t| t.seg.a),
+        _ => None,
+    }
+}
+
+/// Track keepouts on `layers` covering every `cell`-sized square within
+/// `areas` that does not lie wholly inside one piece: one rectangle per
+/// run of such cells along a row, so each is cheap to paint and check.
+fn outside_keepouts(
+    pieces: &[Polygon],
+    areas: &[BBox],
+    layers: LayerMask,
+    cell: Coord,
+) -> Vec<Keepout> {
+    let c = i64::from(cell);
+    let mut cells: Vec<(i64, i64)> = Vec::new();
+    for a in areas {
+        let (x0, x1) = (
+            i64::from(a.min.x).div_euclid(c),
+            i64::from(a.max.x).div_euclid(c),
+        );
+        let (y0, y1) = (
+            i64::from(a.min.y).div_euclid(c),
+            i64::from(a.max.y).div_euclid(c),
+        );
+        for iy in y0..=y1 {
+            for ix in x0..=x1 {
+                cells.push((iy, ix));
+            }
+        }
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    let square = |iy: i64, ix: i64| {
+        let p = |x: i64, y: i64| konnect_geom::Point::new((x * c) as Coord, (y * c) as Coord);
+        vec![p(ix, iy), p(ix + 1, iy), p(ix + 1, iy + 1), p(ix, iy + 1)]
+    };
+    let outside = |iy: i64, ix: i64| {
+        let Some(sq) = konnect_geom::ConvexPoly::new(square(iy, ix), 0) else {
+            return true;
+        };
+        let sq = Shape::ConvexPoly(sq);
+        let b = sq.bbox();
+        !pieces
+            .iter()
+            .any(|p| p.bbox().contains_bbox(&b) && shape_within_polygon(&sq, p))
+    };
+    let mut out = Vec::new();
+    let mut run: Option<(i64, i64, i64)> = None;
+    let flush = |run: Option<(i64, i64, i64)>, out: &mut Vec<Keepout>| {
+        if let Some((iy, a, b)) = run {
+            let p = |x: i64, y: i64| konnect_geom::Point::new((x * c) as Coord, (y * c) as Coord);
+            let ring = vec![p(a, iy), p(b + 1, iy), p(b + 1, iy + 1), p(a, iy + 1)];
+            if let Some(region) = Polygon::new(ring, Vec::new()) {
+                out.push(Keepout {
+                    id: crate::api::KeepoutId(0),
+                    name: None,
+                    layers,
+                    region,
+                    rules: KeepoutRules {
+                        tracks: true,
+                        ..KeepoutRules::default()
+                    },
+                });
+            }
+        }
+    };
+    for (iy, ix) in cells {
+        if !outside(iy, ix) {
+            continue;
+        }
+        run = match run {
+            Some((ry, a, b)) if ry == iy && b + 1 == ix => Some((ry, a, ix)),
+            other => {
+                flush(other, &mut out);
+                Some((iy, ix, ix))
+            }
+        };
+    }
+    flush(run, &mut out);
+    out
+}
+
+/// Whether a track's copper, grown by `margin`, lies inside one piece.
+fn over_reference(seg: &Segment, pieces: &[Polygon], margin: Coord) -> bool {
+    let grown = Shape::Segment(Segment::new(
+        seg.a,
+        seg.b,
+        seg.width.saturating_add(2 * margin),
+    ));
+    pieces
+        .iter()
+        .any(|p| p.bbox().contains_bbox(&grown.bbox()) && shape_within_polygon(&grown, p))
 }
 
 /// Append `copper` to `board` as locked copper (what the pipeline does with

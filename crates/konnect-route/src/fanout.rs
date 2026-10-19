@@ -105,6 +105,25 @@ pub struct FanoutSettings {
     /// Round via centres to this grid, nm (1 µm keeps the plan exact).
     #[serde(default = "default_snap")]
     pub snap: Coord,
+    /// Leave alone every pad of a ball-grid footprint whose escapes are
+    /// drawn by hand: at least [`Self::array_min_pads`] round SMD lands,
+    /// some already carrying a track or via ([`escaped_arrays`]). Its plane
+    /// balls are joined through those escapes, never by a new via here.
+    #[serde(default = "yes")]
+    pub exclude_escaped_arrays: bool,
+    #[serde(default = "default_array_min_pads")]
+    pub array_min_pads: u32,
+    /// A third pass for islands the first two found no site for: the via
+    /// must lie inside its own net's plane piece (with spokes) on at least
+    /// one plane layer of the net instead of on every one; on the others it
+    /// perforates whatever is poured there, as any through via does (other
+    /// nets' islands are still avoided when [`Self::avoid_other_islands`]).
+    #[serde(default = "yes")]
+    pub partial_plane_fallback: bool,
+}
+
+fn default_array_min_pads() -> u32 {
+    64
 }
 
 fn default_gaps() -> [Coord; 3] {
@@ -147,6 +166,9 @@ impl Default for FanoutSettings {
             tile: default_tile(),
             skip_escaped: true,
             snap: default_snap(),
+            exclude_escaped_arrays: true,
+            array_min_pads: default_array_min_pads(),
+            partial_plane_fallback: true,
         }
     }
 }
@@ -260,6 +282,12 @@ pub struct FanoutStats {
     pub candidate_ms: u64,
     pub select_ms: u64,
     pub index_ms: u64,
+    /// Footprints left alone as hand-escaped ball grids.
+    #[serde(default)]
+    pub escaped_arrays: usize,
+    /// Sites from the partial-plane pass.
+    #[serde(default)]
+    pub partial_plane_sites: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -352,7 +380,15 @@ pub fn plan_plane_vias_excluding(
     let mut plan = PlaneViaPlan::default();
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
-    let units = collect_units(board, connectivity, settings, exclude, &mut plan);
+    let mut exclude = exclude.to_vec();
+    if settings.exclude_escaped_arrays {
+        let arrays = escaped_arrays(board, connectivity, settings.array_min_pads);
+        plan.stats.escaped_arrays = arrays.len();
+        exclude.extend(arrays);
+        exclude.sort_unstable();
+        exclude.dedup();
+    }
+    let units = collect_units(board, connectivity, settings, &exclude, &mut plan);
     plan.stats.eligible_islands = units.len();
     plan.stats.eligible_pads = units.iter().map(|u| u.pads.len()).sum();
 
@@ -414,6 +450,7 @@ pub fn plan_plane_vias_excluding(
                 let c = &cands[ui][ci];
                 plan.stats.floor_vias += usize::from(c.floor_via);
                 plan.stats.minimum_stubs += usize::from(c.min_stub);
+                plan.stats.partial_plane_sites += usize::from(c.partial);
                 plan.sites.push(PlaneViaSite {
                     pad: c.pad,
                     net: u.net,
@@ -460,6 +497,47 @@ pub fn plan_plane_vias_excluding(
     plan.skipped.sort_by_key(|s| s.0);
     plan.details.sort_by_key(|d| d.pad);
     plan
+}
+
+/// Ball-grid footprints whose escapes are already drawn: at least
+/// `min_pads` pads, every one an SMD land of one circle, and some netted
+/// pad on an island that carries a track, arc or via (a hand-drawn escape
+/// pattern; the field's other balls are left to it as well). Sorted.
+pub fn escaped_arrays(
+    board: &RouteBoard,
+    connectivity: &ConnectivityReport,
+    min_pads: u32,
+) -> Vec<FootprintId> {
+    let mut escaped = vec![false; board.pads.len()];
+    for net in &connectivity.nets {
+        for island in &net.islands {
+            let has_escape = island
+                .items
+                .iter()
+                .any(|i| matches!(i, ItemRef::Track(_) | ItemRef::Arc(_) | ItemRef::Via(_)));
+            if has_escape {
+                for p in island.pads() {
+                    escaped[p.index()] = true;
+                }
+            }
+        }
+    }
+    board
+        .footprints
+        .iter()
+        .filter(|f| {
+            let pads = &board.pads[f.pad_range.0 as usize..f.pad_range.1 as usize];
+            let balls = pads.iter().all(|p| {
+                p.kind == PadKind::Smd && matches!(p.shapes.as_slice(), [Shape::Circle(_)])
+            });
+            balls
+                && pads.len() >= min_pads as usize
+                && pads
+                    .iter()
+                    .any(|p| p.net.is_some() && escaped[p.id.index()])
+        })
+        .map(|f| f.id)
+        .collect()
 }
 
 struct Ctx<'a> {
@@ -552,6 +630,8 @@ struct Cand {
     cost: i64,
     floor_via: bool,
     min_stub: bool,
+    /// From the partial-plane pass.
+    partial: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -778,6 +858,7 @@ fn try_exit(
     t_exit: i64,
     gap: Coord,
     rank: i64,
+    partial: bool,
 ) -> Result<Cand, (Point, &'static str, u8)> {
     let space = ctx.space;
     let mut last = (pp.c, "no candidate", 0u8);
@@ -791,7 +872,7 @@ fn try_exit(
             ),
             ctx.settings.snap,
         );
-        let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers) {
+        let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers, partial) {
             Ok(k) => k,
             Err((why, kind)) => {
                 last = (via, why, kind);
@@ -832,6 +913,7 @@ fn try_exit(
                 cost,
                 floor_via,
                 min_stub,
+                partial,
             });
         }
     }
@@ -864,15 +946,31 @@ fn candidates(ctx: &Ctx<'_>, u: &Unit, cache: &mut ClearanceCache) -> (Vec<Cand>
         .collect();
 
     // Pass 1: the octilinear and corner exits at the near gaps. Pass 2, only
-    // when pass 1 found nothing: more directions, farther out.
-    let passes: [(u32, bool, &[Coord], i64); 2] = [
+    // when pass 1 found nothing: more directions, farther out. Pass 3, only
+    // when both found nothing: every gap and direction again, joining the
+    // plane on one of its layers ([`FanoutSettings::partial_plane_fallback`]).
+    let all_gaps: Vec<Coord> = s
+        .exit_gaps
+        .iter()
+        .chain(&s.fallback_gaps)
+        .copied()
+        .filter(|&g| g > 0)
+        .collect();
+    let third_dirs: u32 = if s.partial_plane_fallback && own_layers.len() > 1 {
+        u32::from(s.fallback_directions).max(8)
+    } else {
+        0
+    };
+    let passes: [(u32, bool, &[Coord], i64); 3] = [
         (8, s.corner_exits, &s.exit_gaps, 0),
         (s.fallback_directions.into(), false, &s.fallback_gaps, 3),
+        (third_dirs, s.corner_exits, &all_gaps, 6),
     ];
     for (pass, &(n_dirs, corners, gaps, rank0)) in passes.iter().enumerate() {
-        if pass == 1 && (!out.is_empty() || n_dirs == 0) {
+        if pass >= 1 && (!out.is_empty() || n_dirs == 0) {
             break;
         }
+        let partial = pass == 2;
         for pp in &plans {
             for dir in directions(pp.pad, n_dirs, corners, pp.c) {
                 let Some(t_exit) = exit_distance(&pp.pad.shapes, pp.c, dir.0, dir.1) else {
@@ -893,6 +991,7 @@ fn candidates(ctx: &Ctx<'_>, u: &Unit, cache: &mut ClearanceCache) -> (Vec<Cand>
                         t_exit,
                         gap,
                         rank0 + gi as i64,
+                        partial,
                     ) {
                         Ok(c) => out.push(c),
                         Err((via, why, kind)) => {
@@ -941,6 +1040,7 @@ fn via_label(c: &Conflict) -> &'static str {
 
 /// Exact via legality against the board and the planes. The error carries
 /// a reason and its class (0 board, 1 plane, 2 spokes).
+#[allow(clippy::too_many_arguments)]
 fn check_via(
     ctx: &Ctx<'_>,
     cache: &mut ClearanceCache,
@@ -949,12 +1049,16 @@ fn check_via(
     diameter: Coord,
     drill: Coord,
     own_layers: &[LayerId],
+    partial: bool,
 ) -> Result<SubjectKey, (&'static str, u8)> {
     let space = ctx.space;
     let s = ctx.settings;
     let r = radius_of(diameter);
     let grown = r + s.plane_margin;
-    // Plane tests first: they are cheap and reject most far-off sites.
+    // Plane tests first: they are cheap and reject most far-off sites. A
+    // partial-plane candidate needs one own layer, the others are skipped.
+    let mut joined = 0usize;
+    let mut spokes_short = false;
     for &l in own_layers {
         let inside = space
             .planes
@@ -962,6 +1066,9 @@ fn check_via(
             .filter(|p| p.net == Some(net) && p.layer == l)
             .find(|p| p.index.disc_inside(via, grown));
         let Some(piece) = inside else {
+            if partial {
+                continue;
+            }
             return Err(("via: outside its own plane piece", 1));
         };
         if s.min_spokes > 0 {
@@ -981,9 +1088,21 @@ fn check_via(
                 best = best.max(n);
             }
             if best < s.min_spokes {
+                if partial {
+                    spokes_short = true;
+                    continue;
+                }
                 return Err(("via: too few spokes reach its plane", 2));
             }
         }
+        joined += 1;
+    }
+    if partial && joined == 0 {
+        return Err(if spokes_short {
+            ("via: too few spokes reach its plane", 2)
+        } else {
+            ("via: outside its own plane piece", 1)
+        });
     }
     let islands = space
         .planes
@@ -1649,6 +1768,77 @@ mod tests {
         assert!(p.details[0]
             .rejections
             .contains_key("via: outside its own plane piece"));
+    }
+
+    #[test]
+    fn a_partial_plane_site_joins_one_of_the_net_planes() {
+        // GND pours on In1 everywhere but on In2 only on the left: a pad on
+        // the right has no site inside both, but one inside In1.
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
+        b.zone("GND", "In2.Cu", (0.5, 0.5, 9.0, 9.5));
+        let g = b.footprint("C2", (15.0, 5.0));
+        b.smd_pad(g, "1", "GND", (15.0, 5.0), (0.6, 0.6), "F.Cu");
+        let board = b.build();
+        let strict = plan(
+            &board,
+            &FanoutSettings {
+                partial_plane_fallback: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(strict.failed.len(), 1);
+        assert_eq!(strict.failed[0].1, FanoutFailure::OutsideOwnPlane);
+        let p = plan(&board, &FanoutSettings::default());
+        assert_eq!(p.sites.len(), 1, "{:?}", p.details);
+        assert_eq!(p.stats.partial_plane_sites, 1);
+        let s = &p.sites[0];
+        // Inside the In1 pour, by the via's radius.
+        let r = s.via_diameter / 2;
+        assert!(s.via.x - r > 500_000 && s.via.x + r < 19_500_000);
+    }
+
+    #[test]
+    fn hand_escaped_ball_grids_are_left_alone() {
+        // An 8 x 8 grid of GND and signal balls; every ball has a dog-bone
+        // except two GND balls, which a plain fanout would give vias.
+        let mut b = BoardBuilder::new(14.0, 14.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 13.5, 13.5));
+        let u = b.footprint("U1", (7.0, 7.0));
+        for r in 0..8 {
+            for c in 0..8 {
+                let at = (3.5 + c as f64, 3.5 + r as f64);
+                let net = if (r + c) % 2 == 0 {
+                    "GND".to_string()
+                } else {
+                    format!("S{r}_{c}")
+                };
+                b.ball_pad(u, &format!("{r}_{c}"), &net, at, 0.4, "F.Cu");
+                if (r, c) != (0, 0) && (r, c) != (7, 7) {
+                    let via = (at.0 + 0.5, at.1 + 0.5);
+                    b.track(&net, "F.Cu", at, via, 0.12, true);
+                    b.via(&net, via, 0.45, 0.2, true);
+                }
+            }
+        }
+        let board = b.build();
+        let conn = ConnectivityReport::build(&board, &ArcPolicy::default());
+        assert_eq!(escaped_arrays(&board, &conn, 64).len(), 1);
+        let p = plan(&board, &FanoutSettings::default());
+        assert_eq!(p.stats.escaped_arrays, 1);
+        assert!(p.sites.is_empty(), "{:?}", p.sites);
+        assert!(p
+            .skipped
+            .iter()
+            .any(|(_, why)| *why == FanoutSkip::ExcludedFootprint));
+        let open = plan(
+            &board,
+            &FanoutSettings {
+                exclude_escaped_arrays: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(open.stats.eligible_islands, 2);
     }
 
     #[test]

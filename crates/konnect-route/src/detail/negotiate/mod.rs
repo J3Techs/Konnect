@@ -82,9 +82,10 @@ mod tiles;
 pub use reference::ReferenceSearch;
 pub use tiles::{detect_bga_fields, BgaField};
 
+use crate::access::{AccessPoint, PadAccess};
 use crate::api::{
-    Connection, ConnectionId, FailureReason, Generation, ItemKind, ItemRef, LayerId, LayerMask,
-    NetId, Stage, TileId, LATTICE_FINE_PITCH_NM, LATTICE_PITCH_NM,
+    ClassId, Connection, ConnectionId, FailureReason, Generation, ItemKind, ItemRef, LayerId,
+    LayerMask, NetId, PadId, Stage, TileId, LATTICE_FINE_PITCH_NM, LATTICE_PITCH_NM,
 };
 use crate::board::RouteBoard;
 use crate::compute::{
@@ -191,6 +192,29 @@ pub struct NegotiationTuning {
     /// Core size `(width, height)` of the regular grid tiles; snapped to the
     /// base lattice and never below two halos plus 0.5 mm per side.
     pub grid_core: (Coord, Coord),
+    /// Fill passes after negotiation: every connection still failed (but
+    /// not for lack of access or corridor) is routed again with all other
+    /// routed copper as a hard wall, alternating the tiling. A fill pass
+    /// only adds copper that keeps clear of what is already routed, so it
+    /// never undoes a routed connection.
+    pub fill_passes: u32,
+    /// The present factor never grows past this. Path costs are 32-bit and
+    /// saturate: an unbounded factor turns other nets' copper into walls
+    /// (searches report unreachable) instead of costs to negotiate.
+    pub present_factor_max: u32,
+    /// Longest full-width stub from a pad's access point to a lattice node,
+    /// for a pad whose own copper offers no open node.
+    pub stub_reach: Coord,
+    /// Odd iterations below this one use the shifted tiling; later ones
+    /// keep the unshifted tiling, so a connection in conflict on a few
+    /// pieces can reroute just those (fill passes always alternate).
+    pub shift_iterations: u32,
+    /// Consecutive piece-only reroutes of a connection before it is cut
+    /// again from scratch (0: always reroute whole connections).
+    pub partial_tries: u32,
+    /// Stop negotiating early once the number of connections in conflict
+    /// has not improved for this many iterations (0: run every iteration).
+    pub stall_iterations: u32,
 }
 
 impl Default for NegotiationTuning {
@@ -219,8 +243,49 @@ impl Default for NegotiationTuning {
             generation: Generation(1),
             raster_cache_mb: 4_096,
             grid_core: crate::api::TILE_CORE_NM,
+            fill_passes: 2,
+            shift_iterations: 6,
+            partial_tries: 3,
+            present_factor_max: 1_000_000,
+            stub_reach: 500_000,
+            stall_iterations: 0,
         }
     }
+}
+
+/// Narrowing a track where it leaves a pad: a terminal whose pad has no
+/// open lattice node at the class's width may start with a stub of
+/// [`NeckDown::width`] (never below the class's minimum width) at most
+/// [`NeckDown::reach`] long, out to a node where the full width fits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeckDown {
+    pub width: Coord,
+    pub reach: Coord,
+    /// Classes that never neck down (controlled impedance, pairs).
+    #[serde(default)]
+    pub excluded: BTreeSet<ClassId>,
+}
+
+impl Default for NeckDown {
+    fn default() -> Self {
+        NeckDown {
+            width: 100_000,
+            reach: 1_000_000,
+            excluded: BTreeSet::new(),
+        }
+    }
+}
+
+/// Inputs to negotiation beyond the task list and corridors.
+#[derive(Debug, Clone, Default)]
+pub struct NegotiationInputs {
+    /// S4 pin access, one entry per (pad, profile); a profile is a net
+    /// class (`ProfileId(class)`). A pad whose own copper offers no open
+    /// lattice node is entered through a short stub from one of its access
+    /// points along an open exit heading.
+    pub access: Vec<PadAccess>,
+    /// Neck-down at pads (`None`: never).
+    pub neck_down: Option<NeckDown>,
 }
 
 /// One tile of the schedule.
@@ -257,6 +322,9 @@ pub enum DetailFailure {
     /// No legal pin where the connection crosses from one tile to another.
     NoPin { from: TileId, to: TileId },
     /// The search found no path under the hard walls, in both tilings.
+    /// A connection that lost a negotiation keeps its
+    /// [`DetailFailure::Congestion`] even when a fill pass then finds no
+    /// path for it.
     Unreachable,
     /// The search's expansion budget ran out.
     BudgetExhausted,
@@ -312,6 +380,9 @@ impl DetailFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IterationReport {
     pub iteration: u32,
+    /// A fill pass: other nets' routed copper was a hard wall.
+    #[serde(default)]
+    pub fill: bool,
     /// The tile grid was shifted by half a tile.
     pub shifted: bool,
     pub present_factor: u32,
@@ -345,6 +416,10 @@ pub struct DetailResult {
     pub reports: Vec<IterationReport>,
     /// The BGA fields that were split into sub-tiles.
     pub bga_fields: Vec<BgaField>,
+    /// Connections negotiation left in conflict and dropped (before any
+    /// fill pass retried them), sorted.
+    #[serde(default)]
+    pub congestion_lost: Vec<ConnectionId>,
     /// Routed tracks shorter than their `track_segment_length` minimum,
     /// left for S6 to merge or straighten (lattice jogs are one or two
     /// steps long). Collinear runs split at tile pins are already merged.
@@ -432,6 +507,7 @@ pub fn negotiate(
         None,
         settings,
         &NegotiationTuning::default(),
+        &NegotiationInputs::default(),
         backend,
         &mut telemetry,
     )
@@ -480,10 +556,18 @@ pub(crate) struct Ctx<'a> {
     pub margin: Coord,
     /// Half the widest track of any profile, rounded up.
     pub max_half_width: Coord,
+    /// S4 access points per (pad, class).
+    pub access: HashMap<(PadId, ClassId), Vec<AccessPoint>>,
+    pub neck: Option<NeckDown>,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(board: &'a RouteBoard, rules: &'a dyn RuleTable, tuning: NegotiationTuning) -> Self {
+    fn new(
+        board: &'a RouteBoard,
+        rules: &'a dyn RuleTable,
+        tuning: NegotiationTuning,
+        inputs: &NegotiationInputs,
+    ) -> Self {
         let obstacles = Obstacles::build(board, rules);
         let slots: Vec<LayerId> = board.routable.iter().collect();
         // Each class's first net, to probe custom clearance rules against.
@@ -563,6 +647,13 @@ impl<'a> Ctx<'a> {
             net_via,
             margin,
             max_half_width,
+            access: inputs
+                .access
+                .iter()
+                .filter(|a| !a.points.is_empty())
+                .map(|a| ((a.pad, ClassId(a.profile.0)), a.points.clone()))
+                .collect(),
+            neck: inputs.neck_down.clone(),
         }
     }
 
@@ -773,6 +864,7 @@ fn run_dag(
     history: &HistoryMap,
     params: &CostParams,
     iteration: u32,
+    fill: bool,
     forks: Vec<Box<dyn RouteCompute + Send>>,
     cache: &RasterCache,
     telemetry: &mut Telemetry,
@@ -877,7 +969,7 @@ fn run_dag(
                     let mut run = TileRun::build(ctx, spec, jobs, tasks, cache, &mut pool);
                     run.derive_masks(backend.as_mut());
                     run.narrow_vias(ctx, cache);
-                    run.paint_context(ctx, spec, &store, history);
+                    run.paint_context(ctx, spec, &store, history, fill);
                     drop(store);
                     let built = start.elapsed().as_micros() as u64;
                     run.route_all(ctx, tasks, params, iteration, backend.as_mut());
@@ -1017,6 +1109,7 @@ fn run_chunk(
     history: &HistoryMap,
     params: &CostParams,
     iteration: u32,
+    fill: bool,
     backend: &mut dyn RouteCompute,
     pool: &rayon::ThreadPool,
     cache: &RasterCache,
@@ -1047,7 +1140,7 @@ fn run_chunk(
             .zip(chunk.par_iter())
             .for_each(|(r, &t)| {
                 r.narrow_vias(ctx, cache);
-                r.paint_context(ctx, &tiling.tiles[t], store, history);
+                r.paint_context(ctx, &tiling.tiles[t], store, history, fill);
             })
     });
     telemetry.raster_rebuild_us += t0.elapsed().as_micros() as u64;
@@ -1121,6 +1214,75 @@ fn run_chunk(
     done
 }
 
+/// One connection's cut: the tiling it was made in and its pieces' jobs,
+/// each with its tile's index in that tiling.
+#[derive(Debug, Clone)]
+struct Layout {
+    shifted: bool,
+    jobs: Vec<(usize, PieceJob)>,
+}
+
+/// Keep connections still in conflict greedily in commit order: one keeps
+/// its copper unless it clashes with one already kept; the rest fail with
+/// [`DetailFailure::Congestion`].
+fn keep_greedily(
+    tasks: &[Task],
+    against: &BTreeMap<u32, BTreeSet<u32>>,
+    routed: &mut [Option<Vec<Arc<PieceCopper>>>],
+    failure: &mut [Option<DetailFailure>],
+    iterations: u32,
+) {
+    let mut lose = |t: u32, routed: &mut [Option<Vec<Arc<PieceCopper>>>]| {
+        routed[t as usize] = None;
+        failure[t as usize] = Some(DetailFailure::Congestion {
+            iterations,
+            against: against[&t]
+                .iter()
+                .map(|&p| tasks[p as usize].conn.id)
+                .collect(),
+        });
+    };
+    // A greedy maximum independent set of the conflict graph: keep the
+    // connection with the fewest live conflicts (then the lowest rank),
+    // drop its partners, repeat. A connection in conflict with itself never
+    // keeps its copper.
+    let mut alive: BTreeSet<u32> = BTreeSet::new();
+    for (&t, partners) in against {
+        if routed[t as usize].is_none() {
+            continue;
+        }
+        if partners.contains(&t) {
+            lose(t, routed);
+        } else {
+            alive.insert(t);
+        }
+    }
+    while let Some(t) = alive
+        .iter()
+        .copied()
+        .min_by_key(|t| (against[t].iter().filter(|p| alive.contains(p)).count(), *t))
+    {
+        alive.remove(&t);
+        for p in &against[&t] {
+            if alive.remove(p) {
+                lose(*p, routed);
+            }
+        }
+    }
+}
+
+/// The connections a fill pass routes: every one without copper whose
+/// failure another try could change (not a missing terminal or corridor).
+fn fill_queue(
+    routed: &[Option<Vec<Arc<PieceCopper>>>],
+    failure: &[Option<DetailFailure>],
+) -> Vec<u32> {
+    (0..routed.len())
+        .filter(|&t| routed[t].is_none() && failure[t].as_ref().is_none_or(|f| f.retryable()))
+        .map(|t| t as u32)
+        .collect()
+}
+
 /// [`negotiate`] with an explicit task list, optional GCell grid (to read
 /// corridor cells as guide lines), tuning and telemetry.
 #[allow(clippy::too_many_arguments)]
@@ -1135,6 +1297,35 @@ pub fn negotiate_connections(
     backend: &mut dyn RouteCompute,
     telemetry: &mut Telemetry,
 ) -> DetailResult {
+    negotiate_connections_with(
+        board,
+        rules,
+        connections,
+        global,
+        grid,
+        settings,
+        tuning,
+        &NegotiationInputs::default(),
+        backend,
+        telemetry,
+    )
+}
+
+/// [`negotiate_connections`] with pin access and neck-down
+/// ([`NegotiationInputs`]).
+#[allow(clippy::too_many_arguments)]
+pub fn negotiate_connections_with(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    connections: &[Connection],
+    global: &GlobalResult,
+    grid: Option<&GCellGrid>,
+    settings: &NegotiationSettings,
+    tuning: &NegotiationTuning,
+    inputs: &NegotiationInputs,
+    backend: &mut dyn RouteCompute,
+    telemetry: &mut Telemetry,
+) -> DetailResult {
     run_negotiation(
         board,
         rules,
@@ -1144,6 +1335,7 @@ pub fn negotiate_connections(
         grid,
         settings,
         tuning,
+        inputs,
         backend,
         telemetry,
     )
@@ -1161,6 +1353,7 @@ fn run_negotiation(
     grid: Option<&GCellGrid>,
     settings: &NegotiationSettings,
     tuning: &NegotiationTuning,
+    inputs: &NegotiationInputs,
     backend: &mut dyn RouteCompute,
     telemetry: &mut Telemetry,
 ) -> DetailResult {
@@ -1171,7 +1364,7 @@ fn run_negotiation(
         .expect("a rayon pool builds");
     telemetry.threads = pool.current_num_threads() as u32;
     let t_setup = Instant::now();
-    let ctx = Ctx::new(board, rules, *tuning);
+    let ctx = Ctx::new(board, rules, *tuning, inputs);
     let (tasks, refused) = build_tasks(&ctx, connections, report, global, grid);
     telemetry.count("us_setup", t_setup.elapsed().as_micros() as u64);
     let n = tasks.len();
@@ -1181,6 +1374,12 @@ fn run_negotiation(
     let mut routed: Vec<Option<Vec<Arc<PieceCopper>>>> = vec![None; n];
     let mut failure: Vec<Option<DetailFailure>> = vec![None; n];
     let mut failed_in: Vec<[bool; 2]> = vec![[false; 2]; n];
+    // Each connection's last cut: the tiling (shifted or not) and its
+    // pieces, so a connection in conflict on some pieces reroutes only
+    // those, between the same pins.
+    let mut layouts: Vec<Option<Layout>> = vec![None; n];
+    let mut bad: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
+    let mut partial_tries: Vec<u32> = vec![0; n];
     let mut history = HistoryMap::default();
     let mut queue: Vec<u32> = (0..n as u32).collect();
     let mut present_factor = tuning.initial_present_factor;
@@ -1195,13 +1394,39 @@ fn run_negotiation(
         16 * pool.current_num_threads().max(1)
     };
 
-    for it in 0..settings.max_iterations {
-        if queue.is_empty() || ctx.slots.is_empty() {
+    // Negotiation, then the fill passes.
+    let mut fill = false;
+    let mut lost: Vec<ConnectionId> = Vec::new();
+    let mut fills_run = 0u32;
+    let mut best_conflicted = u32::MAX;
+    let mut stalled = 0u32;
+    let mut it = 0u32;
+    loop {
+        if ctx.slots.is_empty() {
+            break;
+        }
+        let stall = tuning.stall_iterations > 0 && stalled >= tuning.stall_iterations;
+        if !fill && (it >= settings.max_iterations || queue.is_empty() || stall) {
+            // Unresolved conflicts: keep a greedy independent set.
+            let before: Vec<bool> = routed.iter().map(Option::is_some).collect();
+            keep_greedily(&tasks, &against, &mut routed, &mut failure, iterations);
+            lost = (0..n)
+                .filter(|&t| before[t] && routed[t].is_none())
+                .map(|t| tasks[t].conn.id)
+                .collect();
+            lost.sort_unstable();
+            against.clear();
+            fill = true;
+            queue = fill_queue(&routed, &failure);
+            telemetry.count("fill_queued", queue.len() as u64);
+        }
+        if fill && (fills_run >= tuning.fill_passes || queue.is_empty()) {
             break;
         }
         let it_start = Instant::now();
         iterations = it + 1;
-        let shift = tuning.shift_odd_iterations && it % 2 == 1;
+        let shift =
+            tuning.shift_odd_iterations && it % 2 == 1 && (fill || it < tuning.shift_iterations);
         let Some(tiling) = Tiling::build(board, shift, &ctx.tuning, ctx.margin) else {
             // No tiles: nothing queued can be (re)routed, and copper still
             // in conflict must not be kept.
@@ -1217,26 +1442,93 @@ fn run_negotiation(
         }
         let mut report = IterationReport {
             iteration: it,
+            fill,
             shifted: shift,
             present_factor,
             queued: queue.len() as u32,
             ..IterationReport::default()
         };
-        // 1. Rip up.
+        // 1. Rip up, keeping the old copper in case the reroute fails. A
+        // fill pass also keeps each connection's congestion failure: one
+        // that lost a negotiation and still finds no path with every other
+        // net's copper as a wall is reported as congestion, not as the
+        // fill search's own failure.
+        let mut previous: BTreeMap<u32, Vec<Arc<PieceCopper>>> = BTreeMap::new();
+        let mut lost_to: BTreeMap<u32, DetailFailure> = BTreeMap::new();
         for &t in &queue {
-            if routed[t as usize].take().is_some() {
+            if let Some(old) = routed[t as usize].take() {
                 telemetry.count("rip_ups", 1);
+                previous.insert(t, old);
             }
-            failure[t as usize] = None;
+            match failure[t as usize].take() {
+                Some(f @ DetailFailure::Congestion { .. }) if fill => {
+                    lost_to.insert(t, f);
+                }
+                _ => {}
+            }
         }
-        // 2. Cut into pieces, pinning crossings away from routed copper.
+        // 2. Cut into pieces, pinning crossings away from routed copper. A
+        // connection whose conflicts touch only some of its pieces, cut in
+        // this same tiling, keeps the others and their pins and reroutes
+        // just those pieces (at most `partial_tries` times in a row).
         let t_split = Instant::now();
-        let kept: Vec<Arc<PieceCopper>> = routed.iter().flatten().flatten().cloned().collect();
-        let kept_index = RoutedIndex::build(kept, board.layer_count(), reach);
         let mut registry = PinRegistry::default();
         let mut by_tile: Vec<Vec<PieceJob>> = vec![Vec::new(); tiling.tiles.len()];
         let mut fresh: Vec<Vec<Option<Arc<PieceCopper>>>> = vec![Vec::new(); n];
+        let mut partial_goods: Vec<Arc<PieceCopper>> = Vec::new();
+        let mut old_layouts: BTreeMap<u32, Option<Layout>> = BTreeMap::new();
+        let mut whole: Vec<u32> = Vec::new();
         for &t in &queue {
+            let ti = t as usize;
+            let plan = match (&layouts[ti], bad.get(&t), previous.get(&t)) {
+                (Some(l), Some(b), Some(old))
+                    if !fill
+                        && l.shifted == shift
+                        && b.len() < l.jobs.len()
+                        && old.len() == l.jobs.len()
+                        && partial_tries[ti] < tuning.partial_tries =>
+                {
+                    Some((l.clone(), b.clone(), old.clone()))
+                }
+                _ => None,
+            };
+            let Some((layout, pieces_bad, old)) = plan else {
+                whole.push(t);
+                continue;
+            };
+            partial_tries[ti] += 1;
+            telemetry.count("partial_reroutes", 1);
+            let net = tasks[ti].conn.net;
+            fresh[ti] = old
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (!pieces_bad.contains(&(i as u8))).then(|| p.clone()))
+                .collect();
+            partial_goods.extend(fresh[ti].iter().flatten().cloned());
+            for (tile, job) in &layout.jobs {
+                if let pieces::Terminal::Pin(p) = job.to {
+                    let slot = ctx.slot_of(p.layer).expect("pins use routable layers");
+                    registry.add(net, p.layer, p.at, ctx.width(net, slot));
+                }
+                if pieces_bad.contains(&job.piece) {
+                    report.pieces += 1;
+                    by_tile[*tile].push(PieceJob {
+                        retries: 0,
+                        ..job.clone()
+                    });
+                }
+            }
+        }
+        let kept: Vec<Arc<PieceCopper>> = routed
+            .iter()
+            .flatten()
+            .flatten()
+            .chain(partial_goods.iter())
+            .cloned()
+            .collect();
+        let kept_index = RoutedIndex::build(kept, board.layer_count(), reach);
+        for &t in &whole {
+            partial_tries[t as usize] = 0;
             match pieces::split(
                 &ctx,
                 &tiling,
@@ -1249,6 +1541,13 @@ fn run_negotiation(
                 Ok(list) => {
                     fresh[t as usize] = vec![None; list.len()];
                     report.pieces += list.len() as u32;
+                    old_layouts.insert(
+                        t,
+                        layouts[t as usize].replace(Layout {
+                            shifted: shift,
+                            jobs: list.clone(),
+                        }),
+                    );
                     for (tile, job) in list {
                         by_tile[tile].push(job);
                     }
@@ -1258,6 +1557,14 @@ fn run_negotiation(
         }
         drop(kept_index);
         telemetry.count("us_split", t_split.elapsed().as_micros() as u64);
+        // Soft-reserve the placed pins, so other nets pay to cross a pin
+        // before its own piece is routed (never in a fill pass, where
+        // routed copper is a wall and a pin must not become one).
+        let pin_marks: Vec<Arc<PieceCopper>> = if fill {
+            Vec::new()
+        } else {
+            registry.marks(&ctx).into_iter().map(Arc::new).collect()
+        };
         report.pins = registry.placed as u32;
         telemetry.count("pins", registry.placed);
         telemetry.count("pieces", u64::from(report.pieces));
@@ -1301,7 +1608,10 @@ fn run_negotiation(
                 .flatten()
                 .filter(|&t| !by_tile[t].is_empty())
                 .collect();
-            let kept: Vec<Arc<PieceCopper>> = routed.iter().flatten().flatten().cloned().collect();
+            let mut kept: Vec<Arc<PieceCopper>> =
+                routed.iter().flatten().flatten().cloned().collect();
+            kept.extend(partial_goods.iter().cloned());
+            kept.extend(pin_marks.iter().cloned());
             let done = run_dag(
                 &ctx,
                 &tiling,
@@ -1312,6 +1622,7 @@ fn run_negotiation(
                 &history,
                 &params,
                 it,
+                fill,
                 forks,
                 &cache,
                 telemetry,
@@ -1332,6 +1643,7 @@ fn run_negotiation(
                     .flatten()
                     .flatten()
                     .chain(fresh.iter().flatten().flatten())
+                    .chain(pin_marks.iter())
                     .cloned()
                     .collect();
                 for chunk in active.chunks(chunk_size) {
@@ -1340,32 +1652,50 @@ fn run_negotiation(
                         .map(|&t| std::mem::take(&mut by_tile[t]))
                         .collect();
                     let done = run_chunk(
-                        &ctx, &tiling, chunk, jobs, &tasks, &store, &history, &params, it, backend,
-                        &pool, &cache, telemetry,
+                        &ctx, &tiling, chunk, jobs, &tasks, &store, &history, &params, it, fill,
+                        backend, &pool, &cache, telemetry,
                     );
                     record(done, &mut fresh, &mut failure);
                 }
             }
         }
 
-        // Assemble the queued connections.
+        // Assemble the queued connections. One that fails to reroute on the
+        // last negotiation iteration keeps its old copper (a last failure
+        // must not undo a route an earlier iteration found); it counts as
+        // new, so its conflicts are detected again and resolved greedily.
+        // Earlier, a failure drops the copper: kept, it would block the
+        // reroutes around it.
         let mut is_new = vec![false; n];
         for &t in &queue {
             let t = t as usize;
-            if failure[t].is_some() {
-                report.failed += 1;
-                continue;
-            }
-            let pieces: Option<Vec<Arc<PieceCopper>>> = fresh[t].iter().cloned().collect();
-            match pieces {
-                Some(p) if !p.is_empty() => {
-                    routed[t] = Some(p);
-                    is_new[t] = true;
-                    report.routed += 1;
+            if failure[t].is_none() {
+                let pieces: Option<Vec<Arc<PieceCopper>>> = fresh[t].iter().cloned().collect();
+                match pieces {
+                    Some(p) if !p.is_empty() => {
+                        routed[t] = Some(p);
+                        is_new[t] = true;
+                        report.routed += 1;
+                        continue;
+                    }
+                    _ => failure[t] = Some(DetailFailure::Unreachable),
                 }
-                _ => {
-                    failure[t] = Some(DetailFailure::Unreachable);
-                    report.failed += 1;
+            }
+            report.failed += 1;
+            // The last iteration: the schedule's, or one a stall stop may
+            // end on (if this iteration then improves, the restored copper
+            // is simply queued again).
+            let last = !fill
+                && (it + 1 >= settings.max_iterations
+                    || (tuning.stall_iterations > 0 && stalled + 1 >= tuning.stall_iterations));
+            if let Some(old) = previous.remove(&(t as u32)).filter(|_| last) {
+                routed[t] = Some(old);
+                failure[t] = None;
+                is_new[t] = true;
+                telemetry.count("restored", 1);
+                // The copper is the old cut's: so is the layout.
+                if let Some(l) = old_layouts.remove(&(t as u32)) {
+                    layouts[t] = l;
                 }
             }
         }
@@ -1382,6 +1712,57 @@ fn run_negotiation(
         telemetry.count("us_conflicts", t_conf.elapsed().as_micros() as u64);
         report.conflict_pairs = pairs.len() as u32;
         against.clear();
+        bad.clear();
+        for &pair in &pairs {
+            let ((ta, pa), (tb, pb)) = index.pieces_of(pair);
+            bad.entry(ta).or_default().insert(pa);
+            bad.entry(tb).or_default().insert(pb);
+        }
+        if fill {
+            // New copper yields to copper already kept, then greedily in
+            // commit order among itself.
+            let mut clash: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+            for &pair in &pairs {
+                let (ta, tb) = index.tasks_of(pair);
+                clash.entry(ta).or_default().insert(tb);
+                clash.entry(tb).or_default().insert(ta);
+            }
+            let mut kept_new: BTreeSet<u32> = BTreeSet::new();
+            for (&t, partners) in &clash {
+                if !is_new[t as usize] {
+                    continue;
+                }
+                let blocked = partners
+                    .iter()
+                    .any(|&p| p == t || !is_new[p as usize] || kept_new.contains(&p));
+                if blocked {
+                    routed[t as usize] = None;
+                    report.routed -= 1;
+                    report.failed += 1;
+                    failure[t as usize] = Some(DetailFailure::Congestion {
+                        iterations: it + 1,
+                        against: partners
+                            .iter()
+                            .map(|&p| tasks[p as usize].conn.id)
+                            .collect(),
+                    });
+                } else {
+                    kept_new.insert(t);
+                }
+            }
+            for (t, f) in lost_to {
+                if routed[t as usize].is_none() {
+                    failure[t as usize] = Some(f);
+                }
+            }
+            telemetry.count("fill_routed", u64::from(report.routed));
+            telemetry.count("us_fill", it_start.elapsed().as_micros() as u64);
+            reports.push(report);
+            queue = fill_queue(&routed, &failure);
+            fills_run += 1;
+            it += 1;
+            continue;
+        }
         let mut cells = HashSet::new();
         for &pair in &pairs {
             let (ta, tb) = index.tasks_of(pair);
@@ -1417,6 +1798,12 @@ fn run_negotiation(
         if !pairs.is_empty() {
             telemetry.congested_iteration_us += elapsed;
         }
+        if report.conflicted < best_conflicted {
+            best_conflicted = report.conflicted;
+            stalled = 0;
+        } else {
+            stalled += 1;
+        }
         reports.push(report);
         queue = next.into_iter().collect();
         // PathFinder schedule: multiply, but never below the floor (so a
@@ -1424,28 +1811,12 @@ fn run_negotiation(
         present_factor =
             u32::try_from(u64::from(present_factor) * u64::from(settings.present_growth) / 1000)
                 .unwrap_or(u32::MAX)
-                .max(tuning.present_factor_floor);
+                .max(tuning.present_factor_floor)
+                .min(tuning.present_factor_max.max(tuning.present_factor_floor));
+        it += 1;
     }
-
-    // Unresolved conflicts: keep greedily in commit order.
-    let mut kept_conflicted: BTreeSet<u32> = BTreeSet::new();
-    for (&t, partners) in &against {
-        if routed[t as usize].is_none() {
-            continue;
-        }
-        if partners.contains(&t) || partners.iter().any(|p| kept_conflicted.contains(p)) {
-            routed[t as usize] = None;
-            failure[t as usize] = Some(DetailFailure::Congestion {
-                iterations,
-                against: partners
-                    .iter()
-                    .map(|&p| tasks[p as usize].conn.id)
-                    .collect(),
-            });
-        } else {
-            kept_conflicted.insert(t);
-        }
-    }
+    // A run that never reached the fill stage (no slots) still resolves.
+    keep_greedily(&tasks, &against, &mut routed, &mut failure, iterations);
 
     // Assemble the result.
     let gen = tuning.generation;
@@ -1454,6 +1825,7 @@ fn run_negotiation(
         generation: gen,
         reports,
         bga_fields: fields,
+        congestion_lost: lost,
         ..DetailResult::default()
     };
     let mut failed: Vec<(ConnectionId, DetailFailure)> =

@@ -34,6 +34,7 @@ use konnect_route::compute::{
     SearchBackend, SearchOutcome, TileRaster, TileStack, Window,
 };
 use konnect_route::detail::search::{search_with, SearchConfig, SearchContext, SearchStats};
+use konnect_route::pipeline::backend::min_run_nets;
 use konnect_route::pipeline::{route_board_with, KernelBackend, PipelineScope, PipelineSettings};
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable};
 use std::io::{Read, Write};
@@ -457,9 +458,14 @@ impl SearchBackend for CaptureBackend {
                 continue;
             }
             let stack = &stacks[job.window as usize];
+            // The job's own minimum-run flag, as the backend set it.
+            let min_run = self.inner.min_run
+                && self.inner.min_run_nets.as_ref().is_none_or(|nets| {
+                    nets.get(job.net as usize).copied().unwrap_or(false)
+                });
             let bytes = encode(
                 &self.inner.config,
-                self.inner.min_run,
+                min_run,
                 params,
                 job,
                 pool,
@@ -560,11 +566,17 @@ fn capture_negotiation_searches() {
         every: env_num("KONNECT_SEARCH_CAPTURE_EVERY", 150),
         written: AtomicU64::new(0),
     });
+    // The kernel backend exactly as `route_board` sets it up.
+    let mut inner = KernelBackend::new(settings.search.clone());
+    if settings.search_min_run {
+        if let Some((nets, min)) = min_run_nets(&board, &rules) {
+            inner.min_run = true;
+            inner.min_run_nets = Some(Arc::new(nets));
+            inner.config.min_run_nm = min;
+        }
+    }
     let mut backend = CaptureBackend {
-        inner: KernelBackend {
-            config: settings.search.clone(),
-            min_run: settings.search_min_run,
-        },
+        inner,
         shared: shared.clone(),
     };
     let t = Instant::now();
@@ -718,10 +730,9 @@ fn replay_captured_searches() {
         if let Some(f) = field_after {
             config.field_after = f;
         }
-        let mut backend = KernelBackend {
-            config,
-            min_run: c.min_run,
-        };
+        // The capture holds the job's own flag, so flag every job.
+        let mut backend = KernelBackend::new(config);
+        backend.min_run = c.min_run;
         let mut pool = JobPool::default();
         let mut job = c.job;
         job.window = 0;

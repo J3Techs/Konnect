@@ -203,6 +203,12 @@ impl RoutedIndex {
         (self.piece_of(pair.0).task, self.piece_of(pair.1).task)
     }
 
+    /// The (task, piece) of each side of a conflicting pair.
+    pub fn pieces_of(&self, pair: (u32, u32)) -> ((u32, u8), (u32, u8)) {
+        let (a, b) = (self.piece_of(pair.0), self.piece_of(pair.1));
+        ((a.task, a.piece), (b.task, b.piece))
+    }
+
     /// History cells (layer, cell x, cell y) where item `a`'s centre line is
     /// within conflict distance of item `b`.
     pub fn conflict_cells(

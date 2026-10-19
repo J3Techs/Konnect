@@ -11,6 +11,7 @@
 //! direction (within ±45°), so the joint never makes an acute angle.
 
 use super::conflicts::{HistoryMap, RoutedIndex};
+use super::copper::{PieceCopper, SegCopper};
 use super::tiles::Tiling;
 use super::{Ctx, DetailFailure, Task};
 use crate::api::{ItemKind, ItemRef, LayerId, NetId, LATTICE_PITCH_NM};
@@ -93,7 +94,37 @@ impl PinRegistry {
         false
     }
 
-    fn add(&mut self, net: NetId, layer: LayerId, p: Point, width: Coord) {
+    /// Every placed pin as a copper dot of its net's width, in a
+    /// deterministic order: soft paint that reserves the pin. Their task is
+    /// `u32::MAX`, so they never stand for a routed connection.
+    pub fn marks(&self, ctx: &Ctx<'_>) -> Vec<PieceCopper> {
+        let mut all: Vec<(u8, Point, NetId, Coord)> = self
+            .cells
+            .iter()
+            .flat_map(|(&(l, _, _), list)| list.iter().map(move |&(p, n, w)| (l, p, n, w)))
+            .collect();
+        all.sort_unstable_by_key(|&(l, p, n, w)| (l, p.x, p.y, n, w));
+        all.dedup();
+        all.into_iter()
+            .map(|(l, p, net, w)| {
+                let seg = Segment::new(p, p, w);
+                let courtyards = ctx.obstacles.courtyards.hits(&Shape::Segment(seg));
+                PieceCopper::new(
+                    u32::MAX,
+                    0,
+                    net,
+                    vec![SegCopper {
+                        layer: LayerId(l),
+                        seg,
+                        courtyards,
+                    }],
+                    Vec::new(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn add(&mut self, net: NetId, layer: LayerId, p: Point, width: Coord) {
         self.cells
             .entry(Self::key(layer, p))
             .or_default()
@@ -197,6 +228,7 @@ fn choose_pin(
     registry: &PinRegistry,
     routed: &RoutedIndex,
     history: &HistoryMap,
+    search: Coord,
 ) -> Option<Pin> {
     let a = &tiling.tiles[cr.from];
     let b = &tiling.tiles[cr.to];
@@ -281,7 +313,7 @@ fn choose_pin(
         layers.retain(|l| *l != h);
         layers.insert(0, h);
     }
-    let max_steps = i64::from(ctx.tuning.pin_search / pitch);
+    let max_steps = i64::from(search / pitch);
     let layer_penalty = 5 * i64::from(pitch);
     let mut strict: Option<(i64, Point, LayerId)> = None;
     let mut loose: Option<(i64, Point, LayerId)> = None;
@@ -382,7 +414,15 @@ pub(crate) fn split(
     }
     let mut pins = Vec::with_capacity(crossings.len());
     for (k, cr) in crossings.iter().enumerate() {
-        let Some(pin) = choose_pin(ctx, tiling, task, k, cr, registry, routed, history) else {
+        // Near the guide crossing first; then three times as far along the
+        // boundary before giving up on the crossing.
+        let pin = [
+            ctx.tuning.pin_search,
+            ctx.tuning.pin_search.saturating_mul(3),
+        ]
+        .into_iter()
+        .find_map(|search| choose_pin(ctx, tiling, task, k, cr, registry, routed, history, search));
+        let Some(pin) = pin else {
             return Err(DetailFailure::NoPin {
                 from: tiling.tiles[cr.from].tile.id,
                 to: tiling.tiles[cr.to].tile.id,

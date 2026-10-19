@@ -234,8 +234,13 @@ fn assert_clean_and_connected(board: &RouteBoard, result: &DetailResult) {
 /// `n` nets from the left column to the right column in reverse order on a
 /// two-layer board: every net crosses every other.
 fn crossing_bundle(n: usize) -> RouteBoard {
+    crossing_bundle_on(n, &["F.Cu", "B.Cu"])
+}
+
+/// [`crossing_bundle`] on the given copper layers.
+fn crossing_bundle_on(n: usize, layers: &[&str]) -> RouteBoard {
     let h = 2.0 * n as f64 + 2.0;
-    let mut b = BoardBuilder::new(16.0, h, &["F.Cu", "B.Cu"]);
+    let mut b = BoardBuilder::new(16.0, h, layers);
     let l = b.footprint("J1", (2.0, h / 2.0));
     let r = b.footprint("J2", (14.0, h / 2.0));
     for i in 0..n {
@@ -457,9 +462,11 @@ fn negotiation_converges_on_a_crossing_bundle() {
 #[test]
 fn unresolved_conflicts_keep_copper_greedily_and_fail_the_rest() {
     let board = crossing_bundle(6);
-    // One iteration blind to congestion leaves conflicts unresolved.
+    // One iteration blind to congestion leaves conflicts unresolved (and no
+    // fill pass routes the losers).
     let tuning = NegotiationTuning {
         initial_present_factor: 0,
+        fill_passes: 0,
         ..NegotiationTuning::default()
     };
     let (result, _) = route_with(
@@ -668,8 +675,12 @@ fn unroutable_connections_get_named_reasons() {
         reason("INNER"),
         Some(FailureReason::NoAccess { .. })
     ));
-    // A hard failure is retried once in the shifted tiling, then given up.
-    assert_eq!(result.iterations, 2, "{:?}", result.reports);
+    // A hard failure is retried once in the shifted tiling, then given up
+    // by negotiation; the fill passes try it once more in each tiling.
+    let negotiated = result.reports.iter().filter(|r| !r.fill).count();
+    assert_eq!(negotiated, 2, "{:?}", result.reports);
+    let fills = result.reports.iter().filter(|r| r.fill).count();
+    assert_eq!(fills, 2, "{:?}", result.reports);
     assert_clean_and_connected(&board, &result);
 }
 
@@ -1161,4 +1172,403 @@ fn pinned_runs_are_merged_and_short_segments_are_reported() {
     // Without the rule nothing is reported.
     let (plain, _) = route(&board);
     assert!(plain.short_segments.is_empty());
+}
+
+#[test]
+fn reopened_via_sites_match_a_full_erosion() {
+    // Re-deriving a node range from the live counters gives exactly what
+    // the full erosion gives there.
+    let w = Window::new(Point::new(0, 0), 50_000, 37, 29).unwrap();
+    let mut r = TileRaster::new(TileId(0), LayerId(0), crate::api::ProfileId(0), w);
+    let mut seed = 12_345u32;
+    for row in 0..29u32 {
+        for col in 0..37u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if (seed >> 16).is_multiple_of(23) {
+                *r.halo.get_mut(col, row) = 1;
+            }
+            if (seed >> 16).is_multiple_of(97) {
+                *r.core.get_mut(col, row) = 1;
+                *r.halo.get_mut(col, row) = 1;
+            }
+        }
+    }
+    for k in [0usize, 1, 2, 3] {
+        let mut full = r.clone();
+        for row in 0..29u32 {
+            for col in 0..37u32 {
+                let v = u8::from(full.core.get(col, row) == 0);
+                full.via_site.set(col, row, v);
+            }
+        }
+        run::erode_for_test(&mut full, k);
+        let mut part = r.clone();
+        part.via_site.fill(7);
+        run::rederive_for_test(&mut part, (3, 2, 30, 25), k);
+        for row in 0..29u32 {
+            for col in 0..37u32 {
+                let inside = (3..=30).contains(&col) && (2..=25).contains(&row);
+                let want = if inside {
+                    full.via_site.get(col, row)
+                } else {
+                    7
+                };
+                assert_eq!(part.via_site.get(col, row), want, "k {k} ({col}, {row})");
+            }
+        }
+    }
+}
+
+#[test]
+fn fill_passes_route_more_and_stay_legal() {
+    let board = crossing_bundle(6);
+    let blind = |fill_passes| NegotiationTuning {
+        initial_present_factor: 0,
+        fill_passes,
+        ..NegotiationTuning::default()
+    };
+    let settings = NegotiationSettings {
+        threads: 2,
+        max_iterations: 1,
+        ..NegotiationSettings::default()
+    };
+    let (without, _) = route_with(&board, settings, blind(0));
+    let (with, _) = route_with(&board, settings, blind(2));
+    assert!(!without.failed.is_empty());
+    assert!(
+        with.routed.len() > without.routed.len(),
+        "{} vs {}",
+        with.routed.len(),
+        without.routed.len()
+    );
+    assert!(with.reports.iter().any(|r| r.fill));
+    // Fill copper never conflicts with what was already kept.
+    assert_clean_and_connected(&board, &with);
+}
+
+/// Two nets on one layer whose pads sit in the corners of a narrow strip,
+/// too close to the edges for a track to pass around them: they must
+/// cross, so only one can route.
+fn pinched_crossing() -> RouteBoard {
+    let mut b = BoardBuilder::new(16.0, 4.0, &["F.Cu"]);
+    let l = b.footprint("J1", (0.8, 2.0));
+    let r = b.footprint("J2", (15.2, 2.0));
+    let pad = (0.8, 0.8);
+    b.smd_pad(l, "1", "A", (0.8, 0.8), pad, "F.Cu");
+    b.smd_pad(l, "2", "B", (0.8, 3.2), pad, "F.Cu");
+    b.smd_pad(r, "1", "A", (15.2, 3.2), pad, "F.Cu");
+    b.smd_pad(r, "2", "B", (15.2, 0.8), pad, "F.Cu");
+    b.build()
+}
+
+#[test]
+fn congestion_losers_a_fill_cannot_route_still_report_congestion() {
+    // One blind iteration routes both nets across each other; one loses
+    // the conflict, and the fill passes find no path for it with the
+    // winner as a wall. It lost a negotiation, so it reports congestion.
+    let board = pinched_crossing();
+    let settings = NegotiationSettings {
+        threads: 2,
+        max_iterations: 1,
+        ..NegotiationSettings::default()
+    };
+    let tuning = NegotiationTuning {
+        initial_present_factor: 0,
+        fill_passes: 2,
+        ..NegotiationTuning::default()
+    };
+    let (result, _) = route_with(&board, settings, tuning);
+    assert_eq!(result.reports.iter().filter(|r| r.fill).count(), 2);
+    assert_eq!(result.routed.len(), 1, "{result:?}");
+    assert_eq!(result.congestion_lost.len(), 1);
+    let (c, f) = &result.failure_details[0];
+    assert_eq!(*c, result.congestion_lost[0]);
+    assert!(
+        matches!(f, DetailFailure::Congestion { against, .. } if against == &result.routed),
+        "{f:?}"
+    );
+    assert_eq!(
+        result.failed[0].1,
+        FailureReason::Congestion { iterations: 1 }
+    );
+    assert_clean_and_connected(&board, &result);
+}
+
+fn bare_task(i: u32) -> Task {
+    Task {
+        conn: Connection {
+            id: ConnectionId(i),
+            net: NetId(i),
+            from: ItemRef::Pad(PadId(0)),
+            to: ItemRef::Pad(PadId(0)),
+        },
+        rank: i,
+        a: Point::default(),
+        b: Point::default(),
+        layers: LayerMask::EMPTY,
+        line: Vec::new(),
+        hints: Vec::new(),
+        profile: 0,
+        from_island: Vec::new(),
+        to_island: Vec::new(),
+    }
+}
+
+#[test]
+fn keep_greedily_keeps_fewest_conflicts_and_drops_self_conflicts() {
+    // 0 clashes with 1, 2 and 3; 2 also clashes with itself. Commit order
+    // would keep 0 and drop the other three; fewest live conflicts keeps
+    // 1 and 3 instead.
+    let tasks: Vec<Task> = (0..4).map(bare_task).collect();
+    let mut against: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for (a, b) in [(0, 1), (0, 2), (0, 3), (2, 2)] {
+        against.entry(a).or_default().insert(b);
+        against.entry(b).or_default().insert(a);
+    }
+    let mut routed: Vec<Option<Vec<Arc<PieceCopper>>>> = vec![Some(Vec::new()); 4];
+    let mut failure: Vec<Option<DetailFailure>> = vec![None; 4];
+    keep_greedily(&tasks, &against, &mut routed, &mut failure, 5);
+    let kept: Vec<usize> = (0..4).filter(|&t| routed[t].is_some()).collect();
+    assert_eq!(kept, vec![1, 3]);
+    assert_eq!(
+        failure[0],
+        Some(DetailFailure::Congestion {
+            iterations: 5,
+            against: vec![ConnectionId(1), ConnectionId(2), ConnectionId(3)],
+        })
+    );
+    assert_eq!(
+        failure[2],
+        Some(DetailFailure::Congestion {
+            iterations: 5,
+            against: vec![ConnectionId(0), ConnectionId(2)],
+        })
+    );
+    assert!(failure[1].is_none() && failure[3].is_none());
+}
+
+/// [`UniformRules`] with a smaller minimum track width than the preferred.
+struct NeckRules(UniformRules, Coord);
+
+impl RuleTable for NeckRules {
+    fn class_of(&self, net: Option<NetId>) -> crate::api::ClassId {
+        self.0.class_of(net)
+    }
+    fn class(&self, class: crate::api::ClassId) -> &crate::rules::NetClassRules {
+        self.0.class(class)
+    }
+    fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, layer: LayerId) -> Coord {
+        self.0.clearance(a, b, layer)
+    }
+    fn track_width(&self, s: &RuleSubject<'_>, layer: LayerId) -> crate::rules::WidthRule {
+        crate::rules::WidthRule {
+            min: self.1,
+            ..self.0.track_width(s, layer)
+        }
+    }
+    fn via(&self, s: &RuleSubject<'_>) -> ViaRule {
+        self.0.via(s)
+    }
+    fn min_track_angle_deg(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<f64> {
+        self.0.min_track_angle_deg(s, layer)
+    }
+    fn min_segment_length(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<Coord> {
+        self.0.min_segment_length(s, layer)
+    }
+    fn edge_clearance(&self) -> Coord {
+        self.0.edge_clearance()
+    }
+    fn hole_clearance(&self) -> Coord {
+        self.0.hole_clearance()
+    }
+    fn hole_to_hole(&self) -> Coord {
+        self.0.hole_to_hole()
+    }
+    fn max_clearance(&self) -> Coord {
+        self.0.max_clearance()
+    }
+    fn inert_rules(&self) -> &[crate::rules::InertRule] {
+        self.0.inert_rules()
+    }
+}
+
+fn negotiate_inputs(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    inputs: &NegotiationInputs,
+) -> DetailResult {
+    let connections = ConnectivityReport::build(board, &ArcPolicy::default()).connections(board);
+    let mut backend = ReferenceSearch::new(1);
+    let r = negotiate_connections_with(
+        board,
+        rules,
+        &connections,
+        &GlobalResult::default(),
+        None,
+        &NegotiationSettings {
+            threads: 1,
+            ..NegotiationSettings::default()
+        },
+        &NegotiationTuning::default(),
+        inputs,
+        &mut backend,
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.routed.len() + r.failed.len(), connections.len());
+    r
+}
+
+#[test]
+fn a_pad_off_the_lattice_is_entered_by_a_stub() {
+    let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu"]);
+    let u = b.footprint("U1", (5.0, 5.0));
+    // Smaller than a lattice pitch and between nodes: no node touches it.
+    b.smd_pad(u, "1", "S", (5.025, 5.025), (0.03, 0.03), "F.Cu");
+    let j = b.footprint("J1", (15.0, 5.0));
+    b.smd_pad(j, "1", "S", (15.0, 5.0), (0.6, 0.6), "F.Cu");
+    let board = b.build();
+    let r = negotiate_inputs(
+        &board,
+        &UniformRules::default(),
+        &NegotiationInputs::default(),
+    );
+    assert!(r.failed.is_empty(), "{:?}", r.failure_details);
+    let v = violations(&board, &r.copper);
+    assert!(v.is_empty(), "{v:?}");
+    let routed = with_copper(&board, &r.copper);
+    assert_eq!(
+        ConnectivityReport::build(&routed, &ArcPolicy::default()).connection_count(),
+        0
+    );
+}
+
+/// A pad squeezed between pads of another net: at the preferred width no
+/// track can leave it, at the neck-down width one can.
+fn squeezed_pad() -> RouteBoard {
+    let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu"]);
+    let u = b.footprint("U1", (10.0, 10.0));
+    b.smd_pad(u, "1", "N", (10.0, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "2", "X", (9.5, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "3", "X", (10.5, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "4", "X", (10.0, 9.5), (0.4, 0.4), "F.Cu");
+    let j = b.footprint("J1", (22.0, 14.0));
+    b.smd_pad(j, "1", "N", (22.0, 14.0), (0.6, 0.6), "F.Cu");
+    b.build()
+}
+
+#[test]
+fn a_squeezed_pad_necks_down_only_when_allowed() {
+    let board = squeezed_pad();
+    let wide = UniformRules {
+        class: crate::rules::NetClassRules {
+            track_width: 300_000,
+            ..UniformRules::default().class
+        },
+        ..UniformRules::default()
+    };
+    let rules = NeckRules(wide.clone(), 100_000);
+    let n = board.net_by_name("N").unwrap();
+    let conns = ConnectivityReport::build(&board, &ArcPolicy::default()).connections(&board);
+    let conn_n = conns.iter().find(|c| c.net == n).unwrap().id;
+
+    let plain = negotiate_inputs(&board, &rules, &NegotiationInputs::default());
+    assert!(
+        plain
+            .failure_details
+            .iter()
+            .any(|(c, f)| *c == conn_n && matches!(f, DetailFailure::NoAccess { .. })),
+        "{:?}",
+        plain.failure_details
+    );
+    let excluded = NegotiationInputs {
+        neck_down: Some(NeckDown {
+            excluded: [crate::api::ClassId(0)].into_iter().collect(),
+            ..NeckDown::default()
+        }),
+        ..NegotiationInputs::default()
+    };
+    let r = negotiate_inputs(&board, &rules, &excluded);
+    assert!(!r.routed.contains(&conn_n), "an excluded class never necks");
+
+    let necked = NegotiationInputs {
+        neck_down: Some(NeckDown::default()),
+        ..NegotiationInputs::default()
+    };
+    let r = negotiate_inputs(&board, &rules, &necked);
+    assert!(r.routed.contains(&conn_n), "{:?}", r.failure_details);
+    let v = violations_with(&board, &r.copper, &wide);
+    assert!(v.is_empty(), "{v:?}");
+    // One narrow stub within the neck-down reach of the pad; the rest of
+    // the route is at the preferred width.
+    let pad = board.pads.iter().find(|p| p.net == Some(n)).unwrap().center;
+    let narrow: Vec<_> = r
+        .copper
+        .tracks
+        .iter()
+        .filter(|t| t.net == n && t.seg.width < 300_000)
+        .collect();
+    assert_eq!(narrow.len(), 1, "{:?}", r.copper.tracks);
+    assert_eq!(narrow[0].seg.width, 100_000);
+    for p in [narrow[0].seg.a, narrow[0].seg.b] {
+        assert!((p - pad).length2() <= 1_000_000i128 * 1_000_000);
+    }
+    let routed = with_copper(&board, &r.copper);
+    let left = ConnectivityReport::build(&routed, &ArcPolicy::default());
+    let islands = left.nets[n.index()]
+        .islands
+        .iter()
+        .filter(|i| i.has_pad())
+        .count();
+    assert_eq!(islands, 1);
+}
+
+/// [`crossing_bundle`] stretched over several tiles, so every connection is
+/// cut into pieces at tile crossings.
+fn wide_crossing_bundle(n: usize, width: f64) -> RouteBoard {
+    let h = 2.0 * n as f64 + 2.0;
+    let mut b = BoardBuilder::new(width, h, &["F.Cu", "B.Cu"]);
+    let l = b.footprint("J1", (2.0, h / 2.0));
+    let r = b.footprint("J2", (width - 2.0, h / 2.0));
+    for i in 0..n {
+        let net = format!("X{i:02}");
+        let yl = 2.0 + 2.0 * i as f64;
+        let yr = 2.0 + 2.0 * (n - 1 - i) as f64;
+        b.smd_pad(l, &(i + 1).to_string(), &net, (2.0, yl), (0.8, 0.5), "F.Cu");
+        let at = (width - 2.0, yr);
+        b.smd_pad(r, &(i + 1).to_string(), &net, at, (0.8, 0.5), "F.Cu");
+    }
+    b.build()
+}
+
+#[test]
+fn connections_in_conflict_on_some_pieces_reroute_only_those() {
+    let board = wide_crossing_bundle(6, 50.0);
+    let tuning = NegotiationTuning {
+        initial_present_factor: 0,
+        shift_iterations: 0,
+        ..NegotiationTuning::default()
+    };
+    let settings = |threads| NegotiationSettings {
+        threads,
+        max_iterations: 20,
+        ..NegotiationSettings::default()
+    };
+    let (result, telemetry) = route_with(&board, settings(4), tuning);
+    assert!(result.reports[0].conflict_pairs > 0, "{:?}", result.reports);
+    assert!(
+        telemetry
+            .counters
+            .get("partial_reroutes")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "{:?}",
+        telemetry.counters
+    );
+    assert!(result.reports.iter().all(|r| !r.shifted || r.fill));
+    assert!(result.failed.is_empty(), "{:?}", result.failure_details);
+    assert_clean_and_connected(&board, &result);
+    // The same on one thread.
+    let (one, _) = route_with(&board, settings(1), tuning);
+    assert_eq!(one, result);
 }
