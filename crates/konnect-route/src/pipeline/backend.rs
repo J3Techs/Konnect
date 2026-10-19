@@ -42,7 +42,7 @@ pub const VIA_CONGESTION_REACH_NM: konnect_geom::Coord = 250_000;
 /// cost-to-go field ([`SearchConfig::field_after`]): searches that flood
 /// their window around routed copper then expand little beyond their path,
 /// at the same path cost.
-pub const FIELD_AFTER: u64 = 5_000;
+pub const FIELD_AFTER: u64 = 2_000;
 
 /// WS-D1's kernel as a [`RouteCompute`] backend for negotiation.
 #[derive(Debug, Clone)]
