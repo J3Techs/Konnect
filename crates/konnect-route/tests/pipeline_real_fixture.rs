@@ -25,14 +25,28 @@
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
 //! - `KONNECT_PIPELINE_OUT=dir`: write `summary.json` and `plan.json` there
-//!   (keep it in an ignored build location).
+//!   (keep it in an ignored build location);
+//! - `KONNECT_PIPELINE_FILL` (fill passes, default 2),
+//!   `KONNECT_PIPELINE_STALL` (stop after this many iterations without
+//!   fewer conflicts, default 0: off);
+//! - `KONNECT_PIPELINE_NO_STUBS=1`: do not hand S4 access to negotiation;
+//! - `KONNECT_PIPELINE_CLASS_LAYERS=Class=F.Cu+B.Cu;…`: class layer masks;
+//! - `KONNECT_PIPELINE_CLASS_FALLBACK=Class=F.Cu+B.Cu@Plane.Cu:margin_mm;…`:
+//!   second-chance layers, optionally over a reference plane's fill;
+//! - `KONNECT_PIPELINE_NECK=ClassA,ClassB`: neck down at pads (0.10 mm
+//!   within 1 mm) for every class except these;
+//! - `KONNECT_PIPELINE_DIAG=1`: list every failed connection.
 
 use konnect_geom::{BBox, Point};
 use konnect_route::api::Stage;
+use konnect_route::api::{ClassId, LayerMask};
+use konnect_route::detail::negotiate::NeckDown;
 use konnect_route::detail::negotiate::ReferenceSearch;
 use konnect_route::pipeline::{
-    route_board, route_board_with, PipelineResult, PipelineScope, PipelineSettings,
+    route_board, route_board_with, ClassFallback, PipelineResult, PipelineScope, PipelineSettings,
+    ReferencePlane,
 };
+use konnect_route::rules::RuleTable;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -121,6 +135,77 @@ fn pipeline_real_board_fixture() {
     if env_on("KONNECT_PIPELINE_NO_OPTIMIZE") {
         settings.optimize = None;
     }
+    settings.tuning.fill_passes = env_num(
+        "KONNECT_PIPELINE_FILL",
+        u64::from(settings.tuning.fill_passes),
+    ) as u32;
+    settings.tuning.stall_iterations = env_num("KONNECT_PIPELINE_STALL", 0) as u32;
+    if env_on("KONNECT_PIPELINE_NO_STUBS") {
+        settings.use_access = false;
+    }
+    let class_id = |name: &str| {
+        let idx = rules
+            .classes()
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no net class '{name}'"));
+        ClassId(idx as u16)
+    };
+    let mask = |spec: &str| {
+        spec.split('+')
+            .map(|l| board.layers.expand(l.trim()))
+            .fold(LayerMask::EMPTY, LayerMask::union)
+    };
+    if let Ok(spec) = std::env::var("KONNECT_PIPELINE_CLASS_LAYERS") {
+        for part in spec.split(';').filter(|s| !s.trim().is_empty()) {
+            let (class, layers) = part.split_once('=').expect("Class=Layer+Layer");
+            settings
+                .layer_policy
+                .class_layers
+                .insert(class_id(class.trim()), mask(layers));
+        }
+    }
+    if let Ok(spec) = std::env::var("KONNECT_PIPELINE_CLASS_FALLBACK") {
+        for part in spec.split(';').filter(|s| !s.trim().is_empty()) {
+            let (class, rest) = part.split_once('=').expect("Class=Layers[@Plane:mm]");
+            let (layers, reference) = match rest.split_once('@') {
+                Some((l, r)) => (l, Some(r)),
+                None => (rest, None),
+            };
+            let layers = mask(layers);
+            let reference = reference.map(|r| {
+                let (plane, margin) = r.split_once(':').unwrap_or((r, "0"));
+                let plane = board.layers.by_name(plane.trim()).expect("plane layer");
+                let margin: f64 = margin.trim().parse().expect("margin in mm");
+                // The fallback's layers beyond the class's own need it.
+                let own = settings
+                    .layer_policy
+                    .class_layers
+                    .get(&class_id(class.trim()))
+                    .copied()
+                    .unwrap_or(LayerMask::EMPTY);
+                ReferencePlane {
+                    plane,
+                    over: LayerMask(layers.0 & !own.0),
+                    margin: (margin * 1e6).round() as i32,
+                }
+            });
+            settings
+                .class_fallback
+                .insert(class_id(class.trim()), ClassFallback { layers, reference });
+        }
+    }
+    if let Ok(spec) = std::env::var("KONNECT_PIPELINE_NECK") {
+        let excluded = spec
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| class_id(s.trim()))
+            .collect();
+        settings.neck_down = Some(NeckDown {
+            excluded,
+            ..NeckDown::default()
+        });
+    }
     let reference = env_on("KONNECT_PIPELINE_REFERENCE");
 
     let t = Instant::now();
@@ -190,10 +275,53 @@ fn pipeline_real_board_fixture() {
         r.detail.iterations,
         r.detail.short_segments.len()
     );
+    // Failures per net class and reason (printed only; nothing committed).
+    let mut by_class: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    for (id, d) in &r.detail.failure_details {
+        let c = &r.connections[id.index()];
+        let class = rules.class(rules.class_of(Some(c.net))).name.clone();
+        *by_class.entry((class, d.name())).or_default() += 1;
+    }
+    println!("failures by class: {by_class:?}");
+    if env_on("KONNECT_PIPELINE_DIAG") {
+        let item = |i: konnect_route::api::ItemRef| match i {
+            konnect_route::api::ItemRef::Pad(p) => {
+                let pad = &board.pads[p.index()];
+                format!(
+                    "{}.{} @({:.3},{:.3})",
+                    board.footprints[pad.footprint.index()]
+                        .reference
+                        .as_deref()
+                        .unwrap_or("?"),
+                    pad.number,
+                    pad.center.x as f64 / 1e6,
+                    pad.center.y as f64 / 1e6
+                )
+            }
+            other => format!("{other:?}"),
+        };
+        for (id, d) in &r.detail.failure_details {
+            let c = &r.connections[id.index()];
+            println!(
+                "  fail {:5} {:24} {:16} {} -> {}",
+                id.0,
+                board.nets[c.net.index()].name,
+                d.name(),
+                item(c.from),
+                item(c.to)
+            );
+        }
+    }
     for it in &r.detail.reports {
         println!(
-            "  it {:2} routed {:5} failed {:5} conflicted {:5} pieces {:5}",
-            it.iteration, it.routed, it.failed, it.conflicted, it.pieces
+            "  it {:2}{} queued {:5} routed {:5} failed {:5} conflicted {:5} pieces {:5}",
+            it.iteration,
+            if it.fill { " fill" } else { "     " },
+            it.queued,
+            it.routed,
+            it.failed,
+            it.conflicted,
+            it.pieces
         );
     }
     if let Some(o) = &r.optimize {

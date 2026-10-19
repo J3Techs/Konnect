@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::check::ViolationKind;
+use crate::detail::negotiate::negotiate_connections;
 use crate::synthetic::{plane_with_pads, two_pin_nets, BoardBuilder, UniformRules};
-use konnect_geom::{Point, Segment};
+use konnect_geom::Point;
 
 fn settings(threads: usize) -> PipelineSettings {
     PipelineSettings {
