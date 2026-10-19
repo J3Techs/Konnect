@@ -13,8 +13,10 @@
 //! and `KONNECT_SEARCH_REFERENCE_DIR` (a directory holding a routed copy of
 //! the same board, whose two-pin net lengths are compared). For timing on a
 //! busy machine, `KONNECT_SEARCH_ONLY` (comma-separated name filters) and
-//! `KONNECT_SEARCH_REPEAT` (runs per variant; take the minimum). For each chosen tile and net class it paints the fixed copper
-//! into rasters, then routes every connection whose two islands fit in the
+//! `KONNECT_SEARCH_REPEAT` (runs per variant; take the minimum).
+//!
+//! For each chosen tile and net class it paints the fixed copper into
+//! rasters, then routes every connection whose two islands fit in the
 //! tile, one at a time against the fixed board (no negotiation): the own
 //! net is unpainted around each search and repainted after. It prints
 //! expansions per second, milliseconds per connection and path length

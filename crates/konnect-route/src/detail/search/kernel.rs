@@ -51,7 +51,8 @@ struct TBox {
 /// One search state.
 ///
 /// `info`: bit 0 closed; bits 1–4 parent heading (0–8, [`SEED`] for none);
-/// bits 5–8 parent run bucket; bits 9–13 parent layer.
+/// bits 5–9 parent run bucket (0..=[`MAX_RUN_BUCKET`]); bits 10–14 parent
+/// layer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct StateRec {
@@ -60,10 +61,21 @@ struct StateRec {
     info: u16,
 }
 
+/// `v` as a `u32`, saturating at `u32::MAX` ([`Cost::INFINITE`]).
+#[inline]
+fn sat32(v: u64) -> u32 {
+    v.min(u64::from(u32::MAX)) as u32
+}
+
 #[inline]
 fn info(ph: u32, prun: u32, pl: u32) -> u16 {
-    ((ph << 1) | (prun << 5) | (pl << 9)) as u16
+    ((ph << 1) | (prun << 5) | (pl << 10)) as u16
 }
+
+/// The largest run bucket `info` can hold: a minimum run of up to 31 half
+/// base pitches (775 µm at 50 µm) is enforced exactly; a longer one makes
+/// the job unreachable rather than under-enforced.
+pub(crate) const MAX_RUN_BUCKET: u32 = 31;
 
 /// Per node-layer terminal flags and the exact-check cache.
 /// `tag` is `gen << 2 | flags`.
@@ -252,6 +264,9 @@ pub(crate) struct Problem<'a> {
     pub lookahead: Option<&'a MapLookahead>,
     pub gcells: Option<&'a GCellGrid>,
     pub mode: Mode,
+    /// Expansions an earlier attempt of the same search already used; the
+    /// budget is `config.max_expansions − spent`.
+    pub spent: u64,
 }
 
 /// Lattice indices of a GCell id's footprint, clipped to the grid.
@@ -407,8 +422,8 @@ fn parent_of<G: Grid>(grid: &G, lay: &Layout, st: u32, rec: StateRec) -> Option<
     if ph == u32::from(SEED) {
         return None;
     }
-    let prun = u32::from((rec.info >> 5) & 15);
-    let pl = u32::from((rec.info >> 9) & 31);
+    let prun = u32::from((rec.info >> 5) & 31);
+    let pl = u32::from((rec.info >> 10) & 31);
     let (node, layer, h, _) = lay.dec(st);
     if h == u32::from(HEADING_NONE) {
         // A via landing: same node, another layer.
@@ -472,7 +487,13 @@ pub(crate) fn run<G: Grid>(
     let pitch = grid.pitch().max(1);
     let run_buckets: u32 = if p.job.has_flag(JOB_MIN_RUN) && cfg.min_run_nm > 0 {
         let need = (i64::from(cfg.min_run_nm) * 2 + i64::from(pitch) - 1) / i64::from(pitch);
-        (need.clamp(0, 15) + 1) as u32
+        if need > i64::from(MAX_RUN_BUCKET) {
+            // The run field cannot count that far: refuse rather than
+            // accept runs shorter than the rule.
+            stats.min_run_rejects += 1;
+            return unreachable(0);
+        }
+        need.max(0) as u32 + 1
     } else {
         1
     };
@@ -626,11 +647,9 @@ pub(crate) fn run<G: Grid>(
     } else {
         None
     };
-    let map_slack: u32 = if grid.uniform() {
-        0
-    } else {
-        super::lattice::DIAGONAL + 2 * cfg.bend_90.0
-    };
+    // The map table is built on a uniform lattice; a non-uniform lattice's
+    // shorter gaps would make it overestimate, so it is not used there.
+    let lookahead = lookahead.filter(|_| grid.uniform());
     let tboxes = std::mem::take(&mut s.tboxes);
     let field = p.mode == Mode::Field;
     // Any path to a same-layer target off the state's heading ray turns at
@@ -670,7 +689,7 @@ pub(crate) fn run<G: Grid>(
                         dx / i64::from(pitch),
                         dy / i64::from(pitch),
                     );
-                    m = q.map_or(0, |v| v.saturating_sub(map_slack));
+                    m = q.unwrap_or(0);
                 }
             }
             lo[k] = base.max(m);
@@ -716,7 +735,7 @@ pub(crate) fn run<G: Grid>(
     let corr_pen = u64::from(cfg.corridor_penalty.0);
     let pf = u64::from(params.present_factor);
     let hf = u64::from(params.history_factor);
-    let max_exp = cfg.max_expansions;
+    let max_exp = cfg.max_expansions.saturating_sub(p.spent);
     let mut dead_end_checked = cfg.dead_end_check_after == 0;
 
     let outcome = loop {
@@ -826,7 +845,9 @@ pub(crate) fn run<G: Grid>(
 
         if uflags & DST != 0 && !field {
             let entering_ok = h == none || s.nl_of(nl).dst_mask & (1 << h) != 0;
-            if entering_ok && run >= need_run {
+            // A via landing (no heading) ends no track run: the run before
+            // the via was already checked when the via was taken.
+            if entering_ok && (run >= need_run || h == none) {
                 break found(grid, p, s, &lay, st, gs, expansions);
             }
         }
@@ -892,15 +913,17 @@ pub(crate) fn run<G: Grid>(
                 let pres = v.present[vi16];
                 let hist = v.history[vi16];
                 if pres | hist != 0 {
-                    let b = u64::from(base) * (1000 + u64::from(hist) * hf) / 1000
-                        * (1000 + u64::from(pres) * pf)
+                    let b = (u64::from(base).saturating_mul(1000 + u64::from(hist) * hf) / 1000)
+                        .saturating_mul(1000 + u64::from(pres) * pf)
                         / 1000;
                     base = b.min(u64::from(u32::MAX >> 2)) as u32;
                 }
+                // Saturating throughout: a `Cost::INFINITE` term forbids
+                // the edge instead of wrapping to a cheap one.
                 let mut c = base;
                 if h != none && nh != h {
                     let d = (nh + 8 - h) & 7;
-                    c += if d == 1 || d == 7 { bend45 } else { bend90 };
+                    c = c.saturating_add(if d == 1 || d == 7 { bend45 } else { bend90 });
                 }
                 if wrong != 0 {
                     let pen = match (prefs[layer as usize], nh) {
@@ -911,7 +934,7 @@ pub(crate) fn run<G: Grid>(
                         (_, n) if n & 1 == 1 => wrong * u64::from(step.cost) / 2000,
                         _ => 0,
                     };
-                    c += pen as u32;
+                    c = c.saturating_add(sat32(pen));
                 }
                 if corridor_on {
                     let gcx = s.gcol[(step.col - c0) as usize];
@@ -922,13 +945,16 @@ pub(crate) fn run<G: Grid>(
                         id < s.corr_stamp.len() && s.corr_stamp[id] == gen
                     };
                     if !inside {
-                        c += (corr_pen * u64::from(step.cost) / 1000) as u32;
+                        c = c.saturating_add(sat32(corr_pen * u64::from(step.cost) / 1000));
                     }
                 }
                 if near {
-                    c += near_step;
+                    c = c.saturating_add(near_step);
                 }
                 let ng = gs.saturating_add(c);
+                if ng == u32::MAX {
+                    continue;
+                }
                 if target.gen != sgen || ng < target.g {
                     s.st[ns as usize] = StateRec {
                         g: ng,
@@ -964,12 +990,13 @@ pub(crate) fn run<G: Grid>(
             if ok && s.via_stamp[node as usize] == gen && s.via_state[node as usize] == 2 {
                 ok = false;
             }
-            if ok {
-                let mut vcost = via_cost;
-                if check && p.checker.is_none() {
-                    vcost = vcost.saturating_add(near_step);
-                }
-                let ng = gs.saturating_add(vcost);
+            let mut vcost = via_cost;
+            if check && p.checker.is_none() {
+                vcost = vcost.saturating_add(near_step);
+            }
+            let ng = gs.saturating_add(vcost);
+            // An infinite via cost forbids the via.
+            if ok && ng != u32::MAX {
                 for l2 in 0..lcount {
                     if l2 == layer {
                         continue;

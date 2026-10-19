@@ -29,9 +29,15 @@ use rayon::prelude::*;
 const MARGIN: u32 = 4;
 
 /// What a table was built for; a search only uses a matching table.
+///
+/// Only the inputs that change an obstacle-free table: the via cost and
+/// the wrong-way penalty from [`CostParams`]. Present and history factors,
+/// the history increment and `near_step` never apply on an empty lattice,
+/// so PathFinder can raise them every iteration and keep the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Key {
-    params: CostParams,
+    via: Cost,
+    wrong_way_step: Cost,
     pitch: Coord,
     layers: u8,
     prefs: Vec<Preferred>,
@@ -57,7 +63,8 @@ fn key_of(params: &CostParams, config: &SearchConfig, pitch: Coord, layers: u8) 
         prefs.pop();
     }
     Key {
-        params: *params,
+        via: params.via,
+        wrong_way_step: params.wrong_way_step,
         pitch,
         layers,
         prefs,
@@ -137,6 +144,7 @@ impl MapLookahead {
                     lookahead: None,
                     gcells: None,
                     mode: Mode::Field,
+                    spent: 0,
                 };
                 let mut scratch = Scratch::default();
                 let mut stats = SearchStats::default();

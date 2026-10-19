@@ -561,6 +561,7 @@ fn cost_field_with(
         lookahead: None,
         gcells: None,
         mode: Mode::Field,
+        spent: 0,
     };
     let g = UniformGrid::new(st.window);
     let region = Region::full(&g);
@@ -883,4 +884,169 @@ fn sealed_targets_are_found_unreachable_without_flooding_the_window() {
     let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(10, 10, 0)], &[node(120, 190, 1)]);
     let ctx = SearchContext::new(&st, &cfg);
     assert!(matches!(run_ctx(&ctx, &pool, i).0, SearchOutcome::Found(_)));
+}
+
+#[test]
+fn infinite_cost_terms_forbid_instead_of_wrapping() {
+    // A Near column across the window: crossing it costs near_step.
+    let mut st = stack(30, 20, 1);
+    for row in 0..20 {
+        st.layers[0].halo.set(15, row, 1);
+    }
+    rederive(&mut st);
+    let cfg = SearchConfig::default();
+    let ctx = SearchContext::new(&st, &cfg);
+    let (pool, i) = pool_with(job(0), &[node(5, 10, 0)], &[node(25, 10, 0)]);
+    let params = CostParams {
+        near_step: Cost::INFINITE,
+        ..CostParams::default()
+    };
+    let mut stats = SearchStats::default();
+    let o = search_with(&ctx, &pool, &pool.jobs[i as usize], i, &params, &mut stats);
+    assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
+
+    // Infinite bends: only a straight run reaches the target.
+    let st = stack(30, 30, 1);
+    let cfg = SearchConfig {
+        bend_45: Cost::INFINITE,
+        bend_90: Cost::INFINITE,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (pool, i) = pool_with(job(0), &[node(5, 5, 0)], &[node(20, 5, 0)]);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    assert_eq!(found(&o).cost, Cost(15_000));
+    let (pool, i) = pool_with(job(0), &[node(5, 5, 0)], &[node(20, 9, 0)]);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
+
+    // An infinite via cost forbids the via; huge wrong-way and congestion
+    // terms saturate rather than wrap.
+    let mut st = stack(30, 20, 2);
+    block(&mut st, 0, 15..=15, 0..=19);
+    rederive(&mut st);
+    for col in 0..30 {
+        *st.layers[1].present.get_mut(col, 10) = u16::MAX;
+        *st.layers[1].history.get_mut(col, 10) = u16::MAX;
+    }
+    let cfg = SearchConfig {
+        layer_pref: vec![Preferred::Vertical, Preferred::Vertical],
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(5, 10, 0)], &[node(25, 10, 0)]);
+    let params = CostParams {
+        via: Cost::INFINITE,
+        ..CostParams::default()
+    };
+    let mut stats = SearchStats::default();
+    let o = search_with(&ctx, &pool, &pool.jobs[i as usize], i, &params, &mut stats);
+    assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
+    let params = CostParams {
+        wrong_way_step: Cost(u32::MAX - 1),
+        present_factor: u32::MAX,
+        history_factor: u32::MAX,
+        ..CostParams::default()
+    };
+    let mut stats = SearchStats::default();
+    let o = search_with(&ctx, &pool, &pool.jobs[i as usize], i, &params, &mut stats);
+    // Every crossing pays wrong-way steps on layer 1 (vertical preferred):
+    // a saturated, not a wrapped, cost.
+    if let SearchOutcome::Found(p) = &o {
+        assert!(p.cost.0 > 1_000_000_000, "{:?}", p.cost);
+    }
+}
+
+#[test]
+fn minimum_runs_beyond_the_run_field_are_refused_not_shortened() {
+    let st = stack(60, 60, 1);
+    let (pool, i) = pool_with(job(JOB_MIN_RUN), &[node(5, 5, 0)], &[node(50, 40, 0)]);
+    // 31 half pitches (775 µm) is the most the run field counts.
+    let cfg = SearchConfig {
+        min_run_nm: 775_000,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (o, stats) = run_ctx(&ctx, &pool, i);
+    let p = found(&o);
+    assert_eq!(stats.min_run_rejects, 0);
+    for w in p.nodes.windows(2) {
+        let dc = (i32::from(w[1].col) - i32::from(w[0].col)).abs();
+        let dr = (i32::from(w[1].row) - i32::from(w[0].row)).abs();
+        let len =
+            f64::from(dc.max(dr)) * f64::from(PITCH) * if dc == dr { 2f64.sqrt() } else { 1.0 };
+        assert!(len >= 775_000.0 - 1.0, "short run {w:?}");
+    }
+    // One more half pitch does not fit: refused, not silently clamped.
+    let cfg = SearchConfig {
+        min_run_nm: 800_000,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let (o, stats) = run_ctx(&ctx, &pool, i);
+    assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
+    assert_eq!(stats.min_run_rejects, 1);
+    // Jobs without the flag ignore the minimum.
+    let (pool, i) = pool_with(job(0), &[node(5, 5, 0)], &[node(50, 40, 0)]);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    found(&o);
+}
+
+#[test]
+fn minimum_run_jobs_may_end_on_a_via_at_the_target() {
+    // The target sits on layer 1 directly under a straight run on layer 0.
+    let st = stack(40, 20, 2);
+    let cfg = SearchConfig {
+        min_run_nm: 300_000,
+        ..SearchConfig::default()
+    };
+    let ctx = SearchContext::new(&st, &cfg);
+    let mut t = node(20, 10, 1);
+    // No track may enter the target on layer 1: only a via lands there.
+    t.heading_mask = 0;
+    let (pool, i) = pool_with(job(JOB_MIN_RUN | JOB_ALLOW_VIA), &[node(5, 10, 0)], &[t]);
+    let (o, _) = run_ctx(&ctx, &pool, i);
+    let p = found(&o);
+    let last = p.nodes[p.nodes.len() - 1];
+    let before = p.nodes[p.nodes.len() - 2];
+    assert_eq!((last.col, last.row, last.layer), (20, 10, 1));
+    assert_eq!((before.col, before.row, before.layer), (20, 10, 0));
+}
+
+#[test]
+fn the_map_table_survives_negotiation_factor_changes() {
+    let st = stack(20, 20, 2);
+    let params = CostParams::default();
+    let cfg = SearchConfig {
+        heuristic: Heuristic::Map,
+        ..SearchConfig::default()
+    };
+    let la = MapLookahead::for_window(&st.window, 2, &params, &cfg).unwrap();
+    let later = CostParams {
+        present_factor: params.present_factor * 3,
+        history_factor: params.history_factor + 500,
+        history_increment: 4,
+        near_step: Cost(900),
+        ..params
+    };
+    assert!(la.matches(&later, &cfg, PITCH, 2));
+    let other_via = CostParams {
+        via: Cost(params.via.0 + 1),
+        ..params
+    };
+    assert!(!la.matches(&other_via, &cfg, PITCH, 2));
+    let other_wrong = CostParams {
+        wrong_way_step: Cost(params.wrong_way_step.0 + 1),
+        ..params
+    };
+    assert!(!la.matches(&other_wrong, &cfg, PITCH, 2));
+}
+
+#[test]
+fn search_stats_read_telemetry_written_before_new_counters() {
+    let s: SearchStats =
+        serde_json::from_str(r#"{"expansions":7,"exact_checks":2,"exact_check_cache_hits":1}"#)
+            .unwrap();
+    assert_eq!(s.expansions, 7);
+    assert_eq!(s.min_run_rejects, 0);
 }

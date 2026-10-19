@@ -8,8 +8,13 @@
 //! (normally [`crate::api::LATTICE_PITCH_NM`]), adds lines at the fine pitch
 //! across each fine region (BGA fields), and forces lines through caller
 //! points: pad centres, access points, channel midlines, inflated obstacle
-//! edges. A forced line closer than `snap_nm` to a base line replaces it, so
-//! no gap exceeds `base_pitch + snap_nm` and no gap is below `snap_nm`.
+//! edges. A forced line closer than `snap_nm` to a base line replaces it.
+//! Two neighbouring replacements can open a gap of almost
+//! `base_pitch + 2 · snap_nm`, so after snapping every gap wider than
+//! `base_pitch + snap_nm` is split evenly; with `snap_nm ≤ 0.4 · base_pitch`
+//! no gap then exceeds `base_pitch + snap_nm` (below `√2 · base_pitch`) and
+//! none is below `snap_nm`. [`Lattice::from_axes`] rejects axes with a gap
+//! above `√2 · base_pitch`.
 //!
 //! Moves:
 //! - straight moves go to the adjacent line, at a cost proportional to the
@@ -18,9 +23,11 @@
 //!   one lies within one base pitch on both axes; otherwise that diagonal
 //!   does not exist from this node.
 //!
-//! Every edge is then at most one base half-diagonal from one of its
-//! endpoints, so the tri-state contract of [`crate::compute::raster`] holds
-//! with the halo painted at the base pitch. Rasters for a non-uniform
+//! Every point of an edge is then within one base half-diagonal of one of
+//! its endpoints (a straight edge is at most `√2 · base_pitch` long, a
+//! diagonal at most one base pitch on each axis), so the tri-state contract
+//! of [`crate::compute::raster`] holds with the halo painted at the base
+//! pitch. Rasters for a non-uniform
 //! lattice are indexed by lattice `(col, row)`; their [`Window`] carries the
 //! dimensions and base pitch but **not** the node positions, so paint them
 //! with [`paint_on_lattice`], never with `CpuCompute::paint`.
@@ -158,7 +165,9 @@ pub struct LatticeSpec {
     pub forced_x: Vec<Coord>,
     pub forced_y: Vec<Coord>,
     /// Minimum line spacing; a forced line this close to a base line
-    /// replaces it. At most `0.4 · base_pitch` keeps the halo contract.
+    /// replaces it. At most `0.4 · base_pitch`, so the largest gap after
+    /// snapping and splitting, `base_pitch + snap_nm`, stays below
+    /// `√2 · base_pitch` and the halo contract holds.
     pub snap_nm: Coord,
 }
 
@@ -300,7 +309,32 @@ fn build_axis(
             }
         }
     }
-    kept.into_iter().map(|(v, _)| v).collect()
+    // A replacement can follow a dropped base line (base lines 0 and 50,
+    // forced -9 and 59: a 68 gap), so split every gap above `base + snap`
+    // into `ceil(gap / base)` equal parts. Each part is at most `base` and
+    // above `base / 2 ≥ snap`, so the spacing floor still holds.
+    let max_gap = i64::from(base) + i64::from(snap);
+    let mut out: Vec<Coord> = Vec::with_capacity(kept.len());
+    for (v, _) in kept {
+        if let Some(&last) = out.last() {
+            let gap = i64::from(v) - i64::from(last);
+            if gap > max_gap {
+                let parts = (gap + i64::from(base) - 1) / i64::from(base);
+                for k in 1..parts {
+                    out.push((i64::from(last) + gap * k / parts) as Coord);
+                }
+            }
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// Whether a gap of `gap` nm keeps every point of a straight edge within
+/// the base half-diagonal of an endpoint: `gap ≤ √2 · base`.
+fn gap_within_contract(gap: i64, base: Coord) -> bool {
+    let (g, b) = (i128::from(gap), i128::from(base));
+    g * g <= 2 * b * b
 }
 
 impl Lattice {
@@ -360,15 +394,22 @@ impl Lattice {
         Self::from_axes(xs, ys, p)
     }
 
-    /// A lattice from explicit sorted, strictly increasing axes.
+    /// A lattice from explicit sorted, strictly increasing axes. `None` if
+    /// an axis is unsorted or has a gap above `√2 · base_pitch`, which
+    /// would let an edge between two Free nodes pass an obstacle.
     pub fn from_axes(xs: Vec<Coord>, ys: Vec<Coord>, base_pitch: Coord) -> Option<Self> {
+        let bad_axis = |a: &[Coord]| {
+            a.windows(2).any(|w| {
+                w[0] >= w[1] || !gap_within_contract(i64::from(w[1]) - i64::from(w[0]), base_pitch)
+            })
+        };
         if xs.is_empty()
             || ys.is_empty()
             || base_pitch <= 0
             || xs.len() > usize::from(u16::MAX)
             || ys.len() > usize::from(u16::MAX)
-            || xs.windows(2).any(|w| w[0] >= w[1])
-            || ys.windows(2).any(|w| w[0] >= w[1])
+            || bad_axis(&xs)
+            || bad_axis(&ys)
         {
             return None;
         }
@@ -729,7 +770,12 @@ pub struct ViaGeometry {
     pub track_half_width: Coord,
 }
 
-/// `via_site` values written by the mask derivation.
+/// `via_site` values written by the mask derivation. [`VIA_NO`]: rejected
+/// without a check. A Blocked node lies within the via's reach; that is a
+/// certain violation only when the via's clearance is at least the track
+/// clearance the raster was painted with and the sagitta is 0, and merely
+/// conservative otherwise (it can reject a legal via under type-specific
+/// rules).
 pub const VIA_NO: u8 = 0;
 /// A via may fit; an exact check decides.
 pub const VIA_CHECK: u8 = 1;
@@ -743,9 +789,14 @@ pub const VIA_FREE: u8 = 2;
 ///   neighbour in heading `h` exists and is not Blocked.
 /// - `via_site`: without via geometry, [`VIA_CHECK`] on every node that is
 ///   not Blocked. With it, let `ρ = radius − track_half_width`: a node with
-///   any Blocked node within `ρ` gets [`VIA_NO`] (the via certainly
-///   violates); a node whose nodes within `ρ + half-diagonal` all have
-///   `halo == 0` gets [`VIA_FREE`]; anything else [`VIA_CHECK`].
+///   any Blocked node within `ρ` gets [`VIA_NO`]; a node whose nodes
+///   within `ρ + half-diagonal` all have `halo == 0`, and whose lattice
+///   cells under the disc all have a covering radius (half the cell
+///   diagonal) of at most the half-diagonal, gets [`VIA_FREE`]; anything
+///   else [`VIA_CHECK`]. The covering condition always holds on a uniform
+///   lattice; on a non-uniform one a cell wider than the base pitch can
+///   leave a disc point farther than the half-diagonal from every node,
+///   where `halo == 0` proves nothing.
 pub(crate) fn derive_masks_on<G: Grid>(
     raster: &mut TileRaster,
     grid: &G,
@@ -888,11 +939,42 @@ fn via_site_at<G: Grid>(
             }
         }
     }
+    if free && !grid.uniform() && !cells_covered(grid, cx, cy, rho, outer - rho) {
+        free = false;
+    }
     if free {
         VIA_FREE
     } else {
         VIA_CHECK
     }
+}
+
+/// Whether every lattice cell meeting the box of the `ρ`-disc at `(cx, cy)`
+/// has a covering radius (half its diagonal) of at most `hd`, so every
+/// disc point lies within `hd` of a cell corner, and that corner within
+/// `ρ + hd` of the centre. Conservative: it pairs the widest column gap
+/// with the widest row gap. The caller has checked that the disc lies
+/// inside the lattice.
+fn cells_covered<G: Grid>(grid: &G, cx: i64, cy: i64, rho: i64, hd: i64) -> bool {
+    let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as Coord;
+    let widest = |lo: u32, hi: u32, at: &dyn Fn(u32) -> Coord| -> i64 {
+        (lo..hi)
+            .map(|i| i64::from(at(i + 1)) - i64::from(at(i)))
+            .max()
+            .unwrap_or(0)
+    };
+    let gx = widest(
+        grid.col_at_or_before(clamp(cx - rho)),
+        grid.col_at_or_after(clamp(cx + rho)),
+        &|c| grid.x(c),
+    );
+    let gy = widest(
+        grid.row_at_or_before(clamp(cy - rho)),
+        grid.row_at_or_after(clamp(cy + rho)),
+        &|r| grid.y(r),
+    );
+    let (gx, gy, hd) = (i128::from(gx), i128::from(gy), i128::from(hd));
+    gx * gx + gy * gy <= 4 * hd * hd
 }
 
 /// Derive masks for a raster of `lattice` (uniform or not).
@@ -945,6 +1027,126 @@ mod tests {
         // The fine region's y lines span every column.
         assert!(l.ys().contains(&75_000));
         assert!(l.hits(Point::new(330_000, 75_000)));
+    }
+
+    fn max_gap(axis: &[Coord]) -> i64 {
+        axis.windows(2)
+            .map(|w| i64::from(w[1]) - i64::from(w[0]))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn neighbouring_replacements_do_not_open_a_gap_past_the_contract() {
+        // Base lines at 50 and 100 µm both replaced from the outside.
+        for (snap, forced) in [(10_000, [41_000, 109_000]), (20_000, [31_000, 119_000])] {
+            let mut spec =
+                LatticeSpec::new(BBox::new(Point::new(0, 0), Point::new(300_000, 100_000)));
+            spec.snap_nm = snap;
+            spec.forced_x = forced.to_vec();
+            let l = Lattice::build(&spec).unwrap();
+            let xs = l.xs();
+            assert!(xs.contains(&forced[0]) && xs.contains(&forced[1]), "{xs:?}");
+            assert!(max_gap(xs) <= i64::from(spec.base_pitch + snap), "{xs:?}");
+            assert!(xs.windows(2).all(|w| w[1] - w[0] >= snap), "{xs:?}");
+        }
+    }
+
+    #[test]
+    fn random_forced_lines_at_the_snap_limit_keep_the_gap_bounds() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |m: u64| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) % m
+        };
+        for round in 0..300 {
+            let mut spec =
+                LatticeSpec::new(BBox::new(Point::new(0, 0), Point::new(2_000_000, 200_000)));
+            // Up to the 0.4 · base limit `build` accepts.
+            spec.snap_nm = [10_000, 15_000, 20_000][round % 3];
+            let n = next(60) as usize;
+            spec.forced_x = (0..n).map(|_| next(2_000_001) as Coord).collect();
+            if round % 4 == 0 {
+                // Lines just outside every base line, alternating sides.
+                spec.forced_x = (1..40)
+                    .map(|k| k * 50_000 + if k % 2 == 0 { 1 } else { -1 } * (spec.snap_nm - 1))
+                    .collect();
+            }
+            if round % 5 == 0 {
+                spec.fine_regions = vec![BBox::new(
+                    Point::new(next(1_000_000) as Coord, 0),
+                    Point::new(1_000_000 + next(1_000_000) as Coord, 100_000),
+                )];
+            }
+            let l = Lattice::build(&spec).expect("a valid spec builds");
+            let xs = l.xs();
+            assert!(
+                max_gap(xs) <= i64::from(spec.base_pitch + spec.snap_nm),
+                "round {round}: {xs:?}"
+            );
+            assert!(
+                xs.windows(2).all(|w| w[1] - w[0] >= spec.snap_nm),
+                "round {round}: {xs:?}"
+            );
+            for f in &spec.forced_x {
+                // Every forced line is kept or within `snap` of a kept line.
+                let near = xs
+                    .iter()
+                    .any(|&v| (i64::from(v) - i64::from(*f)).abs() < i64::from(spec.snap_nm));
+                assert!(xs.contains(f) || near, "round {round}: lost {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_axes_with_gaps_past_root_two_pitches_are_rejected() {
+        // √2 · 50 µm ≈ 70.71 µm.
+        assert!(Lattice::from_axes(vec![0, 70_000, 120_000], vec![0, 50_000], 50_000).is_some());
+        assert!(Lattice::from_axes(vec![0, 70_711, 120_000], vec![0, 50_000], 50_000).is_none());
+        assert!(Lattice::from_axes(vec![0, 50_000], vec![0, 80_000], 50_000).is_none());
+    }
+
+    #[test]
+    fn wide_cells_never_mark_a_via_free() {
+        // 70 µm cells: the cell centre is 49.5 µm from every corner, more
+        // than the 35.4 µm half-diagonal the halo covers.
+        let axis: Vec<Coord> = (0..11).map(|i| i * 70_000).collect();
+        let wide = Lattice::from_axes(axis.clone(), axis, 50_000).unwrap();
+        let narrow_axis: Vec<Coord> = (0..15).map(|i| i * 50_000).collect();
+        let narrow = Lattice::from_axes(narrow_axis.clone(), narrow_axis, 50_000).unwrap();
+        let profile = ProfileGeometry {
+            track_width: 10_000,
+            sagitta: 0,
+        };
+        let via = ViaGeometry {
+            radius: 65_000,
+            track_half_width: 5_000,
+        };
+        // A small obstacle at the centre of the cell next to node (5, 5):
+        // no node is in its halo, yet a 65 µm via at (5, 5) overlaps it.
+        let obstacle = PaintShape {
+            shape: Shape::Circle(Circle::new(Point::new(385_000, 385_000), 1_000)),
+            clearance: 5_000,
+            kind: PaintKind::Hard,
+        };
+        let mut r = TileRaster::new(TileId(0), LayerId(0), ProfileId(0), wide.window());
+        paint_on_lattice(
+            &mut r,
+            &wide,
+            std::slice::from_ref(&obstacle),
+            &profile,
+            true,
+        );
+        assert!(r.halo.as_slice().iter().all(|&v| v == 0));
+        derive_masks_on_lattice(&mut r, &wide, Some(via));
+        assert_eq!(r.via_site.get(5, 5), VIA_CHECK);
+        assert!(r.via_site.as_slice().iter().all(|&v| v != VIA_FREE));
+        // On base-pitch cells an empty raster still has free interior sites.
+        let mut r = TileRaster::new(TileId(0), LayerId(0), ProfileId(0), narrow.window());
+        derive_masks_on_lattice(&mut r, &narrow, Some(via));
+        assert_eq!(r.via_site.get(7, 7), VIA_FREE);
     }
 
     #[test]

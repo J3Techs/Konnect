@@ -70,8 +70,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
-/// Per-search counters for telemetry.
+/// Per-search counters for telemetry. Missing fields deserialize as 0, so
+/// telemetry written before a counter existed still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchStats {
     pub expansions: u64,
     pub exact_checks: u64,
@@ -90,6 +92,9 @@ pub struct SearchStats {
     /// Reverse floods run, and how many proved the job unreachable.
     pub dead_end_checks: u64,
     pub dead_ends: u64,
+    /// `JOB_MIN_RUN` searches refused because the minimum run is longer
+    /// than the run field can count (see `kernel::MAX_RUN_BUCKET`).
+    pub min_run_rejects: u64,
 }
 
 impl SearchStats {
@@ -103,6 +108,7 @@ impl SearchStats {
         self.region_retries += o.region_retries;
         self.dead_end_checks += o.dead_end_checks;
         self.dead_ends += o.dead_ends;
+        self.min_run_rejects += o.min_run_rejects;
         self.window_nodes = self.window_nodes.max(o.window_nodes);
     }
 
@@ -118,6 +124,7 @@ impl SearchStats {
         t.count("search_region_retries", self.region_retries);
         t.count("search_dead_end_checks", self.dead_end_checks);
         t.count("search_dead_ends", self.dead_ends);
+        t.count("search_min_run_rejects", self.min_run_rejects);
         let name = match outcome {
             SearchOutcome::Found(_) => "search_found",
             SearchOutcome::Unreachable { .. } => "search_unreachable",
@@ -201,7 +208,14 @@ pub enum Heuristic {
     #[default]
     Octile,
     /// [`MapLookahead`] when the context supplies a matching table; falls
-    /// back to octile-plus-via outside its range.
+    /// back to octile-plus-via outside its range and on non-uniform
+    /// lattices (the table is built on a uniform one).
+    ///
+    /// Admissible but not consistent: the table is indexed by offset and
+    /// layer, not by the state's heading, so `T(n) ≤ c(n, n') + T(n')` can
+    /// fail by up to one bend. With the closed set this A* may return a
+    /// path costing up to about one bend more than the optimum; use
+    /// [`Heuristic::Octile`] where exact optimality matters.
     Map,
 }
 
@@ -222,7 +236,10 @@ pub struct SearchConfig {
     pub retry_full_window: bool,
     /// The `track_angle` minimum; `None` is 90°.
     pub min_track_angle_deg: Option<f64>,
-    /// Minimum straight run between turns for `JOB_MIN_RUN` jobs, nm.
+    /// Minimum straight run between turns for `JOB_MIN_RUN` jobs, nm. Runs
+    /// are counted in half base pitches up to 31 (775 µm at 50 µm); a
+    /// longer minimum makes such jobs `Unreachable` (counted in
+    /// [`SearchStats::min_run_rejects`]).
     pub min_run_nm: Coord,
     pub bend_45: Cost,
     pub bend_90: Cost,
@@ -265,6 +282,14 @@ impl Default for SearchConfig {
 
 /// The exact legality oracle the search asks about `Near` edges and vias.
 /// Implementations resolve the job's net and profile themselves.
+///
+/// What the search does **not** ask, so callers must cover it elsewhere:
+/// - hole-to-hole and via-to-via spacing between vias of the same
+///   proposal (each via is checked alone against the fixed obstacles);
+/// - anything against the job's own-net copper the driver unpaints
+///   (own-net drills in particular: hole-to-hole applies within a net);
+/// - edges and vias whose ends are both Free (halo 0) when
+///   `check_free_vias` is off: those are trusted to the rasters.
 pub trait ExactCheck: Sync {
     /// A track of the job's profile from `a` to `b` on stack layer `layer`
     /// is clear of every hard obstacle.
@@ -374,9 +399,16 @@ pub fn search_with(
         lookahead,
         gcells: ctx.gcells,
         mode: Mode::Route,
+        spent: 0,
     };
     match ctx.lattice {
         Some(l) if !l.is_uniform() => run_bounded(&LatticeGrid { lattice: l }, &problem, stats),
+        Some(l) if l.window() != ctx.stack.window => {
+            // A uniform lattice must be the stack's own window (origin and
+            // pitch, not only the dimensions the kernel checks).
+            debug_assert!(false, "uniform lattice differs from the stack window");
+            bad(0)
+        }
         Some(l) => run_bounded(&UniformGrid::new(l.window()), &problem, stats),
         None => run_bounded(&UniformGrid::new(ctx.stack.window), &problem, stats),
     }
@@ -395,12 +427,10 @@ fn run_bounded<G: Grid>(grid: &G, p: &Problem<'_>, stats: &mut SearchStats) -> S
             {
                 stats.region_retries += 1;
                 stats.window_nodes = full.nodes() as u64;
-                let config = SearchConfig {
-                    max_expansions: p.config.max_expansions.saturating_sub(expansions),
-                    ..p.config.clone()
-                };
+                // The remaining budget travels as `spent`, so the retry
+                // does not clone the config (whose `layer_pref` allocates).
                 let p2 = Problem {
-                    config: &config,
+                    spent: p.spent.saturating_add(expansions),
                     ..*p
                 };
                 let add = |e: u64| e + expansions;
@@ -521,6 +551,13 @@ pub fn search_batch_default(
 
 /// Cost-to-reach every node of `stack` from `sources` (Dijkstra, every
 /// layer, vias allowed, default tuning, no checker). Row-major per layer.
+///
+/// The field is heading-aware: it is the minimum over arrival headings of
+/// the search's own state costs, so it includes bend costs and the turn
+/// policy (no 135° turns). A heading-free sweep (plain octile relaxation,
+/// as a simple GPU kernel would do) gives lower values wherever the
+/// cheapest path bends; compare against it only with zero bend costs and
+/// on paths that need no 135° turn.
 pub fn cost_field_on(
     stack: &TileStack,
     lattice: Option<&Lattice>,
@@ -550,6 +587,7 @@ pub fn cost_field_on(
         lookahead: None,
         gcells: None,
         mode: Mode::Field,
+        spent: 0,
     };
     let layers = stack.layers.len() as u32;
     let mut costs = Vec::new();
