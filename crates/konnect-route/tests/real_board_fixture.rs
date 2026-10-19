@@ -141,9 +141,10 @@ fn real_board_fixture_loads_faithfully() {
     let connections = conn.connections(&board);
     println!("connectivity: {conn_ms} ms");
     println!(
-        "multi-pad nets: {}, connections needed: {}",
+        "multi-pad nets: {}, connections needed: {}, unfilled zone pieces skipped: {}",
         conn.multi_pad_net_count(),
-        conn.connection_count()
+        conn.connection_count(),
+        conn.unfilled_zones_skipped
     );
     assert_eq!(connections.len(), conn.connection_count());
 }

@@ -97,7 +97,9 @@ impl Window {
     }
 }
 
-/// One row-major plane of `T` with rows padded to a 4-byte multiple.
+/// One row-major plane of `T` with rows padded to a 4-byte multiple. `T`
+/// must be 1, 2 or 4 bytes wide (`u8`, `u16`, `u32`), so whole elements fill
+/// a padded row exactly; [`Plane::new`] refuses anything else at compile time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plane<T> {
     cols: u32,
@@ -108,7 +110,8 @@ pub struct Plane<T> {
 
 impl<T: Copy + Default> Plane<T> {
     pub fn new(cols: u32, rows: u32) -> Self {
-        let size = std::mem::size_of::<T>().max(1);
+        const { assert!(matches!(std::mem::size_of::<T>(), 1 | 2 | 4)) };
+        let size = std::mem::size_of::<T>();
         let row_bytes = cols as usize * size;
         let padded = row_bytes.div_ceil(4) * 4;
         let stride = (padded / size) as u32;

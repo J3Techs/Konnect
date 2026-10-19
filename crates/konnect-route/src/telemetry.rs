@@ -47,6 +47,21 @@ impl Histogram {
         self.max = self.max.max(v);
     }
 
+    /// Add `o`'s samples. `false`, with nothing changed, when the bucket
+    /// bounds differ and the counts cannot be lined up.
+    pub fn merge(&mut self, o: &Histogram) -> bool {
+        if self.bounds != o.bounds {
+            return false;
+        }
+        for (a, b) in self.counts.iter_mut().zip(&o.counts) {
+            *a += b;
+        }
+        self.total += o.total;
+        self.sum = self.sum.saturating_add(o.sum);
+        self.max = self.max.max(o.max);
+        true
+    }
+
     pub fn mean(&self) -> f64 {
         if self.total == 0 {
             0.0
@@ -63,6 +78,10 @@ pub struct StageTiming {
     pub wall_us: u64,
     pub runs: u32,
 }
+
+/// The counter [`Telemetry::merge`] adds a histogram's samples to when its
+/// bucket bounds do not match.
+pub const HISTOGRAM_SAMPLES_DROPPED: &str = "histogram_samples_dropped";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Telemetry {
@@ -145,6 +164,9 @@ impl Telemetry {
                 None => self.stages.push(*s),
             }
         }
+        // A histogram with other bounds cannot be folded in; its samples are
+        // counted as dropped rather than lost silently.
+        let mut dropped = 0;
         for (mine, theirs) in [
             (
                 &mut self.expansions_per_connection,
@@ -152,14 +174,12 @@ impl Telemetry {
             ),
             (&mut self.window_nodes, &o.window_nodes),
         ] {
-            if mine.bounds == theirs.bounds {
-                for (a, b) in mine.counts.iter_mut().zip(&theirs.counts) {
-                    *a += b;
-                }
-                mine.total += theirs.total;
-                mine.sum = mine.sum.saturating_add(theirs.sum);
-                mine.max = mine.max.max(theirs.max);
+            if !mine.merge(theirs) {
+                dropped += theirs.total;
             }
+        }
+        if dropped > 0 {
+            self.count(HISTOGRAM_SAMPLES_DROPPED, dropped);
         }
         self.congested_iteration_us += o.congested_iteration_us;
         self.raster_rebuild_us += o.raster_rebuild_us;
@@ -202,5 +222,20 @@ mod tests {
         assert_eq!(t.expansions_per_connection.total, 1);
         assert_eq!(t.counters["rip_ups"], 2);
         assert_eq!(t.stages[0].stage, Stage::Detail);
+        assert!(!t.counters.contains_key(HISTOGRAM_SAMPLES_DROPPED));
+    }
+
+    #[test]
+    fn mismatched_histograms_are_counted_not_lost() {
+        let mut t = Telemetry::default();
+        let mut other = Telemetry {
+            window_nodes: Histogram::new(vec![10, 100]),
+            ..Telemetry::default()
+        };
+        other.window_nodes.record(5);
+        other.window_nodes.record(50);
+        t.merge(&other);
+        assert_eq!(t.window_nodes.total, 0);
+        assert_eq!(t.counters[HISTOGRAM_SAMPLES_DROPPED], 2);
     }
 }

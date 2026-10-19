@@ -89,6 +89,8 @@ impl RouteBoard {
     /// the stack. Returns the first broken invariant.
     pub fn validate(&self) -> Result<(), String> {
         let layer_ok = |l: LayerId| l.index() < self.layer_count();
+        let all = self.layers.all();
+        let mask_ok = |m: LayerMask| m.0 & !all.0 == 0;
         if self.layer_count() == 0 || self.layer_count() > 32 {
             return Err(format!("{} copper layers; need 1..=32", self.layer_count()));
         }
@@ -104,10 +106,20 @@ impl RouteBoard {
             if f.id.index() != i {
                 return Err(format!("footprint index {i} has id {}", f.id.0));
             }
+            let (start, end) = (f.pad_range.0 as usize, f.pad_range.1 as usize);
+            if start > end
+                || end > self.pads.len()
+                || self.pads[start..end].iter().any(|p| p.footprint != f.id)
+            {
+                return Err(format!("footprint index {i} has a bad pad_range"));
+            }
         }
         for (i, p) in self.pads.iter().enumerate() {
             if p.id.index() != i || p.footprint.index() >= self.footprints.len() {
                 return Err(format!("pad index {i} has a bad id or footprint"));
+            }
+            if !mask_ok(p.layers) {
+                return Err(format!("pad index {i} names layers beyond the stack"));
             }
         }
         for (i, t) in self.tracks.iter().enumerate() {
@@ -121,8 +133,8 @@ impl RouteBoard {
             }
         }
         for (i, v) in self.vias.iter().enumerate() {
-            if v.id.index() != i {
-                return Err(format!("via index {i} has id {}", v.id.0));
+            if v.id.index() != i || !mask_ok(v.layers) {
+                return Err(format!("via index {i} has a bad id or layers"));
             }
         }
         for (i, z) in self.zones.iter().enumerate() {
@@ -130,8 +142,12 @@ impl RouteBoard {
                 return Err(format!("zone piece index {i} has a bad id or layer"));
             }
         }
-        let all = self.layers.all();
-        if self.routable.0 & !all.0 != 0 {
+        for (i, k) in self.keepouts.iter().enumerate() {
+            if k.id.index() != i || !mask_ok(k.layers) {
+                return Err(format!("keepout index {i} has a bad id or layers"));
+            }
+        }
+        if !mask_ok(self.routable) {
             return Err("routable mask names layers beyond the stack".to_string());
         }
         Ok(())
@@ -147,8 +163,11 @@ pub struct BoardOutline {
     /// (week 1: an axis-aligned rectangle). Empty when unproven — use
     /// `edges` for edge clearance and do not assume containment.
     pub regions: Vec<Polygon>,
-    /// Every Edge.Cuts boundary piece as a zero-width segment (arcs and
-    /// circles approximated). Copper-to-edge clearance is measured to these.
+    /// Every Edge.Cuts boundary piece as a segment. Straight pieces have
+    /// zero width; arcs and circles are inscribed chords whose width (twice
+    /// the arc error, plus rounding) covers the true curve on both sides, so
+    /// clearance measured to them never under-protects an outer edge or a
+    /// cut-out. Copper-to-edge clearance is measured to these.
     pub edges: Vec<Segment>,
     /// Advisory bounding box of the edge graphics.
     pub bbox: Option<BBox>,
@@ -354,7 +373,8 @@ pub struct Pad {
     pub number: String,
     pub net: Option<NetId>,
     pub kind: PadKind,
-    /// The pad anchor in board coordinates.
+    /// The pad anchor in board coordinates: where the hole is. A drill
+    /// offset moves the copper in `shapes`, not the anchor.
     pub center: Point,
     /// Board-space orientation in degrees (KiCad stores it including the
     /// footprint's rotation).
@@ -365,7 +385,8 @@ pub struct Pad {
     /// several for custom pads). The same on every layer in `layers`.
     pub shapes: Vec<Shape>,
     pub drill: Option<Drill>,
-    /// The pad's own `(clearance …)` override.
+    /// The pad's own `(clearance …)` override, or its footprint's when the
+    /// pad has none (KiCad's inheritance).
     pub local_clearance: Option<Coord>,
     /// True when the loader could not represent the pad exactly and stored a
     /// superset (chamfers, per-layer padstacks).
@@ -435,13 +456,14 @@ pub struct Via {
 }
 
 impl Via {
-    /// The annular copper, identical on every spanned layer.
+    /// The annular copper, identical on every spanned layer. An odd-nm
+    /// diameter rounds the radius up, so the disc never under-covers.
     pub fn shape(&self) -> Shape {
-        Shape::Circle(Circle::new(self.center, self.diameter / 2))
+        Shape::Circle(Circle::from_diameter(self.center, self.diameter))
     }
 
     pub fn hole(&self) -> Shape {
-        Shape::Circle(Circle::new(self.center, self.drill / 2))
+        Shape::Circle(Circle::from_diameter(self.center, self.drill))
     }
 }
 

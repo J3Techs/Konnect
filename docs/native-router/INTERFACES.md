@@ -58,7 +58,8 @@ panic if called. Replace a stub's body; keep its signature.
 - **Arcs** are lowered under an explicit `ArcPolicy`; the default
   `max_error_nm` is 1 µm. `Inscribed` is for copper you connect to: add
   `max_error_nm` to any clearance checked against it. `Circumscribed` is for
-  obstacles, keepouts and courtyards, and may only over-protect.
+  obstacles, keepouts and courtyards: its chords are tangents, so it may
+  only over-protect.
 - **Costs** are `compute::Cost(u32)` fixed point: a straight step is 1000, a
   diagonal step 1414. Adds saturate, and `Cost::INFINITE` absorbs everything.
 
@@ -71,10 +72,10 @@ panic if called. Replace a stub's body; keep its signature.
 | `Point { x, y: Coord }`, `Vector { x, y: i64 }` | Position and exact difference. `Ord` on `Point` exists only for deterministic sorting |
 | `BBox { min, max }` | A closed box that is never empty; an empty set is `None` |
 | `Segment { a, b, width }` | A track or stadium; `a == b` is a dot |
-| `Circle { center, radius }` | A disc |
+| `Circle { center, radius }` | A disc. `Circle::from_diameter` rounds an odd diameter's radius up |
 | `ConvexPoly::new(pts, radius)` | A convex polygon swept by `radius`, which covers round-rect pads. Winding is normalized; non-convex input is refused |
-| `Polygon { outline, holes }` | A region with holes: zone fills, keepouts, courtyards, outlines |
-| `Shape` | `Segment`, `Circle`, `ConvexPoly` or `Polygon`: a core plus a sweep radius |
+| `Polygon::new(outline, holes)` | A region with holes: zone fills, keepouts, courtyards, outlines. The rings are private (`outline()`, `holes()`) |
+| `Shape` | `Segment`, `Circle`, `ConvexPoly` or `Polygon`: a core plus a sweep radius. Deserializing a `ConvexPoly` or `Polygon` runs its constructor's checks |
 | `gap_cmp(a, b, clearance) -> Ordering` | The edge-to-edge gap compared with `clearance`; `Less` is a violation |
 | `has_clearance`, `touches` | Wrappers over `gap_cmp`. `touches` is the connectivity test |
 | `point_segment_distance_cmp`, `segment_segment_distance_cmp`, `segment_polygon_distance_cmp`, `segments_intersect`, `point_in_polygon -> Containment` | The exact primitives |
@@ -125,7 +126,9 @@ A `RouteBoard` is plain data:
 
 - `outline`:
   - `regions`, filled only when the outline is provably a rectangle;
-  - `edges`, zero-width segments that edge clearance is measured to;
+  - `edges`, the segments that edge clearance is measured to: zero width
+    for straight pieces, and wide enough on curved ones to cover the true
+    curve on both sides;
   - `bbox`.
 - `layers` (`LayerTable`, with `expand("*.Cu" | "F&B.Cu" | name)`) and
   `routable`.
@@ -133,11 +136,12 @@ A `RouteBoard` is plain data:
 - `footprints`, each with a reference, side, lock state, courtyard polygons
   and `pad_range`.
 - `pads`. Each pad has:
-  - a board-space `center` and `angle_deg`;
+  - a board-space `center` (the anchor, where the hole is; a drill offset
+    moves only the copper) and `angle_deg`;
   - a copper `layers` mask;
   - `shapes`, a union of exact shapes;
   - an optional `drill`;
-  - an optional `local_clearance`;
+  - an optional `local_clearance`, the pad's own or else its footprint's;
   - an `approximated` flag.
 - `tracks`, `arcs`, `vias` and `zones`. Each zone piece is one fill polygon
   on one layer and one net. An unfilled zone uses its outline, with
@@ -168,19 +172,32 @@ A `RouteBoard` is plain data:
   - edge, hole and hole-to-hole clearance;
   - custom `clearance` overrides with conditions on `NetName`, `NetClass`,
     `Type`, `Reference`, `intersectsCourtyard()` and `enclosedByArea()`;
-  - the via floor (`via_diameter`, `hole_size`, `annular_width`);
-  - `track_width`, `track_segment_length` and `track_angle`.
+  - via sizes: `via_diameter` and `hole_size` (`min`, `opt`, `max`) and
+    `annular_width` (`min`); a via's diameter never drops below its drill
+    plus twice the annular floor;
+  - `track_width` (`min`, `opt`, `max`), `track_segment_length` and
+    `track_angle` (`min`).
 
   Anything else is reported inert with a reason. That includes a condition
-  that names an area or footprint the board lacks.
-- **Precedence is a hypothesis until the oracle confirms it:**
-  1. the last matching custom rule, with two-item conditions tried in both
-     orders;
-  2. otherwise local pad overrides;
-  3. otherwise the net class (the larger of the two items' values for
-     clearance).
+  that names an area or footprint the board lacks, a limit the table does
+  not apply (such as a `max` on a clearance), a length too large for a
+  `Coord`, a rule with `(severity ignore)`, and a via constraint scoped to
+  one layer.
+- **Precedence is a hypothesis until the oracle confirms it.** For
+  clearance, following KiCad's `DRC_ENGINE::EvalRules`:
+  1. a local override on either item (the pad's own `(clearance …)`, else
+     its footprint's), the larger of the two, beats every rule;
+  2. otherwise the last matching custom rule, with two-item conditions tried
+     in both orders;
+  3. otherwise the net class (the larger of the two items' values).
 
-  Board minimums are a floor under every result.
+  Other constraints take the last matching custom rule, then the net class.
+  Board minimums are a floor under every result, and a floor beats a
+  conflicting `max`.
+- **Deviation from the plan.** The plan has week 1 run on a hard-coded table
+  of one board's rules. The table is compiled from the project files
+  instead, so no board's values live in this public repository and any
+  project loads the same way.
 - **`synthetic::UniformRules`** is a constant table for tests.
 
 ### Connectivity: `konnect-route::connectivity`
@@ -189,6 +206,8 @@ A `RouteBoard` is plain data:
 copper that touches on a shared layer, using `touches`. It returns islands
 per net.
 
+- Zone pieces with no fill are left out, because their outline only bounds
+  the copper. `unfilled_zones_skipped` counts them.
 - `connection_count()` is the sum over nets of pad islands minus one.
 - `connections(board)` builds a deterministic minimum spanning tree over each
   net's pad islands and returns the routing task list.

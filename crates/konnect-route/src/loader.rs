@@ -332,33 +332,49 @@ fn outline(tree: &SexpNode, policy: &ArcPolicy, report: &mut LoadReport) -> Boar
             );
         }
     }
-    let polyline = |pts: &[Point], closed: bool, edges: &mut Vec<Segment>| {
+    let polyline = |pts: &[Point], closed: bool, width: Coord, edges: &mut Vec<Segment>| {
         for w in pts.windows(2) {
-            edges.push(Segment::new(w[0], w[1], 0));
+            edges.push(Segment::new(w[0], w[1], width));
         }
         if closed && pts.len() > 2 {
-            edges.push(Segment::new(pts[pts.len() - 1], pts[0], 0));
+            edges.push(Segment::new(pts[pts.len() - 1], pts[0], width));
         }
     };
+    // Inscribed chords lie up to the arc error (plus a vertex's rounding) on
+    // one side of the true curve, and which side the board material is on
+    // depends on the outline: a stroke this wide covers the curve either way.
+    let curved = 2 * (policy.max_error_nm.max(1) + 1);
     for child in tree.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
         if child.find_str("layer") != Some("Edge.Cuts") {
             continue;
         }
-        let pts: Option<(Vec<Point>, bool)> = match head {
-            "gr_line" => (|| Some((vec![pt(child, "start")?, pt(child, "end")?], false)))(),
+        let pts: Option<(Vec<Point>, bool, Coord)> = match head {
+            "gr_line" => (|| Some((vec![pt(child, "start")?, pt(child, "end")?], false, 0)))(),
             "gr_rect" => (|| {
                 let (a, b) = (pt(child, "start")?, pt(child, "end")?);
-                Some((vec![a, Point::new(b.x, a.y), b, Point::new(a.x, b.y)], true))
+                Some((
+                    vec![a, Point::new(b.x, a.y), b, Point::new(a.x, b.y)],
+                    true,
+                    0,
+                ))
             })(),
             "gr_arc" => (|| {
                 let (s, m, e) = (pt(child, "start")?, pt(child, "mid")?, pt(child, "end")?);
-                Some((approximate_arc(s, m, e, policy, ArcSide::Inscribed), false))
+                Some((
+                    approximate_arc(s, m, e, policy, ArcSide::Inscribed),
+                    false,
+                    curved,
+                ))
             })(),
             "gr_circle" => (|| {
                 let (c, e) = (pt(child, "center")?, pt(child, "end")?);
                 let r = (e - c).length_f64().round() as Coord;
-                Some((approximate_circle(c, r, policy, ArcSide::Inscribed), true))
+                Some((
+                    approximate_circle(c, r, policy, ArcSide::Inscribed),
+                    true,
+                    curved,
+                ))
             })(),
             "gr_poly" | "gr_curve" => (|| {
                 if head == "gr_curve" {
@@ -368,12 +384,12 @@ fn outline(tree: &SexpNode, policy: &ArcPolicy, report: &mut LoadReport) -> Boar
                 for p in child.find("pts")?.find_all("xy") {
                     v.push(Point::from_mm(p.get_f64(1)?, p.get_f64(2)?)?);
                 }
-                Some((v, head == "gr_poly"))
+                Some((v, head == "gr_poly", 0))
             })(),
             _ => continue,
         };
         match pts {
-            Some((pts, closed)) => polyline(&pts, closed, &mut out.edges),
+            Some((pts, closed, width)) => polyline(&pts, closed, width, &mut out.edges),
             None => report.skip("edge graphic"),
         }
     }
@@ -438,9 +454,12 @@ fn load_footprints(
             report.note("footprint Edge.Cuts graphics not in the outline model");
         }
 
+        // KiCad pads without their own override inherit the footprint's.
+        let fp_clearance = local_clearance(fp);
         let first_pad = board.pads.len() as u32;
         for pad in fp.find_all("pad") {
-            match lower_pad(pad, (fx, fy, rot), id, nets, &board.layers, policy, report) {
+            let parent = (fx, fy, rot, fp_clearance);
+            match lower_pad(pad, parent, id, nets, &board.layers, policy, report) {
                 Some(mut p) => {
                     p.id = PadId(board.pads.len() as u32);
                     board.pads.push(p);
@@ -515,10 +534,7 @@ impl PadFrame {
         let (ix, iy) = (w / 2.0 - r, h / 2.0 - r);
         let rn = if r > EPS { mm_to_nm(r)? } else { 0 };
         if ix <= EPS && iy <= EPS {
-            return Some(Shape::Circle(Circle::new(
-                self.point(0.0, 0.0)?,
-                mm_to_nm(w.min(h) / 2.0)?,
-            )));
+            return Some(circle_d(self.point(0.0, 0.0)?, mm_to_nm(w.min(h))?));
         }
         if ix <= EPS {
             return Some(Shape::Segment(Segment::new(
@@ -548,10 +564,55 @@ impl PadFrame {
     }
 }
 
+/// An item's own `(clearance …)` override, in nm.
+fn local_clearance(node: &SexpNode) -> Option<Coord> {
+    node.find_f64("clearance")
+        .filter(|c| c.is_finite() && *c >= 0.0)
+        .and_then(mm_to_nm)
+}
+
+/// A disc of `diameter` nm whose radius rounds up for an odd diameter.
+fn circle_d(center: Point, diameter: Coord) -> Shape {
+    Shape::Circle(Circle::from_diameter(center, diameter))
+}
+
+/// `(drill [oval] W [H] [(offset X Y)])`, parsed. KiCad writes
+/// `(drill (offset X Y))` with no size for an SMD pad whose copper is offset.
+struct DrillSpec {
+    oval: bool,
+    dims: Vec<f64>,
+    offset: (f64, f64),
+}
+
+fn parse_drill(d: &SexpNode) -> Option<DrillSpec> {
+    let mut spec = DrillSpec {
+        oval: false,
+        dims: Vec::new(),
+        offset: (0.0, 0.0),
+    };
+    for c in d.children()?.iter().skip(1) {
+        match c {
+            SexpNode::Atom(a) if a == "oval" => spec.oval = true,
+            SexpNode::Atom(a) => spec
+                .dims
+                .push(a.parse::<f64>().ok().filter(|v| v.is_finite())?),
+            SexpNode::List(_) if c.head() == Some("offset") => {
+                let (x, y) = (c.get_f64(1)?, c.get_f64(2)?);
+                if !(x.is_finite() && y.is_finite()) {
+                    return None;
+                }
+                spec.offset = (x, y);
+            }
+            _ => return None,
+        }
+    }
+    Some(spec)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_pad(
     pad: &SexpNode,
-    (fx, fy, rot): (f64, f64, f64),
+    (fx, fy, rot, inherited_clearance): (f64, f64, f64, Option<Coord>),
     footprint: FootprintId,
     nets: &NetResolver,
     layers: &LayerTable,
@@ -574,7 +635,21 @@ fn lower_pad(
         return None;
     }
     let (cx, cy) = transform_pad(lx, ly, fx, fy, rot);
-    let frame = PadFrame { cx, cy, angle };
+    // The anchor is where the hole is; `(drill … (offset X Y))` moves the
+    // copper (shape and custom primitives alike) away from it, rotated with
+    // the pad (KiCad's `PAD::ShapePos`).
+    let anchor = PadFrame { cx, cy, angle };
+    let drill_spec = match pad.find("drill") {
+        Some(d) => Some(parse_drill(d)?),
+        None => None,
+    };
+    let (ox, oy) = drill_spec.as_ref().map_or((0.0, 0.0), |d| d.offset);
+    let (sx, sy) = rotate_about(ox, oy, cx, cy, angle);
+    let frame = PadFrame {
+        cx: sx,
+        cy: sy,
+        angle,
+    };
     let size = pad.find("size")?;
     let (w, h) = (size.get_f64(1)?, size.get_f64(2)?);
     if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
@@ -583,10 +658,7 @@ fn lower_pad(
 
     let mut approximated = false;
     let shapes = match shape_name {
-        "circle" => vec![Shape::Circle(Circle::new(
-            frame.point(0.0, 0.0)?,
-            mm_to_nm(w / 2.0)?,
-        ))],
+        "circle" => vec![circle_d(frame.point(0.0, 0.0)?, mm_to_nm(w)?)],
         "rect" => vec![frame.rounded_rect(w, h, 0.0)?],
         "roundrect" => {
             let ratio = pad
@@ -627,8 +699,8 @@ fn lower_pad(
         report.note("per-layer padstack stored as its default shape on every layer");
     }
 
-    let drill = match pad.find("drill") {
-        Some(d) => lower_drill(d, &frame, kind)?,
+    let drill = match &drill_spec {
+        Some(d) => lower_drill(d, &anchor, kind)?,
         None => None,
     };
     let layer_tokens: Vec<&str> = pad
@@ -646,55 +718,36 @@ fn lower_pad(
         number,
         net: nets.resolve(pad),
         kind,
-        center: frame.point(0.0, 0.0)?,
+        center: anchor.point(0.0, 0.0)?,
         angle_deg: angle,
         layers: layers.expand_all(layer_tokens),
         shapes,
         drill,
-        local_clearance: pad
-            .find_f64("clearance")
-            .filter(|c| c.is_finite() && *c >= 0.0)
-            .and_then(mm_to_nm),
+        local_clearance: local_clearance(pad).or(inherited_clearance),
         approximated,
         ownership: Ownership::Fixed,
         uuid: uuid(pad),
     })
 }
 
-/// `(drill [oval] W [H] [(offset X Y)])`. `Some(None)` for a zero drill.
-fn lower_drill(d: &SexpNode, frame: &PadFrame, kind: PadKind) -> Option<Option<Drill>> {
-    let mut oval = false;
-    let mut dims = Vec::new();
-    let mut offset = (0.0, 0.0);
-    for c in d.children()?.iter().skip(1) {
-        match c {
-            SexpNode::Atom(a) if a == "oval" => oval = true,
-            SexpNode::Atom(a) => dims.push(a.parse::<f64>().ok().filter(|v| v.is_finite())?),
-            SexpNode::List(_) if c.head() == Some("offset") => {
-                offset = (c.get_f64(1)?, c.get_f64(2)?)
-            }
-            _ => return None,
-        }
-    }
-    let dw = *dims.first()?;
-    let dh = if oval {
-        *dims.get(1).unwrap_or(&dw)
+/// The hole of a parsed drill, centred on the pad anchor. `Some(None)` for
+/// no hole: a zero size, or an offset-only drill node.
+fn lower_drill(d: &DrillSpec, anchor: &PadFrame, kind: PadKind) -> Option<Option<Drill>> {
+    let Some(&dw) = d.dims.first() else {
+        return Some(None);
+    };
+    let dh = if d.oval {
+        *d.dims.get(1).unwrap_or(&dw)
     } else {
         dw
     };
     if dw <= 0.0 || dh <= 0.0 {
         return Some(None);
     }
-    let (hx, hy) = rotate_about(offset.0, offset.1, frame.cx, frame.cy, frame.angle);
-    let hole = PadFrame {
-        cx: hx,
-        cy: hy,
-        angle: frame.angle,
-    };
-    let shape = if oval && (dw - dh).abs() > 1e-9 {
-        hole.stadium(dw, dh)?
+    let shape = if d.oval && (dw - dh).abs() > 1e-9 {
+        anchor.stadium(dw, dh)?
     } else {
-        Shape::Circle(Circle::new(hole.point(0.0, 0.0)?, mm_to_nm(dw / 2.0)?))
+        circle_d(anchor.point(0.0, 0.0)?, mm_to_nm(dw)?)
     };
     Some(Some(Drill {
         shape,
@@ -718,10 +771,8 @@ fn custom_pad_shapes(
         .unwrap_or("circle");
     let mut shapes = vec![match anchor {
         "rect" => frame.rounded_rect(w, h, 0.0)?,
-        _ => Shape::Circle(Circle::new(
-            frame.point(0.0, 0.0)?,
-            mm_to_nm(w.min(h) / 2.0)?,
-        )),
+        // KiCad sizes a circular anchor by its x size.
+        _ => circle_d(frame.point(0.0, 0.0)?, mm_to_nm(w)?),
     }];
     let Some(prims) = pad.find("primitives") else {
         return Some(shapes);
@@ -765,7 +816,7 @@ fn custom_pad_shapes(
                     *approximated = true;
                     report.note("unfilled custom-pad circle stored filled");
                 }
-                shapes.push(Shape::Circle(Circle::new(c, r + wn / 2)));
+                shapes.push(Shape::Circle(Circle::new(c, r + wn / 2 + wn % 2)));
             }
             "gr_rect" => {
                 let (x0, y0) = xy(prim, "start")?;
@@ -778,7 +829,7 @@ fn custom_pad_shapes(
                     *approximated = true;
                     report.note("unfilled custom-pad rectangle stored filled");
                 }
-                shapes.push(Shape::ConvexPoly(ConvexPoly::new(pts, wn / 2)?));
+                shapes.push(Shape::ConvexPoly(ConvexPoly::new(pts, wn / 2 + wn % 2)?));
             }
             "gr_line" => shapes.push(Shape::Segment(Segment::new(
                 local("start")?,
@@ -1089,6 +1140,85 @@ mod tests {
         assert_eq!(b.outline.regions.len(), 1);
         assert_eq!(b.outline.edges.len(), 4);
         assert!(report.notes.is_empty(), "{:?}", report.notes);
+    }
+
+    /// A footprint-level clearance, a copper offset from its hole on an SMD
+    /// and a rotated through-hole pad, and a round Edge.Cuts cut-out.
+    const OFFSET_BOARD: &str = r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(layers
+		(0 "F.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+		(31 "F.CrtYd" user "F.Courtyard")
+	)
+	(footprint "Offset_Pads"
+		(layer "F.Cu")
+		(at 10 10)
+		(property "Reference" "X1" (at 0 -3 0) (layer "F.SilkS"))
+		(clearance 0.25)
+		(fp_rect (start -3 -2) (end 4 2) (stroke (width 0.05) (type default)) (layer "F.CrtYd"))
+		(pad "1" smd rect
+			(at 0 0)
+			(size 1 0.5)
+			(drill (offset 0.3 0))
+			(layers "F.Cu")
+			(net "A")
+		)
+		(pad "2" thru_hole rect
+			(at 2 0 90)
+			(size 2 1)
+			(drill 0.8 (offset 0.5 0))
+			(layers "*.Cu")
+			(clearance 0.1)
+			(net "B")
+		)
+	)
+	(gr_rect (start 0 0) (end 50 40) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts"))
+	(gr_circle (center 30 30) (end 32 30) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts"))
+)
+"#;
+
+    #[test]
+    fn drill_offsets_move_the_copper_and_clearance_is_inherited() {
+        let (b, report) = load_board_str(OFFSET_BOARD, &LoadOptions::default()).unwrap();
+        assert_eq!(report.skipped_total(), 0, "{report:?}");
+        let (smd, th) = (&b.pads[0], &b.pads[1]);
+
+        // The SMD copper sits 0.3 mm right of the anchor; there is no hole.
+        assert_eq!(smd.center, Point::new(10_000_000, 10_000_000));
+        assert!(smd.drill.is_none());
+        let bb = smd.shapes[0].bbox();
+        assert_eq!((bb.min.x, bb.max.x), (9_800_000, 10_800_000));
+        assert_eq!(smd.local_clearance, Some(250_000));
+
+        // Rotated 90 (screen-CCW, Y down), the (0.5, 0) offset points up:
+        // copper centred at (12, 9.5), the hole still at the anchor (12, 10).
+        assert_eq!(th.center, Point::new(12_000_000, 10_000_000));
+        let bb = th.shapes[0].bbox();
+        assert_eq!((bb.min.x, bb.max.x), (11_500_000, 12_500_000));
+        assert_eq!((bb.min.y, bb.max.y), (8_500_000, 10_500_000));
+        let Shape::Circle(hole) = th.drill.as_ref().unwrap().shape else {
+            panic!("round drill lowers to a circle");
+        };
+        assert_eq!(
+            hole,
+            Circle::new(Point::new(12_000_000, 10_000_000), 400_000)
+        );
+        // The pad's own override beats the footprint's.
+        assert_eq!(th.local_clearance, Some(100_000));
+    }
+
+    #[test]
+    fn curved_edges_carry_a_covering_width() {
+        let (b, _) = load_board_str(OFFSET_BOARD, &LoadOptions::default()).unwrap();
+        let policy = ArcPolicy::default();
+        let (straight, curved): (Vec<&Segment>, Vec<&Segment>) =
+            b.outline.edges.iter().partition(|s| s.width == 0);
+        assert_eq!(straight.len(), 4);
+        assert!(curved.len() >= 8);
+        assert!(curved.iter().all(|s| s.width >= 2 * policy.max_error_nm));
     }
 
     #[test]

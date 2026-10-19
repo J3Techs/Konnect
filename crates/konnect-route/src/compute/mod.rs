@@ -24,8 +24,8 @@ pub mod job;
 pub mod raster;
 
 pub use backend::{
-    CostField, CpuCompute, PaintKind, PaintShape, PathProposal, RouteCompute, SearchBackend,
-    SearchOutcome,
+    CostField, CpuCompute, PaintKind, PaintShape, PathProposal, ProfileGeometry, RouteCompute,
+    SearchBackend, SearchOutcome,
 };
 pub use batch::{Batch, BatchBuilder, BatchPolicy};
 pub use cost::{Cost, CostParams};

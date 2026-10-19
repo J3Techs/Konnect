@@ -8,7 +8,9 @@
 //! no 499-item cap and does not depend on KiCad's ratsnest.
 //!
 //! Items without a net never join anything: KiCad's unconnected pseudo-net
-//! is not a net.
+//! is not a net. Nor does an unfilled zone, whose outline is only an upper
+//! bound on its copper; such pieces are counted in
+//! [`ConnectivityReport::unfilled_zones_skipped`].
 
 use crate::api::{Connection, ConnectionId, ItemRef, LayerId, NetId, PadId};
 use crate::board::RouteBoard;
@@ -115,6 +117,10 @@ pub struct ConnectivityReport {
     /// One entry per board net, by net id (nets with no copper have no
     /// islands).
     pub nets: Vec<NetConnectivity>,
+    /// Netted zone pieces left out because the zone had no fill: their
+    /// authored outline only bounds the copper a refill could pour, so it
+    /// cannot prove that anything is joined.
+    pub unfilled_zones_skipped: usize,
 }
 
 impl ConnectivityReport {
@@ -166,7 +172,12 @@ impl ConnectivityReport {
                 }
             }
         }
+        let mut unfilled_zones_skipped = 0;
         for z in &board.zones {
+            if !z.filled {
+                unfilled_zones_skipped += usize::from(z.net.is_some());
+                continue;
+            }
             let node = nodes.len() as u32;
             nodes.push((ItemRef::Zone(z.id), z.net));
             if z.net.is_some() {
@@ -233,7 +244,10 @@ impl ConnectivityReport {
                 }
             })
             .collect();
-        ConnectivityReport { nets }
+        ConnectivityReport {
+            nets,
+            unfilled_zones_skipped,
+        }
     }
 
     /// Nets with at least two pads.
@@ -356,5 +370,20 @@ mod tests {
         assert_eq!(net.pad_count, 4);
         assert_eq!(net.pad_island_count(), 3);
         assert_eq!(net.connections_needed(), 2);
+        assert_eq!(report.unfilled_zones_skipped, 0);
+    }
+
+    #[test]
+    fn an_unfilled_zone_joins_nothing() {
+        let mut board = synthetic::plane_with_pads();
+        for z in &mut board.zones {
+            z.filled = false;
+        }
+        let report = ConnectivityReport::build(&board, &ArcPolicy::default());
+        let gnd = board.net_by_name("GND").unwrap();
+        // The outline would join the TH pads; without a fill, all four are
+        // apart.
+        assert_eq!(report.nets[gnd.index()].pad_island_count(), 4);
+        assert_eq!(report.unfilled_zones_skipped, board.zones.len());
     }
 }
