@@ -11,16 +11,72 @@
 //! are unchanged: drop or [`CheckCache::clear`] the cache when fixed copper
 //! changes (a new fanout commit), not on rip-up of routed copper, which
 //! the inner checker does not treat as hard.
+//!
+//! Segment keys hold the **stack layer index** the search passes, not a
+//! board layer: share one cache only across tile stacks that list the same
+//! layers in the same order (the router builds every stack from one global
+//! routable-layer list). Stacks with different layer orders need separate
+//! caches.
 
 use super::ExactCheck;
 use crate::compute::JobDescriptor;
 use konnect_geom::Point;
 use std::collections::HashMap;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const SHARDS: usize = 64;
+
+/// A multiplicative (Fx-style) hasher: the keys are a few small integers,
+/// and SipHash would cost more than the lock it guards. Not DoS-resistant,
+/// which does not matter for coordinates the router produced.
+#[derive(Default, Clone, Copy)]
+struct FxHasher(u64);
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.write_u64(u64::from(v));
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+    #[inline]
+    fn write_i32(&mut self, v: i32) {
+        self.write_u64(u64::from(v as u32));
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Fold the high bits down: the shard index takes the low ones.
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+type FxBuild = BuildHasherDefault<FxHasher>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Key {
@@ -48,8 +104,8 @@ pub struct CacheStats {
 
 pub struct CheckCache<'a> {
     inner: &'a dyn ExactCheck,
-    shards: Vec<Mutex<HashMap<Key, bool>>>,
-    hasher: std::collections::hash_map::RandomState,
+    shards: Vec<Mutex<HashMap<Key, bool, FxBuild>>>,
+    hasher: FxBuild,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -58,8 +114,10 @@ impl<'a> CheckCache<'a> {
     pub fn new(inner: &'a dyn ExactCheck) -> Self {
         CheckCache {
             inner,
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            hasher: std::collections::hash_map::RandomState::new(),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(HashMap::default()))
+                .collect(),
+            hasher: FxBuild::default(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
