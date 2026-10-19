@@ -124,7 +124,7 @@ impl PinRegistry {
             .collect()
     }
 
-    fn add(&mut self, net: NetId, layer: LayerId, p: Point, width: Coord) {
+    pub fn add(&mut self, net: NetId, layer: LayerId, p: Point, width: Coord) {
         self.cells
             .entry(Self::key(layer, p))
             .or_default()

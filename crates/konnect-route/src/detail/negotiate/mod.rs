@@ -202,6 +202,13 @@ pub struct NegotiationTuning {
     /// Longest full-width stub from a pad's access point to a lattice node,
     /// for a pad whose own copper offers no open node.
     pub stub_reach: Coord,
+    /// Odd iterations below this one use the shifted tiling; later ones
+    /// keep the unshifted tiling, so a connection in conflict on a few
+    /// pieces can reroute just those (fill passes always alternate).
+    pub shift_iterations: u32,
+    /// Consecutive piece-only reroutes of a connection before it is cut
+    /// again from scratch (0: always reroute whole connections).
+    pub partial_tries: u32,
     /// Stop negotiating early once the number of connections in conflict
     /// has not improved for this many iterations (0: run every iteration).
     pub stall_iterations: u32,
@@ -233,6 +240,8 @@ impl Default for NegotiationTuning {
             generation: Generation(1),
             raster_cache_mb: 4_096,
             fill_passes: 2,
+            shift_iterations: 6,
+            partial_tries: 3,
             present_factor_max: 1_000_000,
             stub_reach: 500_000,
             stall_iterations: 0,
@@ -1165,6 +1174,14 @@ fn run_chunk(
     done
 }
 
+/// One connection's cut: the tiling it was made in and its pieces' jobs,
+/// each with its tile's index in that tiling.
+#[derive(Debug, Clone)]
+struct Layout {
+    shifted: bool,
+    jobs: Vec<(usize, PieceJob)>,
+}
+
 /// Keep connections still in conflict greedily in commit order: one keeps
 /// its copper unless it clashes with one already kept; the rest fail with
 /// [`DetailFailure::Congestion`].
@@ -1317,6 +1334,12 @@ fn run_negotiation(
     let mut routed: Vec<Option<Vec<Arc<PieceCopper>>>> = vec![None; n];
     let mut failure: Vec<Option<DetailFailure>> = vec![None; n];
     let mut failed_in: Vec<[bool; 2]> = vec![[false; 2]; n];
+    // Each connection's last cut: the tiling (shifted or not) and its
+    // pieces, so a connection in conflict on some pieces reroutes only
+    // those, between the same pins.
+    let mut layouts: Vec<Option<Layout>> = vec![None; n];
+    let mut bad: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
+    let mut partial_tries: Vec<u32> = vec![0; n];
     let mut history = HistoryMap::default();
     let mut queue: Vec<u32> = (0..n as u32).collect();
     let mut present_factor = tuning.initial_present_factor;
@@ -1362,7 +1385,8 @@ fn run_negotiation(
         }
         let it_start = Instant::now();
         iterations = it + 1;
-        let shift = tuning.shift_odd_iterations && it % 2 == 1;
+        let shift =
+            tuning.shift_odd_iterations && it % 2 == 1 && (fill || it < tuning.shift_iterations);
         let Some(tiling) = Tiling::build(board, shift, &ctx.tuning, ctx.margin) else {
             // No tiles: nothing queued can be (re)routed, and copper still
             // in conflict must not be kept.
@@ -1393,14 +1417,68 @@ fn run_negotiation(
             }
             failure[t as usize] = None;
         }
-        // 2. Cut into pieces, pinning crossings away from routed copper.
+        // 2. Cut into pieces, pinning crossings away from routed copper. A
+        // connection whose conflicts touch only some of its pieces, cut in
+        // this same tiling, keeps the others and their pins and reroutes
+        // just those pieces (at most `partial_tries` times in a row).
         let t_split = Instant::now();
-        let kept: Vec<Arc<PieceCopper>> = routed.iter().flatten().flatten().cloned().collect();
-        let kept_index = RoutedIndex::build(kept, board.layer_count(), reach);
         let mut registry = PinRegistry::default();
         let mut by_tile: Vec<Vec<PieceJob>> = vec![Vec::new(); tiling.tiles.len()];
         let mut fresh: Vec<Vec<Option<Arc<PieceCopper>>>> = vec![Vec::new(); n];
+        let mut partial_goods: Vec<Arc<PieceCopper>> = Vec::new();
+        let mut old_layouts: BTreeMap<u32, Option<Layout>> = BTreeMap::new();
+        let mut whole: Vec<u32> = Vec::new();
         for &t in &queue {
+            let ti = t as usize;
+            let plan = match (&layouts[ti], bad.get(&t), previous.get(&t)) {
+                (Some(l), Some(b), Some(old))
+                    if !fill
+                        && l.shifted == shift
+                        && b.len() < l.jobs.len()
+                        && old.len() == l.jobs.len()
+                        && partial_tries[ti] < tuning.partial_tries =>
+                {
+                    Some((l.clone(), b.clone(), old.clone()))
+                }
+                _ => None,
+            };
+            let Some((layout, pieces_bad, old)) = plan else {
+                whole.push(t);
+                continue;
+            };
+            partial_tries[ti] += 1;
+            telemetry.count("partial_reroutes", 1);
+            let net = tasks[ti].conn.net;
+            fresh[ti] = old
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (!pieces_bad.contains(&(i as u8))).then(|| p.clone()))
+                .collect();
+            partial_goods.extend(fresh[ti].iter().flatten().cloned());
+            for (tile, job) in &layout.jobs {
+                if let pieces::Terminal::Pin(p) = job.to {
+                    let slot = ctx.slot_of(p.layer).expect("pins use routable layers");
+                    registry.add(net, p.layer, p.at, ctx.width(net, slot));
+                }
+                if pieces_bad.contains(&job.piece) {
+                    report.pieces += 1;
+                    by_tile[*tile].push(PieceJob {
+                        retries: 0,
+                        ..job.clone()
+                    });
+                }
+            }
+        }
+        let kept: Vec<Arc<PieceCopper>> = routed
+            .iter()
+            .flatten()
+            .flatten()
+            .chain(partial_goods.iter())
+            .cloned()
+            .collect();
+        let kept_index = RoutedIndex::build(kept, board.layer_count(), reach);
+        for &t in &whole {
+            partial_tries[t as usize] = 0;
             match pieces::split(
                 &ctx,
                 &tiling,
@@ -1413,6 +1491,13 @@ fn run_negotiation(
                 Ok(list) => {
                     fresh[t as usize] = vec![None; list.len()];
                     report.pieces += list.len() as u32;
+                    old_layouts.insert(
+                        t,
+                        layouts[t as usize].replace(Layout {
+                            shifted: shift,
+                            jobs: list.clone(),
+                        }),
+                    );
                     for (tile, job) in list {
                         by_tile[tile].push(job);
                     }
@@ -1475,6 +1560,7 @@ fn run_negotiation(
                 .collect();
             let mut kept: Vec<Arc<PieceCopper>> =
                 routed.iter().flatten().flatten().cloned().collect();
+            kept.extend(partial_goods.iter().cloned());
             kept.extend(pin_marks.iter().cloned());
             let done = run_dag(
                 &ctx,
@@ -1549,6 +1635,10 @@ fn run_negotiation(
                 failure[t] = None;
                 is_new[t] = true;
                 telemetry.count("restored", 1);
+                // The copper is the old cut's: so is the layout.
+                if let Some(l) = old_layouts.remove(&(t as u32)) {
+                    layouts[t] = l;
+                }
             }
         }
 
@@ -1564,6 +1654,12 @@ fn run_negotiation(
         telemetry.count("us_conflicts", t_conf.elapsed().as_micros() as u64);
         report.conflict_pairs = pairs.len() as u32;
         against.clear();
+        bad.clear();
+        for &pair in &pairs {
+            let ((ta, pa), (tb, pb)) = index.pieces_of(pair);
+            bad.entry(ta).or_default().insert(pa);
+            bad.entry(tb).or_default().insert(pb);
+        }
         if fill {
             // New copper yields to copper already kept, then greedily in
             // commit order among itself.

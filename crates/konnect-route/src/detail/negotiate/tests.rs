@@ -1415,3 +1415,54 @@ fn a_squeezed_pad_necks_down_only_when_allowed() {
         .count();
     assert_eq!(islands, 1);
 }
+
+/// [`crossing_bundle`] stretched over several tiles, so every connection is
+/// cut into pieces at tile crossings.
+fn wide_crossing_bundle(n: usize, width: f64) -> RouteBoard {
+    let h = 2.0 * n as f64 + 2.0;
+    let mut b = BoardBuilder::new(width, h, &["F.Cu", "B.Cu"]);
+    let l = b.footprint("J1", (2.0, h / 2.0));
+    let r = b.footprint("J2", (width - 2.0, h / 2.0));
+    for i in 0..n {
+        let net = format!("X{i:02}");
+        let yl = 2.0 + 2.0 * i as f64;
+        let yr = 2.0 + 2.0 * (n - 1 - i) as f64;
+        b.smd_pad(l, &(i + 1).to_string(), &net, (2.0, yl), (0.8, 0.5), "F.Cu");
+        let at = (width - 2.0, yr);
+        b.smd_pad(r, &(i + 1).to_string(), &net, at, (0.8, 0.5), "F.Cu");
+    }
+    b.build()
+}
+
+#[test]
+fn connections_in_conflict_on_some_pieces_reroute_only_those() {
+    let board = wide_crossing_bundle(6, 50.0);
+    let tuning = NegotiationTuning {
+        initial_present_factor: 0,
+        shift_iterations: 0,
+        ..NegotiationTuning::default()
+    };
+    let settings = |threads| NegotiationSettings {
+        threads,
+        max_iterations: 20,
+        ..NegotiationSettings::default()
+    };
+    let (result, telemetry) = route_with(&board, settings(4), tuning);
+    assert!(result.reports[0].conflict_pairs > 0, "{:?}", result.reports);
+    assert!(
+        telemetry
+            .counters
+            .get("partial_reroutes")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "{:?}",
+        telemetry.counters
+    );
+    assert!(result.reports.iter().all(|r| !r.shifted || r.fill));
+    assert!(result.failed.is_empty(), "{:?}", result.failure_details);
+    assert_clean_and_connected(&board, &result);
+    // The same on one thread.
+    let (one, _) = route_with(&board, settings(1), tuning);
+    assert_eq!(one, result);
+}
