@@ -7,9 +7,11 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -26,6 +28,8 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the REST API may take to listen once the MCP endpoint answers.
+const API_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How much of the router's stderr is kept in memory for error messages;
 /// the whole stream goes to the stderr log.
 const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -39,9 +43,10 @@ const MAX_HEAP_MB: u32 = 256 * 1024;
 /// run at once.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LaunchOptions {
-    /// Port of Freerouting's REST API on 127.0.0.1. 0 lets the system pick
-    /// a free one; Freerouting then points its MCP tools at the port it
-    /// bound (2.3 and 2.5 both read it back with `getLocalPort`).
+    /// Port of Freerouting's REST API on 127.0.0.1. 0 has Konnect choose a
+    /// free one (see [`ApiPort`]). Freerouting is never given port 0: 2.3
+    /// starts the API on a background thread and reads its port back before
+    /// it is bound, which would point its MCP tools at port 0.
     pub api_port: u16,
     /// Freerouting's `--user_data_path`: its settings file and its own log.
     /// None uses a temporary directory removed when the process ends.
@@ -56,10 +61,10 @@ pub(crate) struct LaunchOptions {
 }
 
 /// The server's MCP endpoint always takes a system-chosen port: the stdio
-/// bridge inside Freerouting reads back the port it bound.
-fn server_arguments(launch: &LaunchOptions, user_data_path: &Path) -> Vec<String> {
-    let api_port = launch.api_port;
-    let mut arguments = vec![
+/// bridge inside Freerouting waits for the port it bound, in 2.3 and 2.5.
+/// The REST API gets a real port, and the MCP tools are pointed at it.
+fn server_arguments(api_port: u16, user_data_path: &Path) -> Vec<String> {
+    vec![
         "--api_server.enabled=true".to_string(),
         "--api_server.authentication.enabled=false".to_string(),
         format!("--api_server-endpoints=http://127.0.0.1:{api_port}"),
@@ -69,13 +74,56 @@ fn server_arguments(launch: &LaunchOptions, user_data_path: &Path) -> Vec<String
         "--mcp_server.stdio=true".to_string(),
         "--gui.enabled=false".to_string(),
         format!("--user_data_path={}", user_data_path.display()),
-    ];
-    if api_port != 0 {
-        arguments.push(format!(
-            "--mcp_server.target_api_base_url=http://127.0.0.1:{api_port}"
-        ));
+        format!("--mcp_server.target_api_base_url=http://127.0.0.1:{api_port}"),
+    ]
+}
+
+/// REST API ports Konnect chose for live processes. The system keeps a port
+/// free only while it is bound, so without this two runs started together
+/// could be handed the same one.
+static CHOSEN_API_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// One process's REST API port: the caller's, or one Konnect chose and
+/// holds in [`CHOSEN_API_PORTS`] until the client is dropped.
+#[derive(Debug)]
+struct ApiPort {
+    port: u16,
+    chosen: bool,
+}
+
+impl ApiPort {
+    fn for_launch(launch: &LaunchOptions) -> Result<Self> {
+        if launch.api_port != 0 {
+            return Ok(Self {
+                port: launch.api_port,
+                chosen: false,
+            });
+        }
+        for _ in 0..16 {
+            let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .and_then(|listener| listener.local_addr())
+                .context("find a free loopback port for the Freerouting API")?
+                .port();
+            let mut chosen = CHOSEN_API_PORTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if chosen.insert(port) {
+                return Ok(Self { port, chosen: true });
+            }
+        }
+        bail!("found no free loopback port for the Freerouting API")
     }
-    arguments
+}
+
+impl Drop for ApiPort {
+    fn drop(&mut self) {
+        if self.chosen {
+            CHOSEN_API_PORTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.port);
+        }
+    }
 }
 
 /// The JVM options before `-jar`: only the allowlisted heap limit.
@@ -268,7 +316,8 @@ pub(crate) async fn route_local_monitored(
         .clone();
     if stderr_log.exists() {
         bail!(
-            "Freerouting diagnostics output already exists: {}",
+            "Freerouting diagnostics output already exists: {} (left by an earlier run; \
+             remove it or choose another ses_output_path)",
             stderr_log.display()
         );
     }
@@ -822,15 +871,35 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
-    /// The temporary data directory of a process given none; removed with
-    /// the client, after the process has ended.
-    _user_data: Option<tempfile::TempDir>,
+    /// The temporary data directory of a process given none; removed by
+    /// [`Self::close`] once the process has ended, or on drop.
+    user_data: Option<tempfile::TempDir>,
+    _api_port: ApiPort,
 }
 
 impl LocalMcpClient {
+    /// Start the process and wait until both its MCP endpoint and its REST
+    /// API answer. Another program can take a port Konnect chose before
+    /// Freerouting binds it, so that start is retried once on a new port.
     async fn start(jar: &Path, launch: &LaunchOptions) -> Result<Self> {
-        let mut client = Self::spawn(jar, launch)?;
-        if let Err(error) = client.initialize().await {
+        let mut retried = false;
+        loop {
+            let api_port = ApiPort::for_launch(launch)?;
+            let (port, chosen) = (api_port.port, api_port.chosen);
+            let mut client = Self::spawn(jar, launch, api_port, retried)?;
+            let error = match client.initialize().await {
+                Ok(()) if client.api_listening(port).await => return Ok(client),
+                Ok(()) if chosen && !retried => {
+                    client.close().await;
+                    retried = true;
+                    continue;
+                }
+                Ok(()) => anyhow::anyhow!(
+                    "Freerouting's REST API did not listen on 127.0.0.1:{port} within {} seconds",
+                    API_READY_TIMEOUT.as_secs()
+                ),
+                Err(error) => error,
+            };
             let diagnostics = client.close().await;
             return if diagnostics.is_empty() {
                 Err(error)
@@ -838,10 +907,39 @@ impl LocalMcpClient {
                 Err(error).context(format!("Freerouting stderr: {diagnostics}"))
             };
         }
-        Ok(client)
     }
 
-    fn spawn(jar: &Path, launch: &LaunchOptions) -> Result<Self> {
+    /// Whether the REST API accepts connections within [`API_READY_TIMEOUT`];
+    /// false as soon as the process has ended.
+    async fn api_listening(&mut self, port: u16) -> bool {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let deadline = Instant::now() + API_READY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if let Ok(Ok(_)) = timeout(remaining, tokio::net::TcpStream::connect(address)).await {
+                return true;
+            }
+            let running = self
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+            if !running {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// `append_log` continues the stderr log of an earlier attempt.
+    fn spawn(
+        jar: &Path,
+        launch: &LaunchOptions,
+        api_port: ApiPort,
+        append_log: bool,
+    ) -> Result<Self> {
         let (user_data_path, user_data) = match &launch.user_data_path {
             Some(path) => {
                 std::fs::create_dir_all(path).with_context(|| {
@@ -861,7 +959,8 @@ impl LocalMcpClient {
             Some(path) => Some(tokio::fs::File::from_std(
                 std::fs::OpenOptions::new()
                     .write(true)
-                    .create_new(true)
+                    .append(append_log)
+                    .create_new(!append_log)
                     .open(path)
                     .with_context(|| format!("create Freerouting stderr log {}", path.display()))?,
             )),
@@ -872,7 +971,7 @@ impl LocalMcpClient {
             .args(jvm_arguments(launch))
             .arg("-jar")
             .arg(jar)
-            .args(server_arguments(launch, &user_data_path))
+            .args(server_arguments(api_port.port, &user_data_path))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -901,7 +1000,8 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
-            _user_data: user_data,
+            user_data,
+            _api_port: api_port,
         })
     }
 
@@ -1039,10 +1139,22 @@ impl LocalMcpClient {
                 let _ = child.wait().await;
             }
         }
-        match self.stderr_task.take() {
+        let diagnostics = match self.stderr_task.take() {
             Some(task) => task.await.unwrap_or_default(),
             None => String::new(),
+        };
+        // Dropping a TempDir ignores errors; on Windows a file the JVM left
+        // open would keep the directory without anyone noticing.
+        if let Some(directory) = self.user_data.take() {
+            let path = directory.path().to_path_buf();
+            if let Err(error) = directory.close() {
+                tracing::warn!(
+                    "could not remove Freerouting data directory {}: {error}",
+                    path.display()
+                );
+            }
         }
+        diagnostics
     }
 }
 
@@ -1380,16 +1492,40 @@ mod tests {
     #[test]
     fn unauthenticated_servers_are_forced_to_loopback() {
         let data = Path::new("job/freerouting-data");
-        let arguments = server_arguments(&LaunchOptions::default(), data);
+        let arguments = server_arguments(41_003, data);
         let has = |wanted: &str| arguments.iter().any(|argument| argument == wanted);
         assert!(has("--api_server.authentication.enabled=false"));
-        assert!(has("--api_server-endpoints=http://127.0.0.1:0"));
+        assert!(has("--api_server-endpoints=http://127.0.0.1:41003"));
         assert!(has("--mcp_server.authentication.enabled=false"));
         assert!(has("--mcp_server-endpoints=http://127.0.0.1:0"));
+        assert!(has(
+            "--mcp_server.target_api_base_url=http://127.0.0.1:41003"
+        ));
         assert!(has(&format!("--user_data_path={}", data.display())));
         assert!(!arguments
             .iter()
-            .any(|argument| argument.contains("0.0.0.0") || argument.contains("target_api")));
+            .any(|argument| argument.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn a_chosen_api_port_is_real_unique_and_released() {
+        let first = ApiPort::for_launch(&LaunchOptions::default()).unwrap();
+        let second = ApiPort::for_launch(&LaunchOptions::default()).unwrap();
+        assert!(first.chosen && second.chosen);
+        assert_ne!(first.port, 0, "Freerouting 2.3 cannot be given port 0");
+        assert_ne!(first.port, second.port);
+        let port = first.port;
+        assert!(CHOSEN_API_PORTS.lock().unwrap().contains(&port));
+        drop(first);
+        assert!(!CHOSEN_API_PORTS.lock().unwrap().contains(&port));
+
+        let fixed = LaunchOptions {
+            api_port: 41_004,
+            ..Default::default()
+        };
+        let fixed = ApiPort::for_launch(&fixed).unwrap();
+        assert_eq!((fixed.port, fixed.chosen), (41_004, false));
+        assert!(!CHOSEN_API_PORTS.lock().unwrap().contains(&41_004));
     }
 
     #[test]
@@ -1399,7 +1535,7 @@ mod tests {
             max_heap_mb: Some(6144),
             ..Default::default()
         };
-        let arguments = server_arguments(&launch, Path::new("data"));
+        let arguments = server_arguments(launch.api_port, Path::new("data"));
         assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:41001".to_string()));
         assert!(arguments
             .contains(&"--mcp_server.target_api_base_url=http://127.0.0.1:41001".to_string()));

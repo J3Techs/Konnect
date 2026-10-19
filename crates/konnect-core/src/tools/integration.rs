@@ -2365,20 +2365,28 @@ async fn handle_check_freerouting(
     }
 }
 
-const API_PORT_DESCRIPTION: &str = "Port of this run's Freerouting REST API on 127.0.0.1. 0 (the default) lets the system pick a free port, so concurrent runs never clash; the MCP endpoint always takes a system-chosen port.";
+const API_PORT_DESCRIPTION: &str = "Port of this run's Freerouting REST API on 127.0.0.1. 0 (the default) has Konnect choose a free port, so concurrent runs never clash; Freerouting's MCP tools are always pointed at the chosen port, and its MCP endpoint always takes a system-chosen port.";
 const MAX_HEAP_DESCRIPTION: &str = "Java heap limit for this run's Freerouting process, in MiB (passed as -Xmx). Omit for Java's default.";
 
 /// `api_port` and `max_heap_mb`, range-checked; the heap bounds are
-/// checked again with the other settings.
+/// checked again with the other settings. A value that is present but not
+/// a non-negative integer is refused, not read as absent.
 fn freerouting_launch_args(args: &serde_json::Value) -> anyhow::Result<(u16, Option<u32>)> {
-    let api_port = match args["api_port"].as_u64() {
-        Some(port) => {
-            u16::try_from(port).map_err(|_| anyhow::anyhow!("api_port must be 0..=65535"))?
+    let integer = |name: &str| -> anyhow::Result<Option<u64>> {
+        match &args[name] {
+            serde_json::Value::Null => Ok(None),
+            value => value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("{name} must be a non-negative integer")),
         }
-        None => 0,
     };
-    let max_heap_mb = args["max_heap_mb"]
-        .as_u64()
+    let api_port = integer("api_port")?
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("api_port must be 0..=65535"))?
+        .unwrap_or(0);
+    let max_heap_mb = integer("max_heap_mb")?
         .map(u32::try_from)
         .transpose()
         .map_err(|_| anyhow::anyhow!("max_heap_mb is too large"))?;
@@ -2576,6 +2584,25 @@ mod freerouting_tests {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn launch_arguments_refuse_values_that_are_not_integers() {
+        let parse = |args: serde_json::Value| freerouting_launch_args(&args);
+        assert_eq!(parse(serde_json::json!({})).unwrap(), (0, None));
+        assert_eq!(
+            parse(serde_json::json!({ "api_port": 41001, "max_heap_mb": 6144 })).unwrap(),
+            (41_001, Some(6144))
+        );
+        for args in [
+            serde_json::json!({ "api_port": -1 }),
+            serde_json::json!({ "api_port": 70000 }),
+            serde_json::json!({ "api_port": "41001" }),
+            serde_json::json!({ "max_heap_mb": 4096.5 }),
+            serde_json::json!({ "max_heap_mb": -1 }),
+        ] {
+            assert!(parse(args.clone()).is_err(), "{args}");
         }
     }
 

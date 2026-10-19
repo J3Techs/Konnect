@@ -155,7 +155,8 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
 }
 
-/// Append one JSON line to `progress.jsonl`.
+/// Append one JSON line to `progress.jsonl`. The file is not capped: at the
+/// default poll interval a day-long job writes on the order of 10 MB.
 fn append_progress(dir: &Path, line: &Value) -> Result<()> {
     use std::io::Write;
     let path = dir.join(PROGRESS_FILE);
