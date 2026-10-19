@@ -188,6 +188,9 @@ pub struct NegotiationTuning {
     /// Memory for hard raster state reused across iterations, MiB (0 turns
     /// the cache off; never changes the result).
     pub raster_cache_mb: u32,
+    /// Core size `(width, height)` of the regular grid tiles; snapped to the
+    /// base lattice and never below two halos plus 0.5 mm per side.
+    pub grid_core: (Coord, Coord),
 }
 
 impl Default for NegotiationTuning {
@@ -215,6 +218,7 @@ impl Default for NegotiationTuning {
             lockstep_rounds: false,
             generation: Generation(1),
             raster_cache_mb: 4_096,
+            grid_core: crate::api::TILE_CORE_NM,
         }
     }
 }
@@ -925,12 +929,16 @@ fn run_dag(
     let mut finish = vec![0u64; n];
     let mut via: Vec<Option<usize>> = vec![None; n];
     let mut busy_of = vec![0u64; n];
+    let mut build_of = vec![0u64; n];
+    let mut searches_of = vec![0u64; n];
     let mut work = vec![0u64; n];
     for (k, r) in s.results.into_iter().enumerate() {
         let (d, t, busy) = r.expect("every tile ran");
         telemetry.merge(&t);
         busy_total += busy;
         busy_of[k] = busy;
+        build_of[k] = t.raster_rebuild_us;
+        searches_of[k] = t.counters.get("searches").copied().unwrap_or(0);
         let e = t.counters.get("expansions").copied().unwrap_or(0);
         work[k] = e + preds[k].iter().map(|&j| work[j]).max().unwrap_or(0);
         let best = preds[k]
@@ -950,8 +958,34 @@ fn run_dag(
     );
     if let Some(end) = (0..n).max_by_key(|&k| (finish[k], std::cmp::Reverse(k))) {
         telemetry.count("us_dag_critical", finish[end]);
+        let trace = std::env::var_os("KONNECT_DAG_TRACE").is_some();
+        if trace {
+            eprintln!(
+                "dag it {iteration}: wall {:.1} s, busy {:.1} s, critical {:.1} s, tiles {n}",
+                wall as f64 / 1e6,
+                busy_total as f64 / 1e6,
+                finish[end] as f64 / 1e6
+            );
+        }
         let mut at = Some(end);
         while let Some(k) = at {
+            if trace {
+                let t = &tiling.tiles[order[k]].tile;
+                eprintln!(
+                    "  tile {:4} phase {} colour {} core ({:.1},{:.1})-({:.1},{:.1}) busy {:.2} s build {:.2} s searches {} exp {}",
+                    t.id.0,
+                    t.phase,
+                    t.colour,
+                    t.core.min.x as f64 / 1e6,
+                    t.core.min.y as f64 / 1e6,
+                    t.core.max.x as f64 / 1e6,
+                    t.core.max.y as f64 / 1e6,
+                    busy_of[k] as f64 / 1e6,
+                    build_of[k] as f64 / 1e6,
+                    searches_of[k],
+                    work[k] - preds[k].iter().map(|&j| work[j]).max().unwrap_or(0)
+                );
+            }
             let phase = if tiling.tiles[order[k]].tile.phase == 0 {
                 "bga"
             } else {

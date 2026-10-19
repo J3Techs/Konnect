@@ -1,4 +1,5 @@
-//! The tile schedule: a regular grid of [`TILE_CORE_NM`] cores with
+//! The tile schedule: a regular grid of cores
+//! ([`NegotiationTuning::grid_core`], by default [`crate::api::TILE_CORE_NM`]) with
 //! [`TILE_HALO_NM`] halos, 4-coloured so same-colour tiles never share a
 //! halo, shifted by half a tile on odd iterations; and fine-pitch BGA fields
 //! carved out as sub-tiles on the fine lattice, scheduled first.
@@ -10,7 +11,7 @@
 //! both pieces reach exactly.
 
 use super::{NegotiationTuning, Tile};
-use crate::api::{FootprintId, TileId, LATTICE_PITCH_NM, TILE_CORE_NM, TILE_HALO_NM};
+use crate::api::{FootprintId, TileId, LATTICE_PITCH_NM, TILE_HALO_NM};
 use crate::board::RouteBoard;
 use crate::compute::Window;
 use konnect_geom::{BBox, Coord, Point};
@@ -45,6 +46,9 @@ pub(crate) struct Tiling {
     pub fields: Vec<BgaField>,
     bga_tiles: usize,
     origin: Point,
+    /// Grid core width and height.
+    tw: Coord,
+    th: Coord,
     nx: u32,
     ny: u32,
 }
@@ -67,6 +71,14 @@ pub(crate) fn board_bbox(board: &RouteBoard) -> Option<BBox> {
             .filter_map(|p| p.bbox())
             .reduce(BBox::union)
     })
+}
+
+/// The grid core size: the tuning's, snapped to the base lattice and kept
+/// above two halos plus 0.5 mm so same-colour windows stay disjoint.
+fn grid_core(tuning: &NegotiationTuning) -> (Coord, Coord) {
+    let min = 2 * TILE_HALO_NM + 500_000;
+    let side = |v: Coord| snap_up(v.max(min), LATTICE_PITCH_NM);
+    (side(tuning.grid_core.0), side(tuning.grid_core.1))
 }
 
 /// Half-open containment, so a point on a shared boundary has one owner.
@@ -231,13 +243,17 @@ impl Tiling {
 
         // The regular grid, aligned to the base lattice, shifted by half a
         // tile on odd iterations.
-        let (tw, th) = TILE_CORE_NM;
+        let (tw, th) = grid_core(tuning);
         let mut origin = Point::new(
             snap_down(bb.min.x, LATTICE_PITCH_NM),
             snap_down(bb.min.y, LATTICE_PITCH_NM),
         );
         if shift {
-            origin = Point::new(origin.x - tw / 2, origin.y - th / 2);
+            // Half a tile, kept on the base lattice.
+            origin = Point::new(
+                origin.x - snap_down(tw / 2, LATTICE_PITCH_NM),
+                origin.y - snap_down(th / 2, LATTICE_PITCH_NM),
+            );
         }
         let nx = ((i64::from(bb.max.x) - i64::from(origin.x)) / i64::from(tw) + 1) as u32;
         let ny = ((i64::from(bb.max.y) - i64::from(origin.y)) / i64::from(th) + 1) as u32;
@@ -255,6 +271,8 @@ impl Tiling {
             fields,
             bga_tiles,
             origin,
+            tw,
+            th,
             nx,
             ny,
         })
@@ -269,7 +287,7 @@ impl Tiling {
         {
             return i;
         }
-        let (tw, th) = TILE_CORE_NM;
+        let (tw, th) = (self.tw, self.th);
         let ix = ((i64::from(p.x) - i64::from(self.origin.x)).div_euclid(i64::from(tw)))
             .clamp(0, i64::from(self.nx) - 1);
         let iy = ((i64::from(p.y) - i64::from(self.origin.y)).div_euclid(i64::from(th)))

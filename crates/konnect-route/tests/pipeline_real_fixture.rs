@@ -24,6 +24,7 @@
 //! - `KONNECT_PIPELINE_MIN_RUN=1`: ask the kernel for minimum runs;
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
+//! - `KONNECT_PIPELINE_GRID_CORE_MM=w,h`: negotiation's grid tile core size;
 //! - `KONNECT_PIPELINE_OUT=dir`: write `summary.json` and `plan.json` there
 //!   (keep it in an ignored build location).
 
@@ -112,6 +113,17 @@ fn pipeline_real_board_fixture() {
         u64::from(settings.search.astar_factor),
     ) as u32;
     settings.search_min_run = env_on("KONNECT_PIPELINE_MIN_RUN");
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_GRID_CORE_MM") {
+        let mm: Vec<f64> = v
+            .split(',')
+            .map(|x| x.trim().parse().expect("mm"))
+            .collect();
+        assert_eq!(mm.len(), 2, "width,height");
+        settings.tuning.grid_core = (
+            konnect_geom::mm_to_nm(mm[0]).expect("width"),
+            konnect_geom::mm_to_nm(mm[1]).expect("height"),
+        );
+    }
     if env_on("KONNECT_PIPELINE_NO_FANOUT") {
         settings.fanout = None;
     }
