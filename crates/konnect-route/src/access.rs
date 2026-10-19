@@ -640,6 +640,7 @@ fn escape_ends(
                 .any(|v| v.layers.contains(layer) && touches(&dot, &v.shape()))
     };
     let mut ends: Vec<(LayerId, Point, Coord)> = Vec::new();
+    let mut joints: Vec<(LayerId, Point, Coord)> = Vec::new();
     for item in &island.items {
         match *item {
             ItemRef::Via(v) => {
@@ -654,42 +655,57 @@ fn escape_ends(
                     continue;
                 }
                 for e in [tr.seg.a, tr.seg.b] {
-                    if !in_pad(e, tr.layer) && !joint(tr.layer, e) {
-                        ends.push((tr.layer, e, radius_of(tr.seg.width)));
+                    if in_pad(e, tr.layer) {
+                        continue;
                     }
+                    let list = if joint(tr.layer, e) {
+                        &mut joints
+                    } else {
+                        &mut ends
+                    };
+                    list.push((tr.layer, e, radius_of(tr.seg.width)));
                 }
             }
             _ => {}
         }
     }
-    ends.sort_by_key(|&(l, p, _)| (l, p));
-    ends.dedup_by_key(|&mut (l, p, _)| (l, p));
-    let mut out = Vec::new();
-    for (layer, pt, r) in ends {
-        let mut open = 0u8;
-        for (h, &(ux, uy)) in HEADINGS.iter().enumerate() {
-            *checks += 1;
-            let len = f64::from(r + reach);
-            let end = Point::new(
-                (f64::from(pt.x) + ux * len).round() as Coord,
-                (f64::from(pt.y) + uy * len).round() as Coord,
-            );
-            let seg = Segment::new(pt, end, width);
-            let key = space.subject_for(ItemKind::Track, Some(net), &Shape::Segment(seg));
-            if space
-                .track_conflict(cache, ctx.rules, layer, seg, Some(net), &key)
-                .is_none()
-            {
-                open |= 1 << h;
+    let mut open_points = |mut list: Vec<(LayerId, Point, Coord)>| {
+        list.sort_by_key(|&(l, p, _)| (l, p));
+        list.dedup_by_key(|&mut (l, p, _)| (l, p));
+        let mut out = Vec::new();
+        for (layer, pt, r) in list {
+            let mut open = 0u8;
+            for (h, &(ux, uy)) in HEADINGS.iter().enumerate() {
+                *checks += 1;
+                let len = f64::from(r + reach);
+                let end = Point::new(
+                    (f64::from(pt.x) + ux * len).round() as Coord,
+                    (f64::from(pt.y) + uy * len).round() as Coord,
+                );
+                let seg = Segment::new(pt, end, width);
+                let key = space.subject_for(ItemKind::Track, Some(net), &Shape::Segment(seg));
+                if space
+                    .track_conflict(cache, ctx.rules, layer, seg, Some(net), &key)
+                    .is_none()
+                {
+                    open |= 1 << h;
+                }
+            }
+            if open != 0 {
+                out.push(AccessPoint {
+                    point: pt,
+                    layer,
+                    headings: open,
+                });
             }
         }
-        if open != 0 {
-            out.push(AccessPoint {
-                point: pt,
-                layer,
-                headings: open,
-            });
-        }
+        out
+    };
+    // Joints between escape segments are attach points only when no free
+    // end of the escape is open (a neck that runs from pad to pad).
+    let mut out = open_points(ends);
+    if out.is_empty() {
+        out = open_points(joints);
     }
     rank(&mut out, pad.center);
     out
@@ -891,6 +907,22 @@ mod tests {
         let pts: Vec<Point> = out[0].points.iter().map(|a| a.point).collect();
         assert_eq!(pts[0], far, "{pts:?}");
         assert!(!pts.contains(&joint), "{pts:?}");
+    }
+
+    #[test]
+    fn a_neck_from_pad_to_pad_offers_its_joint() {
+        // No free end: both ends of the neck lie in pads. The joint is
+        // then the escape's attach point.
+        let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+        let f = b.footprint("R1", (4.0, 5.0));
+        b.smd_pad(f, "1", "A", (3.0, 5.0), (0.6, 0.6), "F.Cu");
+        b.smd_pad(f, "2", "A", (5.0, 5.0), (0.6, 0.6), "F.Cu");
+        b.track("A", "F.Cu", (3.0, 5.0), (4.0, 6.0), 0.15, true)
+            .track("A", "F.Cu", (4.0, 6.0), (5.0, 5.0), 0.15, true);
+        let board = b.build();
+        let rules = UniformRules::default();
+        let out = compute_pin_access(&board, &rules, &[PadId(0)], ProfileId(0));
+        assert_eq!(out[0].points[0].point, Point::new(4_000_000, 6_000_000));
     }
 
     #[test]
