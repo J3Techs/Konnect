@@ -1522,6 +1522,26 @@ fn a_squeezed_pad_necks_down_only_when_allowed() {
     assert_eq!(islands, 1);
 }
 
+#[test]
+fn a_track_end_terminal_keeps_the_joint_within_the_angle_rule() {
+    use super::run::track_end_mask;
+    // A track running towards board +x ends at the origin's east end.
+    let (from, end) = (Point::new(0, 0), Point::new(1_000_000, 0));
+    // No rule: every heading.
+    assert_eq!(track_end_mask(from, end, None, true), 0xff);
+    // 135 degrees: carry on within 45 degrees (headings 7, 0, 1).
+    assert_eq!(track_end_mask(from, end, Some(135.0), true), 0b1000_0011);
+    // 89 degrees: right angles too (headings 6, 7, 0, 1, 2).
+    assert_eq!(track_end_mask(from, end, Some(89.0), true), 0b1100_0111);
+    // A target is arrived at in the reverse headings.
+    assert_eq!(track_end_mask(from, end, Some(135.0), false), 0b0011_1000);
+    // A track running towards board +y (Y-down) carries on in Y-up heading 6.
+    let down = Point::new(0, 1_000_000);
+    assert_eq!(track_end_mask(from, down, Some(135.0), true), 0b1110_0000);
+    // A dot allows everything.
+    assert_eq!(track_end_mask(from, from, Some(135.0), true), 0xff);
+}
+
 /// The squeezed pad's only exit is towards board +y (Y-down), which is
 /// heading 6 in the raster's Y-up encoding. The search must leave the stub
 /// within 45 degrees of it, never fold back towards the pad.

@@ -97,6 +97,39 @@ struct SavedSites {
     values: Vec<u8>,
 }
 
+/// The headings (raster encoding) a route may take at the end `end` of a
+/// fixed track that runs from `from`, so that the joint keeps at least
+/// `min_angle_deg` (a `track_angle` rule's minimum): the turn away from the
+/// track carrying on past `end` is at most `180 - min_angle_deg`. A source
+/// leaves in those headings; a target is arrived at in the reverse ones.
+/// No rule, or a dot (`from == end`), allows every heading.
+pub(crate) fn track_end_mask(
+    from: Point,
+    end: Point,
+    min_angle_deg: Option<f64>,
+    source: bool,
+) -> u8 {
+    let (vx, vy) = (f64::from(end.x - from.x), f64::from(end.y - from.y));
+    let len = vx.hypot(vy);
+    let Some(min) = min_angle_deg.filter(|m| *m > 0.0) else {
+        return 0xff;
+    };
+    if len == 0.0 {
+        return 0xff;
+    }
+    let max_turn = (180.0 - min).clamp(0.0, 180.0).to_radians();
+    let mut mask = 0u8;
+    for h in 0..8u8 {
+        let (dc, dr) = crate::detail::search::heading_delta(h);
+        let (dc, dr) = (f64::from(dc), f64::from(dr));
+        let cos = (dc * vx + dr * vy) / (len * dc.hypot(dr));
+        if cos.clamp(-1.0, 1.0).acos() <= max_turn + 1e-9 {
+            mask |= 1 << if source { h } else { (h + 4) % 8 };
+        }
+    }
+    mask
+}
+
 pub(crate) fn half_diag(pitch: i32) -> i32 {
     ((f64::from(pitch) * std::f64::consts::FRAC_1_SQRT_2).ceil()) as i32
 }
@@ -643,48 +676,64 @@ impl TileRun {
         let mut stub_slots: Vec<usize> = Vec::new();
         let stack = self.stacks[k].as_ref().expect("stack at home");
         let w = self.lattice;
-        let node = |c: u32, r: u32, slot: usize| JobNode {
+        let node = |c: u32, r: u32, slot: usize, heading_mask: u8| JobNode {
             col: c as u16,
             row: r as u16,
             layer: slot as u8,
-            heading_mask: 0xff,
+            heading_mask,
             reserved: 0,
         };
         let open = |slot: usize, c: u32, r: u32| stack.layers[slot].core.get(c, r) == 0;
         {
             {
-                let (shapes, layers, points): (Vec<&Shape>, _, Vec<Point>) = match item {
+                // Each point with the headings a route may use there: any at
+                // a pad or via; at a track end, only those that keep the
+                // joint with the fixed track within its `track_angle` rule
+                // (`track_end_mask`).
+                let (shapes, layers, points): (Vec<&Shape>, _, Vec<(Point, u8)>) = match item {
                     ItemRef::Pad(id) => {
                         let pad = &ctx.board.pads[id.index()];
-                        (pad.shapes.iter().collect(), pad.layers, vec![pad.center])
+                        (
+                            pad.shapes.iter().collect(),
+                            pad.layers,
+                            vec![(pad.center, 0xff)],
+                        )
                     }
                     ItemRef::Via(id) => {
                         let v = &ctx.board.vias[id.index()];
-                        (Vec::new(), v.layers, vec![v.center])
+                        (Vec::new(), v.layers, vec![(v.center, 0xff)])
                     }
                     ItemRef::Track(id) => {
                         let t = &ctx.board.tracks[id.index()];
+                        let (a, b) = (t.seg.a, t.seg.b);
+                        let min = ctx.rules.min_track_angle_deg(
+                            &RuleSubject::new(ItemKind::Track, Some(task.conn.net)),
+                            t.layer,
+                        );
                         (
                             Vec::new(),
                             crate::api::LayerMask::single(t.layer),
-                            vec![t.seg.a, t.seg.b],
+                            vec![
+                                (a, track_end_mask(b, a, min, source)),
+                                (b, track_end_mask(a, b, min, source)),
+                            ],
                         )
                     }
                     _ => return,
                 };
-                let centre = points[0];
+                let centre = points[0].0;
                 for (slot, &layer) in ctx.slots.iter().enumerate() {
                     if !layers.contains(layer) || !task.layers.contains(layer) {
                         continue;
                     }
-                    let mut cand: Vec<(i128, u32, u32)> = Vec::new();
+                    let mut cand: Vec<(i128, u32, u32, u8)> = Vec::new();
                     if shapes.is_empty() {
                         // A via or track end: the node nearest each point, if
                         // it is on the copper (within half a pitch it is).
-                        for p in &points {
-                            if let Some((c, r)) = w.nearest(*p) {
+                        for &(p, mask) in &points {
+                            if let Some((c, r)) = w.nearest(p) {
                                 if open(slot, c, r) {
-                                    cand.push(((w.node(c, r) - *p).length2(), r, c));
+                                    cand.push(((w.node(c, r) - p).length2(), r, c, mask));
                                 }
                             }
                         }
@@ -706,7 +755,7 @@ impl TileRun {
                                 if open(slot, c, r)
                                     && touches(shape, &Shape::Circle(Circle::new(q, 0)))
                                 {
-                                    cand.push(((q - centre).length2(), r, c));
+                                    cand.push(((q - centre).length2(), r, c, 0xff));
                                 }
                             }
                         }
@@ -716,8 +765,9 @@ impl TileRun {
                     if cand.is_empty() && !shapes.is_empty() {
                         stub_slots.push(slot);
                     }
-                    for &(_, r, c) in cand.iter().take(ctx.tuning.max_terminal_nodes as usize) {
-                        out.push(node(c, r, slot));
+                    for &(_, r, c, mask) in cand.iter().take(ctx.tuning.max_terminal_nodes as usize)
+                    {
+                        out.push(node(c, r, slot, mask));
                     }
                 }
             }
