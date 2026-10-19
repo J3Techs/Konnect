@@ -1225,10 +1225,10 @@ fn the_relaxed_field_proves_sealed_targets_unreachable() {
     let (o, stats) = run_ctx(&ctx, &pool, i);
     assert!(matches!(o, SearchOutcome::Unreachable { .. }), "{o:?}");
     assert_eq!(stats.field_runs, 1);
-    // The field ran dry inside the ring (and on it); the forward search
-    // never started.
+    // The field ran dry inside the ring (and on it, plus the target's
+    // pass-through state); the forward search never started.
     assert!(
-        stats.field_settled <= 2 * 21 * 21,
+        stats.field_settled <= 2 * 21 * 21 + 1,
         "{}",
         stats.field_settled
     );

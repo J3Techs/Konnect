@@ -566,38 +566,41 @@ pub fn search_batch_with(
     ctx: &BatchContext<'_>,
     params: &CostParams,
 ) -> BatchOutcome {
-    let results: Vec<(SearchOutcome, SearchStats)> = batch
-        .jobs
-        .par_iter()
-        .map(|&j| {
-            let mut stats = SearchStats::default();
-            let Some(job) = pool.jobs.get(j as usize) else {
-                let o = SearchOutcome::Unreachable {
-                    job: j,
-                    expansions: 0,
-                };
-                return (o, stats);
+    let one = |&j: &u32| {
+        let mut stats = SearchStats::default();
+        let Some(job) = pool.jobs.get(j as usize) else {
+            let o = SearchOutcome::Unreachable {
+                job: j,
+                expansions: 0,
             };
-            let w = job.window as usize;
-            let Some(stack) = ctx.stacks.get(w) else {
-                let o = SearchOutcome::Unreachable {
-                    job: j,
-                    expansions: 0,
-                };
-                return (o, stats);
+            return (o, stats);
+        };
+        let w = job.window as usize;
+        let Some(stack) = ctx.stacks.get(w) else {
+            let o = SearchOutcome::Unreachable {
+                job: j,
+                expansions: 0,
             };
-            let sc = SearchContext {
-                stack,
-                lattice: ctx.lattices.and_then(|l| l.get(w)),
-                config: ctx.config,
-                checker: ctx.checker,
-                lookahead: ctx.lookahead,
-                gcells: ctx.gcells,
-            };
-            let o = search_with(&sc, pool, job, j, params, &mut stats);
-            (o, stats)
-        })
-        .collect();
+            return (o, stats);
+        };
+        let sc = SearchContext {
+            stack,
+            lattice: ctx.lattices.and_then(|l| l.get(w)),
+            config: ctx.config,
+            checker: ctx.checker,
+            lookahead: ctx.lookahead,
+            gcells: ctx.gcells,
+        };
+        let o = search_with(&sc, pool, job, j, params, &mut stats);
+        (o, stats)
+    };
+    // A one-job batch runs on the calling thread: no hand-off to the pool,
+    // and the search reads rasters the caller just built from its caches.
+    let results: Vec<(SearchOutcome, SearchStats)> = if batch.jobs.len() == 1 {
+        batch.jobs.iter().map(one).collect()
+    } else {
+        batch.jobs.par_iter().map(one).collect()
+    };
     let (outcomes, stats) = results.into_iter().unzip();
     BatchOutcome { outcomes, stats }
 }

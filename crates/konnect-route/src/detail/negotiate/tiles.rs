@@ -316,3 +316,53 @@ impl Tiling {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synthetic::BoardBuilder;
+
+    #[test]
+    fn custom_grid_cores_stay_on_the_lattice_and_keep_colours_apart() {
+        let board = BoardBuilder::new(70.0, 40.0, &["F.Cu", "B.Cu"]).build();
+        // 11.25 mm halves to 5.625 mm, which is off the 50 um lattice.
+        let tuning = NegotiationTuning {
+            grid_core: (15_000_000, 11_250_000),
+            ..NegotiationTuning::default()
+        };
+        for shift in [false, true] {
+            let tiling = Tiling::build(&board, shift, &tuning, 0).expect("tiles");
+            let grid: Vec<&Tile> = tiling.tiles.iter().map(|t| &t.tile).collect();
+            assert!(!grid.is_empty());
+            for (i, a) in grid.iter().enumerate() {
+                assert_eq!(a.core.width(), 15_000_000);
+                assert_eq!(a.core.height(), 11_250_000);
+                for v in [a.core.min.x, a.core.min.y, a.core.max.x, a.core.max.y] {
+                    assert_eq!(v.rem_euclid(LATTICE_PITCH_NM), 0, "{a:?}");
+                }
+                for t in &grid[i + 1..] {
+                    if t.colour == a.colour {
+                        assert!(!t.window.intersects(&a.window), "{a:?} / {t:?}");
+                    }
+                }
+                // Every core point has exactly one owner.
+                let mid = Point::new(
+                    ((i64::from(a.core.min.x) + i64::from(a.core.max.x)) / 2) as Coord,
+                    ((i64::from(a.core.min.y) + i64::from(a.core.max.y)) / 2) as Coord,
+                );
+                assert_eq!(tiling.owner(mid), i);
+            }
+        }
+        // Cores below two halos plus 0.5 mm are raised to that.
+        let tiny = NegotiationTuning {
+            grid_core: (1_000_000, 1_000_000),
+            ..NegotiationTuning::default()
+        };
+        let tiling = Tiling::build(&board, false, &tiny, 0).expect("tiles");
+        let side = 2 * TILE_HALO_NM + 500_000;
+        assert!(tiling
+            .tiles
+            .iter()
+            .all(|t| t.tile.core.width() == i64::from(side)));
+    }
+}
