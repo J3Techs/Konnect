@@ -1,25 +1,44 @@
 //! S6 optimization (owned by WS-E).
 //!
 //! Gridless clean-up of routed copper, in the spirit of Freerouting's
-//! pull-tight and KiCad's "merge obtuse" (ideas only; no code from either):
+//! pull-tight and KiCad's "merge obtuse" and "smart pads" (ideas only; no
+//! code from either). Each pass runs, per net:
 //!
-//! 1. **Junction splitting.** A routed track ending on the middle of another
+//! 1. **Overlap merging.** Collinear tracks of one width that overlap along
+//!    a length become their union (the same copper).
+//! 2. **Junction splitting.** A routed track ending on the middle of another
 //!    of its net splits that track there, so every joint is a vertex.
-//! 2. **Collinear merging.** Two tracks meeting end to end in a straight line,
+//! 3. **Collinear merging.** Two tracks meeting end to end in a straight line,
 //!    same width, nothing else at the joint, become one.
-//! 3. **Redundant-via removal.** A routed via whose copper connects to its
+//! 4. **Redundant-via removal.** A routed via whose copper connects to its
 //!    net on one layer only, through track ends at its centre, goes.
-//! 4. **Pull-tight.** Along each chain of degree-2 joints, a run of segments
+//! 5. **Pull-tight.** Along each chain of degree-2 joints, a run of segments
 //!    is replaced by the shortest octilinear connection (a straight piece,
-//!    or one straight and one 45° piece) when that is shorter and legal.
-//! 5. **45° corner cuts.** A right-angle bend left after pull-tight is
+//!    or one straight and one 45° piece), or by one straight piece within
+//!    `max_skew_deg` of octilinear, when that is shorter and legal.
+//! 6. **45° corner cuts.** A right-angle bend left after pull-tight is
 //!    chamfered, as large as the neighbourhood allows.
+//! 7. **Jog smoothing.** A short step between two parallel runs (a jog the
+//!    lint refuses) becomes one slant whose bends stay under 20°.
+//! 8. **Junction squaring.** A branch meeting a run at a sharp angle moves
+//!    to the foot of its perpendicular: a right-angle T.
+//! 9. **Pad-entry trimming.** Two tracks meeting sharply inside a pad or via
+//!    of their net: one ends short, still inside it.
 //!
 //! Every candidate edit passes three gates before it is taken: the geometry
 //! guard ([`lint`]: it may not add a jog, hairpin, acute bend, T-junction,
 //! near joint or short segment near the edit), connectivity (every same-net
-//! item the old copper touched, the new copper touches), and the exact
-//! checker ([`exact::ExactChecker`]) against the board and every other net.
+//! item the old copper touched, the new copper still reaches, directly or
+//! through a pad or via both touch), and the exact checker
+//! ([`exact::ExactChecker`]) against the board and every other net.
+//!
+//! # Checking
+//!
+//! [`crate::check::check_routed`] (S7, WS-A) judges a whole copper set. The
+//! optimizer needs the same verdict for one candidate segment at a time,
+//! tens of thousands of times, so it uses [`exact::ExactChecker`]: the same
+//! exact kernel, rule table and [`crate::check::Violation`] vocabulary,
+//! with the board indexed once. S7 remains the gate after S6.
 //!
 //! # Parallelism and determinism
 //!

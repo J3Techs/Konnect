@@ -14,11 +14,11 @@
 //! ```
 
 use konnect_geom::ArcPolicy;
-use konnect_route::api::{Generation, Ownership, TrackId, ViaId};
+use konnect_route::api::Generation;
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
 use konnect_route::optimize::{geometry_defects, optimize_checked, OptimizeOptions};
-use konnect_route::plan::{RoutedCopper, RoutedTrack, RoutedVia};
+use konnect_route::plan::RoutedCopper;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable, RouteBoard, RoutePlan};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,72 +47,13 @@ fn routed_board(dir: &Path) -> Option<PathBuf> {
 
 /// Move the board's unlocked tracks and vias into routed copper.
 fn split(board: &mut RouteBoard) -> RoutedCopper {
-    let mut copper = RoutedCopper::default();
-    let tracks = std::mem::take(&mut board.tracks);
-    for t in tracks {
-        match (t.ownership, t.net) {
-            (Ownership::Fixed, Some(net)) if t.seg.a != t.seg.b => {
-                copper.tracks.push(RoutedTrack {
-                    net,
-                    layer: t.layer,
-                    seg: t.seg,
-                    gen: Generation(0),
-                })
-            }
-            _ => {
-                let mut t = t;
-                t.id = TrackId(board.tracks.len() as u32);
-                board.tracks.push(t);
-            }
-        }
-    }
-    let all = board.layers.all();
-    let vias = std::mem::take(&mut board.vias);
-    for v in vias {
-        match (v.ownership, v.net) {
-            (Ownership::Fixed, Some(net)) if v.layers == all => copper.vias.push(RoutedVia {
-                net,
-                center: v.center,
-                diameter: v.diameter,
-                drill: v.drill,
-                layers: v.layers,
-                gen: Generation(0),
-            }),
-            _ => {
-                let mut v = v;
-                v.id = ViaId(board.vias.len() as u32);
-                board.vias.push(v);
-            }
-        }
-    }
-    copper
+    RoutedCopper::take_unlocked(board, None, Generation(0))
 }
 
 /// The board with `copper` put back as board copper, for the union-find.
 fn joined(board: &RouteBoard, copper: &RoutedCopper) -> RouteBoard {
     let mut b = board.clone();
-    for t in &copper.tracks {
-        b.tracks.push(konnect_route::board::Track {
-            id: TrackId(b.tracks.len() as u32),
-            net: Some(t.net),
-            layer: t.layer,
-            seg: t.seg,
-            ownership: Ownership::Fixed,
-            uuid: None,
-        });
-    }
-    for v in &copper.vias {
-        b.vias.push(konnect_route::board::Via {
-            id: ViaId(b.vias.len() as u32),
-            net: Some(v.net),
-            center: v.center,
-            diameter: v.diameter,
-            drill: v.drill,
-            layers: v.layers,
-            ownership: Ownership::Fixed,
-            uuid: None,
-        });
-    }
+    copper.freeze_into(&mut b);
     b
 }
 

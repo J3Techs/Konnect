@@ -142,6 +142,118 @@ pub enum PlanError {
     Invalid { field: String, reason: String },
 }
 
+impl RoutedCopper {
+    /// Move `board`'s unlocked, netted tracks and through vias into routed
+    /// copper (generation `gen`), keeping locked copper and everything
+    /// outside `region` as board copper. Ids of what stays are renumbered so
+    /// they still equal their index. This is how existing routing (an
+    /// imported Specctra session, a previous run) is handed to the
+    /// optimizer.
+    pub fn take_unlocked(
+        board: &mut RouteBoard,
+        region: Option<konnect_geom::BBox>,
+        gen: Generation,
+    ) -> RoutedCopper {
+        use crate::api::{Ownership, TrackId, ViaId};
+        let inside = |b: konnect_geom::BBox| region.is_none_or(|r| r.contains_bbox(&b));
+        let mut copper = RoutedCopper::default();
+        for t in std::mem::take(&mut board.tracks) {
+            match (t.ownership, t.net) {
+                (Ownership::Fixed, Some(net)) if t.seg.a != t.seg.b && inside(t.seg.bbox()) => {
+                    copper.tracks.push(RoutedTrack {
+                        net,
+                        layer: t.layer,
+                        seg: t.seg,
+                        gen,
+                    })
+                }
+                _ => {
+                    let mut t = t;
+                    t.id = TrackId(board.tracks.len() as u32);
+                    board.tracks.push(t);
+                }
+            }
+        }
+        let all = board.layers.all();
+        for v in std::mem::take(&mut board.vias) {
+            let bbox = konnect_geom::BBox::point(v.center).inflate(v.diameter / 2 + 1);
+            match (v.ownership, v.net) {
+                (Ownership::Fixed, Some(net)) if v.layers == all && inside(bbox) => {
+                    copper.vias.push(RoutedVia {
+                        net,
+                        center: v.center,
+                        diameter: v.diameter,
+                        drill: v.drill,
+                        layers: v.layers,
+                        gen,
+                    })
+                }
+                _ => {
+                    let mut v = v;
+                    v.id = ViaId(board.vias.len() as u32);
+                    board.vias.push(v);
+                }
+            }
+        }
+        copper
+    }
+
+    /// Append this copper to `board` as fixed copper: an obstacle and
+    /// terminal for whatever is optimized or checked next.
+    pub fn freeze_into(&self, board: &mut RouteBoard) {
+        use crate::api::{Ownership, TrackId, ViaId};
+        for t in &self.tracks {
+            board.tracks.push(crate::board::Track {
+                id: TrackId(board.tracks.len() as u32),
+                net: Some(t.net),
+                layer: t.layer,
+                seg: t.seg,
+                ownership: Ownership::Fixed,
+                uuid: None,
+            });
+        }
+        for v in &self.vias {
+            board.vias.push(crate::board::Via {
+                id: ViaId(board.vias.len() as u32),
+                net: Some(v.net),
+                center: v.center,
+                diameter: v.diameter,
+                drill: v.drill,
+                layers: v.layers,
+                ownership: Ownership::Fixed,
+                uuid: None,
+            });
+        }
+    }
+
+    /// Split into (the nets and region to work on, everything else).
+    pub fn partition(
+        self,
+        nets: Option<&std::collections::BTreeSet<NetId>>,
+        region: Option<konnect_geom::BBox>,
+    ) -> (RoutedCopper, RoutedCopper) {
+        let keep_net = |n: NetId| nets.is_none_or(|s| s.contains(&n));
+        let inside = |b: konnect_geom::BBox| region.is_none_or(|r| r.contains_bbox(&b));
+        let (mut work, mut rest) = (RoutedCopper::default(), RoutedCopper::default());
+        for t in self.tracks {
+            if keep_net(t.net) && inside(t.seg.bbox()) {
+                work.tracks.push(t);
+            } else {
+                rest.tracks.push(t);
+            }
+        }
+        for v in self.vias {
+            let b = konnect_geom::BBox::point(v.center).inflate(v.diameter / 2 + 1);
+            if keep_net(v.net) && inside(b) {
+                work.vias.push(v);
+            } else {
+                rest.vias.push(v);
+            }
+        }
+        (work, rest)
+    }
+}
+
 impl RoutePlan {
     /// Lower routed copper to names and millimetres.
     pub fn from_routed(board: &RouteBoard, copper: &RoutedCopper) -> Result<Self, PlanError> {
