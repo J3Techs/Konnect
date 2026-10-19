@@ -255,14 +255,17 @@ impl RoutingAllowances {
                     let mut set = BTreeSet::new();
                     for p in patterns {
                         let pat: Vec<char> = p.chars().collect();
-                        let before = set.len();
+                        // Whether this pattern matched any net, even one an
+                        // earlier pattern already took.
+                        let mut matched = false;
                         for n in &board.nets {
                             let chars: Vec<char> = n.name.chars().collect();
                             if n.class == id && crate::rules::wildcard_match_chars(&pat, &chars) {
                                 set.insert(n.id);
+                                matched = true;
                             }
                         }
-                        if set.len() == before {
+                        if !matched {
                             return Err(AllowanceError::Invalid(format!(
                                 "layer_fallback for '{}': '{p}' matches no net of the class",
                                 f.class
@@ -543,6 +546,14 @@ mod tests {
             Some(BTreeSet::from([x1]))
         );
         assert_eq!(r.layer_fallback["Fast"].nets, vec!["X1".to_string()]);
+        // A pattern whose nets an earlier one already named still matches.
+        spec(&["X1", "X*"])
+            .resolve(&board, &classes(), &mut s)
+            .unwrap();
+        assert_eq!(
+            s.class_fallback[&ClassId(1)].nets,
+            Some(BTreeSet::from([x1]))
+        );
         // X2 is not in the class: a pattern matching only it is refused.
         assert!(spec(&["X2"]).resolve(&board, &classes(), &mut s).is_err());
     }
