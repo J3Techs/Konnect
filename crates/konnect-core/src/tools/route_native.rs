@@ -69,7 +69,31 @@ fn job_props() -> Value {
         "threads": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Worker threads (all cores by default)" },
         "optimize": { "type": "boolean", "default": true, "description": "Run the exact-checked optimizer (S6)" },
         "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Treat other nets' zone fills as copper" },
-        "clear_findings": { "type": "boolean", "description": "After the optimizer, remove each piece of routed copper the exact check still finds a defect in, leaving its connections open (default: on for native routing, off for a plan or the board's own copper)" }
+        "clear_findings": { "type": "boolean", "description": "After the optimizer, remove each piece of routed copper the exact check still finds a defect in, leaving its connections open (default: on for native routing, off for a plan or the board's own copper)" },
+        "class_layers": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                          "description": "Native routing: net class name to the copper layers it routes on (e.g. [\"F.Cu\"]); unlisted classes use every routable layer" },
+        "layer_fallback": { "type": "array", "description": "Native routing: a second chance on more layers for a class's connections negotiation failed, routed around all copper already routed",
+                            "items": { "type": "object", "required": ["class", "layers"], "additionalProperties": false, "properties": {
+                                "class": { "type": "string" },
+                                "layers": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Every layer of the second chance, the class's own included" },
+                                "nets": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Only these nets of the class (names or * ? patterns)" },
+                                "reference": { "type": "object", "required": ["plane"], "additionalProperties": false,
+                                               "description": "Needs the class in class_layers. Tracks of the fallback's nets on the 'over' layers must lie over one filled piece of this plane, margin_mm inside it and clear of the holes other nets' vias and tracks will cut at the refill (checked again after the optimizer). Use a margin of at least the zone clearance",
+                                               "properties": { "plane": { "type": "string" },
+                                                               "over": { "type": "array", "items": { "type": "string" }, "description": "Default: the fallback layers beyond the class's own; only those are allowed" },
+                                                               "margin_mm": { "type": "number", "minimum": 0 } } } } } },
+        "neck_down": { "type": "object", "additionalProperties": false,
+                       "description": "Native routing: let a track leave a pad narrower than its class width, within reach_mm of the pad (never below the rules' minimum)",
+                       "properties": { "width_mm": { "type": "number", "exclusiveMinimum": 0, "default": 0.1 },
+                                       "reach_mm": { "type": "number", "exclusiveMinimum": 0, "default": 1.0 },
+                                       "classes": { "type": "array", "items": { "type": "string" }, "description": "Only these classes (default: every class not excluded)" },
+                                       "exclude_classes": { "type": "array", "items": { "type": "string" }, "description": "Classes that never neck down" } } },
+        "exclude_classes": { "type": "array", "items": { "type": "string" },
+                             "description": "Native routing: classes left unrouted (zones or hand copper); their connections are reported as excluded_by_policy, not as failures. Default: every class whose track width is at least 0.5 mm. [] routes every class" },
+        "net_classes": { "type": "string", "enum": ["auto", "kicad", "project"], "default": "auto",
+                         "description": "Where net classes come from: kicad (KiCad's effective class per net over IPC; the board must be open), project (the .kicad_pro patterns, resolved as KiCad does), auto (kicad when KiCad has the board open, else project)" },
+        "fanout_plan": { "type": "string", "description": "Native routing: write the plane fanout (S2) to this new routing_file, to apply with locked: true, and leave it out of output_plan" },
+        "fanout_share_within_mm": { "type": "number", "minimum": 0, "description": "Native routing: a plane pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" }
     })
 }
 
@@ -95,7 +119,9 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "plan_plane_vias",
             "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only.",
             with_props(json!({
-                "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
+                "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
+                "share_within_mm": { "type": "number", "minimum": 0, "description": "A pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" },
+                "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits, placed against the sites already chosen" }
             }), &["board", "output_plan"]),
             |args, ctx| async move { handle_plan_plane_vias(args, ctx).await }
         ),
@@ -301,6 +327,9 @@ fn base_spec(args: &Value, output_plan: PathBuf) -> anyhow::Result<Result<Native
         zones_are_obstacles: true,
         clear_findings: None,
         time_limit_seconds: None,
+        allowances: Default::default(),
+        net_classes: None,
+        fanout_plan: None,
     }))
 }
 
@@ -345,6 +374,27 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
             Some(Value::Bool(b)) => Some(*b),
             Some(_) => return Err(invalid("clear_findings", "must be a boolean")),
         };
+        let mut allowance_args = serde_json::Map::new();
+        for key in [
+            "class_layers",
+            "layer_fallback",
+            "neck_down",
+            "exclude_classes",
+            "fanout_share_within_mm",
+        ] {
+            if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                allowance_args.insert(key.to_string(), v.clone());
+            }
+        }
+        spec.allowances = serde_json::from_value(Value::Object(allowance_args))
+            .map_err(|e| invalid("allowances", &format!("cannot be read: {e}")))?;
+        if spec.source != CopperSource::Native && !spec.allowances.is_default() {
+            return Err(invalid(
+                "allowances",
+                "class_layers, layer_fallback, neck_down, exclude_classes and                  fanout_share_within_mm apply only when source is native",
+            ));
+        }
+        spec.fanout_plan = opt_path(args, "fanout_plan")?;
         spec.time_limit_seconds = match args.get("time_limit_seconds") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_u64() {
@@ -375,10 +425,83 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
     spec.output_plan = abs(&spec.output_plan);
     spec.project = spec.project.as_ref().map(abs);
     spec.rules = spec.rules.as_ref().map(abs);
+    spec.fanout_plan = spec.fanout_plan.as_ref().map(abs);
     if let CopperSource::Plan { path } = &spec.source {
         spec.source = CopperSource::Plan { path: abs(path) };
     }
     Ok(Ok(spec))
+}
+
+/// Where a job's net classes should come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassMode {
+    Auto,
+    Kicad,
+    Project,
+}
+
+fn class_mode(args: &Value) -> Result<ClassMode, Refusal> {
+    let mode = match args.get("net_classes") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) => Some(m.as_str()),
+        Some(_) => return Err(invalid("net_classes", "must be auto, kicad or project")),
+    };
+    match mode {
+        None | Some("auto") => Ok(ClassMode::Auto),
+        Some("kicad") => Ok(ClassMode::Kicad),
+        Some("project") => Ok(ClassMode::Project),
+        Some(other) => Err(invalid(
+            "net_classes",
+            &format!("'{other}' is not auto, kicad or project"),
+        )),
+    }
+}
+
+/// Fill `spec.net_classes` with KiCad's effective class of every net when
+/// `mode` asks for it and KiCad holds the board open. Returns how the
+/// classes will be resolved, for the reply; a refusal when `mode` is
+/// `kicad` and KiCad cannot answer.
+async fn kicad_classes(
+    ctx: &ToolContext,
+    spec: &mut NativeJobSpec,
+    mode: ClassMode,
+) -> anyhow::Result<Result<Value, CallToolResult>> {
+    if mode == ClassMode::Project || spec.source != CopperSource::Native {
+        return Ok(Ok(json!({ "source": "project_patterns" })));
+    }
+    let why_not = if ctx.config.ipc_address.is_empty() {
+        "no KiCad IPC address is configured".to_string()
+    } else {
+        let bound = super::with_bound_board_ipc_classified(ctx, &spec.board, |client, document| {
+            client.get_effective_routing_rules_in(document)
+        })
+        .await?;
+        match bound {
+            Ok(super::BoardBinding::Bound(rules)) => {
+                let map: BTreeMap<String, Vec<String>> = rules
+                    .into_iter()
+                    .map(|(net, r)| {
+                        let mut names = vec![r.class_name];
+                        names.extend(r.constituents);
+                        (net, names)
+                    })
+                    .collect();
+                let nets = map.len();
+                spec.net_classes = Some(map);
+                return Ok(Ok(json!({ "source": "kicad_ipc", "nets": nets })));
+            }
+            Ok(super::BoardBinding::Unserved { message, .. }) => message,
+            Err(e) => e.message().to_string(),
+        }
+    };
+    if mode == ClassMode::Kicad {
+        return Ok(Err(CallToolResult::error(format!(
+            "net_classes is kicad, but KiCad's classes could not be read: {why_not}. Nothing was started."
+        ))));
+    }
+    Ok(Ok(
+        json!({ "source": "project_patterns", "kicad_unavailable": why_not }),
+    ))
 }
 
 fn loaded(
@@ -586,14 +709,30 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
+    let mut settings = konnect_route::fanout::FanoutSettings::default();
+    match args.get("share_within_mm") {
+        None | Some(Value::Null) => {}
+        Some(v) => match v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .and_then(konnect_geom::mm_to_nm)
+        {
+            Some(nm) => settings.share_within = nm,
+            None => {
+                return Ok(invalid(
+                    "share_within_mm",
+                    "must be a non-negative length in mm",
+                ))
+            }
+        },
+    }
+    settings.retry_failed = match opt_bool(args, "retry_failed", true) {
+        Ok(b) => b,
+        Err(r) => return Ok(r),
+    };
     let conn = ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default());
     let plan = match guarded("fanout", || {
-        konnect_route::fanout::plan_plane_vias(
-            &board,
-            &rules,
-            &conn,
-            &konnect_route::fanout::FanoutSettings::default(),
-        )
+        konnect_route::fanout::plan_plane_vias(&board, &rules, &conn, &settings)
     }) {
         Ok(p) => p,
         Err(e) => return Ok(stage_failure("plan_plane_vias", e)),
@@ -621,13 +760,35 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             });
         }
     }
+    let pad_label = |pad: konnect_route::api::PadId| {
+        let p = &board.pads[pad.index()];
+        format!(
+            "{}.{}",
+            board.footprints[p.footprint.index()]
+                .reference
+                .as_deref()
+                .unwrap_or("?"),
+            p.number
+        )
+    };
     let failed: Vec<Value> = plan
         .failed
         .iter()
         .map(|(pad, why)| {
             let p = &board.pads[pad.index()];
+            let detail = plan.details.iter().find(|d| d.pad == *pad);
+            let mut top: Vec<(&String, &u32)> =
+                detail.map(|d| d.rejections.iter().collect()).unwrap_or_default();
+            top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            top.truncate(3);
             json!({ "reference": board.footprints[p.footprint.index()].reference,
-                    "pad": p.number, "failure": why })
+                    "pad": p.number,
+                    "net": p.net.map(|n| board.net(n).name.clone()),
+                    "failure": why,
+                    "candidates": detail.map(|d| d.candidates),
+                    "legal": detail.map(|d| d.legal),
+                    "top_rejections": top.into_iter().map(|(k, v)| json!({ "reason": k, "count": v })).collect::<Vec<_>>(),
+                    "blocked_by": detail.map(|d| d.blocked_by.iter().map(|b| pad_label(*b)).collect::<Vec<_>>()).unwrap_or_default() })
         })
         .collect();
     let written = routing.item_count() > 0;
@@ -649,6 +810,8 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "sites": plan.sites.len(),
+        "shared_vias": plan.stats.shared_vias,
+        "retried_sites": plan.stats.retried_sites,
         "failed": failed.len(),
         "failures": failed,
         "plan_written": written,
@@ -755,10 +918,14 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
 
 async fn handle_route_native_region(
     args: &Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let spec = match job_spec(args)? {
+    let mut spec = match job_spec(args)? {
         Ok(s) => s,
+        Err(r) => return Ok(r),
+    };
+    let mode = match class_mode(args) {
+        Ok(m) => m,
         Err(r) => return Ok(r),
     };
     let Some([x1, y1, x2, y2]) = spec.region_mm else {
@@ -781,6 +948,10 @@ async fn handle_route_native_region(
             ),
         ));
     }
+    let classes = match kicad_classes(ctx, &mut spec, mode).await? {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
     let run = spec.clone();
     let report =
         tokio::task::spawn_blocking(move || native_route_job::run_pipeline(&run, None, &mut Quiet))
@@ -808,20 +979,33 @@ async fn handle_route_native_region(
         "optimize": report.optimize,
         "check": report.check,
         "threads": report.telemetry.threads,
-        "next": "Apply the plan with add_routing (geometry_check strict), refill zones, then run DRC.",
+        "net_classes": classes,
+        "allowances": report.allowances,
+        "excluded_by_policy": report.excluded_by_policy,
+        "reference": report.reference,
+        "fanout_plan": report.fanout_plan_path,
+        "next": "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones.",
     })))
 }
 
 async fn handle_start_native_route_job(
     args: &Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let spec = match job_spec(args)? {
+    let mut spec = match job_spec(args)? {
         Ok(s) => s,
         Err(r) => return Ok(r),
     };
     let resume = match opt_bool(args, "resume", false) {
         Ok(b) => b,
+        Err(r) => return Ok(r),
+    };
+    let mode = match class_mode(args) {
+        Ok(m) => m,
+        Err(r) => return Ok(r),
+    };
+    let classes = match kicad_classes(ctx, &mut spec, mode).await? {
+        Ok(v) => v,
         Err(r) => return Ok(r),
     };
     let body = match native_route_job::start(&spec, resume).await {
@@ -838,6 +1022,8 @@ async fn handle_start_native_route_job(
             body["error"].as_str().unwrap_or("see the job status")
         )));
     }
+    let mut body = body;
+    body["net_classes"] = classes;
     Ok(CallToolResult::json(&body))
 }
 

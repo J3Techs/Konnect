@@ -43,6 +43,10 @@
 //!   second-chance layers, optionally over a reference plane's fill;
 //! - `KONNECT_PIPELINE_NECK=ClassA,ClassB`: neck down at pads (0.10 mm
 //!   within 1 mm) for every class except these;
+//! - `KONNECT_PIPELINE_ALLOWANCES=<JSON or path to a JSON file>`: a
+//!   [`RoutingAllowances`] (class layers, layer fallbacks, neck-down and
+//!   excluded classes, by name), resolved as the job tools resolve it; it
+//!   replaces the three knobs above. Unset, no class is excluded;
 //! - `KONNECT_PIPELINE_DIAG=1`: list every failed connection.
 
 use konnect_geom::{BBox, Point};
@@ -52,7 +56,7 @@ use konnect_route::detail::negotiate::NeckDown;
 use konnect_route::detail::negotiate::ReferenceSearch;
 use konnect_route::pipeline::{
     route_board, route_board_with, ClassFallback, PipelineResult, PipelineScope, PipelineSettings,
-    ReferencePlane,
+    ReferencePlane, RoutingAllowances,
 };
 use konnect_route::rules::RuleTable;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable};
@@ -233,9 +237,14 @@ fn pipeline_real_board_fixture() {
                     margin: (margin * 1e6).round() as i32,
                 }
             });
-            settings
-                .class_fallback
-                .insert(class_id(class.trim()), ClassFallback { layers, reference });
+            settings.class_fallback.insert(
+                class_id(class.trim()),
+                ClassFallback {
+                    layers,
+                    reference,
+                    nets: None,
+                },
+            );
         }
     }
     if let Ok(spec) = std::env::var("KONNECT_PIPELINE_NECK") {
@@ -248,6 +257,18 @@ fn pipeline_real_board_fixture() {
             excluded,
             ..NeckDown::default()
         });
+    }
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_ALLOWANCES") {
+        let text = if v.trim_start().starts_with('{') {
+            v
+        } else {
+            std::fs::read_to_string(v.trim()).expect("allowances file reads")
+        };
+        let a: RoutingAllowances = serde_json::from_str(&text).expect("allowances parse");
+        let report = a
+            .resolve(&board, rules.classes(), &mut settings)
+            .expect("allowances resolve");
+        println!("allowances: {}", serde_json::to_string(&report).unwrap());
     }
     let reference = env_on("KONNECT_PIPELINE_REFERENCE");
 
@@ -332,6 +353,15 @@ fn pipeline_real_board_fixture() {
         *tasks_by_class.entry(class).or_default() += 1;
     }
     println!("tasks by class: {tasks_by_class:?}");
+    let mut excluded_by_class: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &r.excluded {
+        let class = rules.class(rules.class_of(Some(c.net))).name.clone();
+        *excluded_by_class.entry(class).or_default() += 1;
+    }
+    println!(
+        "excluded by policy: {} {excluded_by_class:?}",
+        r.excluded.len()
+    );
     let mut lost_by_class: BTreeMap<String, usize> = BTreeMap::new();
     for id in &r.detail.congestion_lost {
         let c = &r.connections[id.index()];
@@ -412,6 +442,56 @@ fn pipeline_real_board_fixture() {
     );
     let by_kind = r.check.counts();
     println!("check: {} findings {:?}", r.check.violations.len(), by_kind);
+    if env_on("KONNECT_PIPELINE_DIAG") {
+        let all = r.all_copper();
+        let nf = r.fanout_copper.tracks.len() as u32;
+        let nfv = r.fanout_copper.vias.len() as u32;
+        let name = |i: konnect_route::check::CheckedItem| match i {
+            konnect_route::check::CheckedItem::RoutedTrack { index } => format!(
+                "{} track {} on {}",
+                if index < nf { "fanout" } else { "routed" },
+                board.nets[all.tracks[index as usize].net.index()].name,
+                board.layers.name(all.tracks[index as usize].layer)
+            ),
+            konnect_route::check::CheckedItem::RoutedVia { index } => format!(
+                "{} via {}",
+                if index < nfv { "fanout" } else { "routed" },
+                board.nets[all.vias[index as usize].net.index()].name
+            ),
+            other => format!("{other:?}"),
+        };
+        for v in &r.check.violations {
+            println!(
+                "  finding {:?} at ({:.3},{:.3}): {} / {}",
+                v.kind,
+                v.at.x as f64 / 1e6,
+                v.at.y as f64 / 1e6,
+                name(v.a),
+                v.b.map(name).unwrap_or_default()
+            );
+        }
+    }
+    // The reference planes hold for the plan: checking it again changes
+    // nothing.
+    if settings
+        .class_fallback
+        .values()
+        .any(|f| f.reference.is_some())
+    {
+        // Against the board with the fanout on it, as the run saw it: the
+        // fanout's vias cut holes in the plane too.
+        let mut work = board.clone();
+        konnect_route::pipeline::add_locked(&mut work, &r.fanout_copper);
+        let mut copy = r.routed.clone();
+        let again =
+            konnect_route::pipeline::enforce_reference(&work, &rules, &settings, None, &mut copy);
+        println!(
+            "reference: {} tracks checked again, {} nets off it",
+            again.tracks_checked,
+            again.dropped_nets.len()
+        );
+        assert!(again.dropped_nets.is_empty(), "tracks off the reference");
+    }
     println!(
         "plan: {} tracks, {} vias; connections open {} -> {}",
         r.plan.tracks.len(),
@@ -455,6 +535,7 @@ fn pipeline_real_board_fixture() {
             "global_overflow": r.global.stats.total_overflow,
             "routed": r.detail.routed.len(),
             "failed": reasons,
+            "excluded": r.excluded.len(),
             "check": by_kind.iter().map(|(k, v)| (format!("{k:?}"), *v)).collect::<BTreeMap<_, _>>(),
             "connections_after": r.connections_after,
             "plan_tracks": r.plan.tracks.len(),

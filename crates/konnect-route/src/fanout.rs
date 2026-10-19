@@ -120,6 +120,19 @@ pub struct FanoutSettings {
     /// nets' islands are still avoided when [`Self::avoid_other_islands`]).
     #[serde(default = "yes")]
     pub partial_plane_fallback: bool,
+    /// A retry round for islands the selection left without a site: every
+    /// pass is generated for them (also when an early pass found legal
+    /// candidates that all conflicted), plus [`Self::far_directions`] exits
+    /// at the [`Self::far_gaps`], and they are placed against every site
+    /// already chosen. Sites placed in the first round never move.
+    #[serde(default = "yes")]
+    pub retry_failed: bool,
+    /// Gaps of the retry round's far exits, nm (longer stubs; 0 skipped).
+    #[serde(default = "default_far_gaps")]
+    pub far_gaps: [Coord; 3],
+    /// Evenly spaced exit directions of the retry round's far exits.
+    #[serde(default = "default_far_directions")]
+    pub far_directions: u8,
 }
 
 fn default_array_min_pads() -> u32 {
@@ -136,6 +149,14 @@ fn default_fallback_gaps() -> [Coord; 3] {
 
 fn default_fallback_directions() -> u8 {
     16
+}
+
+fn default_far_gaps() -> [Coord; 3] {
+    [2_000_000, 2_500_000, 3_000_000]
+}
+
+fn default_far_directions() -> u8 {
+    32
 }
 
 fn yes() -> bool {
@@ -169,6 +190,9 @@ impl Default for FanoutSettings {
             exclude_escaped_arrays: true,
             array_min_pads: default_array_min_pads(),
             partial_plane_fallback: true,
+            retry_failed: true,
+            far_gaps: default_far_gaps(),
+            far_directions: default_far_directions(),
         }
     }
 }
@@ -259,6 +283,10 @@ pub struct FailureDetail {
     /// Every rejected candidate of the pad's island.
     #[serde(default)]
     pub trials: Vec<Trial>,
+    /// For a [`FanoutFailure::Conflict`]: the pads whose chosen sites
+    /// conflict with this island's legal candidates, sorted.
+    #[serde(default)]
+    pub blocked_by: Vec<PadId>,
 }
 
 /// Counters for one run.
@@ -288,6 +316,9 @@ pub struct FanoutStats {
     /// Sites from the partial-plane pass.
     #[serde(default)]
     pub partial_plane_sites: usize,
+    /// Islands placed by the retry round ([`FanoutSettings::retry_failed`]).
+    #[serde(default)]
+    pub retried_sites: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -415,7 +446,10 @@ pub fn plan_plane_vias_excluding(
     }
 
     let t2 = std::time::Instant::now();
-    let chosen = select(&ctx, &units, &cands, &mut plan.stats);
+    let mut chosen = select(&ctx, &units, &cands, &mut plan.stats);
+    if settings.retry_failed {
+        plan.stats.retried_sites = retry(&ctx, &units, &mut cands, &mut rejections, &mut chosen);
+    }
     let shares = if settings.share_within > 0 {
         share_vias(&ctx, &units, &cands, &chosen)
     } else {
@@ -478,6 +512,11 @@ pub fn plan_plane_vias_excluding(
                     FanoutFailure::NoLegalSite
                 };
                 let (reasons, trials) = (r.reasons(), r.trial_list());
+                let blocked_by = if cands[ui].is_empty() {
+                    Vec::new()
+                } else {
+                    blockers(&ctx, &units, &cands, &chosen, ui)
+                };
                 for &p in &u.pads {
                     plan.failed.push((p, failure.clone()));
                     plan.details.push(FailureDetail {
@@ -487,6 +526,7 @@ pub fn plan_plane_vias_excluding(
                         legal: cands[ui].len() as u32,
                         rejections: reasons.clone(),
                         trials: trials.clone(),
+                        blocked_by: blocked_by.clone(),
                     });
                 }
             }
@@ -921,6 +961,17 @@ fn try_exit(
 }
 
 fn candidates(ctx: &Ctx<'_>, u: &Unit, cache: &mut ClearanceCache) -> (Vec<Cand>, Rejections) {
+    candidates_with(ctx, u, cache, false)
+}
+
+/// The candidates of one island. `exhaustive` (the retry round) runs every
+/// pass whatever the earlier ones found, plus the far exits.
+fn candidates_with(
+    ctx: &Ctx<'_>,
+    u: &Unit,
+    cache: &mut ClearanceCache,
+    exhaustive: bool,
+) -> (Vec<Cand>, Rejections) {
     let space = ctx.space;
     let s = ctx.settings;
     let mut out = Vec::new();
@@ -961,23 +1012,39 @@ fn candidates(ctx: &Ctx<'_>, u: &Unit, cache: &mut ClearanceCache) -> (Vec<Cand>
     } else {
         0
     };
-    let passes: [(u32, bool, &[Coord], i64); 3] = [
-        (8, s.corner_exits, &s.exit_gaps, 0),
-        (s.fallback_directions.into(), false, &s.fallback_gaps, 3),
-        (third_dirs, s.corner_exits, &all_gaps, 6),
+    let far: Vec<Coord> = s.far_gaps.iter().copied().filter(|&g| g > 0).collect();
+    let far_dirs: u32 = if exhaustive {
+        s.far_directions.into()
+    } else {
+        0
+    };
+    // (directions, corner exits, gaps, rank of the first gap, partial plane)
+    let passes: [(u32, bool, &[Coord], i64, bool); 4] = [
+        (8, s.corner_exits, &s.exit_gaps, 0, false),
+        (
+            s.fallback_directions.into(),
+            false,
+            &s.fallback_gaps,
+            3,
+            false,
+        ),
+        (far_dirs, false, &far, 6, false),
+        (third_dirs, s.corner_exits, &all_gaps, 9, true),
     ];
-    for (pass, &(n_dirs, corners, gaps, rank0)) in passes.iter().enumerate() {
-        if pass >= 1 && (!out.is_empty() || n_dirs == 0) {
+    for (pass, &(n_dirs, corners, gaps, rank0, partial)) in passes.iter().enumerate() {
+        if n_dirs == 0 {
+            continue;
+        }
+        if pass >= 1 && !exhaustive && !out.is_empty() {
             break;
         }
-        let partial = pass == 2;
         for pp in &plans {
             for dir in directions(pp.pad, n_dirs, corners, pp.c) {
                 let Some(t_exit) = exit_distance(&pp.pad.shapes, pp.c, dir.0, dir.1) else {
                     continue;
                 };
                 for (gi, &gap) in gaps.iter().enumerate() {
-                    if pass == 1 && gap <= 0 {
+                    if pass >= 1 && gap <= 0 {
                         continue;
                     }
                     rej.total += 1;
@@ -1279,6 +1346,84 @@ fn stub_clears(
     true
 }
 
+// ─── Retry round ─────────────────────────────────────────────────────────────
+
+/// Regenerate every candidate (all passes and the far exits) for the
+/// islands `chosen` left without a site and place them, serially, against
+/// every site already chosen. Returns how many were placed.
+fn retry(
+    ctx: &Ctx<'_>,
+    units: &[Unit],
+    cands: &mut [Vec<Cand>],
+    rejections: &mut [Rejections],
+    chosen: &mut [Option<usize>],
+) -> usize {
+    let failed: Vec<usize> = (0..units.len()).filter(|&u| chosen[u].is_none()).collect();
+    if failed.is_empty() {
+        return 0;
+    }
+    let regenerated: Vec<(Vec<Cand>, Rejections)> = failed
+        .par_iter()
+        .map_init(ClearanceCache::default, |cache, &u| {
+            candidates_with(ctx, &units[u], cache, true)
+        })
+        .collect();
+    for (&u, (c, r)) in failed.iter().zip(regenerated) {
+        cands[u] = c;
+        rejections[u] = r;
+    }
+    let cell = 1_000_000;
+    let mut committed = SiteGrid::new(cell);
+    for (u, c) in chosen.iter().enumerate() {
+        if let Some(ci) = *c {
+            committed.insert(&cand_bbox(&cands[u][ci]), Placed { unit: u, cand: ci });
+        }
+    }
+    let members: Vec<usize> = failed
+        .into_iter()
+        .filter(|&u| !cands[u].is_empty())
+        .collect();
+    let reach = i64::from(ctx.space.reach) + 1;
+    let mut cache = ClearanceCache::default();
+    let (picks, _) = solve_tile(
+        ctx, &mut cache, units, cands, &members, &committed, reach, cell,
+    );
+    for &(u, ci) in &picks {
+        chosen[u] = Some(ci);
+    }
+    picks.len()
+}
+
+/// The pads whose chosen sites conflict with any legal candidate of the
+/// unplaced island `ui`, sorted.
+fn blockers(
+    ctx: &Ctx<'_>,
+    units: &[Unit],
+    cands: &[Vec<Cand>],
+    chosen: &[Option<usize>],
+    ui: usize,
+) -> Vec<PadId> {
+    let mut cache = ClearanceCache::default();
+    let reach = ctx.space.reach.saturating_add(1);
+    let mut out: Vec<PadId> = Vec::new();
+    for c in &cands[ui] {
+        let q = cand_bbox(c).inflate(reach);
+        for (o, oc) in chosen.iter().enumerate() {
+            let Some(oc) = *oc else { continue };
+            let other = &cands[o][oc];
+            if o == ui || !q.intersects(&cand_bbox(other)) {
+                continue;
+            }
+            if !compatible(ctx, &mut cache, c, units[ui].net, other, units[o].net) {
+                out.push(other.pad);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 // ─── Selection ───────────────────────────────────────────────────────────────
 
 /// Whether two candidates of different islands can both be built.
@@ -1300,7 +1445,10 @@ fn compatible(
         return false;
     }
     if an == bn {
-        return true;
+        // Two stubs of one net on one layer may not touch: KiCad measures
+        // the angle wherever same-net tracks meet, and a crossing is
+        // rarely square.
+        return a.layer != b.layer || !touches(&Shape::Segment(a.stub), &Shape::Segment(b.stub));
     }
     let (da, db) = (
         Shape::Circle(Circle::from_diameter(a.via, a.diameter)),
@@ -1867,21 +2015,20 @@ mod tests {
     #[test]
     fn a_crowded_pad_can_share_a_neighbours_via() {
         // Two GND pads 4.2 mm apart; the plane ends 2.7 mm short of the
-        // second, beyond its longest exit, so only sharing joins it.
-        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
-        b.zone("GND", "In1.Cu", (2.0, 0.5, 6.5, 9.5));
-        let f = b.footprint("C1", (5.0, 5.0));
-        b.smd_pad(f, "1", "GND", (5.0, 5.0), (0.6, 0.6), "F.Cu");
-        let g = b.footprint("C2", (9.2, 5.0));
-        b.smd_pad(g, "1", "GND", (9.2, 5.0), (0.6, 0.6), "F.Cu");
-        let board = b.build();
-        let p = plan(&board, &FanoutSettings::default());
+        // second, beyond its first-round exits (the retry round is off), so
+        // only sharing joins it.
+        let board = far_pad_board();
+        let no_retry = FanoutSettings {
+            retry_failed: false,
+            ..Default::default()
+        };
+        let p = plan(&board, &no_retry);
         assert_eq!(p.sites.len(), 1);
         let shared = plan(
             &board,
             &FanoutSettings {
                 share_within: 5_000_000,
-                ..Default::default()
+                ..no_retry
             },
         );
         assert_eq!(shared.sites.len(), 2, "{:?}", shared.details);
@@ -1891,6 +2038,66 @@ mod tests {
         assert_eq!(own.via, guest.via);
         let routed = shared.route_plan(&board).unwrap();
         assert_eq!((routed.vias.len(), routed.tracks.len()), (1, 2));
+    }
+
+    fn far_pad_board() -> RouteBoard {
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (2.0, 0.5, 6.5, 9.5));
+        let f = b.footprint("C1", (5.0, 5.0));
+        b.smd_pad(f, "1", "GND", (5.0, 5.0), (0.6, 0.6), "F.Cu");
+        let g = b.footprint("C2", (9.2, 5.0));
+        b.smd_pad(g, "1", "GND", (9.2, 5.0), (0.6, 0.6), "F.Cu");
+        b.build()
+    }
+
+    #[test]
+    fn the_retry_round_reaches_a_far_plane_with_a_long_stub() {
+        let board = far_pad_board();
+        let p = plan(&board, &FanoutSettings::default());
+        assert!(p.failed.is_empty(), "{:?}", p.details);
+        assert_eq!((p.sites.len(), p.stats.retried_sites), (2, 1));
+        let far = p
+            .sites
+            .iter()
+            .find(|s| board.pads[s.pad.index()].center.x > 9_000_000)
+            .unwrap();
+        let (a, b, _) = far.stub.unwrap();
+        assert!((b - a).length_f64() > 2_000_000.0, "a long stub: {far:?}");
+        assert!(!far.shared);
+    }
+
+    #[test]
+    fn a_conflict_names_the_sites_that_block_it() {
+        // Two nets' pads 1.2 mm apart whose only plane copper is one narrow
+        // strip between them: one via fits, the other island is blocked by
+        // it.
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (4.6, 4.0, 5.4, 6.0));
+        b.zone("PWR", "In1.Cu", (4.6, 4.0, 5.4, 6.0));
+        let f = b.footprint("C1", (4.4, 5.0));
+        b.smd_pad(f, "1", "GND", (4.4, 5.0), (0.3, 0.3), "F.Cu");
+        let g = b.footprint("C2", (5.6, 5.0));
+        b.smd_pad(g, "1", "PWR", (5.6, 5.0), (0.3, 0.3), "F.Cu");
+        let board = b.build();
+        let p = plan(&board, &FanoutSettings::default());
+        assert!(
+            p.failed.iter().any(|f| f.1 == FanoutFailure::Conflict),
+            "sites {:?} failed {:?}",
+            p.sites,
+            p.failed
+        );
+        for d in &p.details {
+            let failure = &p.failed.iter().find(|f| f.0 == d.pad).unwrap().1;
+            if *failure == FanoutFailure::Conflict {
+                assert!(!d.blocked_by.is_empty(), "{d:?}");
+                assert!(d
+                    .blocked_by
+                    .iter()
+                    .all(|b| p.sites.iter().any(|s| s.pad == *b)));
+            } else {
+                assert!(d.blocked_by.is_empty());
+            }
+        }
     }
 
     #[test]
