@@ -1384,10 +1384,12 @@ fn run_negotiation(
             queued: queue.len() as u32,
             ..IterationReport::default()
         };
-        // 1. Rip up.
+        // 1. Rip up, keeping the old copper in case the reroute fails.
+        let mut previous: BTreeMap<u32, Vec<Arc<PieceCopper>>> = BTreeMap::new();
         for &t in &queue {
-            if routed[t as usize].take().is_some() {
+            if let Some(old) = routed[t as usize].take() {
                 telemetry.count("rip_ups", 1);
+                previous.insert(t, old);
             }
             failure[t as usize] = None;
         }
@@ -1522,25 +1524,31 @@ fn run_negotiation(
             }
         }
 
-        // Assemble the queued connections.
+        // Assemble the queued connections. One that fails to reroute keeps
+        // its old copper (a failure in one tiling must not undo a route the
+        // other tiling found); it counts as new, so its conflicts with the
+        // copper around it now are detected again.
         let mut is_new = vec![false; n];
         for &t in &queue {
             let t = t as usize;
-            if failure[t].is_some() {
-                report.failed += 1;
-                continue;
+            if failure[t].is_none() {
+                let pieces: Option<Vec<Arc<PieceCopper>>> = fresh[t].iter().cloned().collect();
+                match pieces {
+                    Some(p) if !p.is_empty() => {
+                        routed[t] = Some(p);
+                        is_new[t] = true;
+                        report.routed += 1;
+                        continue;
+                    }
+                    _ => failure[t] = Some(DetailFailure::Unreachable),
+                }
             }
-            let pieces: Option<Vec<Arc<PieceCopper>>> = fresh[t].iter().cloned().collect();
-            match pieces {
-                Some(p) if !p.is_empty() => {
-                    routed[t] = Some(p);
-                    is_new[t] = true;
-                    report.routed += 1;
-                }
-                _ => {
-                    failure[t] = Some(DetailFailure::Unreachable);
-                    report.failed += 1;
-                }
+            report.failed += 1;
+            if let Some(old) = previous.remove(&(t as u32)) {
+                routed[t] = Some(old);
+                failure[t] = None;
+                is_new[t] = true;
+                telemetry.count("restored", 1);
             }
         }
 
