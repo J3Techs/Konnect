@@ -95,6 +95,11 @@ pub struct SearchStats {
     /// `JOB_MIN_RUN` searches refused because the minimum run is longer
     /// than the run field can count (see `kernel::MAX_RUN_BUCKET`).
     pub min_run_rejects: u64,
+    /// Searches restarted with the relaxed cost-to-go field
+    /// ([`SearchConfig::field_after`]).
+    pub field_runs: u64,
+    /// Node-layers the relaxed fields settled.
+    pub field_settled: u64,
 }
 
 impl SearchStats {
@@ -109,6 +114,8 @@ impl SearchStats {
         self.dead_end_checks += o.dead_end_checks;
         self.dead_ends += o.dead_ends;
         self.min_run_rejects += o.min_run_rejects;
+        self.field_runs += o.field_runs;
+        self.field_settled += o.field_settled;
         self.window_nodes = self.window_nodes.max(o.window_nodes);
     }
 
@@ -125,6 +132,8 @@ impl SearchStats {
         t.count("search_dead_end_checks", self.dead_end_checks);
         t.count("search_dead_ends", self.dead_ends);
         t.count("search_min_run_rejects", self.min_run_rejects);
+        t.count("search_field_runs", self.field_runs);
+        t.count("search_field_settled", self.field_settled);
         let name = match outcome {
             SearchOutcome::Found(_) => "search_found",
             SearchOutcome::Unreachable { .. } => "search_unreachable",
@@ -265,6 +274,18 @@ pub struct SearchConfig {
     /// another net's routed track at no cost and the conflict never clears.
     #[serde(default)]
     pub via_congestion_reach_nm: Option<Coord>,
+    /// After this many expansions without a result, restart the search with
+    /// a relaxed cost-to-go field in the heuristic: one backward Dijkstra
+    /// from the targets over the region that keeps the congestion-scaled
+    /// step costs and the walls but drops bends, the turn rule and the
+    /// extras, and bounds passing through a target apart from ending
+    /// there. The bound is consistent, so the path cost is the same as
+    /// without it (ties may resolve differently); a search that floods its
+    /// window around congestion then expands little beyond its path, and an
+    /// enclosed target is proved unreachable without a flood. 0 (the
+    /// default) never restarts.
+    #[serde(default)]
+    pub field_after: u64,
 }
 
 impl Default for SearchConfig {
@@ -286,6 +307,7 @@ impl Default for SearchConfig {
             check_free_vias: true,
             dead_end_check_after: 20_000,
             via_congestion_reach_nm: None,
+            field_after: 0,
         }
     }
 }
@@ -410,6 +432,8 @@ pub fn search_with(
         gcells: ctx.gcells,
         mode: Mode::Route,
         spent: 0,
+        cap: u64::MAX,
+        use_field: false,
     };
     match ctx.lattice {
         Some(l) if !l.is_uniform() => run_bounded(&LatticeGrid { lattice: l }, &problem, stats),
@@ -424,13 +448,69 @@ pub fn search_with(
     }
 }
 
+/// `outcome` with `extra` more expansions.
+fn add_expansions(outcome: SearchOutcome, extra: u64) -> SearchOutcome {
+    match outcome {
+        SearchOutcome::Found(mut pp) => {
+            pp.expansions += extra;
+            SearchOutcome::Found(pp)
+        }
+        SearchOutcome::Unreachable { job, expansions } => SearchOutcome::Unreachable {
+            job,
+            expansions: expansions + extra,
+        },
+        SearchOutcome::BudgetExhausted { job, expansions } => SearchOutcome::BudgetExhausted {
+            job,
+            expansions: expansions + extra,
+        },
+    }
+}
+
+fn expansions_of(outcome: &SearchOutcome) -> u64 {
+    match outcome {
+        SearchOutcome::Found(pp) => pp.expansions,
+        SearchOutcome::Unreachable { expansions, .. }
+        | SearchOutcome::BudgetExhausted { expansions, .. } => *expansions,
+    }
+}
+
+/// One attempt over `region`: plain A* first; when
+/// [`SearchConfig::field_after`] is set and that many expansions do not
+/// finish the search, it restarts with the relaxed cost-to-go field in the
+/// heuristic (a consistent bound, so the path cost is unchanged).
+fn run_attempt<G: Grid>(
+    grid: &G,
+    p: &Problem<'_>,
+    region: Region,
+    s: &mut Scratch,
+    stats: &mut SearchStats,
+) -> SearchOutcome {
+    let after = p.config.field_after;
+    if after == 0 || p.mode != Mode::Route || p.use_field {
+        return kernel::run(grid, p, region, s, stats);
+    }
+    let p1 = Problem { cap: after, ..*p };
+    let first = kernel::run(grid, &p1, region, s, stats);
+    if !s.capped {
+        return first;
+    }
+    let spent = expansions_of(&first);
+    stats.field_runs += 1;
+    let p2 = Problem {
+        spent: p.spent.saturating_add(spent),
+        use_field: true,
+        ..*p
+    };
+    add_expansions(kernel::run(grid, &p2, region, s, stats), spent)
+}
+
 fn run_bounded<G: Grid>(grid: &G, p: &Problem<'_>, stats: &mut SearchStats) -> SearchOutcome {
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
         let full = Region::full(grid);
         let region = kernel::job_region(grid, p);
         stats.window_nodes = region.nodes() as u64;
-        let first = kernel::run(grid, p, region, &mut s, stats);
+        let first = run_attempt(grid, p, region, &mut s, stats);
         match first {
             SearchOutcome::Unreachable { expansions, .. }
                 if region != full && p.config.retry_full_window =>
@@ -443,25 +523,7 @@ fn run_bounded<G: Grid>(grid: &G, p: &Problem<'_>, stats: &mut SearchStats) -> S
                     spent: p.spent.saturating_add(expansions),
                     ..*p
                 };
-                let add = |e: u64| e + expansions;
-                match kernel::run(grid, &p2, full, &mut s, stats) {
-                    SearchOutcome::Found(mut pp) => {
-                        pp.expansions = add(pp.expansions);
-                        SearchOutcome::Found(pp)
-                    }
-                    SearchOutcome::Unreachable { job, expansions: e } => {
-                        SearchOutcome::Unreachable {
-                            job,
-                            expansions: add(e),
-                        }
-                    }
-                    SearchOutcome::BudgetExhausted { job, expansions: e } => {
-                        SearchOutcome::BudgetExhausted {
-                            job,
-                            expansions: add(e),
-                        }
-                    }
-                }
+                add_expansions(run_attempt(grid, &p2, full, &mut s, stats), expansions)
             }
             other => other,
         }
@@ -505,38 +567,41 @@ pub fn search_batch_with(
     ctx: &BatchContext<'_>,
     params: &CostParams,
 ) -> BatchOutcome {
-    let results: Vec<(SearchOutcome, SearchStats)> = batch
-        .jobs
-        .par_iter()
-        .map(|&j| {
-            let mut stats = SearchStats::default();
-            let Some(job) = pool.jobs.get(j as usize) else {
-                let o = SearchOutcome::Unreachable {
-                    job: j,
-                    expansions: 0,
-                };
-                return (o, stats);
+    let one = |&j: &u32| {
+        let mut stats = SearchStats::default();
+        let Some(job) = pool.jobs.get(j as usize) else {
+            let o = SearchOutcome::Unreachable {
+                job: j,
+                expansions: 0,
             };
-            let w = job.window as usize;
-            let Some(stack) = ctx.stacks.get(w) else {
-                let o = SearchOutcome::Unreachable {
-                    job: j,
-                    expansions: 0,
-                };
-                return (o, stats);
+            return (o, stats);
+        };
+        let w = job.window as usize;
+        let Some(stack) = ctx.stacks.get(w) else {
+            let o = SearchOutcome::Unreachable {
+                job: j,
+                expansions: 0,
             };
-            let sc = SearchContext {
-                stack,
-                lattice: ctx.lattices.and_then(|l| l.get(w)),
-                config: ctx.config,
-                checker: ctx.checker,
-                lookahead: ctx.lookahead,
-                gcells: ctx.gcells,
-            };
-            let o = search_with(&sc, pool, job, j, params, &mut stats);
-            (o, stats)
-        })
-        .collect();
+            return (o, stats);
+        };
+        let sc = SearchContext {
+            stack,
+            lattice: ctx.lattices.and_then(|l| l.get(w)),
+            config: ctx.config,
+            checker: ctx.checker,
+            lookahead: ctx.lookahead,
+            gcells: ctx.gcells,
+        };
+        let o = search_with(&sc, pool, job, j, params, &mut stats);
+        (o, stats)
+    };
+    // A one-job batch runs on the calling thread: no hand-off to the pool,
+    // and the search reads rasters the caller just built from its caches.
+    let results: Vec<(SearchOutcome, SearchStats)> = if batch.jobs.len() == 1 {
+        batch.jobs.iter().map(one).collect()
+    } else {
+        batch.jobs.par_iter().map(one).collect()
+    };
     let (outcomes, stats) = results.into_iter().unzip();
     BatchOutcome { outcomes, stats }
 }
@@ -598,6 +663,8 @@ pub fn cost_field_on(
         gcells: None,
         mode: Mode::Field,
         spent: 0,
+        cap: u64::MAX,
+        use_field: false,
     };
     let layers = stack.layers.len() as u32;
     let mut costs = Vec::new();

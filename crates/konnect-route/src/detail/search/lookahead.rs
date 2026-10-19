@@ -145,6 +145,8 @@ impl MapLookahead {
                     gcells: None,
                     mode: Mode::Field,
                     spent: 0,
+                    cap: u64::MAX,
+                    use_field: false,
                 };
                 let mut scratch = Scratch::default();
                 let mut stats = SearchStats::default();

@@ -1,4 +1,5 @@
-//! The tile schedule: a regular grid of [`TILE_CORE_NM`] cores with
+//! The tile schedule: a regular grid of cores
+//! ([`NegotiationTuning::grid_core`], by default [`crate::api::TILE_CORE_NM`]) with
 //! [`TILE_HALO_NM`] halos, 4-coloured so same-colour tiles never share a
 //! halo, shifted by half a tile on odd iterations; and fine-pitch BGA fields
 //! carved out as sub-tiles on the fine lattice, scheduled first.
@@ -10,7 +11,7 @@
 //! both pieces reach exactly.
 
 use super::{NegotiationTuning, Tile};
-use crate::api::{FootprintId, TileId, LATTICE_PITCH_NM, TILE_CORE_NM, TILE_HALO_NM};
+use crate::api::{FootprintId, TileId, LATTICE_PITCH_NM, TILE_HALO_NM};
 use crate::board::RouteBoard;
 use crate::compute::Window;
 use konnect_geom::{BBox, Coord, Point};
@@ -45,6 +46,9 @@ pub(crate) struct Tiling {
     pub fields: Vec<BgaField>,
     bga_tiles: usize,
     origin: Point,
+    /// Grid core width and height.
+    tw: Coord,
+    th: Coord,
     nx: u32,
     ny: u32,
 }
@@ -67,6 +71,14 @@ pub(crate) fn board_bbox(board: &RouteBoard) -> Option<BBox> {
             .filter_map(|p| p.bbox())
             .reduce(BBox::union)
     })
+}
+
+/// The grid core size: the tuning's, snapped to the base lattice and kept
+/// above two halos plus 0.5 mm so same-colour windows stay disjoint.
+fn grid_core(tuning: &NegotiationTuning) -> (Coord, Coord) {
+    let min = 2 * TILE_HALO_NM + 500_000;
+    let side = |v: Coord| snap_up(v.max(min), LATTICE_PITCH_NM);
+    (side(tuning.grid_core.0), side(tuning.grid_core.1))
 }
 
 /// Half-open containment, so a point on a shared boundary has one owner.
@@ -231,13 +243,17 @@ impl Tiling {
 
         // The regular grid, aligned to the base lattice, shifted by half a
         // tile on odd iterations.
-        let (tw, th) = TILE_CORE_NM;
+        let (tw, th) = grid_core(tuning);
         let mut origin = Point::new(
             snap_down(bb.min.x, LATTICE_PITCH_NM),
             snap_down(bb.min.y, LATTICE_PITCH_NM),
         );
         if shift {
-            origin = Point::new(origin.x - tw / 2, origin.y - th / 2);
+            // Half a tile, kept on the base lattice.
+            origin = Point::new(
+                origin.x - snap_down(tw / 2, LATTICE_PITCH_NM),
+                origin.y - snap_down(th / 2, LATTICE_PITCH_NM),
+            );
         }
         let nx = ((i64::from(bb.max.x) - i64::from(origin.x)) / i64::from(tw) + 1) as u32;
         let ny = ((i64::from(bb.max.y) - i64::from(origin.y)) / i64::from(th) + 1) as u32;
@@ -255,6 +271,8 @@ impl Tiling {
             fields,
             bga_tiles,
             origin,
+            tw,
+            th,
             nx,
             ny,
         })
@@ -269,7 +287,7 @@ impl Tiling {
         {
             return i;
         }
-        let (tw, th) = TILE_CORE_NM;
+        let (tw, th) = (self.tw, self.th);
         let ix = ((i64::from(p.x) - i64::from(self.origin.x)).div_euclid(i64::from(tw)))
             .clamp(0, i64::from(self.nx) - 1);
         let iy = ((i64::from(p.y) - i64::from(self.origin.y)).div_euclid(i64::from(th)))
@@ -296,5 +314,55 @@ impl Tiling {
                     .collect()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synthetic::BoardBuilder;
+
+    #[test]
+    fn custom_grid_cores_stay_on_the_lattice_and_keep_colours_apart() {
+        let board = BoardBuilder::new(70.0, 40.0, &["F.Cu", "B.Cu"]).build();
+        // 11.25 mm halves to 5.625 mm, which is off the 50 um lattice.
+        let tuning = NegotiationTuning {
+            grid_core: (15_000_000, 11_250_000),
+            ..NegotiationTuning::default()
+        };
+        for shift in [false, true] {
+            let tiling = Tiling::build(&board, shift, &tuning, 0).expect("tiles");
+            let grid: Vec<&Tile> = tiling.tiles.iter().map(|t| &t.tile).collect();
+            assert!(!grid.is_empty());
+            for (i, a) in grid.iter().enumerate() {
+                assert_eq!(a.core.width(), 15_000_000);
+                assert_eq!(a.core.height(), 11_250_000);
+                for v in [a.core.min.x, a.core.min.y, a.core.max.x, a.core.max.y] {
+                    assert_eq!(v.rem_euclid(LATTICE_PITCH_NM), 0, "{a:?}");
+                }
+                for t in &grid[i + 1..] {
+                    if t.colour == a.colour {
+                        assert!(!t.window.intersects(&a.window), "{a:?} / {t:?}");
+                    }
+                }
+                // Every core point has exactly one owner.
+                let mid = Point::new(
+                    ((i64::from(a.core.min.x) + i64::from(a.core.max.x)) / 2) as Coord,
+                    ((i64::from(a.core.min.y) + i64::from(a.core.max.y)) / 2) as Coord,
+                );
+                assert_eq!(tiling.owner(mid), i);
+            }
+        }
+        // Cores below two halos plus 0.5 mm are raised to that.
+        let tiny = NegotiationTuning {
+            grid_core: (1_000_000, 1_000_000),
+            ..NegotiationTuning::default()
+        };
+        let tiling = Tiling::build(&board, false, &tiny, 0).expect("tiles");
+        let side = 2 * TILE_HALO_NM + 500_000;
+        assert!(tiling
+            .tiles
+            .iter()
+            .all(|t| t.tile.core.width() == i64::from(side)));
     }
 }

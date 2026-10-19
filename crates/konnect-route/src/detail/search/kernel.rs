@@ -20,7 +20,7 @@
 //! grows: after warm-up a search does not allocate except for its result.
 
 use super::heap::RadixHeap;
-use super::lattice::{Grid, VIA_CHECK, VIA_NO};
+use super::lattice::{Grid, DIAGONAL, STRAIGHT, VIA_CHECK, VIA_NO};
 use super::lookahead::MapLookahead;
 use super::{turn_set, ExactCheck, Heuristic, Preferred, SearchConfig, SearchStats, HEADING_NONE};
 use crate::compute::job::{JOB_ALLOW_VIA, JOB_MIN_RUN};
@@ -77,6 +77,55 @@ fn info(ph: u32, prun: u32, pl: u32) -> u16 {
 /// the job unreachable rather than under-enforced.
 pub(crate) const MAX_RUN_BUCKET: u32 = 31;
 
+/// The relaxed field's per node-layer records, generation-stamped so a run
+/// never clears them: `d` is valid where `tag >> 1` is the run's
+/// generation, and `tag & 1` marks it closed.
+#[derive(Debug, Default)]
+struct FieldMap {
+    recs: Vec<(u32, u32)>,
+    gen: u32,
+}
+
+impl FieldMap {
+    /// Start a run over `len` node-layers.
+    fn begin(&mut self, len: usize) {
+        if self.recs.len() < len {
+            self.recs.resize(len, (u32::MAX, 0));
+        }
+        self.gen += 1;
+        if self.gen >= 1 << 30 {
+            self.recs.iter_mut().for_each(|r| r.1 = 0);
+            self.gen = 1;
+        }
+    }
+
+    /// The cost so far (`u32::MAX`: not reached).
+    #[inline]
+    fn get(&self, i: usize) -> u32 {
+        let r = self.recs[i];
+        if r.1 >> 1 == self.gen {
+            r.0
+        } else {
+            u32::MAX
+        }
+    }
+
+    #[inline]
+    fn closed(&self, i: usize) -> bool {
+        self.recs[i].1 == self.gen << 1 | 1
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, d: u32) {
+        self.recs[i] = (d, self.gen << 1);
+    }
+
+    #[inline]
+    fn close(&mut self, i: usize) {
+        self.recs[i].1 = self.gen << 1 | 1;
+    }
+}
+
 /// Per node-layer terminal flags and the exact-check cache.
 /// `tag` is `gen << 2 | flags`.
 #[repr(C)]
@@ -99,6 +148,12 @@ pub(crate) struct Scratch {
     nl: Vec<NlRec>,
     via_stamp: Vec<u32>,
     via_state: Vec<u8>,
+    /// Per node: the via cost this search charges there (`u32::MAX`: no
+    /// via), valid where `vcost_stamp` equals the generation. A via's cost
+    /// depends only on its node, so it is computed once per node, not once
+    /// per expanded state.
+    vcost_stamp: Vec<u32>,
+    vcost: Vec<u32>,
     corr_stamp: Vec<u32>,
     gcol: Vec<u32>,
     grow: Vec<u32>,
@@ -107,6 +162,16 @@ pub(crate) struct Scratch {
     /// Reverse-flood visit stamps (per node-layer) and its queue.
     flood_stamp: Vec<u32>,
     flood_queue: Vec<u32>,
+    /// The relaxed cost-to-go field per node-layer ([`relaxed_field`]) and
+    /// the heap that builds it.
+    field: FieldMap,
+    fheap: RadixHeap,
+    /// The field's pass-through bounds at the target node-layers.
+    fpass: Vec<PassBound>,
+    /// Per region column, then row: the gap to the sources' box, nm.
+    gaps: Vec<i64>,
+    /// The last [`run`] stopped at its [`Problem::cap`].
+    pub capped: bool,
 }
 
 impl Scratch {
@@ -115,6 +180,7 @@ impl Scratch {
         if self.gen >= (1 << 29) {
             self.nl.iter_mut().for_each(|r| r.tag = 0);
             self.via_stamp.iter_mut().for_each(|s| *s = 0);
+            self.vcost_stamp.iter_mut().for_each(|s| *s = 0);
             self.corr_stamp.iter_mut().for_each(|s| *s = 0);
             self.st.iter_mut().for_each(|r| r.gen = 0);
             self.flood_stamp.iter_mut().for_each(|s| *s = 0);
@@ -136,6 +202,8 @@ impl Scratch {
         if self.via_stamp.len() < nodes {
             self.via_stamp.resize(nodes, 0);
             self.via_state.resize(nodes, 0);
+            self.vcost_stamp.resize(nodes, 0);
+            self.vcost.resize(nodes, 0);
         }
         self.heap.clear();
         self.tboxes.clear();
@@ -152,7 +220,9 @@ impl Scratch {
         8 * self.st.capacity()
             + 8 * self.nl.capacity()
             + 5 * self.via_stamp.capacity()
+            + 8 * self.vcost_stamp.capacity()
             + 4 * (self.flood_stamp.capacity()
+                + 2 * self.field.recs.capacity()
                 + self.flood_queue.capacity()
                 + self.corr_stamp.capacity()
                 + self.gcol.capacity()
@@ -267,6 +337,11 @@ pub(crate) struct Problem<'a> {
     /// Expansions an earlier attempt of the same search already used; the
     /// budget is `config.max_expansions − spent`.
     pub spent: u64,
+    /// Stop after this many expansions of this attempt and set
+    /// [`Scratch::capped`] (`u64::MAX`: no cap).
+    pub cap: u64,
+    /// Add the relaxed cost-to-go field ([`relaxed_field`]) to the heuristic.
+    pub use_field: bool,
 }
 
 /// Lattice indices of a GCell id's footprint, clipped to the grid.
@@ -377,41 +452,71 @@ fn reaches(x: i64, y: i64, h: u32, b: &TBox) -> bool {
     a0.max(b0).max(0) <= a1.min(b1)
 }
 
-/// Index arithmetic for one search.
+/// Index arithmetic for one search. A local node index is
+/// `row << wshift | col` (rows padded to a power of two), and a state is
+/// `node << bshift | (layer · 9 + heading) · R + run` (each node's block
+/// padded to a power of two), so decoding is shifts and masks plus a
+/// division by the constant 9.
 #[derive(Clone, Copy)]
 struct Layout {
-    nodes: u32,
+    layers: u32,
     runs: u32,
     region: Region,
+    wshift: u32,
+    bshift: u32,
 }
 
 impl Layout {
+    fn new(region: Region, layers: u32, runs: u32) -> Self {
+        let pow2 = |v: u32| v.max(1).next_power_of_two().trailing_zeros();
+        Layout {
+            layers,
+            runs,
+            region,
+            wshift: pow2(region.w),
+            bshift: pow2(layers * HS * runs),
+        }
+    }
+
+    /// Node slots, including row padding.
+    fn padded_nodes(&self) -> usize {
+        (self.region.h as usize) << self.wshift
+    }
+
+    /// State slots, including padding.
+    fn states(&self) -> usize {
+        self.padded_nodes() << self.bshift
+    }
+
     #[inline]
     fn enc(&self, node: u32, layer: u32, h: u32, run: u32) -> u32 {
-        ((layer * HS + h) * self.runs + run) * self.nodes + node
+        (node << self.bshift) | ((layer * HS + h) * self.runs + run)
     }
 
     /// `(node, layer, heading, run)`.
     #[inline]
     fn dec(&self, st: u32) -> (u32, u32, u32, u32) {
-        let node = st % self.nodes;
-        let t = st / self.nodes;
-        let run = t % self.runs;
-        let t = t / self.runs;
-        (node, t / HS, t % HS, run)
+        let node = st >> self.bshift;
+        let rest = st & ((1 << self.bshift) - 1);
+        let (lh, run) = if self.runs == 1 {
+            (rest, 0)
+        } else {
+            (rest / self.runs, rest % self.runs)
+        };
+        (node, lh / HS, lh % HS, run)
     }
 
     #[inline]
     fn col_row(&self, node: u32) -> (u32, u32) {
         (
-            self.region.c0 + node % self.region.w,
-            self.region.r0 + node / self.region.w,
+            self.region.c0 + (node & ((1 << self.wshift) - 1)),
+            self.region.r0 + (node >> self.wshift),
         )
     }
 
     #[inline]
     fn local(&self, c: u32, r: u32) -> u32 {
-        (r - self.region.r0) * self.region.w + (c - self.region.c0)
+        ((r - self.region.r0) << self.wshift) | (c - self.region.c0)
     }
 }
 
@@ -443,6 +548,7 @@ pub(crate) fn run<G: Grid>(
     s: &mut Scratch,
     stats: &mut SearchStats,
 ) -> SearchOutcome {
+    s.capped = false;
     let job_no = p.job_index;
     let unreachable = |e| SearchOutcome::Unreachable {
         job: job_no,
@@ -504,20 +610,16 @@ pub(crate) fn run<G: Grid>(
         prefs[i] = *pr;
     }
 
-    let nodes = region.nodes();
+    let lay = Layout::new(region, lcount, run_buckets);
+    let nodes = lay.padded_nodes();
     let node_layers = nodes * nl_layers;
-    let states = node_layers * HS as usize * run_buckets as usize;
-    if nodes == 0 || states >= u32::MAX as usize {
+    let states = lay.states();
+    if region.nodes() == 0 || states >= u32::MAX as usize {
         return unreachable(0);
     }
     s.begin(states, node_layers, nodes);
     let gen = s.gen;
     let sgen = s.sgen();
-    let lay = Layout {
-        nodes: nodes as u32,
-        runs: run_buckets,
-        region,
-    };
     let (c0, r0, rw, rh) = (region.c0, region.r0, region.w, region.h);
     let in_region = |c: u32, r: u32| c >= c0 && r >= r0 && c - c0 < rw && r - r0 < rh;
     let nl_index = |node: u32, layer: u32| node as usize * nl_layers + layer as usize;
@@ -638,8 +740,115 @@ pub(crate) fn run<G: Grid>(
         }
     }
 
-    // Heuristic.
+    // Via congestion sampling offsets in nodes (straight, diagonal); off
+    // the uniform lattice only the via's own node is sampled.
+    let via_reach: Option<(i64, i64)> = cfg.via_congestion_reach_nm.map(|r| {
+        if !grid.uniform() {
+            return (0, 0);
+        }
+        let d = (i64::from(r.max(0)) + i64::from(pitch) / 2) / i64::from(pitch);
+        let e = (d as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i64;
+        (d, e)
+    });
+    let vp = ViaPricing {
+        base: params.via.0,
+        reach: via_reach,
+        dims: (grid.cols(), grid.rows()),
+        factors: (
+            u64::from(params.history_factor),
+            u64::from(params.present_factor),
+        ),
+        check_free: cfg.check_free_vias,
+        checker: p.checker.is_some(),
+        near: params.near_step.0,
+    };
+
+    // The relaxed cost-to-go field, for searches that flood.
+    let use_field = p.use_field && p.mode == Mode::Route;
     let inv_pitch: u64 = (1u64 << 32) / pitch as u64;
+    // The sources' box in nm, for the backward search's heuristic.
+    let mut sbox = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    let mut src_layers = 0u64;
+    for n in p.sources.iter().filter(|n| usable(n)) {
+        src_layers |= 1 << n.layer;
+        let (x, y) = (
+            i64::from(grid.x(n.col.into())),
+            i64::from(grid.y(n.row.into())),
+        );
+        sbox = (sbox.0.min(x), sbox.1.max(x), sbox.2.min(y), sbox.3.max(y));
+    }
+    // Per region column and row, the gap to the sources' box.
+    let mut gaps = std::mem::take(&mut s.gaps);
+    gaps.clear();
+    if use_field && sbox.0 != i64::MAX {
+        gaps.extend((c0..c0 + rw).map(|c| axis_gap(i64::from(grid.x(c)), sbox.0, sbox.1)));
+        gaps.extend((r0..r0 + rh).map(|r| axis_gap(i64::from(grid.y(r)), sbox.2, sbox.3)));
+    }
+    let gaps = gaps;
+    // A node-layer off every source's layer needs at least one via more.
+    let to_sources = |c: u32, r: u32, l: u32| {
+        let o = octile(
+            gaps[(c - c0) as usize],
+            gaps[(rw + r - r0) as usize],
+            inv_pitch,
+        );
+        if src_layers & (1 << l) == 0 {
+            o.saturating_add(params.via.0)
+        } else {
+            o
+        }
+    };
+    let mut fmap = std::mem::take(&mut s.field);
+    let mut fbound = FieldBound {
+        stop: 0,
+        complete: false,
+    };
+    s.fpass.clear();
+    if use_field && sbox.0 != i64::MAX {
+        let (settled, b) = relaxed_field(
+            grid,
+            &lay,
+            &views,
+            &layer_ok,
+            allow_via,
+            params,
+            &vp,
+            p.targets,
+            &to_sources,
+            s,
+            &mut fmap,
+        );
+        stats.field_settled += settled;
+        fbound = b;
+    }
+    let fmap = fmap;
+    let fpass = std::mem::take(&mut s.fpass);
+    // The field's bound at a node-layer: exact where the backward search
+    // closed it; elsewhere `stop - octile to the sources` (every unclosed
+    // node had `d + octile >= stop`), or unreachable once it ran dry. A
+    // state at a target that its mask does not end (arrived in heading `h`
+    // outside it) only passes through: it takes the pass-through bound,
+    // not the end state's 0, or a step into it would be inconsistent.
+    let fd_at = |c: u32, r: u32, l: u32, h: u32| {
+        let i = lay.local(c, r) as usize * nl_layers + l as usize;
+        if fmap.closed(i) {
+            let v = fmap.get(i);
+            if v == 0 && h != none {
+                if let Ok(k) = fpass.binary_search_by_key(&i, |p| p.nl) {
+                    if fpass[k].mask & (1 << h) == 0 {
+                        return fpass[k].d;
+                    }
+                }
+            }
+            v
+        } else if fbound.complete {
+            u32::MAX
+        } else {
+            fbound.stop.saturating_sub(to_sources(c, r, l))
+        }
+    };
+
+    // Heuristic.
     let factor = u64::from(cfg.astar_factor.max(1000));
     let via_cost = params.via.0;
     let lookahead = if cfg.heuristic == Heuristic::Map {
@@ -659,18 +868,28 @@ pub(crate) fn run<G: Grid>(
         if field {
             return 0;
         }
+        // With the field, a state that cannot reach a target is `u32::MAX`
+        // (never pushed), and every other bound is raised to the field.
+        let floor = if use_field {
+            let v = fd_at(c, r, l, h);
+            if v == u32::MAX {
+                return u32::MAX;
+            }
+            v
+        } else {
+            0
+        };
         let x = i64::from(grid.x(c));
         let y = i64::from(grid.y(r));
-        // Per box, the bound is `lo` if a straight run in the state's
-        // heading can reach it and `hi` otherwise: any path to a same-layer
-        // target off the ray turns at least once (or vias, which costs
-        // more). The minimum over boxes is `min(min hi, min lo of the
-        // reachable boxes)`, and only boxes with `lo < min hi` need the ray
-        // test, which is usually one box or none.
-        let mut lo = [0u32; MAX_TARGET_BOXES];
-        let mut hi = [0u32; MAX_TARGET_BOXES];
-        let mut min_hi = u32::MAX;
-        for (k, b) in tboxes.iter().enumerate() {
+        let scale = |best: u32| {
+            let best = best.max(floor);
+            if factor == 1000 {
+                best
+            } else {
+                (u64::from(best) * factor / 1000).min(u64::from(u32::MAX >> 1)) as u32
+            }
+        };
+        let bound = |b: &TBox| {
             let dx = axis_gap(x, b.min_x, b.max_x);
             let dy = axis_gap(y, b.min_y, b.max_y);
             let other_layer = b.layer != u8::MAX && u32::from(b.layer) != l;
@@ -692,8 +911,29 @@ pub(crate) fn run<G: Grid>(
                     m = q.unwrap_or(0);
                 }
             }
-            lo[k] = base.max(m);
-            hi[k] = base.saturating_add(bend).max(m);
+            (base.max(m), base.saturating_add(bend).max(m))
+        };
+        // One box (the common case): the same bound without the tables.
+        if let [b] = tboxes.as_slice() {
+            let (lo, hi) = bound(b);
+            let best = if lo < hi && reaches(x, y, h, b) {
+                lo
+            } else {
+                hi
+            };
+            return scale(best);
+        }
+        // Per box, the bound is `lo` if a straight run in the state's
+        // heading can reach it and `hi` otherwise: any path to a same-layer
+        // target off the ray turns at least once (or vias, which costs
+        // more). The minimum over boxes is `min(min hi, min lo of the
+        // reachable boxes)`, and only boxes with `lo < min hi` need the ray
+        // test, which is usually one box or none.
+        let mut lo = [0u32; MAX_TARGET_BOXES];
+        let mut hi = [0u32; MAX_TARGET_BOXES];
+        let mut min_hi = u32::MAX;
+        for (k, b) in tboxes.iter().enumerate() {
+            (lo[k], hi[k]) = bound(b);
             min_hi = min_hi.min(hi[k]);
         }
         let mut best = min_hi;
@@ -702,11 +942,7 @@ pub(crate) fn run<G: Grid>(
                 best = lo[k];
             }
         }
-        if factor == 1000 {
-            best
-        } else {
-            (u64::from(best) * factor / 1000).min(u64::from(u32::MAX >> 1)) as u32
-        }
+        scale(best)
     };
 
     // Seeds.
@@ -717,12 +953,16 @@ pub(crate) fn run<G: Grid>(
         if rec.gen == sgen {
             continue;
         }
+        let hv = heur(c, r, l, none);
+        if use_field && hv == u32::MAX {
+            continue;
+        }
         *rec = StateRec {
             g: 0,
             gen: sgen,
             info: info(u32::from(SEED), 0, 0),
         };
-        s.heap.push(heur(c, r, l, none), st);
+        s.heap.push(hv, st);
         stats.pushes += 1;
     }
 
@@ -735,16 +975,6 @@ pub(crate) fn run<G: Grid>(
     let corr_pen = u64::from(cfg.corridor_penalty.0);
     let pf = u64::from(params.present_factor);
     let hf = u64::from(params.history_factor);
-    // Via congestion sampling offsets in nodes (straight, diagonal); off
-    // the uniform lattice only the via's own node is sampled.
-    let via_reach: Option<(i64, i64)> = cfg.via_congestion_reach_nm.map(|r| {
-        if !grid.uniform() {
-            return (0, 0);
-        }
-        let d = (i64::from(r.max(0)) + i64::from(pitch) / 2) / i64::from(pitch);
-        let e = (d as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i64;
-        (d, e)
-    });
     let max_exp = cfg.max_expansions.saturating_sub(p.spent);
     let mut dead_end_checked = cfg.dead_end_check_after == 0;
 
@@ -834,6 +1064,13 @@ pub(crate) fn run<G: Grid>(
 
         expansions += 1;
         let gs = rec.g;
+        if expansions > p.cap && p.cap < max_exp {
+            s.capped = true;
+            break SearchOutcome::BudgetExhausted {
+                job: job_no,
+                expansions,
+            };
+        }
         if expansions > max_exp
             || (bound != u32::MAX && (gs > bound || (factor == 1000 && key > bound)))
         {
@@ -966,13 +1203,16 @@ pub(crate) fn run<G: Grid>(
                     continue;
                 }
                 if target.gen != sgen || ng < target.g {
+                    let hv = heur(step.col, step.row, layer, nh);
+                    if use_field && hv == u32::MAX {
+                        continue;
+                    }
                     s.st[ns as usize] = StateRec {
                         g: ng,
                         gen: sgen,
                         info: info(h, run, layer),
                     };
-                    s.heap
-                        .push(ng.saturating_add(heur(step.col, step.row, layer, nh)), ns);
+                    s.heap.push(ng.saturating_add(hv), ns);
                     stats.pushes += 1;
                 }
             }
@@ -985,36 +1225,11 @@ pub(crate) fn run<G: Grid>(
             run >= need_run
         };
         if allow_via && via_from_here {
-            let mut ok = true;
-            let mut check = cfg.check_free_vias;
-            for vw in views.iter().take(nl_layers) {
-                let vs = vw.via[row as usize * vw.s8 + col as usize];
-                if vs == VIA_NO {
-                    ok = false;
-                    break;
-                }
-                if vs == VIA_CHECK {
-                    check = true;
-                }
-            }
-            if ok && s.via_stamp[node as usize] == gen && s.via_state[node as usize] == 2 {
-                ok = false;
-            }
-            let mut vcost = via_cost;
-            if let Some((d, e)) = via_reach {
-                vcost = via_congestion_cost(
-                    &views[..nl_layers],
-                    col,
-                    row,
-                    (d, e),
-                    (grid.cols(), grid.rows()),
-                    vcost,
-                    (hf, pf),
-                );
-            }
-            if check && p.checker.is_none() {
-                vcost = vcost.saturating_add(near_step);
-            }
+            // The node's via cost (`u32::MAX`: no via here), once per node.
+            let n = node as usize;
+            let vcost = vp.cached(s, &views[..nl_layers], node, col, row);
+            // An exact check may have refused this node's via.
+            let ok = !(s.via_stamp[n] == gen && s.via_state[n] == 2);
             let ng = gs.saturating_add(vcost);
             // An infinite via cost forbids the via.
             if ok && ng != u32::MAX {
@@ -1028,12 +1243,16 @@ pub(crate) fn run<G: Grid>(
                     let ns = lay.enc(node, l2, none, 0);
                     let target = s.st[ns as usize];
                     if target.gen != sgen || (target.info & 1 == 0 && ng < target.g) {
+                        let hv = heur(col, row, l2, none);
+                        if use_field && hv == u32::MAX {
+                            continue;
+                        }
                         s.st[ns as usize] = StateRec {
                             g: ng,
                             gen: sgen,
                             info: info(h, run, layer),
                         };
-                        s.heap.push(ng.saturating_add(heur(col, row, l2, none)), ns);
+                        s.heap.push(ng.saturating_add(hv), ns);
                         stats.pushes += 1;
                     }
                 }
@@ -1041,8 +1260,64 @@ pub(crate) fn run<G: Grid>(
         }
     };
     s.tboxes = tboxes;
+    s.field = fmap;
+    s.fpass = fpass;
+    s.gaps = gaps;
     stats.expansions += expansions;
     outcome
+}
+
+/// How a search prices a via at a node, once per node.
+#[derive(Clone, Copy)]
+struct ViaPricing {
+    base: u32,
+    /// Congestion sampling offsets in nodes (straight, diagonal).
+    reach: Option<(i64, i64)>,
+    dims: (u32, u32),
+    factors: (u64, u64),
+    /// Add `near` where a site needs an exact check and no checker runs.
+    check_free: bool,
+    checker: bool,
+    near: u32,
+}
+
+impl ViaPricing {
+    /// The cost of a through via at `(col, row)`, `u32::MAX` where a layer
+    /// refuses the site.
+    #[inline]
+    fn cost(&self, views: &[View<'_>], col: u32, row: u32) -> u32 {
+        let mut check = self.check_free;
+        for vw in views {
+            let vs = vw.via[row as usize * vw.s8 + col as usize];
+            if vs == VIA_NO {
+                return u32::MAX;
+            }
+            if vs == VIA_CHECK {
+                check = true;
+            }
+        }
+        let mut vcost = self.base;
+        if let Some(de) = self.reach {
+            vcost = via_congestion_cost(views, col, row, de, self.dims, vcost, self.factors);
+        }
+        if check && !self.checker {
+            vcost = vcost.saturating_add(self.near);
+        }
+        vcost
+    }
+
+    /// [`ViaPricing::cost`] through the search's per-node cache.
+    #[inline]
+    fn cached(&self, s: &mut Scratch, views: &[View<'_>], node: u32, col: u32, row: u32) -> u32 {
+        let n = node as usize;
+        if s.vcost_stamp[n] == s.gen {
+            return s.vcost[n];
+        }
+        let v = self.cost(views, col, row);
+        s.vcost_stamp[n] = s.gen;
+        s.vcost[n] = v;
+        v
+    }
 }
 
 /// A via's cost scaled by the worst routed-copper congestion under it: the
@@ -1088,6 +1363,302 @@ fn via_congestion_cost(
     let b = u64::from(base).saturating_mul(1000u64.saturating_add(hist.saturating_mul(hf))) / 1000;
     let c = b.saturating_mul(1000u64.saturating_add(pres.saturating_mul(pf))) / 1000;
     c.min(u64::from(u32::MAX - 1)) as u32
+}
+
+/// The field's bound for passing through a target node-layer: arriving in
+/// a heading outside its `mask` (the target's entry headings) ends nothing,
+/// and the cheapest way on is a step off it (or a via) and a path from
+/// there. Exact where the backward search closed that state, otherwise the
+/// [`FieldBound`] value, `u32::MAX` when nothing on is reachable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PassBound {
+    /// The target's node-layer index.
+    nl: usize,
+    d: u32,
+    closed: bool,
+    mask: u8,
+}
+
+/// Where [`relaxed_field`] stopped.
+#[derive(Clone, Copy)]
+struct FieldBound {
+    /// The smallest open `d + octile to the sources` when it stopped.
+    stop: u32,
+    /// The search ran dry: every node-layer it did not close cannot reach a
+    /// target.
+    complete: bool,
+}
+
+/// The relaxed cost-to-go field: a backward A* from the targets toward the
+/// sources over the search region, on a relaxation of the search graph
+/// that drops bends, the turn rule, the heading mask, run lengths and the
+/// wrong-way and corridor costs (it keeps the congestion-scaled step costs,
+/// the `Near` surcharges, the walls and the real via prices). Every real
+/// move is a move of the relaxation and costs at least as much, so a closed
+/// node-layer's `fd` is a lower bound on the real cost to a target from any
+/// state there. A target node-layer has two values: 0 for the states its
+/// entry mask ends, and the cost of passing through it for the others
+/// (left in `s.fpass`, [`PassBound`]). It runs until a source closes and
+/// the open keys pass that source's cost by a slack; an unclosed
+/// node-layer then has `d >= stop - h`, `h` the octile to the sources plus
+/// a via off their layers ([`FieldBound`]). Both bounds are consistent on
+/// every edge of the real search (into a target's pass-through states
+/// too), so its path cost is unchanged; ties may resolve differently.
+#[allow(clippy::too_many_arguments)]
+fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
+    grid: &G,
+    lay: &Layout,
+    views: &[View<'_>; MAX_LAYERS],
+    layer_ok: &[bool; MAX_LAYERS],
+    allow_via: bool,
+    params: &CostParams,
+    vp: &ViaPricing,
+    targets: &[JobNode],
+    to_sources: &F,
+    s: &mut Scratch,
+    fd: &mut FieldMap,
+) -> (u64, FieldBound) {
+    let region = lay.region;
+    let nl_layers = lay.layers as usize;
+    let lcount = lay.layers;
+    let total = lay.padded_nodes() * nl_layers;
+    fd.begin(total);
+    let mut heap = std::mem::take(&mut s.fheap);
+    heap.clear();
+    let in_region = |c: u32, r: u32| {
+        c >= region.c0 && r >= region.r0 && c - region.c0 < region.w && r - region.r0 < region.h
+    };
+    for t in targets {
+        let (c, r, l) = (u32::from(t.col), u32::from(t.row), u32::from(t.layer));
+        if l >= lcount || !in_region(c, r) {
+            continue;
+        }
+        let nl = lay.local(c, r) as usize * nl_layers + l as usize;
+        if fd.get(nl) != 0 {
+            fd.set(nl, 0);
+            heap.push(to_sources(c, r, l), nl as u32);
+        }
+    }
+    let pf = u64::from(params.present_factor);
+    let hf = u64::from(params.history_factor);
+    let near_step = params.near_step.0;
+    let uniform = grid.uniform();
+    // `(dcol, drow)` per heading; with heading parity, straight or diagonal.
+    const DELTAS: [(isize, isize); 8] = [
+        (1, 0),
+        (1, -1),
+        (0, -1),
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ];
+    let row_step = 1isize << lay.wshift;
+    let mut settled = 0u64;
+    let mut limit = u32::MAX;
+    let mut bound = FieldBound {
+        stop: u32::MAX,
+        complete: true,
+    };
+    // Each push carries `d + octile to the sources`; `fd` keeps `d`.
+    // A target node-layer has two states: the end (`fd` 0), entered only
+    // in a heading its mask allows (or by a via), and passing through it,
+    // which any track step may do. The through costs live here, sorted by
+    // node-layer, and their heap entries carry `THROUGH`.
+    const THROUGH: u32 = 1 << 31;
+    let mut through = std::mem::take(&mut s.fpass);
+    through.clear();
+    for t in targets {
+        let (c, r, l) = (u32::from(t.col), u32::from(t.row), u32::from(t.layer));
+        if l < lcount && in_region(c, r) {
+            let nl = lay.local(c, r) as usize * nl_layers + l as usize;
+            through.push(PassBound {
+                nl,
+                d: u32::MAX,
+                closed: false,
+                mask: s.nl_of(nl).dst_mask,
+            });
+        }
+    }
+    through.sort_unstable_by_key(|t| t.nl);
+    through.dedup_by_key(|t| t.nl);
+    let push = |heap: &mut RadixHeap,
+                fd: &mut FieldMap,
+                through: &mut [PassBound],
+                pnl: usize,
+                nd: u32,
+                pc: u32,
+                pr: u32| {
+        let cur = fd.get(pnl);
+        if cur == 0 {
+            // A target's end state: the step passes through it instead.
+            if let Ok(i) = through.binary_search_by_key(&pnl, |t| t.nl) {
+                if nd < through[i].d {
+                    through[i].d = nd;
+                    heap.push(
+                        nd.saturating_add(to_sources(pc, pr, (pnl % nl_layers) as u32)),
+                        pnl as u32 | THROUGH,
+                    );
+                }
+            }
+        } else if nd < cur {
+            fd.set(pnl, nd);
+            heap.push(
+                nd.saturating_add(to_sources(pc, pr, (pnl % nl_layers) as u32)),
+                pnl as u32,
+            );
+        }
+    };
+    while let Some((key, id)) = heap.pop() {
+        let is_through = id & THROUGH != 0;
+        let nl = (id & !THROUGH) as usize;
+        let node = (nl / nl_layers) as u32;
+        let layer = nl % nl_layers;
+        let (c, r) = lay.col_row(node);
+        let d = if is_through {
+            let Ok(i) = through.binary_search_by_key(&nl, |t| t.nl) else {
+                continue;
+            };
+            if through[i].closed {
+                continue;
+            }
+            through[i].d
+        } else {
+            if fd.closed(nl) {
+                continue;
+            }
+            fd.get(nl)
+        };
+        // No freshness test: an improvement pushes a smaller key, which
+        // pops (and closes the record) before any stale entry of it.
+        if key > limit {
+            bound = FieldBound {
+                stop: key,
+                complete: false,
+            };
+            break;
+        }
+        if is_through {
+            if let Ok(i) = through.binary_search_by_key(&nl, |t| t.nl) {
+                through[i].closed = true;
+            }
+        } else {
+            fd.close(nl);
+        }
+        settled += 1;
+        let v = &views[layer];
+        let i8 = r as usize * v.s8 + c as usize;
+        let flags = s.flags_of(nl);
+        // The end state of a target is entered only in a heading its mask
+        // allows; every other state may be entered from any side.
+        let arrive: u8 = if flags & DST != 0 && !is_through {
+            s.nl_of(nl).dst_mask
+        } else {
+            0xff
+        };
+        if flags & SRC != 0 && limit == u32::MAX {
+            // A source closed: go on a small slack past its cost, so the
+            // forward search finds exact bounds along near-optimal paths.
+            // (Measured on real negotiation searches: a wider slack closes
+            // more of the window than the forward search then saves.)
+            limit = key.saturating_add(d / 256).saturating_add(1_000);
+        }
+        // Track steps into this node from its neighbours on this layer.
+        let blocked = v.core[i8] > 0;
+        if layer_ok[layer] && (!blocked || flags & (SRC | DST) != 0) {
+            // A step into a blocked terminal, or touching a HALO node, pays
+            // `near_step` on top (the predecessor's HALO is read below).
+            let v_near = blocked || v.halo[i8] > 0;
+            let i16 = r as usize * v.s16 + c as usize;
+            let (pres, hist) = (v.present[i16], v.history[i16]);
+            let scaled = |base: u32| {
+                if pres | hist == 0 {
+                    return base;
+                }
+                let b = (u64::from(base).saturating_mul(1000 + u64::from(hist) * hf) / 1000)
+                    .saturating_mul(1000 + u64::from(pres) * pf)
+                    / 1000;
+                b.min(u64::from(u32::MAX >> 2)) as u32
+            };
+            let interior = c > region.c0
+                && r > region.r0
+                && c + 1 < region.c0 + region.w
+                && r + 1 < region.r0 + region.h;
+            if uniform && interior {
+                // Every neighbour is in the region: index arithmetic only.
+                let costs = [scaled(STRAIGHT), scaled(DIAGONAL)];
+                for (h, &(dc, dr)) in DELTAS.iter().enumerate() {
+                    // The step from that neighbour into this node heads
+                    // the opposite way.
+                    if arrive & (1 << ((h + 4) & 7)) == 0 {
+                        continue;
+                    }
+                    let mut nd = d.saturating_add(costs[h & 1]);
+                    let hi = (i8 as isize + dr * v.s8 as isize + dc) as usize;
+                    if v_near || v.halo[hi] > 0 {
+                        nd = nd.saturating_add(near_step);
+                    }
+                    let pnl = (nl as isize + (dr * row_step + dc) * nl_layers as isize) as usize;
+                    let (pc, pr) = ((c as isize + dc) as u32, (r as isize + dr) as u32);
+                    push(&mut heap, fd, &mut through, pnl, nd, pc, pr);
+                }
+            } else {
+                for h in 0..8u8 {
+                    if arrive & (1 << ((h + 4) & 7)) == 0 {
+                        continue;
+                    }
+                    let Some(step) = grid.step(c, r, h) else {
+                        continue;
+                    };
+                    if !in_region(step.col, step.row) {
+                        continue;
+                    }
+                    // Lattice edges are symmetric: the step back costs the
+                    // same.
+                    let mut nd = d.saturating_add(scaled(step.cost));
+                    if v_near || v.halo[step.row as usize * v.s8 + step.col as usize] > 0 {
+                        nd = nd.saturating_add(near_step);
+                    }
+                    let pnl = lay.local(step.col, step.row) as usize * nl_layers + layer;
+                    push(&mut heap, fd, &mut through, pnl, nd, step.col, step.row);
+                }
+            }
+        }
+        // A via landing on this node-layer, from any other layer (a via
+        // landing on a target ends there, so a through state has none).
+        if allow_via && !is_through && (layer_ok[layer] || flags & DST != 0) {
+            let vcost = vp.cached(s, &views[..nl_layers], node, c, r);
+            if vcost != u32::MAX {
+                let nd = d.saturating_add(vcost);
+                if nd != u32::MAX {
+                    for l2 in 0..nl_layers {
+                        let pnl = node as usize * nl_layers + l2;
+                        if l2 != layer {
+                            push(&mut heap, fd, &mut through, pnl, nd, c, r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    s.fheap = heap;
+    // An unclosed pass-through state takes the bound of every unclosed
+    // node-layer.
+    for t in &mut through {
+        if !t.closed {
+            t.d = if bound.complete {
+                u32::MAX
+            } else {
+                let (c, r) = lay.col_row((t.nl / nl_layers) as u32);
+                bound
+                    .stop
+                    .saturating_sub(to_sources(c, r, (t.nl % nl_layers) as u32))
+            };
+        }
+    }
+    s.fpass = through;
+    (settled, bound)
 }
 
 /// Whether the targets sit in a pocket no source can reach: a breadth-first
@@ -1273,18 +1844,23 @@ pub(crate) fn field_costs(
     run_buckets: u32,
     out: &mut Vec<Cost>,
 ) {
+    let lay = Layout::new(region, lcount, run_buckets);
     let nodes = region.nodes();
     out.clear();
     out.resize(nodes * lcount as usize, Cost::INFINITE);
     let sgen = s.sgen();
-    for l in 0..lcount as usize {
-        for hr in 0..(HS * run_buckets) as usize {
-            let base = (l * (HS * run_buckets) as usize + hr) * nodes;
-            for node in 0..nodes {
-                let r = s.st[base + node];
-                if r.gen == sgen {
-                    let o = &mut out[l * nodes + node];
-                    o.0 = o.0.min(r.g);
+    let per_layer = HS * run_buckets;
+    for r in region.r0..region.r0 + region.h {
+        for c in region.c0..region.c0 + region.w {
+            let node = lay.local(c, r);
+            let flat = ((r - region.r0) * region.w + (c - region.c0)) as usize;
+            for l in 0..lcount {
+                let base = lay.enc(node, l, 0, 0) as usize;
+                for rec in &s.st[base..base + per_layer as usize] {
+                    if rec.gen == sgen {
+                        let o = &mut out[l as usize * nodes + flat];
+                        o.0 = o.0.min(rec.g);
+                    }
                 }
             }
         }
