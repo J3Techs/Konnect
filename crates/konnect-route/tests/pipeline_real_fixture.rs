@@ -15,7 +15,7 @@
 //!
 //! - `KONNECT_PIPELINE_THREADS` (default 0: the whole machine);
 //! - `KONNECT_PIPELINE_NEGOTIATE_THREADS` (default: the pipeline's);
-//! - `KONNECT_PIPELINE_ITERATIONS` (negotiation, default: the pipeline's);
+//! - `KONNECT_PIPELINE_ITERATIONS` (negotiation, default 10);
 //! - `KONNECT_PIPELINE_REGION=x0,y0,x1,y1` in mm;
 //! - `KONNECT_PIPELINE_NO_FANOUT=1`, `KONNECT_PIPELINE_NO_ACCESS=1`,
 //!   `KONNECT_PIPELINE_NO_OPTIMIZE=1`;
@@ -120,10 +120,7 @@ fn pipeline_real_board_fixture() {
         ..PipelineSettings::default()
     };
     settings.negotiation.threads = env_num("KONNECT_PIPELINE_NEGOTIATE_THREADS", 0) as usize;
-    settings.negotiation.max_iterations = env_num(
-        "KONNECT_PIPELINE_ITERATIONS",
-        u64::from(settings.negotiation.max_iterations),
-    ) as u32;
+    settings.negotiation.max_iterations = env_num("KONNECT_PIPELINE_ITERATIONS", 10) as u32;
     settings.negotiation.present_growth = env_num(
         "KONNECT_PIPELINE_PRESENT_GROWTH",
         u64::from(settings.negotiation.present_growth),

@@ -437,12 +437,6 @@ impl TileRun {
         } else {
             PaintKind::Soft
         };
-        // Routed copper is checked exactly only after commit, so its paint
-        // reaches a node's half-diagonal further than the clearance: a
-        // lattice step between two nodes just outside the clearance can
-        // still pass too close, and the search must see that as congestion
-        // (or, in a fill pass, as a wall), or the conflict never resolves.
-        let reach = half_diag(self.lattice.pitch_nm);
         let stack = self.stacks[k].as_mut().expect("stack at home");
         for (slot, &layer) in ctx.slots.iter().enumerate() {
             let geom = ctx.geometry(p, slot);
@@ -450,7 +444,7 @@ impl TileRun {
             for (shape, kind, cy) in piece.items_on(layer) {
                 let me = RuleSubject::new(ItemKind::Track, Some(rep)).with_courtyards(cy);
                 let c = ctx.rules.clearance(&piece.subject(kind, cy), &me, layer);
-                CpuCompute::paint_shape(r, &shape, c.saturating_add(reach), paint, &geom, up);
+                CpuCompute::paint_shape(r, &shape, c, paint, &geom, up);
             }
             // A via's hole, where `hole_clearance` reaches past the copper
             // clearance of its disc.
@@ -463,7 +457,7 @@ impl TileRun {
                         .clearance(&piece.subject(ItemKind::Via, &v.courtyards), &me, layer);
                 if v.drill / 2 + hc > v.diameter / 2 + c {
                     let hole = Shape::Circle(v.hole());
-                    CpuCompute::paint_shape(r, &hole, hc.saturating_add(reach), paint, &geom, up);
+                    CpuCompute::paint_shape(r, &hole, hc, paint, &geom, up);
                 }
             }
         }
