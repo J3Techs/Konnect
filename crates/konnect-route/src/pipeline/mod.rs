@@ -99,7 +99,9 @@ pub struct PipelineSettings {
     /// Ask the kernel for a minimum straight run between turns on the jobs
     /// of nets with a `track_segment_length` rule, at the longest such
     /// minimum ([`backend::min_run_nets`]), so detail draws no segment the
-    /// rule refuses. Off: S6 merges and straightens short segments instead.
+    /// rule refuses. When any net has such a rule, that longest minimum
+    /// replaces any `min_run_nm` set in [`Self::search`]. Off: S6 merges and
+    /// straightens short segments instead.
     pub search_min_run: bool,
     /// S6; `None` keeps the routed copper as negotiation drew it.
     pub optimize: Option<OptimizeOptions>,

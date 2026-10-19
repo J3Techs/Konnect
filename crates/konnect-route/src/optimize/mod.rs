@@ -1627,12 +1627,12 @@ impl<'c, 'b> NetWork<'c, 'b> {
 
     /// Delete whole tracks that only hurt: one of two tracks meeting at an
     /// acute bend (the shorter first), or a spur with an end that touches
-    /// nothing, hanging off a junction, pad or via. Taken only when every same-net item the track touched is
-    /// still joined to the others without it ([`Self::removal_keeps_joins`])
-    /// and the geometry gate passes. Two connections of a net often share
-    /// copper; when the optimizer straightens one, the other's last lattice
-    /// step is left as a spur doubling back along it. Returns whether any
-    /// track went.
+    /// nothing, hanging off a junction, pad or via. Taken only when every
+    /// same-net item the track touched is still joined to the others without
+    /// it ([`Self::removal_keeps_joins`]) and the geometry gate passes. Two
+    /// connections of a net often share copper; when the optimizer
+    /// straightens one, the other's last lattice step is left as a spur
+    /// doubling back along it. Returns whether any track went.
     fn prune_stubs(&mut self) -> bool {
         let mut any = false;
         let mut refused: BTreeSet<usize> = BTreeSet::new();
@@ -1650,8 +1650,10 @@ impl<'c, 'b> NetWork<'c, 'b> {
                 if live.len() == 1 {
                     // A dead end: only a spur hanging off a junction, a pad,
                     // a via or a fixed track's end. A track continuing a
-                    // single run is left alone, so an unfinished route is
-                    // never eaten back.
+                    // single run is left alone, so a dangling run of two or
+                    // more tracks is never eaten back; a dangling branch of
+                    // exactly one track off a junction is pruned, as it joins
+                    // nothing.
                     let (s, far) = live[0];
                     let others = joints.get(&(*layer, far)).map_or(0, |e| {
                         e.iter()

@@ -102,7 +102,8 @@ fn pipeline_tail_on_routed_copper() {
     let mut work = board.clone();
     add_locked(&mut work, &fanout);
 
-    // `KONNECT_PIPELINE_REPLAY_OFF=a,b`: optimizer passes to turn off.
+    // `KONNECT_PIPELINE_REPLAY_OFF=a,b`: optimizer passes to turn off;
+    // `skew` instead turns the old 2 degree skew allowance back on.
     let mut opts = OptimizeOptions::default();
     for pass in std::env::var("KONNECT_PIPELINE_REPLAY_OFF")
         .unwrap_or_default()
@@ -119,7 +120,7 @@ fn pipeline_tail_on_routed_copper() {
             "jogs" => opts.smooth_jogs = false,
             "square" => opts.square_junctions = false,
             "prune" => opts.prune_stubs = false,
-            "skew" => opts.max_skew_deg = 0.0,
+            "skew" => opts.max_skew_deg = 2.0,
             other => panic!("unknown pass {other}"),
         }
     }
