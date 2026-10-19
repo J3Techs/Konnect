@@ -360,6 +360,21 @@ Tuning round 2 (merged together; all additive):
   nets and the longest minimum. `FIELD_AFTER = 2_000`, which
   `KernelBackend::negotiation_config()` sets as `SearchConfig::field_after`.
 
+**Live round 2: clearing what S7 still finds.**
+`PipelineSettings::clear_findings` (**default on**) runs
+`pipeline::clear_findings(work, rules, &mut routed) -> ClearReport` after S6
+and its guard, so the plan is S7-clean: per net, one named routed track that
+is spare (the net's pads stay as joined without it), else the named track
+that opens the fewest joins, with the routed copper that then dangles;
+whole joined pieces only for findings naming routed vias alone; repeated
+until S7 names no routed copper. Then, anywhere, routed tracks with an end
+touching nothing of their net and routed vias joined on one layer or none,
+whenever the net's pads stay as joined. `ClearReport { single_tracks,
+cut_tracks, opened, dangling_tracks, spurs, lone_vias, pieces, tracks,
+vias, nets, findings }`; counters `pipeline_cleared_*`; time charged to
+`Stage::Check`. `PipelineResult::cleared` holds it. A struct literal of
+`PipelineSettings` needs the new field.
+
 Every stage records its time in the result's `Telemetry` (`Stage::Audit` for
 connectivity, `Fanout`, `Access`, `Global`, `Detail`, `Optimize`, `Check`
 for the guard and the check, `Plan`) plus `pipeline_*` counters. The
@@ -496,6 +511,21 @@ and part of the plan.
 - `RuleTable::clearance` answers must not depend on argument order;
   memoizing callers ask in one fixed order. `ProjectRuleTable::pin_net_class`
   also clears the net from `ambiguous_nets`.
+- **Track angles, pairwise (live round 2).** New `check::junction`:
+  `intersect(a, b)` (KiCad's segment intersection: ends count, collinear
+  overlaps meet at the overlap's middle) and `pair_angle(a, b) ->
+  Option<PairAngle { at, angle_deg, shared_vertex, collinear }>` (KiCad's
+  measurement: ends on the point face away from it, a point along a track
+  keeps its drawn direction and folds the angle below 90°). S7 adds a pass
+  over every pair of same-net tracks on a layer whose centre lines meet away
+  from a shared end (branches on a run's middle, crossings, collinear
+  overlaps), routed against routed and board tracks, off pads. Behaviour
+  change: a collinear overlap from a shared end is now reported at 0° (a
+  live KiCad 10 DRC reports it); the oracle still matches with 0 false
+  positives.
+- A junction counts as on a pad only 5 µm (`PAD_HIT_INSET_NM`) inside the
+  pad's outline; a bend on the very edge of a pad is reported, as KiCad
+  does.
 
 ### Audit, fanout and access (WS-B)
 
@@ -522,6 +552,16 @@ and part of the plan.
   straight shortcut must be exactly octilinear.
 - `konnect-core::native_route_job`: `StopKind` (typed stop reasons),
   `PipelineReport.stop_kind`/`resumed`, `CheckSummary.check_routed_error`.
+- Live round 2: the runner's S6 is `pipeline::optimize_guarded` (the S7
+  guard it lacked) with the sliver floor filled from the rules, followed by
+  a `clear` stage (`pipeline::clear_findings`) before S7.
+  `NativeJobSpec::clear_findings: Option<bool>` (serde default `None`: on
+  for native routing, off for a plan or the board's own copper; the
+  `clear_findings` argument of the job tools). `PipelineReport` gains
+  `optimize_reverted` and `cleared: Option<ClearReport>` (both
+  `#[serde(default)]`), also in the job status. The runner's route stage
+  calls `route_board` with `clear_findings: false`. A struct literal of
+  `NativeJobSpec` needs the new field.
 - `OptimizeOptions` gained `prune_stubs` (**default on**): delete a track
   that makes an acute bend, or a dangling single-track branch off a
   junction, pad or via, when everything it touched stays joined without
@@ -529,6 +569,15 @@ and part of the plan.
   runner uses the default, so imported (for example Freerouting) plans now
   change visibly in S6. `OptimizeReport::stubs_pruned` is
   `#[serde(default)]`, so old checkpoints still load.
+- **Live round 2.** The lint (`lint_group`) also reports KiCad's pairwise
+  track angles ([`check::junction`]) as `AcuteBend` (two fixed pieces
+  excepted), so no edit adds one; stub pruning offers the tracks of such
+  pairs for deletion. New `OptimizeOptions::sliver_floor_nm: Option<Coord>`
+  (default `None`; `Some(0)` off): on nets with no `track_segment_length`
+  rule, the geometry gate counts shorter segments as short too.
+  `optimize::sliver_floor(board, rules)` is the board's smallest rule
+  minimum; the pipeline and the job runner fill `None` with it. A struct
+  literal of `OptimizeOptions` needs the new field.
 - `OptimizeOptions::max_skew_deg` now defaults to 0.0: only exact
   octilinear pieces, since a skewed run meeting a right angle makes an
   interior angle just under 90°. The optimizer never accepts an edit that
@@ -587,7 +636,8 @@ and part of the plan.
   `crates/konnect-route/tests/real_board_fixture.rs`.
 - `tests/pipeline_real_fixture.rs` reads its knobs from
   `KONNECT_PIPELINE_*` variables (listed in its module docs, including
-  `KONNECT_PIPELINE_GRID_CORE_MM`). `tests/pipeline_tail_fixture.rs` re-runs
+  `KONNECT_PIPELINE_GRID_CORE_MM` and `KONNECT_PIPELINE_CLEAR=0|1`).
+  `tests/pipeline_tail_fixture.rs` re-runs
   S6–S8 on copper a previous run saved. `tests/search_replay.rs` is a gated
   capture/replay pair; the capture refuses a directory inside any git work
   tree, because captures hold board data.
