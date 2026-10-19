@@ -29,6 +29,8 @@
 //! - `KONNECT_PIPELINE_FILL` (fill passes, default 2),
 //!   `KONNECT_PIPELINE_STALL` (stop after this many iterations without
 //!   fewer conflicts, default 0: off);
+//! - `KONNECT_PIPELINE_PRESENT_GROWTH` (×1000) and
+//!   `KONNECT_PIPELINE_HISTORY_INC`: the PathFinder schedule;
 //! - `KONNECT_PIPELINE_NO_STUBS=1`: do not hand S4 access to negotiation;
 //! - `KONNECT_PIPELINE_CLASS_LAYERS=Class=F.Cu+B.Cu;…`: class layer masks;
 //! - `KONNECT_PIPELINE_CLASS_FALLBACK=Class=F.Cu+B.Cu@Plane.Cu:margin_mm;…`:
@@ -117,6 +119,14 @@ fn pipeline_real_board_fixture() {
     };
     settings.negotiation.threads = env_num("KONNECT_PIPELINE_NEGOTIATE_THREADS", 0) as usize;
     settings.negotiation.max_iterations = env_num("KONNECT_PIPELINE_ITERATIONS", 10) as u32;
+    settings.negotiation.present_growth = env_num(
+        "KONNECT_PIPELINE_PRESENT_GROWTH",
+        u64::from(settings.negotiation.present_growth),
+    ) as u32;
+    settings.negotiation.history_increment = env_num(
+        "KONNECT_PIPELINE_HISTORY_INC",
+        u64::from(settings.negotiation.history_increment),
+    ) as u16;
     settings.search.max_expansions = env_num(
         "KONNECT_PIPELINE_MAX_EXPANSIONS",
         settings.search.max_expansions,
@@ -283,6 +293,22 @@ fn pipeline_real_board_fixture() {
         *by_class.entry((class, d.name())).or_default() += 1;
     }
     println!("failures by class: {by_class:?}");
+    let mut tasks_by_class: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &r.connections {
+        let class = rules.class(rules.class_of(Some(c.net))).name.clone();
+        *tasks_by_class.entry(class).or_default() += 1;
+    }
+    println!("tasks by class: {tasks_by_class:?}");
+    let mut lost_by_class: BTreeMap<String, usize> = BTreeMap::new();
+    for id in &r.detail.congestion_lost {
+        let c = &r.connections[id.index()];
+        let class = rules.class(rules.class_of(Some(c.net))).name.clone();
+        *lost_by_class.entry(class).or_default() += 1;
+    }
+    println!(
+        "lost to congestion before the fill passes: {} {lost_by_class:?}",
+        r.detail.congestion_lost.len()
+    );
     if env_on("KONNECT_PIPELINE_DIAG") {
         let item = |i: konnect_route::api::ItemRef| match i {
             konnect_route::api::ItemRef::Pad(p) => {

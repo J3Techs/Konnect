@@ -263,3 +263,63 @@ fn negotiation_on_the_kernel_resolves_a_crossing_bundle() {
         BoardChecker::new(&board, &rules, CheckOptions::for_routed()).check_routed(&r.copper);
     assert!(check.violations.is_empty(), "{:?}", check.violations);
 }
+
+/// A net on F.Cu cut by a locked wall of another net on F.Cu: it can only
+/// cross on B.Cu, through vias. A GND pour on In1 covers a band of the
+/// board, the reference a fallback may demand.
+fn walled_net() -> RouteBoard {
+    let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+    b.zone("GND", "In1.Cu", (0.5, 2.0, 19.5, 8.0));
+    let l = b.footprint("J1", (3.0, 5.0));
+    b.smd_pad(l, "1", "S", (3.0, 5.0), (0.6, 0.6), "F.Cu");
+    let r = b.footprint("J2", (17.0, 5.0));
+    b.smd_pad(r, "1", "S", (17.0, 5.0), (0.6, 0.6), "F.Cu");
+    b.track("W", "F.Cu", (10.0, 0.0), (10.0, 10.0), 0.3, true);
+    let mut board = b.build();
+    board.routable = board
+        .layers
+        .expand("F.Cu")
+        .with(board.layers.expand("B.Cu").iter().next().unwrap());
+    board
+}
+
+#[test]
+fn a_class_fallback_routes_on_more_layers_over_its_reference() {
+    let board = walled_net();
+    let rules = UniformRules::default();
+    let f = board.layers.expand("F.Cu");
+    let fb = f.union(board.layers.expand("B.Cu"));
+    let in1 = board.layers.by_name("In1.Cu").unwrap();
+    let mut s = settings(2);
+    s.fanout = None;
+    s.layer_policy.class_layers.insert(ClassId(0), f);
+    let only_f = route_board(&board, &rules, &PipelineScope::default(), &s).unwrap();
+    assert_eq!(only_f.failed.len(), 1, "the wall cuts F.Cu");
+
+    s.class_fallback.insert(
+        ClassId(0),
+        ClassFallback {
+            layers: fb,
+            reference: Some(ReferencePlane {
+                plane: in1,
+                over: board.layers.expand("B.Cu"),
+                margin: 200_000,
+            }),
+        },
+    );
+    let r = route_board(&board, &rules, &PipelineScope::default(), &s).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.detail.failure_details);
+    assert!(r.check.violations.is_empty(), "{:?}", r.check.violations);
+    assert_eq!(r.connections_after, 0);
+    assert_eq!(r.telemetry.counters["pipeline_fallback_routed"], 1);
+    // Every B.Cu track stays over the pour, its edge 0.2 mm inside.
+    let b_cu = board.layers.by_name("B.Cu").unwrap();
+    let on_b: Vec<_> = r.routed.tracks.iter().filter(|t| t.layer == b_cu).collect();
+    assert!(!on_b.is_empty());
+    for t in on_b {
+        for p in [t.seg.a, t.seg.b] {
+            let edge = 200_000 + t.seg.width / 2;
+            assert!(p.y - edge >= 2_000_000 && p.y + edge <= 8_000_000, "{t:?}");
+        }
+    }
+}

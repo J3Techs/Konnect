@@ -395,6 +395,10 @@ pub struct DetailResult {
     pub reports: Vec<IterationReport>,
     /// The BGA fields that were split into sub-tiles.
     pub bga_fields: Vec<BgaField>,
+    /// Connections negotiation left in conflict and dropped (before any
+    /// fill pass retried them), sorted.
+    #[serde(default)]
+    pub congestion_lost: Vec<ConnectionId>,
     /// Routed tracks shorter than their `track_segment_length` minimum,
     /// left for S6 to merge or straighten (lattice jogs are one or two
     /// steps long). Collinear runs split at tile pins are already merged.
@@ -1166,22 +1170,41 @@ fn keep_greedily(
     failure: &mut [Option<DetailFailure>],
     iterations: u32,
 ) {
-    let mut kept: BTreeSet<u32> = BTreeSet::new();
+    let mut lose = |t: u32, routed: &mut [Option<Vec<Arc<PieceCopper>>>]| {
+        routed[t as usize] = None;
+        failure[t as usize] = Some(DetailFailure::Congestion {
+            iterations,
+            against: against[&t]
+                .iter()
+                .map(|&p| tasks[p as usize].conn.id)
+                .collect(),
+        });
+    };
+    // A greedy maximum independent set of the conflict graph: keep the
+    // connection with the fewest live conflicts (then the lowest rank),
+    // drop its partners, repeat. A connection in conflict with itself never
+    // keeps its copper.
+    let mut alive: BTreeSet<u32> = BTreeSet::new();
     for (&t, partners) in against {
         if routed[t as usize].is_none() {
             continue;
         }
-        if partners.contains(&t) || partners.iter().any(|p| kept.contains(p)) {
-            routed[t as usize] = None;
-            failure[t as usize] = Some(DetailFailure::Congestion {
-                iterations,
-                against: partners
-                    .iter()
-                    .map(|&p| tasks[p as usize].conn.id)
-                    .collect(),
-            });
+        if partners.contains(&t) {
+            lose(t, routed);
         } else {
-            kept.insert(t);
+            alive.insert(t);
+        }
+    }
+    while let Some(t) = alive
+        .iter()
+        .copied()
+        .min_by_key(|t| (against[t].iter().filter(|p| alive.contains(p)).count(), *t))
+    {
+        alive.remove(&t);
+        for p in &against[&t] {
+            if alive.remove(p) {
+                lose(*p, routed);
+            }
         }
     }
 }
@@ -1305,6 +1328,7 @@ fn run_negotiation(
 
     // Negotiation, then the fill passes.
     let mut fill = false;
+    let mut lost: Vec<ConnectionId> = Vec::new();
     let mut fills_run = 0u32;
     let mut best_conflicted = u32::MAX;
     let mut stalled = 0u32;
@@ -1315,8 +1339,14 @@ fn run_negotiation(
         }
         let stall = tuning.stall_iterations > 0 && stalled >= tuning.stall_iterations;
         if !fill && (it >= settings.max_iterations || queue.is_empty() || stall) {
-            // Unresolved conflicts: keep greedily in commit order.
+            // Unresolved conflicts: keep a greedy independent set.
+            let before: Vec<bool> = routed.iter().map(Option::is_some).collect();
             keep_greedily(&tasks, &against, &mut routed, &mut failure, iterations);
+            lost = (0..n)
+                .filter(|&t| before[t] && routed[t].is_none())
+                .map(|t| tasks[t].conn.id)
+                .collect();
+            lost.sort_unstable();
             against.clear();
             fill = true;
             queue = fill_queue(&routed, &failure);
@@ -1622,6 +1652,7 @@ fn run_negotiation(
         generation: gen,
         reports,
         bga_fields: fields,
+        congestion_lost: lost,
         ..DetailResult::default()
     };
     let mut failed: Vec<(ConnectionId, DetailFailure)> =
