@@ -1843,6 +1843,7 @@ fn run_negotiation(
             via_at.insert((p.net, v.center));
         }
     }
+    let mut drawn_vias: HashSet<(NetId, Point)> = HashSet::new();
     for (t, task) in tasks.iter().enumerate() {
         match &routed[t] {
             Some(pieces) => {
@@ -1879,6 +1880,12 @@ fn run_negotiation(
                 }
                 for p in pieces {
                     for v in &p.vias {
+                        // Connections of one net may share a via (conflict
+                        // detection lets them): it is drawn once.
+                        if !drawn_vias.insert((p.net, v.center)) {
+                            telemetry.count("shared_vias", 1);
+                            continue;
+                        }
                         result.copper.vias.push(RoutedVia {
                             net: p.net,
                             center: v.center,
