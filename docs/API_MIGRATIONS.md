@@ -13,13 +13,19 @@ accepts the answer only when every setting took in one shape.
 `native_mcp.settings_shape` (and the job status's `settings_shape`) names it.
 2.3 works as before. `jar_path` selects a specific JAR.
 
-**Per-run ports and isolation.** Both tools accept `api_port` (default 0: a
-system-chosen free port) and `max_heap_mb` (256 to 262144, passed as `-Xmx`;
-there is no free-text JVM option). The MCP endpoint always takes a
-system-chosen port, and each run gets its own `--user_data_path` (the job
-directory's `freerouting-data/`, or a temporary directory). Freerouting no
-longer binds the fixed ports 37864 and 37964, so runs, and `check_freerouting`
-during a run, can overlap.
+**Per-run ports and isolation.** Both tools accept `api_port` (default 0:
+Konnect chooses a free loopback port) and `max_heap_mb` (256 to 262144, passed
+as `-Xmx`; there is no free-text JVM option). Both must be non-negative
+integers; other values are refused. Freerouting is always told the REST API
+port and points its MCP tools at it (`--mcp_server.target_api_base_url`),
+because 2.3 reads the port back before its API has bound a port 0. Konnect
+waits for the API to listen before routing and retries once on a new port if
+a chosen one was taken. The MCP endpoint always takes a system-chosen port,
+and each run gets its own `--user_data_path` (the job directory's
+`freerouting-data/`, or a temporary directory). Freerouting no longer binds
+the fixed ports 37864 and 37964, so runs, and `check_freerouting` during a
+run, can overlap. A leftover `<name>.freerouting.log` from a failed run must
+be removed before routing to the same `ses_output_path` again.
 
 **Logs.** The router's whole stderr is written as it arrives, where only the
 last 64 KiB was kept before: beside the SES as `<name>.freerouting.log` for
@@ -32,12 +38,15 @@ one JSON line per poll, checkpoint and finish (`event`, `unix`,
 **Courtyard clearances in the DSN.** With `acknowledge_custom_rules`,
 `export_specctra_dsn` now lowers each `.kicad_dru` rule whose condition is
 exactly `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')`, with no
-layer clause and a `(constraint clearance (min X))`, into the DSN. Nets with a
-pad on REF whose class clearance is below X move into classes of their own
-carrying X, and Specctra `class_class` rules set every pair of classes
-involving them to exactly what it needs: X between nets in the same field, the
-ordinary class clearance otherwise. The board-wide clearance is not raised.
-Items of other nets inside the courtyard are not covered; KiCad DRC stays the
+layer clause, a `(constraint clearance (min X))` and no `(severity ignore)`,
+into the DSN. Nets with a pad on REF whose class clearance is below X move into
+classes of their own carrying X, and Specctra `class_class` rules set every
+pair of classes involving them to exactly what it needs: X between nets in the
+same field, the ordinary class clearance otherwise, including against
+Freerouting's `default` class (no-net pads and keepouts). The board-wide
+clearance is not raised. Items of other nets inside the courtyard are not
+covered, and later rules that lower the clearance for the same items are not
+evaluated (the router is then stricter than KiCad); KiCad DRC stays the
 authority. The answer gains `courtyard_clearances` (each rule, whether its
 footprint was found, and how many nets it raised), `class_pair_rule_count` and
 `courtyard_clearance_error`. `represent_courtyard_clearances: false` restores

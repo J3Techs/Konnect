@@ -285,7 +285,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "represent_courtyard_clearances": {
                         "type": "boolean",
                         "default": true,
-                        "description": "With acknowledge_custom_rules: carry each rule of the form `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')` with a minimum clearance (no layer clause) into the DSN. Nets with a pad on REF get that clearance against each other through their own classes and Specctra class_class rules, while every other class pair keeps its net-class clearance, so the clearance is not raised board-wide. Items of other nets inside the courtyard are not covered. Such a DSN cannot use the native bridge, and Topola's DSN reader does not read class_class."
+                        "description": "With acknowledge_custom_rules: carry each rule of the form `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')` with a minimum clearance (no layer clause, not severity ignore) into the DSN. Nets with a pad on REF get that clearance against each other through their own classes and Specctra class_class rules, while every other class pair, and each such class against Freerouting's default class (no-net items and keepouts), keeps its net-class clearance, so the clearance is not raised board-wide. Later rules that would lower it for the same items are not evaluated. Items of other nets inside the courtyard are not covered. Such a DSN cannot use the native bridge, and Topola's DSN reader does not read class_class."
                     }
                 },
                 "required": ["board", "output"]

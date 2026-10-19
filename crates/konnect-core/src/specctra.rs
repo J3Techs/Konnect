@@ -2121,6 +2121,9 @@ fn normalize_rules(
     Ok((class_nets, net_classes))
 }
 
+/// Freerouting's built-in clearance class, for no-net items and keepouts.
+const FREEROUTING_DEFAULT_CLASS: &str = "default";
+
 /// `class_class` clearances for every pair of classes where one is in a
 /// courtyard field: Specctra's targeted class-to-class rule. A field class
 /// carries the raised clearance itself (so it also holds within the class),
@@ -2128,10 +2131,23 @@ fn normalize_rules(
 /// too; each pair is therefore set to exactly what it needs, which lowers a
 /// field class back to the ordinary clearance against classes outside its
 /// field and keeps the raise inside it. Names follow the classes' order.
+///
+/// That widening also reaches Freerouting's built-in `default` class, which
+/// no-net pads and keepouts use, so each field class is set back to its own
+/// net-class clearance against `default` too. Freerouting resolves that
+/// name to its default class (`KiCadNetClassNames.resolveNetClass`); a
+/// release that did not would only warn and keep the wider value.
 fn class_pair_rules(class_nets: &RuleGroups) -> Vec<(String, String, i64)> {
     let classes = class_nets.keys().enumerate().collect::<Vec<_>>();
     let mut pairs = Vec::new();
     for (position, (first_index, first)) in classes.iter().enumerate() {
+        if !first.fields.is_empty() {
+            pairs.push((
+                format!("konnect_class_{:04}", first_index + 1),
+                FREEROUTING_DEFAULT_CLASS.to_string(),
+                first.clearance_um,
+            ));
+        }
         for (second_index, second) in &classes[position + 1..] {
             if first.fields.is_empty() && second.fields.is_empty() {
                 continue;
@@ -2204,8 +2220,11 @@ fn matching_close(text: &str, open: usize) -> Option<usize> {
 /// The custom rules in a `.kicad_dru` that a DSN can carry as courtyard
 /// fields: no layer clause, the condition exactly
 /// `A.intersectsCourtyard('REF') && B.intersectsCourtyard('REF')` (either
-/// order, either quote, one literal reference) and a minimum clearance.
-/// Every other rule is left to KiCad DRC, as before.
+/// order, either quote, one literal reference), a minimum clearance and no
+/// `(severity ignore)`. Every other rule is left to KiCad DRC, as before.
+/// Precedence between rules is not evaluated: a later rule that lowers the
+/// clearance for some of the same items is not seen, which only makes the
+/// router stricter than KiCad.
 pub(crate) fn courtyard_clearance_rules(dru: &str) -> Result<Vec<CourtyardClearance>> {
     // KiCad allows `#` comment lines, which the S-expression parser does not.
     let text = dru
@@ -2216,7 +2235,13 @@ pub(crate) fn courtyard_clearance_rules(dru: &str) -> Result<Vec<CourtyardCleara
     let tree = parse_sexp(&format!("(kicad_dru\n{text}\n)")).context("parse .kicad_dru rules")?;
     let mut rules = Vec::new();
     for rule in tree.find_all("rule") {
-        if rule.find("layer").is_some() {
+        // A rule KiCad DRC ignores asks nothing of the router either.
+        let ignored = rule
+            .find("severity")
+            .and_then(|severity| severity.get(1))
+            .and_then(SexpNode::as_str)
+            == Some("ignore");
+        if ignored || rule.find("layer").is_some() {
             continue;
         }
         let Some(reference) = rule
@@ -3686,6 +3711,10 @@ mod tests {
 (rule "No unit"
   (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
   (constraint clearance (min 0.2)))
+(rule "Ignored"
+  (severity ignore)
+  (condition "A.intersectsCourtyard('U7') && B.intersectsCourtyard('U7')")
+  (constraint clearance (min 0.3mm)))
 "#;
         assert_eq!(
             courtyard_clearance_rules(dru).unwrap(),
@@ -3806,17 +3835,21 @@ mod tests {
             dsn_integer(structure_rule.find("clearance").unwrap(), 1, "clearance").unwrap(),
             200
         );
-        // Each pair is set to what it needs: the field inside, 0.2 across.
+        // Each pair is set to what it needs: the field inside, 0.2 across,
+        // and 0.2 against Freerouting's default class.
         let pair = |a: &str, b: &str| (format!("konnect_class_{a}"), format!("konnect_class_{b}"));
+        let default = |a: &str| (format!("konnect_class_{a}"), "default".to_string());
         assert_eq!(
             class_pairs(&export.dsn),
             BTreeMap::from([
                 (pair("0001", "0002"), 200),
                 (pair("0001", "0003"), 200),
                 (pair("0002", "0003"), 300),
+                (default("0002"), 200),
+                (default("0003"), 200),
             ])
         );
-        assert_eq!(export.class_pair_rule_count, 3);
+        assert_eq!(export.class_pair_rule_count, 5);
         assert_eq!(export.courtyard_clearances.len(), 1);
         assert_eq!(export.courtyard_clearances[0].raised_net_count, 2);
         assert!(export.courtyard_clearances[0].footprint_found);
@@ -3917,13 +3950,9 @@ mod tests {
             custom_rules_sha256: Some("00".repeat(32)),
             courtyard_clearances: rules,
         };
-        let export = match export_dsn_with(&board, &source, &effective, &options) {
-            Ok(export) => export,
-            Err(error) => {
-                eprintln!("skipped: the fixture board is outside the export profile: {error:#}");
-                return;
-            }
-        };
+        // The fixture is present, so a failed export is a regression.
+        let export = export_dsn_with(&board, &source, &effective, &options)
+            .unwrap_or_else(|error| panic!("the fixture board no longer exports: {error:#}"));
         for report in &export.courtyard_clearances {
             eprintln!(
                 "{}: {} um, footprint found {}, {} nets raised",
