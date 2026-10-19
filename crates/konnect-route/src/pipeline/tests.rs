@@ -299,6 +299,7 @@ fn a_class_fallback_routes_on_more_layers_over_its_reference() {
     s.class_fallback.insert(
         ClassId(0),
         ClassFallback {
+            nets: None,
             layers: fb,
             reference: Some(ReferencePlane {
                 plane: in1,
@@ -460,4 +461,89 @@ fn clear_findings_removes_a_via_joined_on_one_layer_and_its_spur() {
     assert_eq!((r.lone_vias, r.spurs), (1, 1), "{r:?}");
     assert_eq!(routed.tracks.len(), 1);
     assert!(routed.vias.is_empty());
+}
+
+#[test]
+fn excluded_classes_are_left_open_and_never_failed() {
+    let board = two_pin_nets(4, false);
+    let rules = UniformRules::default();
+    let s = PipelineSettings {
+        excluded_classes: BTreeSet::from([ClassId(0)]),
+        ..settings(1)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &s).unwrap();
+    assert!(r.connections.is_empty(), "nothing of the class is routed");
+    assert_eq!(r.excluded.len(), 4);
+    assert!(r
+        .excluded
+        .iter()
+        .enumerate()
+        .all(|(i, c)| c.id.index() == i));
+    assert!(r.failed.is_empty(), "exclusion is not a failure");
+    assert_eq!(r.connections_after, 4);
+    assert_eq!(r.plan.item_count(), 0);
+    assert_eq!(
+        r.telemetry.counters.get("pipeline_excluded_by_policy"),
+        Some(&4)
+    );
+}
+
+#[test]
+fn tracks_off_the_reference_go_back_or_go() {
+    let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+    b.net("GND").net("A").net("B");
+    // Solid reference copper on In1 over the left half only.
+    b.zone("GND", "In1.Cu", (0.5, 0.5, 10.0, 9.5));
+    let board = b.build();
+    let rules = UniformRules::default();
+    let (bcu, fcu) = (
+        board.layers.by_name("B.Cu").unwrap(),
+        board.layers.by_name("F.Cu").unwrap(),
+    );
+    let net = |n: &str| board.net_by_name(n).unwrap();
+    let track = |n: &str, layer, x0: f64, x1: f64| RoutedTrack {
+        net: net(n),
+        layer,
+        seg: konnect_geom::Segment::new(
+            Point::from_mm(x0, 5.0).unwrap(),
+            Point::from_mm(x1, 5.0).unwrap(),
+            150_000,
+        ),
+        gen: crate::api::Generation(0),
+    };
+    let fallback = BTreeMap::from([(
+        ClassId(0),
+        ClassFallback {
+            nets: None,
+            layers: board.layers.all(),
+            reference: Some(ReferencePlane {
+                plane: board.layers.by_name("In1.Cu").unwrap(),
+                over: LayerMask::single(bcu),
+                margin: 300_000,
+            }),
+        },
+    )]);
+    // A: over the plane before S6, moved off it after; B: off it in both.
+    // F.Cu is not covered by the reference.
+    let before = RoutedCopper {
+        tracks: vec![
+            track("A", bcu, 2.0, 6.0),
+            track("B", bcu, 8.0, 14.0),
+            track("B", fcu, 12.0, 18.0),
+        ],
+        vias: vec![],
+    };
+    let mut after = RoutedCopper {
+        tracks: vec![
+            track("A", bcu, 2.0, 12.0),
+            track("B", bcu, 8.0, 14.0),
+            track("B", fcu, 12.0, 18.0),
+        ],
+        vias: vec![],
+    };
+    let r = enforce_reference(&board, &rules, &fallback, Some(&before), &mut after);
+    assert_eq!(r.tracks_checked, 2);
+    assert_eq!(r.reverted_nets, vec![net("A")]);
+    assert_eq!(r.dropped_nets, vec![net("B")]);
+    assert_eq!(after.tracks, vec![track("A", bcu, 2.0, 6.0)]);
 }

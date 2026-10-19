@@ -40,8 +40,13 @@
 //!
 //! Every stage records its wall time in the returned [`Telemetry`].
 
+pub mod allowances;
 pub mod backend;
 
+pub use allowances::{
+    default_excluded_classes, AllowanceError, AllowanceReport, LayerFallbackSpec, NeckDownSpec,
+    ReferenceSpec, RoutingAllowances,
+};
 pub use backend::KernelBackend;
 
 use crate::access::{compute_pin_access_with, AccessSettings, AccessStats, PadAccess};
@@ -69,7 +74,7 @@ use crate::optimize::{optimize_checked, record_counters, OptimizeOptions, Optimi
 use crate::plan::{PlanError, RoutePlan, RoutedCopper, RoutedTrack, RoutedVia};
 use crate::rules::RuleTable;
 use crate::telemetry::Telemetry;
-use konnect_geom::{shape_within_polygon, ArcPolicy, BBox, Coord, Polygon, Segment, Shape};
+use konnect_geom::{ArcPolicy, BBox, Coord, IndexedPolygon, Polygon, Segment, Shape};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -102,6 +107,11 @@ pub struct PipelineSettings {
     /// still failed after negotiation are routed again on
     /// [`ClassFallback::layers`], around all copper routed so far.
     pub class_fallback: BTreeMap<ClassId, ClassFallback>,
+    /// Classes left out of routing (zones or hand-drawn copper): their open
+    /// connections are listed in [`PipelineResult::excluded`], never routed
+    /// and never reported as failures. Empty by default; the job runner
+    /// fills it from [`RoutingAllowances`] ([`default_excluded_classes`]).
+    pub excluded_classes: BTreeSet<ClassId>,
     pub global: GlobalSettings,
     pub layer_policy: LayerPolicy,
     pub negotiation: NegotiationSettings,
@@ -140,6 +150,7 @@ impl Default for PipelineSettings {
             use_access: true,
             neck_down: None,
             class_fallback: BTreeMap::new(),
+            excluded_classes: BTreeSet::new(),
             global: GlobalSettings::default(),
             layer_policy: LayerPolicy::default(),
             // Measured on a dense real board: a 2x present-factor growth
@@ -172,6 +183,10 @@ pub struct ClassFallback {
     /// reference plane.
     #[serde(default)]
     pub reference: Option<ReferencePlane>,
+    /// Only these nets of the class get the second chance (all when
+    /// `None`).
+    #[serde(default)]
+    pub nets: Option<BTreeSet<NetId>>,
 }
 
 /// Solid reference copper a class's tracks must stay over.
@@ -200,6 +215,9 @@ pub struct PipelineResult {
     /// The task list global and detailed routing worked on (after the
     /// fanout, within the scope); ids are positions in it.
     pub connections: Vec<Connection>,
+    /// Open connections of [`PipelineSettings::excluded_classes`], left
+    /// unrouted by policy (ids are positions in this list).
+    pub excluded: Vec<Connection>,
     pub fanout: Option<PlaneViaPlan>,
     pub access: Vec<PadAccess>,
     /// Per net class (as a profile), what pin access did.
@@ -213,6 +231,9 @@ pub struct PipelineResult {
     pub optimize_reverted: Vec<NetId>,
     /// What [`clear_findings`] took out (empty when it did not run).
     pub cleared: ClearReport,
+    /// The reference-plane check of [`ClassFallback::reference`] after S6
+    /// (empty when no fallback names a reference).
+    pub reference: ReferenceReport,
     /// S7 over the fanout and routed copper together (indices follow
     /// [`Self::all_copper`]).
     pub check: CheckReport,
@@ -328,13 +349,15 @@ fn run(
     } else {
         ConnectivityReport::build(&work, &policy)
     };
-    out.connections = select_connections(
+    let selected = select_connections(
         &work,
         conn.connections(&work),
         scope.nets.as_ref(),
         scope.region,
     );
     drop(conn);
+    (out.connections, out.excluded) = split_excluded(rules, selected, &settings.excluded_classes);
+    tel.count("pipeline_excluded_by_policy", out.excluded.len() as u64);
     tel.add_stage_time(Stage::Audit, t.elapsed().as_micros() as u64);
     tel.count("pipeline_connections", out.connections.len() as u64);
 
@@ -428,6 +451,7 @@ fn run(
             &negotiation,
             &inputs,
             backend,
+            tel,
         );
         tel.count("pipeline_fallback_routed", rescued as u64);
         tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
@@ -436,7 +460,12 @@ fn run(
         out.access = inputs.access;
     }
 
-    // 7. Optimize, guarded by the S7 checker.
+    // 7. Optimize, guarded by the S7 checker, then by the reference planes.
+    let negotiated = if settings.optimize.is_some() && has_reference(&settings.class_fallback) {
+        Some(routed.clone())
+    } else {
+        None
+    };
     if let Some(opts) = &settings.optimize {
         let mut opts = *opts;
         if opts.sliver_floor_nm.is_none() {
@@ -452,6 +481,18 @@ fn run(
         );
         out.optimize_reverted = reverted;
         out.optimize = Some(report);
+    }
+    if has_reference(&settings.class_fallback) {
+        let t = Instant::now();
+        out.reference = enforce_reference(
+            &work,
+            rules,
+            &settings.class_fallback,
+            negotiated.as_ref(),
+            &mut routed,
+        );
+        out.reference.record(tel);
+        tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
     }
     if settings.clear_findings {
         let t = Instant::now();
@@ -519,6 +560,31 @@ pub fn select_connections(
         .collect()
 }
 
+/// `connections` split into those to route and those of `excluded`
+/// classes, each list renumbered so ids equal positions.
+pub fn split_excluded(
+    rules: &dyn RuleTable,
+    connections: Vec<Connection>,
+    excluded: &BTreeSet<ClassId>,
+) -> (Vec<Connection>, Vec<Connection>) {
+    if excluded.is_empty() {
+        return (connections, Vec::new());
+    }
+    let (out, keep): (Vec<Connection>, Vec<Connection>) = connections
+        .into_iter()
+        .partition(|c| excluded.contains(&rules.class_of(Some(c.net))));
+    let renumber = |v: Vec<Connection>| -> Vec<Connection> {
+        v.into_iter()
+            .enumerate()
+            .map(|(i, c)| Connection {
+                id: ConnectionId(i as u32),
+                ..c
+            })
+            .collect()
+    };
+    (renumber(keep), renumber(out))
+}
+
 /// Step 7 on its own: S6 over `routed` against `work` (the board with the
 /// fanout as locked copper), then, when `guard_optimize` is set, the S7
 /// guard that puts back every net the optimizer left with more findings.
@@ -568,16 +634,19 @@ fn second_chance(
     negotiation: &NegotiationSettings,
     inputs: &NegotiationInputs,
     backend: &mut (dyn RouteCompute + Send),
+    telemetry: &mut Telemetry,
 ) -> usize {
     let mut rescued_total = 0;
     for (&class, fallback) in &settings.class_fallback {
+        let t_setup = Instant::now();
         let ids: Vec<ConnectionId> = detail
             .failure_details
             .iter()
             .filter(|(id, _)| {
-                connections
-                    .get(id.index())
-                    .is_some_and(|c| rules.class_of(Some(c.net)) == class)
+                connections.get(id.index()).is_some_and(|c| {
+                    rules.class_of(Some(c.net)) == class
+                        && fallback.nets.as_ref().is_none_or(|n| n.contains(&c.net))
+                })
             })
             .map(|(id, _)| *id)
             .collect();
@@ -586,7 +655,7 @@ fn second_chance(
         }
         let mut board = work.clone();
         add_locked(&mut board, routed);
-        let pieces: Vec<Polygon> = fallback
+        let pieces: Vec<IndexedPolygon> = fallback
             .reference
             .map(|r| reference_pieces(work, r.plane))
             .unwrap_or_default();
@@ -627,6 +696,12 @@ fn second_chance(
                 .collect(),
             ..GlobalResult::default()
         };
+        telemetry.count(
+            "pipeline_fallback_us_setup",
+            t_setup.elapsed().as_micros() as u64,
+        );
+        telemetry.count("pipeline_fallback_tasks", tasks.len() as u64);
+        let t_negotiate = Instant::now();
         let mut tel = Telemetry::default();
         let mut second = negotiate_connections_with(
             &board,
@@ -639,6 +714,10 @@ fn second_chance(
             inputs,
             backend,
             &mut tel,
+        );
+        telemetry.count(
+            "pipeline_fallback_us_negotiate",
+            t_negotiate.elapsed().as_micros() as u64,
         );
         // Nets whose new tracks leave the reference by less than the margin.
         let mut dropped: BTreeSet<NetId> = BTreeSet::new();
@@ -678,16 +757,115 @@ fn second_chance(
     rescued_total
 }
 
+fn has_reference(fallback: &BTreeMap<ClassId, ClassFallback>) -> bool {
+    fallback.values().any(|f| f.reference.is_some())
+}
+
+/// What [`enforce_reference`] checked and changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceReport {
+    /// Routed tracks of classes with a reference, on the layers it covers.
+    pub tracks_checked: u32,
+    /// Nets put back to their negotiated copper because S6 moved a track
+    /// off the reference.
+    pub reverted_nets: Vec<NetId>,
+    /// Nets whose copper was taken out because it still left the
+    /// reference (their connections stay open).
+    pub dropped_nets: Vec<NetId>,
+}
+
+impl ReferenceReport {
+    /// The `pipeline_reference_*` counters.
+    pub fn record(&self, tel: &mut Telemetry) {
+        tel.count("pipeline_reference_tracks", u64::from(self.tracks_checked));
+        tel.count(
+            "pipeline_reference_reverted",
+            self.reverted_nets.len() as u64,
+        );
+        tel.count("pipeline_reference_dropped", self.dropped_nets.len() as u64);
+    }
+}
+
+/// Keep every routed track of a class whose [`ClassFallback`] names a
+/// reference plane over that plane's filled copper (grown by the margin) on
+/// the layers the reference covers, whichever stage drew it. A net that
+/// breaks this is put back to `before` (its copper as negotiation drew it,
+/// when given); a net that still breaks it, or has no earlier copper, loses
+/// its routed copper (tracks and vias) and its connections stay open.
+pub fn enforce_reference(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    fallback: &BTreeMap<ClassId, ClassFallback>,
+    before: Option<&RoutedCopper>,
+    routed: &mut RoutedCopper,
+) -> ReferenceReport {
+    let mut out = ReferenceReport::default();
+    let refs: BTreeMap<ClassId, (ReferencePlane, Vec<IndexedPolygon>)> = fallback
+        .iter()
+        .filter_map(|(c, f)| {
+            f.reference
+                .map(|r| (*c, (r, reference_pieces(work, r.plane))))
+        })
+        .collect();
+    if refs.is_empty() {
+        return out;
+    }
+    let off = |copper: &RoutedCopper, count: &mut u32| -> BTreeSet<NetId> {
+        let mut bad = BTreeSet::new();
+        for t in &copper.tracks {
+            let Some((r, pieces)) = refs.get(&rules.class_of(Some(t.net))) else {
+                continue;
+            };
+            if !r.over.contains(t.layer) {
+                continue;
+            }
+            *count += 1;
+            if !bad.contains(&t.net) && !over_reference(&t.seg, pieces, r.margin) {
+                bad.insert(t.net);
+            }
+        }
+        bad
+    };
+    let mut checked = 0;
+    let bad = off(routed, &mut checked);
+    out.tracks_checked = checked;
+    if bad.is_empty() {
+        return out;
+    }
+    let mut dropped: BTreeSet<NetId> = bad.clone();
+    if let Some(before) = before {
+        let mut ignore = 0;
+        let still = off(before, &mut ignore);
+        let restore: BTreeSet<NetId> = bad.difference(&still).copied().collect();
+        dropped = bad.intersection(&still).copied().collect();
+        routed.tracks.retain(|t| !restore.contains(&t.net));
+        routed.vias.retain(|v| !restore.contains(&v.net));
+        routed
+            .tracks
+            .extend(before.tracks.iter().filter(|t| restore.contains(&t.net)));
+        routed
+            .vias
+            .extend(before.vias.iter().filter(|v| restore.contains(&v.net)));
+        out.reverted_nets = restore.into_iter().collect();
+    }
+    routed.tracks.retain(|t| !dropped.contains(&t.net));
+    routed.vias.retain(|v| !dropped.contains(&v.net));
+    out.dropped_nets = dropped.into_iter().collect();
+    out
+}
+
 /// The filled copper pieces of `plane`. KiCad's fills are fractured (each
 /// void joined to the outline by a zero-width slit), so an outline already
 /// excludes antipads, pad clearances and voids: a track over any of them
 /// counts as off the reference, which is stricter than "over the pour".
-fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<Polygon> {
+/// Edge-indexed: a plane piece can carry tens of thousands of vertices.
+fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<IndexedPolygon> {
     board
         .zones
         .iter()
         .filter(|z| z.filled && z.layer == plane && z.net.is_some())
         .filter_map(|z| Polygon::new(z.region.outline().to_vec(), Vec::new()))
+        .map(IndexedPolygon::new)
         .collect()
 }
 
@@ -710,7 +888,7 @@ fn terminal_point(board: &RouteBoard, item: ItemRef) -> Option<konnect_geom::Poi
 /// `areas` that does not lie wholly inside one piece: one rectangle per
 /// run of such cells along a row, so each is cheap to paint and check.
 fn outside_keepouts(
-    pieces: &[Polygon],
+    pieces: &[IndexedPolygon],
     areas: &[BBox],
     layers: LayerMask,
     cell: Coord,
@@ -746,7 +924,7 @@ fn outside_keepouts(
         let b = sq.bbox();
         !pieces
             .iter()
-            .any(|p| p.bbox().contains_bbox(&b) && shape_within_polygon(&sq, p))
+            .any(|p| p.bbox().contains_bbox(&b) && p.contains(&sq))
     };
     let mut out = Vec::new();
     let mut run: Option<(i64, i64, i64)> = None;
@@ -785,7 +963,7 @@ fn outside_keepouts(
 }
 
 /// Whether a track's copper, grown by `margin`, lies inside one piece.
-fn over_reference(seg: &Segment, pieces: &[Polygon], margin: Coord) -> bool {
+fn over_reference(seg: &Segment, pieces: &[IndexedPolygon], margin: Coord) -> bool {
     let grown = Shape::Segment(Segment::new(
         seg.a,
         seg.b,
@@ -793,7 +971,7 @@ fn over_reference(seg: &Segment, pieces: &[Polygon], margin: Coord) -> bool {
     ));
     pieces
         .iter()
-        .any(|p| p.bbox().contains_bbox(&grown.bbox()) && shape_within_polygon(&grown, p))
+        .any(|p| p.bbox().contains_bbox(&grown.bbox()) && p.contains(&grown))
 }
 
 /// Append `copper` to `board` as locked copper (what the pipeline does with

@@ -43,6 +43,10 @@
 //!   second-chance layers, optionally over a reference plane's fill;
 //! - `KONNECT_PIPELINE_NECK=ClassA,ClassB`: neck down at pads (0.10 mm
 //!   within 1 mm) for every class except these;
+//! - `KONNECT_PIPELINE_ALLOWANCES=<JSON or path to a JSON file>`: a
+//!   [`RoutingAllowances`] (class layers, layer fallbacks, neck-down and
+//!   excluded classes, by name), resolved as the job tools resolve it; it
+//!   replaces the three knobs above. Unset, no class is excluded;
 //! - `KONNECT_PIPELINE_DIAG=1`: list every failed connection.
 
 use konnect_geom::{BBox, Point};
@@ -52,7 +56,7 @@ use konnect_route::detail::negotiate::NeckDown;
 use konnect_route::detail::negotiate::ReferenceSearch;
 use konnect_route::pipeline::{
     route_board, route_board_with, ClassFallback, PipelineResult, PipelineScope, PipelineSettings,
-    ReferencePlane,
+    ReferencePlane, RoutingAllowances,
 };
 use konnect_route::rules::RuleTable;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable};
@@ -233,9 +237,14 @@ fn pipeline_real_board_fixture() {
                     margin: (margin * 1e6).round() as i32,
                 }
             });
-            settings
-                .class_fallback
-                .insert(class_id(class.trim()), ClassFallback { layers, reference });
+            settings.class_fallback.insert(
+                class_id(class.trim()),
+                ClassFallback {
+                    layers,
+                    reference,
+                    nets: None,
+                },
+            );
         }
     }
     if let Ok(spec) = std::env::var("KONNECT_PIPELINE_NECK") {
@@ -248,6 +257,18 @@ fn pipeline_real_board_fixture() {
             excluded,
             ..NeckDown::default()
         });
+    }
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_ALLOWANCES") {
+        let text = if v.trim_start().starts_with('{') {
+            v
+        } else {
+            std::fs::read_to_string(v.trim()).expect("allowances file reads")
+        };
+        let a: RoutingAllowances = serde_json::from_str(&text).expect("allowances parse");
+        let report = a
+            .resolve(&board, rules.classes(), &mut settings)
+            .expect("allowances resolve");
+        println!("allowances: {}", serde_json::to_string(&report).unwrap());
     }
     let reference = env_on("KONNECT_PIPELINE_REFERENCE");
 
@@ -332,6 +353,15 @@ fn pipeline_real_board_fixture() {
         *tasks_by_class.entry(class).or_default() += 1;
     }
     println!("tasks by class: {tasks_by_class:?}");
+    let mut excluded_by_class: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &r.excluded {
+        let class = rules.class(rules.class_of(Some(c.net))).name.clone();
+        *excluded_by_class.entry(class).or_default() += 1;
+    }
+    println!(
+        "excluded by policy: {} {excluded_by_class:?}",
+        r.excluded.len()
+    );
     let mut lost_by_class: BTreeMap<String, usize> = BTreeMap::new();
     for id in &r.detail.congestion_lost {
         let c = &r.connections[id.index()];
@@ -455,6 +485,7 @@ fn pipeline_real_board_fixture() {
             "global_overflow": r.global.stats.total_overflow,
             "routed": r.detail.routed.len(),
             "failed": reasons,
+            "excluded": r.excluded.len(),
             "check": by_kind.iter().map(|(k, v)| (format!("{k:?}"), *v)).collect::<BTreeMap<_, _>>(),
             "connections_after": r.connections_after,
             "plan_tracks": r.plan.tracks.len(),
