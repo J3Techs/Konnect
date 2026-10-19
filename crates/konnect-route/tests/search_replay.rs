@@ -24,7 +24,8 @@
 //!   `KONNECT_SEARCH_REPLAY_REPEAT` runs the set that many times.
 //!
 //! Captures hold board-derived rasters: keep them in an ignored build
-//! location, never in the repository.
+//! location, never in the repository. The capture test refuses a
+//! directory inside any git work tree.
 
 use konnect_geom::Point;
 use konnect_route::api::{LayerId, ProfileId, TileId};
@@ -533,6 +534,16 @@ fn capture_negotiation_searches() {
         eprintln!("skipping: the fixture lacks a single .kicad_pcb and .kicad_pro");
         return;
     };
+    // Captures are board data: refuse any directory inside a git work tree,
+    // where one `git add` would commit them.
+    let abs = std::path::absolute(&out).expect("capture dir path");
+    if let Some(repo) = abs.ancestors().find(|a| a.join(".git").exists()) {
+        panic!(
+            "KONNECT_SEARCH_CAPTURE_DIR is inside the git work tree at {}; \
+             captures hold board data, so put them outside any repository",
+            repo.display()
+        );
+    }
     std::fs::create_dir_all(&out).expect("capture dir");
     let (mut board, _) = load_board_file(&pcb, &LoadOptions::default()).expect("board loads");
     let pro_text = std::fs::read_to_string(&pro).expect("project reads");
