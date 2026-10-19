@@ -129,11 +129,11 @@ impl Default for PipelineSettings {
             class_fallback: BTreeMap::new(),
             global: GlobalSettings::default(),
             layer_policy: LayerPolicy::default(),
-            // Measured on a dense real board: 20 iterations with a 2x
-            // present-factor growth and a history step of 3 route more
-            // than 10 iterations of the gentler stand-alone defaults.
+            // Measured on a dense real board: a 2x present-factor growth
+            // (capped) and a history step of 3 route more than the gentler
+            // stand-alone schedule; 20 iterations add little for twice the time.
             negotiation: NegotiationSettings {
-                max_iterations: 20,
+                max_iterations: 10,
                 present_growth: 2_000,
                 history_increment: 3,
                 ..NegotiationSettings::default()
