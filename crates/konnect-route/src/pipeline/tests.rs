@@ -541,9 +541,133 @@ fn tracks_off_the_reference_go_back_or_go() {
         ],
         vias: vec![],
     };
-    let r = enforce_reference(&board, &rules, &fallback, Some(&before), &mut after);
+    let mut s = PipelineSettings {
+        class_fallback: fallback,
+        ..PipelineSettings::default()
+    };
+    s.layer_policy
+        .class_layers
+        .insert(ClassId(0), LayerMask::single(fcu));
+    let r = enforce_reference(&board, &rules, &s, Some(&before), &mut after);
     assert_eq!(r.tracks_checked, 2);
     assert_eq!(r.reverted_nets, vec![net("A")]);
     assert_eq!(r.dropped_nets, vec![net("B")]);
-    assert_eq!(after.tracks, vec![track("A", bcu, 2.0, 6.0)]);
+    assert_eq!((r.dropped_tracks, r.dropped_vias), (1, 0));
+    // B's F.Cu track is a piece of its own: only the offending piece goes.
+    assert_eq!(
+        after.tracks,
+        vec![track("B", fcu, 12.0, 18.0), track("A", bcu, 2.0, 6.0)]
+    );
+}
+
+#[test]
+fn the_reference_holds_only_the_fallback_s_nets_on_its_added_layers() {
+    let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+    b.net("GND").net("A").net("B").net("C");
+    b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
+    let board = b.build();
+    let rules = UniformRules::default();
+    let layer = |n: &str| board.layers.by_name(n).unwrap();
+    let (fcu, bcu) = (layer("F.Cu"), layer("B.Cu"));
+    let net = |n: &str| board.net_by_name(n).unwrap();
+    let track = |n: &str, layer, (x0, x1): (f64, f64), y: f64| RoutedTrack {
+        net: net(n),
+        layer,
+        seg: Segment::new(
+            Point::from_mm(x0, y).unwrap(),
+            Point::from_mm(x1, y).unwrap(),
+            150_000,
+        ),
+        gen: crate::api::Generation(0),
+    };
+    let mut s = PipelineSettings::default();
+    s.class_fallback.insert(
+        ClassId(0),
+        ClassFallback {
+            nets: Some(BTreeSet::from([net("A"), net("B")])),
+            layers: board.layers.all(),
+            reference: Some(ReferencePlane {
+                plane: layer("In1.Cu"),
+                over: board.layers.all(),
+                margin: 100_000,
+            }),
+        },
+    );
+    // A: over the plane on B.Cu, off it on F.Cu (its own layer, never
+    // held to the reference). B: over the plane's saved fill, but a routed
+    // via of C beside it will cut a hole there. C: off the plane on B.Cu,
+    // but outside the fallback's nets.
+    let routed = RoutedCopper {
+        tracks: vec![
+            track("A", bcu, (2.0, 8.0), 5.0),
+            track("A", fcu, (2.0, 8.0), 9.8),
+            track("B", bcu, (12.0, 18.0), 5.0),
+            track("C", bcu, (12.0, 18.0), 9.8),
+        ],
+        vias: vec![RoutedVia {
+            net: net("C"),
+            center: Point::from_mm(15.0, 5.6).unwrap(),
+            diameter: 600_000,
+            drill: 300_000,
+            layers: board.layers.all(),
+            gen: crate::api::Generation(0),
+        }],
+    };
+    // A class with no layers of its own routes on every layer: nothing of
+    // it is held to the reference.
+    let mut copy = routed.clone();
+    let r = enforce_reference(&board, &rules, &s, None, &mut copy);
+    assert_eq!(r, ReferenceReport::default());
+    assert_eq!(copy, routed);
+
+    s.layer_policy
+        .class_layers
+        .insert(ClassId(0), LayerMask::single(fcu));
+    let mut copy = routed.clone();
+    let r = enforce_reference(&board, &rules, &s, None, &mut copy);
+    assert_eq!(r.tracks_checked, 2, "A and B on B.Cu");
+    assert_eq!(r.dropped_nets, vec![net("B")]);
+    assert_eq!((r.dropped_tracks, r.dropped_vias), (1, 0));
+    assert_eq!(copy.tracks.len(), 3);
+    assert!(copy.tracks.iter().all(|t| t.net != net("B")));
+    assert_eq!(copy.vias, routed.vias);
+
+    // Without C's via, B's track is over the plane.
+    let mut no_via = routed.clone();
+    no_via.vias.clear();
+    let r = enforce_reference(&board, &rules, &s, None, &mut no_via);
+    assert!(r.dropped_nets.is_empty(), "{r:?}");
+}
+
+#[test]
+fn connections_whose_copper_the_reference_took_are_failed() {
+    let board = clear_board(false);
+    let connections = ConnectivityReport::build(&board, &ArcPolicy::default()).connections(&board);
+    assert_eq!(connections.len(), 1);
+    let id = connections[0].id;
+    let net = connections[0].net;
+    let joined = routed_tracks(&board, &[((2.0, 5.0), (18.0, 5.0))]);
+    let mut detail = DetailResult {
+        routed: vec![id],
+        ..DetailResult::default()
+    };
+    assert_eq!(
+        fail_unjoined(&board, &connections, &[net], &joined, &mut detail),
+        0
+    );
+    assert_eq!(detail.routed, vec![id]);
+    let opened = fail_unjoined(
+        &board,
+        &connections,
+        &[net],
+        &RoutedCopper::default(),
+        &mut detail,
+    );
+    assert_eq!(opened, 1);
+    assert!(detail.routed.is_empty());
+    assert_eq!(detail.failed, vec![(id, FailureReason::NoCorridor)]);
+    assert_eq!(
+        detail.failure_details,
+        vec![(id, DetailFailure::OffReference)]
+    );
 }

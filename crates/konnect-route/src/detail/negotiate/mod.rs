@@ -335,6 +335,10 @@ pub enum DetailFailure {
         iterations: u32,
         against: Vec<ConnectionId>,
     },
+    /// Routed, then taken out after S6 because its copper left the
+    /// reference plane its class's fallback names
+    /// ([`crate::pipeline::enforce_reference`]).
+    OffReference,
 }
 
 impl DetailFailure {
@@ -344,7 +348,8 @@ impl DetailFailure {
             DetailFailure::NoAccess { item } => FailureReason::NoAccess { item: *item },
             DetailFailure::NoCorridor
             | DetailFailure::NoPin { .. }
-            | DetailFailure::Unreachable => FailureReason::NoCorridor,
+            | DetailFailure::Unreachable
+            | DetailFailure::OffReference => FailureReason::NoCorridor,
             DetailFailure::BudgetExhausted | DetailFailure::ExactCheckRejected => {
                 FailureReason::BudgetExhausted
             }
@@ -358,7 +363,9 @@ impl DetailFailure {
     fn retryable(&self) -> bool {
         !matches!(
             self,
-            DetailFailure::NoAccess { .. } | DetailFailure::NoCorridor
+            DetailFailure::NoAccess { .. }
+                | DetailFailure::NoCorridor
+                | DetailFailure::OffReference
         )
     }
 
@@ -372,6 +379,7 @@ impl DetailFailure {
             DetailFailure::BudgetExhausted => "budget_exhausted",
             DetailFailure::ExactCheckRejected => "exact_check_rejected",
             DetailFailure::Congestion { .. } => "congestion",
+            DetailFailure::OffReference => "off_reference",
         }
     }
 }

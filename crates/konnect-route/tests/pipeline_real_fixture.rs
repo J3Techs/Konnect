@@ -478,14 +478,13 @@ fn pipeline_real_board_fixture() {
         .values()
         .any(|f| f.reference.is_some())
     {
+        // Against the board with the fanout on it, as the run saw it: the
+        // fanout's vias cut holes in the plane too.
+        let mut work = board.clone();
+        konnect_route::pipeline::add_locked(&mut work, &r.fanout_copper);
         let mut copy = r.routed.clone();
-        let again = konnect_route::pipeline::enforce_reference(
-            &board,
-            &rules,
-            &settings.class_fallback,
-            None,
-            &mut copy,
-        );
+        let again =
+            konnect_route::pipeline::enforce_reference(&work, &rules, &settings, None, &mut copy);
         println!(
             "reference: {} tracks checked again, {} nets off it",
             again.tracks_checked,

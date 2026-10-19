@@ -907,7 +907,7 @@ pub fn run_pipeline(
             let rr = konnect_route::pipeline::enforce_reference(
                 &board,
                 &rules,
-                &settings.class_fallback,
+                &settings,
                 Some(before),
                 &mut work,
             );

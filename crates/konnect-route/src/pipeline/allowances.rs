@@ -82,9 +82,9 @@ pub struct LayerFallbackSpec {
 pub struct ReferenceSpec {
     /// The plane layer whose filled copper is the reference.
     pub plane: String,
-    /// The routing layers it applies to. Unset: the fallback's layers that
-    /// are not among the class's own (`class_layers`); every fallback layer
-    /// when the class has no `class_layers` entry.
+    /// The routing layers it applies to: fallback layers that are not
+    /// among the class's own (`class_layers`, which a reference needs).
+    /// Unset: every fallback layer beyond the class's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over: Option<Vec<String>>,
     /// How far inside a filled piece a track's copper edge must stay, mm.
@@ -282,14 +282,36 @@ impl RoutingAllowances {
                         .layers
                         .by_name(r.plane.trim())
                         .ok_or_else(|| AllowanceError::UnknownLayer(r.plane.clone()))?;
+                    // The reference governs only the layers the fallback
+                    // adds: the class's own copper is never held to it.
+                    let Some(own) = own else {
+                        return Err(AllowanceError::Invalid(format!(
+                            "class '{}': a reference needs the class's own layers in class_layers",
+                            f.class
+                        )));
+                    };
                     let over = match &r.over {
                         Some(o) => mask(o)?,
-                        None => LayerMask(layers.0 & !own.unwrap_or(LayerMask::EMPTY).0),
+                        None => LayerMask(layers.0 & !own.0),
                     };
                     if over.is_empty() {
                         return Err(AllowanceError::Invalid(format!(
                             "class '{}': the reference applies to no layer",
                             f.class
+                        )));
+                    }
+                    if !over.intersection(own).is_empty() {
+                        return Err(AllowanceError::Invalid(format!(
+                            "class '{}': the reference's layers {:?} include the class's own layers",
+                            f.class,
+                            names(over)
+                        )));
+                    }
+                    if !LayerMask(over.0 & !layers.0).is_empty() {
+                        return Err(AllowanceError::Invalid(format!(
+                            "class '{}': the reference's layers {:?} are not all fallback layers",
+                            f.class,
+                            names(over)
                         )));
                     }
                     Some(ReferencePlane {
@@ -556,5 +578,48 @@ mod tests {
         );
         // X2 is not in the class: a pattern matching only it is refused.
         assert!(spec(&["X2"]).resolve(&board, &classes(), &mut s).is_err());
+    }
+
+    #[test]
+    fn a_reference_must_cover_only_layers_the_fallback_adds() {
+        let resolve = |v: serde_json::Value| {
+            let a: RoutingAllowances = serde_json::from_value(v).unwrap();
+            a.resolve(&board(), &classes(), &mut PipelineSettings::default())
+        };
+        let fallback = |over: serde_json::Value| {
+            serde_json::json!([ { "class": "Fast", "layers": ["F.Cu", "B.Cu"],
+                                  "reference": { "plane": "In2.Cu", "over": over } } ])
+        };
+        // No layers of its own: the class routes everywhere already.
+        let no_own = resolve(serde_json::json!({
+            "layer_fallback": fallback(serde_json::json!(["B.Cu"]))
+        }));
+        assert!(
+            matches!(no_own, Err(AllowanceError::Invalid(ref m)) if m.contains("class_layers")),
+            "{no_own:?}"
+        );
+        // Over the class's own layer.
+        let own = resolve(serde_json::json!({
+            "class_layers": { "Fast": ["F.Cu"] },
+            "layer_fallback": fallback(serde_json::json!(["F.Cu", "B.Cu"]))
+        }));
+        assert!(
+            matches!(own, Err(AllowanceError::Invalid(ref m)) if m.contains("own layers")),
+            "{own:?}"
+        );
+        // Over a layer the fallback does not add.
+        let outside = resolve(serde_json::json!({
+            "class_layers": { "Fast": ["F.Cu"] },
+            "layer_fallback": fallback(serde_json::json!(["In1.Cu"]))
+        }));
+        assert!(
+            matches!(outside, Err(AllowanceError::Invalid(ref m)) if m.contains("not all fallback")),
+            "{outside:?}"
+        );
+        resolve(serde_json::json!({
+            "class_layers": { "Fast": ["F.Cu"] },
+            "layer_fallback": fallback(serde_json::json!(["B.Cu"]))
+        }))
+        .unwrap();
     }
 }
