@@ -127,8 +127,12 @@ fn a_job_directory_runs_to_a_plan_with_progress_and_a_report() {
     assert!(opt.tracks_before > 100 && opt.tracks_after <= 3, "{opt:?}");
     let check = report.check.unwrap();
     assert_eq!(
-        (check.checker.as_str(), check.violations),
-        ("interim_exact", 0)
+        (
+            check.checker.as_str(),
+            check.violations,
+            check.authoritative
+        ),
+        ("check_routed", 0, true)
     );
     assert!(report.telemetry.stage_us(Stage::Optimize) > 0);
     let cp: Checkpoint = read_json(&dir.join(CHECKPOINT_FILE)).unwrap();
@@ -167,18 +171,38 @@ fn board_copper_can_be_reoptimized_and_a_region_freezes_the_rest() {
 }
 
 #[test]
-fn an_unbuilt_native_stage_ends_the_run_as_unavailable_not_failed() {
+fn a_native_run_routes_through_every_stage_and_reports_them() {
     let f = fixture();
     let s = spec(&f.root, "native.json", CopperSource::Native);
     let dir = prepare(&s, false).unwrap();
     let status = run_job_dir(&dir).unwrap();
-    assert_eq!(status.state, "STAGE_UNAVAILABLE", "{status:?}");
-    assert!(status.error.unwrap().contains("not available"));
-    assert!(!s.output_plan.exists());
+    assert_eq!(status.state, "COMPLETED", "{status:?}");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let route = report
+        .stages
+        .iter()
+        .find(|r| r.stage == "route")
+        .expect("a route stage record");
+    assert_eq!(route.state, "done");
+    for key in ["tasks", "routed", "failed", "connections_after"] {
+        assert!(
+            route.detail.get(key).is_some(),
+            "{key} in {:?}",
+            route.detail
+        );
+    }
+    // The pipeline's own stage timings reach the job's telemetry.
+    assert!(report
+        .telemetry
+        .stages
+        .iter()
+        .any(|t| t.stage == Stage::Global));
+    let planned = report.work_tracks + report.work_vias + report.fanout_tracks + report.fanout_vias;
+    assert_eq!(s.output_plan.exists(), planned > 0, "{report:?}");
     let events = progress(&dir);
     assert!(events
         .iter()
-        .any(|e| e["stage"] == "route" && e["event"] == "failed"));
+        .any(|e| e["stage"] == "route" && e["event"] == "done"));
 }
 
 #[test]
@@ -349,9 +373,12 @@ fn native_routing_sees_only_the_selected_nets_and_region() {
         ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default()).connections(&board)
     };
     assert_eq!(all().len(), 3);
-    assert_eq!(select_connections(&board, all(), None, None).len(), 3);
+    assert_eq!(
+        konnect_route::pipeline::select_connections(&board, all(), None, None).len(),
+        3
+    );
     let alpha: BTreeSet<NetId> = [board.net_by_name("ALPHA").unwrap()].into();
-    let picked = select_connections(&board, all(), Some(&alpha), None);
+    let picked = konnect_route::pipeline::select_connections(&board, all(), Some(&alpha), None);
     assert_eq!(picked.len(), 2);
     assert!(picked.iter().all(|c| alpha.contains(&c.net)));
     // A box round the two left footprints drops the long ALPHA link.
@@ -359,9 +386,10 @@ fn native_routing_sees_only_the_selected_nets_and_region() {
         konnect_geom::Point::from_mm(2.0, 2.0).unwrap(),
         konnect_geom::Point::from_mm(15.0, 12.0).unwrap(),
     );
-    let picked = select_connections(&board, all(), None, Some(region));
+    let picked = konnect_route::pipeline::select_connections(&board, all(), None, Some(region));
     assert_eq!(picked.len(), 2);
-    let picked = select_connections(&board, all(), Some(&alpha), Some(region));
+    let picked =
+        konnect_route::pipeline::select_connections(&board, all(), Some(&alpha), Some(region));
     assert_eq!(picked.len(), 1);
     assert_eq!(picked[0].id.0, 0, "ids are renumbered");
 }

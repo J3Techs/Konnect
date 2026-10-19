@@ -249,6 +249,11 @@ pub struct PipelineReport {
     pub connections_needed: Option<usize>,
     pub work_tracks: usize,
     pub work_vias: usize,
+    /// Plane fanout copper a native run planned beside the work.
+    #[serde(default)]
+    pub fanout_tracks: usize,
+    #[serde(default)]
+    pub fanout_vias: usize,
     pub optimize: Option<OptimizeReport>,
     pub check: Option<CheckSummary>,
     pub plan_items: Option<usize>,
@@ -282,6 +287,10 @@ pub struct Checkpoint {
     /// Copper outside the region or nets, kept as board copper.
     #[serde(default)]
     pub frozen: RoutedCopper,
+    /// Plane fanout (S2) of a native run: board copper for the later
+    /// stages (never optimized), but part of the plan.
+    #[serde(default)]
+    pub fanout: RoutedCopper,
     pub optimize: Option<OptimizeReport>,
     pub check: Option<CheckSummary>,
     pub written_unix: u64,
@@ -401,72 +410,72 @@ fn by_kind(report: &CheckReport) -> BTreeMap<String, usize> {
     m
 }
 
-/// The open connections a run works on: those of `nets` (all when `None`)
-/// whose two terminals both lie inside `region` (anywhere when `None`).
-/// Ids are renumbered to stay equal to their index.
-pub(crate) fn select_connections(
-    board: &RouteBoard,
-    connections: Vec<konnect_route::api::Connection>,
-    nets: Option<&BTreeSet<NetId>>,
-    region: Option<konnect_geom::BBox>,
-) -> Vec<konnect_route::api::Connection> {
-    use konnect_route::api::{ConnectionId, ItemRef};
-    let inside = |item: ItemRef| {
-        let Some(r) = region else { return true };
-        let bbox = match item {
-            ItemRef::Pad(id) => board.pads[id.index()].bbox(),
-            ItemRef::Via(id) => Some(board.vias[id.index()].shape().bbox()),
-            ItemRef::Track(id) => Some(board.tracks[id.index()].seg.bbox()),
-            ItemRef::Arc(id) => {
-                let a = &board.arcs[id.index()];
-                konnect_geom::BBox::from_points([a.start, a.mid, a.end])
-            }
-            ItemRef::Zone(_) => None,
-        };
-        bbox.is_some_and(|b| r.contains_bbox(&b))
-    };
-    connections
-        .into_iter()
-        .filter(|c| nets.is_none_or(|s| s.contains(&c.net)) && inside(c.from) && inside(c.to))
-        .enumerate()
-        .map(|(i, c)| konnect_route::api::Connection {
-            id: ConnectionId(i as u32),
-            ..c
-        })
-        .collect()
+/// What the native stages produced.
+struct NativeRoute {
+    /// S2 plane fanout.
+    fanout: RoutedCopper,
+    /// S5 copper, not yet optimized (the job's own S6 does that).
+    routed: RoutedCopper,
+    /// Counts for the `route` stage record.
+    detail: Value,
+    telemetry: Telemetry,
 }
 
-/// The native S2–S5 route of the board's open connections, limited to
-/// `nets` and `region`: the stages only ever see the selected connections.
+impl NativeRoute {
+    /// Existing copper taken as the work (no fanout, no stage telemetry).
+    fn taken(routed: RoutedCopper) -> Self {
+        NativeRoute {
+            fanout: RoutedCopper::default(),
+            routed,
+            detail: json!({}),
+            telemetry: Telemetry::default(),
+        }
+    }
+}
+
+/// The native S1–S5 stages ([`konnect_route::pipeline::route_board`]) on the
+/// board's open connections, limited to `nets` and `region`: the stages only
+/// ever see the selected connections. The job runs S6–S8 itself, so it can
+/// checkpoint between them.
 fn route_native(
     board: &RouteBoard,
     rules: &dyn RuleTable,
     nets: Option<&BTreeSet<NetId>>,
     region: Option<konnect_geom::BBox>,
-) -> Result<RoutedCopper> {
-    use konnect_route::detail::negotiate::{negotiate, NegotiationSettings};
-    use konnect_route::global::{build_grid, route_global, GlobalSettings};
-    let conn = ConnectivityReport::build(board, &konnect_geom::ArcPolicy::default());
-    let connections = select_connections(board, conn.connections(board), nets, region);
-    if connections.is_empty() {
-        return Ok(RoutedCopper::default());
+) -> Result<NativeRoute> {
+    use konnect_route::pipeline::{route_board, PipelineScope, PipelineSettings};
+    let scope = PipelineScope {
+        nets: nets.cloned(),
+        region,
+    };
+    let settings = PipelineSettings {
+        optimize: None,
+        ..PipelineSettings::default()
+    };
+    let r = guarded("route", || route_board(board, rules, &scope, &settings))?
+        .map_err(|e| anyhow::anyhow!("route: {e}"))?;
+    let mut failed: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, d) in &r.detail.failure_details {
+        *failed.entry(d.name()).or_default() += 1;
     }
-    let settings = GlobalSettings::default();
-    let grid = guarded("global", || build_grid(board, rules, &settings))?;
-    let global = guarded("global", || {
-        route_global(board, rules, &grid, &connections, &settings)
-    })?;
-    let mut backend = konnect_route::compute::CpuCompute::new();
-    let detail = guarded("detail", || {
-        negotiate(
-            board,
-            rules,
-            &global,
-            &NegotiationSettings::default(),
-            &mut backend,
-        )
-    })?;
-    Ok(detail.copper)
+    let detail = json!({
+        "connections_before_fanout": r.connections_before_fanout,
+        "fanout_sites": r.fanout.as_ref().map_or(0, |f| f.sites.len()),
+        "fanout_failed": r.fanout.as_ref().map_or(0, |f| f.failed.len()),
+        "tasks": r.connections.len(),
+        "global_overflow": r.global.stats.total_overflow,
+        "global_failed": r.global.failed.len(),
+        "routed": r.detail.routed.len(),
+        "failed": failed,
+        "iterations": r.detail.iterations,
+        "connections_after": r.connections_after,
+    });
+    Ok(NativeRoute {
+        fanout: r.fanout_copper,
+        routed: r.routed,
+        detail,
+        telemetry: r.telemetry,
+    })
 }
 
 /// Run the pipeline for `spec`, resuming from `resume` when it matches.
@@ -570,6 +579,7 @@ pub fn run_pipeline(
         completed: Vec::new(),
         copper: RoutedCopper::default(),
         frozen: RoutedCopper::default(),
+        fanout: RoutedCopper::default(),
         optimize: None,
         check: None,
         written_unix: 0,
@@ -584,7 +594,7 @@ pub fn run_pipeline(
     report.telemetry.threads = pool.current_num_threads() as u32;
 
     let t = Instant::now();
-    let (mut work, frozen) = if let Some(cp) = resume.as_ref().filter(|_| done("route")) {
+    let (mut work, frozen, fanout) = if let Some(cp) = resume.as_ref().filter(|_| done("route")) {
         // The board still holds the copper the source took; take it off
         // again so it is not doubled, then freeze what the run froze.
         if spec.source == CopperSource::BoardUnlocked {
@@ -597,21 +607,25 @@ pub fn run_pipeline(
             "route",
             "resumed",
             t,
-            json!({ "tracks": cp.copper.tracks.len(), "vias": cp.copper.vias.len() }),
+            json!({ "tracks": cp.copper.tracks.len(), "vias": cp.copper.vias.len(),
+                    "fanout_tracks": cp.fanout.tracks.len(), "fanout_vias": cp.fanout.vias.len() }),
         );
-        (cp.copper.clone(), cp.frozen.clone())
+        (cp.copper.clone(), cp.frozen.clone(), cp.fanout.clone())
     } else {
         observer.event("route", "start", &json!({ "source": spec.source }));
-        let routed = match &spec.source {
-            CopperSource::BoardUnlocked => {
-                Ok(RoutedCopper::take_unlocked(&mut board, None, Generation(0)))
-            }
+        let routed: Result<NativeRoute> = match &spec.source {
+            CopperSource::BoardUnlocked => Ok(NativeRoute::taken(RoutedCopper::take_unlocked(
+                &mut board,
+                None,
+                Generation(0),
+            ))),
             CopperSource::Plan { path } => {
                 let text = std::fs::read_to_string(path)
                     .with_context(|| format!("read {}", path.display()))?;
                 let plan: RoutePlan = serde_json::from_str(&text)
                     .with_context(|| format!("parse {}", path.display()))?;
                 plan.to_routed(&board, Generation(0))
+                    .map(NativeRoute::taken)
                     .map_err(|e| anyhow::anyhow!("source plan: {e}"))
             }
             CopperSource::Native => {
@@ -619,27 +633,28 @@ pub fn run_pipeline(
             }
         };
         match routed {
-            Ok(c) => {
-                // Routing is S2–S5 time; taking existing copper is ingest.
-                let stage = match spec.source {
-                    CopperSource::Native => Stage::Detail,
-                    _ => Stage::Ingest,
-                };
-                report
-                    .telemetry
-                    .add_stage_time(stage, t.elapsed().as_micros() as u64);
+            Ok(r) => {
+                // Routing is S1–S5 time (the pipeline's own stage timings
+                // come with it); taking existing copper is ingest.
+                if spec.source == CopperSource::Native {
+                    report.telemetry.merge(&r.telemetry);
+                } else {
+                    report
+                        .telemetry
+                        .add_stage_time(Stage::Ingest, t.elapsed().as_micros() as u64);
+                }
                 checkpoint.completed.push("route".to_string());
-                record(
-                    &mut report,
-                    observer,
-                    "route",
-                    "done",
-                    t,
-                    json!({ "tracks": c.tracks.len(), "vias": c.vias.len() }),
-                );
+                let mut detail = json!({ "tracks": r.routed.tracks.len(), "vias": r.routed.vias.len(),
+                                         "fanout_tracks": r.fanout.tracks.len(),
+                                         "fanout_vias": r.fanout.vias.len() });
+                if let (Some(d), Some(extra)) = (detail.as_object_mut(), r.detail.as_object()) {
+                    d.extend(extra.clone());
+                }
+                record(&mut report, observer, "route", "done", t, detail);
                 // Copper outside the region or nets is frozen as board
                 // copper: an obstacle and terminal, never edited or planned.
-                c.partition(nets.as_ref(), region)
+                let (work, frozen) = r.routed.partition(nets.as_ref(), region);
+                (work, frozen, r.fanout)
             }
             Err(e) => {
                 record(
@@ -656,10 +671,15 @@ pub fn run_pipeline(
         }
     };
     frozen.freeze_into(&mut board);
+    // The fanout is board copper for every later stage, and planned at S8.
+    fanout.freeze_into(&mut board);
     report.work_tracks = work.tracks.len();
     report.work_vias = work.vias.len();
+    report.fanout_tracks = fanout.tracks.len();
+    report.fanout_vias = fanout.vias.len();
     checkpoint.copper = work.clone();
     checkpoint.frozen = frozen;
+    checkpoint.fanout = fanout.clone();
     checkpoint.written_unix = now_unix();
     observer.checkpoint(&checkpoint);
     if let Some((kind, why)) = stop_check(observer) {
@@ -770,7 +790,11 @@ pub fn run_pipeline(
 
     // S8: plan.
     let t = Instant::now();
-    if work.tracks.is_empty() && work.vias.is_empty() {
+    let planned = RoutedCopper {
+        tracks: fanout.tracks.iter().chain(&work.tracks).copied().collect(),
+        vias: fanout.vias.iter().chain(&work.vias).copied().collect(),
+    };
+    if planned.tracks.is_empty() && planned.vias.is_empty() {
         record(
             &mut report,
             observer,
@@ -781,7 +805,8 @@ pub fn run_pipeline(
         );
         return Ok(report);
     }
-    let plan = RoutePlan::from_routed(&board, &work).map_err(|e| anyhow::anyhow!("plan: {e}"))?;
+    let plan =
+        RoutePlan::from_routed(&board, &planned).map_err(|e| anyhow::anyhow!("plan: {e}"))?;
     let chunks = plan.chunks_by_net(ADD_ROUTING_MAX_ITEMS).len();
     write_new_atomic(&spec.output_plan, plan.to_routing_file_json().as_bytes())?;
     report
