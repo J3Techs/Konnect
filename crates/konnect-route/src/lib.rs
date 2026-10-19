@@ -38,6 +38,7 @@ pub mod fanout;
 pub mod global;
 pub mod loader;
 pub mod optimize;
+pub mod pipeline;
 pub mod plan;
 pub mod rules;
 mod space;
