@@ -40,6 +40,7 @@ pub mod loader;
 pub mod optimize;
 pub mod plan;
 pub mod rules;
+mod space;
 pub mod synthetic;
 pub mod telemetry;
 
