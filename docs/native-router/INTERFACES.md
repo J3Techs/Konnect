@@ -7,8 +7,9 @@ you need an interface it does not provide, follow the change-control rule
 below.
 
 The router plans copper offline. It reads a board model, computes, and
-returns a plan in `add_routing` form. It never talks to KiCad itself, and it
-registers no MCP tools yet.
+returns a plan in `add_routing` form. It never talks to KiCad itself. The
+MCP tools that drive it (the `native_routing` toolset) live in
+`konnect-core` and read only saved files.
 
 ## Module ownership
 
@@ -17,13 +18,13 @@ Anyone may add tests to any module.
 
 | Owner | Modules | Stage |
 |---|---|---|
-| INT (integrator) | `konnect-route::api`, `compute::{job, raster, cost, backend}` trait shapes, `plan` format, `telemetry`, `synthetic`, this document, workspace manifests | — |
+| INT (integrator) | `konnect-route::api`, `compute::{job, raster, cost, backend}` trait shapes, `plan` format, `telemetry`, `synthetic`, `pipeline` (the stage wiring and the kernel backend negotiation runs on), this document, workspace manifests, the tool registry | — |
 | WS-A geometry and checker | `konnect-geom` (all), `konnect-route::check`, `konnect-route::rules` values and semantics | S7; kernel for S2/S5/S6 |
 | WS-B ingest, audit, fanout, access | `konnect-route::{board, loader, connectivity, audit, fanout, access}`, the `konnect-sexp` board-scan additions | S0, S1, S2, S4 |
 | WS-C global | `konnect-route::global`, `compute::batch` | S3 |
 | WS-D1 search | `konnect-route::detail::search`, `CpuCompute::{search_batch, cost_field, derive_masks}` | S5 search |
 | WS-D2 negotiation | `konnect-route::detail::negotiate`, `CpuCompute::{paint, unpaint, update_costs}` | S5 control |
-| WS-E plan, apply, optimize | `konnect-route::{optimize, plan}` bodies, the job runner (later, in `konnect-core`) | S6, S8 |
+| WS-E plan, apply, optimize | `konnect-route::{optimize, plan}` bodies, the job runner and the `native_routing` tools in `konnect-core` (registered by INT) | S6, S8 |
 | WS-G GPU backend | a feature-gated GPU implementation of `RouteCompute` (a separate crate, off by default) | — |
 
 Stub functions carry `todo!("WS-x: …")`, which names the owner. They only
@@ -237,10 +238,13 @@ per net.
   pairwise-disjoint windows in each batch and first-fit placement in
   `order_key` order.
 - **`SearchBackend`.** `search_batch` and `cost_field`.
-- **`RouteCompute: SearchBackend`.** `paint`, `unpaint`, `derive_masks` and
-  `update_costs`.
+- **`RouteCompute: SearchBackend`.** `paint`, `unpaint`, `derive_masks`,
+  `update_costs`, and `fork` (an independent copy per worker thread, or
+  `None` for a device-bound backend; negotiation then runs lockstep batch
+  rounds instead of whole tiles per worker).
 - **`CpuCompute`** is the reference. `paint`, `unpaint` and `update_costs`
-  are implemented; the rest are stubs owned by WS-D1.
+  are the raster reference; `search_batch`, `cost_field` and `derive_masks`
+  are WS-D1's kernel with default tuning (see *Detailed search* below).
 - **A GPU only proposes.** Outcomes are lattice paths (`PathProposal`). The
   CPU re-checks every proposal exactly and commits in deterministic order.
   On device loss, the run latches to the CPU for its remainder.
@@ -285,6 +289,152 @@ Use `merge` to fold a worker's telemetry into the run's.
   outlines in board coordinates. `footprint_courtyard_outline` does the same
   for one footprint. `fp_line` and `fp_arc` pieces are chained into loops in
   local coordinates; open courtyards are skipped and counted.
+
+## Integrated interfaces
+
+Everything below was added by the workstreams after the freeze and merged
+on the integration branch. All of it is additive: no frozen type, field or
+signature changed meaning except where a bullet says so.
+
+### The pipeline: `konnect-route::pipeline` (INT)
+
+`route_board(board, rules, scope, settings) -> Result<PipelineResult, _>`
+runs the stages in order, on WS-D1's kernel (`route_board_with` takes any
+`RouteCompute + Send` backend instead):
+
+1. S1 connectivity of the board as loaded;
+2. S2 plane fanout (`PipelineSettings::fanout`, `None` skips it), kept to
+   the scope and added to a working copy of the board as **locked** copper;
+3. S1 again over the working board, then the scope
+   (`pipeline::select_connections`: nets, and connections whose two
+   terminals lie wholly inside the region; ids renumbered to their index);
+4. S4 pin access, one profile per net class of the selected connections'
+   pads (reported; negotiation still derives its own terminal nodes);
+5. S3 `build_grid_with` and `route_global_with` over that task list;
+6. S5 `negotiate_connections` with the same task list and the grid. A
+   connection S3 failed gets an empty corridor on its class layers, so a
+   coarse-grid failure is not final;
+7. S6 `optimize_checked` (`PipelineSettings::optimize`), then a **guard**:
+   the S7 checker counts each net's findings before and after, and any net
+   the optimizer edited that gained a finding is put back to its routed
+   copper, repeated until none gains;
+8. S7 `BoardChecker::check_routed_timed` over the fanout and routed copper
+   together, against the board as loaded;
+9. S8 one `RoutePlan` (fanout first), and the connections still open on the
+   board with the plan applied.
+
+Every stage records its time in the result's `Telemetry` (`Stage::Audit` for
+connectivity, `Fanout`, `Access`, `Global`, `Detail`, `Optimize`, `Check`
+for the guard and the check, `Plan`) plus `pipeline_*` counters. The
+`konnect-core` job runner's `CopperSource::Native` calls `route_board` with
+`optimize: None` and runs S6–S8 itself, so it can checkpoint between them;
+its `Checkpoint` and `PipelineReport` gained the fanout copper
+(`fanout`, `fanout_tracks`, `fanout_vias`), which is board copper for S6/S7
+and part of the plan.
+
+### Detailed search and negotiation (WS-D1, WS-D2, INT)
+
+- **`PathProposal::nodes` from the kernel are corner nodes**: the source,
+  every node where the heading changes, both ends of each via (same
+  `(col, row)`, consecutive), and the target; consecutive nodes on one
+  layer are joined by one straight octilinear run. Each node's
+  `heading_mask` holds the heading the path leaves it in.
+- **`pipeline::KernelBackend`** is the backend negotiation runs on. It
+  expands kernel paths to one node per lattice step (negotiation's exact
+  check vetoes single steps), delegates raster maintenance to `CpuCompute`,
+  and forks by cloning. `KernelBackend::negotiation_config()` turns the
+  derived heading mask off (negotiation derives masks before it lifts a
+  net's own copper; the kernel reads the live CORE counters instead) and
+  turns via congestion on. `ReferenceSearch` (WS-D2) stays for tests and
+  comparison.
+- **`via_site` values**: `VIA_NO = 0`, `VIA_CHECK = 1` (an exact check
+  decides), `VIA_FREE = 2`. Negotiation narrows sites to where its
+  profile's whole via fits, so a nonzero site there is free of HALO.
+- **Non-uniform lattices** (`Lattice`, `LatticeSpec`): rasters on them are
+  painted with `paint_on_lattice` and derived with `derive_masks_on_lattice`;
+  `Lattice::from_axes` refuses an axis gap above √2 · base pitch. The map
+  lookahead is used on uniform lattices only.
+- **`SearchConfig`** (kernel tuning beside the frozen `CostParams`) gained
+  `via_congestion_reach_nm: Option<Coord>` (serde default `None`): a via is
+  priced by the worst `present`/`history` on every stack layer at its node
+  and at eight points this far out, `b · (1 + h·hf) · (1 + p·pf)`. Without
+  it a via sits on another net's routed track at no cost and negotiation
+  never clears the conflict.
+- **`SearchStats`** is `#[serde(default)]` and gained `min_run_rejects`.
+- **`compute::Plane::as_mut_slice`** beside `as_slice`.
+- **`NegotiationTuning`** is `#[serde(default)]` and gained
+  `raster_cache_mb` (default 4096, 0 off; never changes the result) and
+  `bga_min_fill` (×1000, default 350). **`DetailResult`** gained
+  `short_segments: Vec<ShortSegment>`. `negotiate_connections(board, rules,
+  connections, global, grid, settings, tuning, backend, telemetry)` reads
+  corridors by connection id from `connections` and decodes their cells
+  (base and refined) with `GCellGrid::cell_bbox`.
+
+### Global routing (WS-C)
+
+- **`GlobalSettings`**, `PresentSchedule`, `GlobalCosts` and `LayerPolicy`
+  (per-class layer masks) configure S3; `build_grid_with` and
+  `route_global_with` record telemetry.
+- **`GCellGrid`** gained `fine_pitch`, `refined` (base cells split into
+  fine cells, ascending) and `capacity`. A base cell keeps the frozen
+  `GCellGrid::id`; fine cells follow every base id (`fine_id`). Use
+  `cell_bbox(id)` and `locate(layer, point)` rather than decoding ids. The
+  pitch coarsens until slots × cells ≤ 2^23; `route_global` refuses a grid
+  beyond the limits (every connection `NoCorridor`).
+- **`Corridor.layers`** keeps its frozen meaning, the layers the corridor
+  may use; the new **`Corridor.assigned`** (serde default) is the subset its
+  cells are on. A layer change is two consecutive ids of one area on two
+  layers: one through via.
+- **`GlobalStats.best_iteration`** (serde default): the result is the best
+  iteration, not the last. `converged` also requires no failures; a
+  terminal off the grid fails as `NoAccess`.
+
+### Checker and geometry (WS-A)
+
+- `CheckReport` keeps its frozen shape `{ violations }`; counts come from
+  `BoardChecker::check_board_with_stats` / `check_routed_with_stats` as
+  `(CheckReport, CheckStats)`, and the `*_timed` methods record them.
+- `check_routed` uses `CheckOptions::for_routed()`: zone fills are left to
+  KiCad's refill, and fixed copper is never re-checked against fixed copper.
+- `konnect-geom` gained `IndexedPolygon` (edge-indexed polygons),
+  `measure::{gap_nm, closest}` (f64, reports only),
+  `point_shape_distance_cmp(p, width, shape, clearance)`,
+  `segment_shape_distance_cmp(a, b, width, shape, clearance)` and
+  `shape_within_polygon`.
+- `RuleTable::clearance` answers must not depend on argument order;
+  memoizing callers ask in one fixed order. `ProjectRuleTable::pin_net_class`
+  also clears the net from `ambiguous_nets`.
+
+### Audit, fanout and access (WS-B)
+
+- `AuditSettings` gained `max_states` (default 8,000,000) and `exact_only`;
+  `FootprintAudit` gained `coarsened`, `classes`, `paint_ms`, `search_ms`;
+  `AccessStats` gained `unknown_profile` (a profile naming no class the
+  board uses: every pad is returned without points).
+- `PlaneViaPlan::routed()` returns vias with an empty layer mask (the plan
+  does not hold the stack); `route_plan(board)` and the pipeline fill in
+  every copper layer.
+
+### Optimizer and job runner (WS-E)
+
+- `optimize::record_counters(&OptimizeReport, &mut Telemetry)`.
+- `OptimizeOptions::max_skew_deg: 0.0` also turns off the 1 µm snap, so a
+  straight shortcut must be exactly octilinear.
+- `konnect-core::native_route_job`: `StopKind` (typed stop reasons),
+  `PipelineReport.stop_kind`/`resumed`, `CheckSummary.check_routed_error`.
+
+### Workspace
+
+- `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).
+
+### Known conflicts left open
+
+- Negotiation's grid windows are about 24 × 19 mm, larger than the frozen
+  `GPU_WINDOW_MAX_NM` (about 16.8 mm). A GPU backend has to split them or
+  the constant has to change.
+- The kernel's `SearchContext::gcells` corridor steering reads base cell
+  ids only; negotiation does not pass corridors to the kernel yet (it uses
+  them as guide lines and layer masks).
 
 ## Determinism rules
 
