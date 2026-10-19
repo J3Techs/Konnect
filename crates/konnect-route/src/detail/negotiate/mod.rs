@@ -355,7 +355,7 @@ impl DetailFailure {
     }
 
     /// Whether another iteration (another tiling) could change the outcome.
-    fn retryable(&self) -> bool {
+    pub(crate) fn retryable(&self) -> bool {
         !matches!(
             self,
             DetailFailure::NoAccess { .. } | DetailFailure::NoCorridor
@@ -424,6 +424,13 @@ pub struct DetailResult {
     /// left for S6 to merge or straighten (lattice jogs are one or two
     /// steps long). Collinear runs split at tile pins are already merged.
     pub short_segments: Vec<ShortSegment>,
+    /// Which connection drew each of `copper.tracks` (same order).
+    #[serde(default)]
+    pub track_owner: Vec<ConnectionId>,
+    /// The connections that use each of `copper.vias` (same order): more
+    /// than one where connections of a net share a via.
+    #[serde(default)]
+    pub via_users: Vec<Vec<ConnectionId>>,
 }
 
 /// A routed track below its minimum segment length.
@@ -1757,6 +1764,13 @@ fn run_negotiation(
                     kept_new.insert(t);
                 }
             }
+            // Why the fill's own searches failed (before congestion is put
+            // back), per connection.
+            for &t in &queue {
+                if let Some(f) = &failure[t as usize] {
+                    telemetry.count(&format!("fill_failed_{}", f.name()), 1);
+                }
+            }
             for (t, f) in lost_to {
                 if routed[t as usize].is_none() {
                     failure[t as usize] = Some(f);
@@ -1850,7 +1864,7 @@ fn run_negotiation(
             via_at.insert((p.net, v.center));
         }
     }
-    let mut drawn_vias: HashSet<(NetId, Point)> = HashSet::new();
+    let mut drawn_vias: HashMap<(NetId, Point), usize> = HashMap::new();
     for (t, task) in tasks.iter().enumerate() {
         match &routed[t] {
             Some(pieces) => {
@@ -1884,15 +1898,21 @@ fn run_negotiation(
                         seg: s.seg,
                         gen,
                     });
+                    result.track_owner.push(task.conn.id);
                 }
                 for p in pieces {
                     for v in &p.vias {
                         // Connections of one net may share a via (conflict
                         // detection lets them): it is drawn once.
-                        if !drawn_vias.insert((p.net, v.center)) {
+                        if let Some(&i) = drawn_vias.get(&(p.net, v.center)) {
+                            if !result.via_users[i].contains(&task.conn.id) {
+                                result.via_users[i].push(task.conn.id);
+                            }
                             telemetry.count("shared_vias", 1);
                             continue;
                         }
+                        drawn_vias.insert((p.net, v.center), result.copper.vias.len());
+                        result.via_users.push(vec![task.conn.id]);
                         result.copper.vias.push(RoutedVia {
                             net: p.net,
                             center: v.center,
