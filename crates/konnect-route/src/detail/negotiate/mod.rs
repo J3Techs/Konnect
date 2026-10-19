@@ -195,6 +195,10 @@ pub struct NegotiationTuning {
     /// only adds copper that keeps clear of what is already routed, so it
     /// never undoes a routed connection.
     pub fill_passes: u32,
+    /// The present factor never grows past this. Path costs are 32-bit and
+    /// saturate: an unbounded factor turns other nets' copper into walls
+    /// (searches report unreachable) instead of costs to negotiate.
+    pub present_factor_max: u32,
     /// Longest full-width stub from a pad's access point to a lattice node,
     /// for a pad whose own copper offers no open node.
     pub stub_reach: Coord,
@@ -229,6 +233,7 @@ impl Default for NegotiationTuning {
             generation: Generation(1),
             raster_cache_mb: 4_096,
             fill_passes: 2,
+            present_factor_max: 1_000_000,
             stub_reach: 500_000,
             stall_iterations: 0,
         }
@@ -1639,7 +1644,8 @@ fn run_negotiation(
         present_factor =
             u32::try_from(u64::from(present_factor) * u64::from(settings.present_growth) / 1000)
                 .unwrap_or(u32::MAX)
-                .max(tuning.present_factor_floor);
+                .max(tuning.present_factor_floor)
+                .min(tuning.present_factor_max.max(tuning.present_factor_floor));
         it += 1;
     }
     // A run that never reached the fill stage (no slots) still resolves.

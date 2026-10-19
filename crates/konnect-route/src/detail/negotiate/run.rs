@@ -801,6 +801,11 @@ impl TileRun {
             origins.push((anchor, 0xff));
         }
         let pitch = i64::from(w.pitch_nm);
+        // A stub is a segment of its own: never shorter than the minimum.
+        let min_len = ctx
+            .rules
+            .min_segment_length(&RuleSubject::new(ItemKind::Track, Some(net)), layer)
+            .unwrap_or(0);
         let mut found: Vec<(i128, u32, u32, u8, Point, Coord)> = Vec::new();
         for &(width, reach) in &widths {
             for &(o, headings) in &origins {
@@ -810,7 +815,7 @@ impl TileRun {
                     }
                     let (dx, dy) = crate::detail::search::HEADINGS[h as usize];
                     let diag = dx != 0 && dy != 0;
-                    let mut t = 2 * pitch;
+                    let mut t = (2 * pitch).max(i64::from(min_len));
                     while t <= i64::from(reach) {
                         let d = if diag {
                             (t as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i64
@@ -833,12 +838,24 @@ impl TileRun {
                         if len2 > i128::from(reach) * i128::from(reach) {
                             break;
                         }
+                        if len2 < i128::from(min_len) * i128::from(min_len) {
+                            continue;
+                        }
                         let seg = Segment::new(o, q, width);
                         let cy = ctx.obstacles.courtyards.hits(&Shape::Segment(seg));
-                        if ctx
-                            .obstacles
-                            .check_segment(ctx.rules, net, layer, &seg, &cy)
-                            .is_none()
+                        // A courtyard-scoped rule may want more width here.
+                        let floor = ctx
+                            .rules
+                            .track_width(
+                                &RuleSubject::new(ItemKind::Track, Some(net)).with_courtyards(&cy),
+                                layer,
+                            )
+                            .min;
+                        if width >= floor
+                            && ctx
+                                .obstacles
+                                .check_segment(ctx.rules, net, layer, &seg, &cy)
+                                .is_none()
                         {
                             found.push((len2, c, r, h, o, width));
                         }

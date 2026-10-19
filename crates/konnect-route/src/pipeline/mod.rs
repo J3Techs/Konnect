@@ -55,8 +55,8 @@ use crate::check::{BoardChecker, CheckOptions, CheckReport, CheckedItem};
 use crate::compute::RouteCompute;
 use crate::connectivity::ConnectivityReport;
 use crate::detail::negotiate::{
-    negotiate_connections_with, DetailFailure, DetailResult, NeckDown, NegotiationInputs,
-    NegotiationSettings, NegotiationTuning,
+    negotiate_connections_with, DetailResult, NeckDown, NegotiationInputs, NegotiationSettings,
+    NegotiationTuning,
 };
 use crate::detail::search::SearchConfig;
 use crate::fanout::{plan_plane_vias, FanoutSettings, PlaneViaPlan};
@@ -512,11 +512,10 @@ fn second_chance(
         let ids: Vec<ConnectionId> = detail
             .failure_details
             .iter()
-            .filter(|(id, f)| {
-                !matches!(f, DetailFailure::NoAccess { .. })
-                    && connections
-                        .get(id.index())
-                        .is_some_and(|c| rules.class_of(Some(c.net)) == class)
+            .filter(|(id, _)| {
+                connections
+                    .get(id.index())
+                    .is_some_and(|c| rules.class_of(Some(c.net)) == class)
             })
             .map(|(id, _)| *id)
             .collect();

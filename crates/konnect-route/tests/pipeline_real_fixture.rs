@@ -31,6 +31,8 @@
 //!   fewer conflicts, default 0: off);
 //! - `KONNECT_PIPELINE_PRESENT_GROWTH` (×1000) and
 //!   `KONNECT_PIPELINE_HISTORY_INC`: the PathFinder schedule;
+//! - `KONNECT_PIPELINE_BGA_SUBTILE_MM`, `KONNECT_PIPELINE_PIN_SEARCH_MM`:
+//!   the largest BGA sub-tile core and the pin search reach;
 //! - `KONNECT_PIPELINE_NO_STUBS=1`: do not hand S4 access to negotiation;
 //! - `KONNECT_PIPELINE_CLASS_LAYERS=Class=F.Cu+B.Cu;…`: class layer masks;
 //! - `KONNECT_PIPELINE_CLASS_FALLBACK=Class=F.Cu+B.Cu@Plane.Cu:margin_mm;…`:
@@ -150,6 +152,14 @@ fn pipeline_real_board_fixture() {
         u64::from(settings.tuning.fill_passes),
     ) as u32;
     settings.tuning.stall_iterations = env_num("KONNECT_PIPELINE_STALL", 0) as u32;
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_BGA_SUBTILE_MM") {
+        let mm: f64 = v.trim().parse().expect("mm");
+        settings.tuning.bga_sub_tile_max = (mm * 1e6).round() as i32;
+    }
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_PIN_SEARCH_MM") {
+        let mm: f64 = v.trim().parse().expect("mm");
+        settings.tuning.pin_search = (mm * 1e6).round() as i32;
+    }
     if env_on("KONNECT_PIPELINE_NO_STUBS") {
         settings.use_access = false;
     }
