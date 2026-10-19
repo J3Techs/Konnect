@@ -204,7 +204,10 @@ fn opt_strings(args: &Value, key: &str) -> Result<Option<Vec<String>>, Refusal> 
     }
 }
 
-fn region(args: &Value) -> Result<Option<[f64; 4]>, Refusal> {
+/// A region in mm: x1, y1, x2, y2.
+type RegionMm = [f64; 4];
+
+fn region(args: &Value) -> Result<Option<RegionMm>, Refusal> {
     let Some(r) = args.get("region").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
@@ -366,42 +369,44 @@ fn stage_failure(capability: &str, error: StageError) -> CallToolResult {
 
 // ─── Handlers ────────────────────────────────────────────────────────────
 
-/// Run a handler that loads the board and checks it (half a second or
-/// more) on the blocking pool, off the server's async workers.
-async fn blocking(
-    args: &Value,
-    f: fn(&Value) -> anyhow::Result<CallToolResult>,
-) -> anyhow::Result<CallToolResult> {
-    let args = args.clone();
-    tokio::task::spawn_blocking(move || f(&args)).await?
-}
-
 async fn handle_connectivity_report(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    blocking(args, connectivity_report_blocking).await
+    // Loading and checking a board takes half a second or more: run it on
+    // the blocking pool, off the server's async workers.
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || connectivity_report_blocking(&args)).await?
 }
 
 async fn handle_audit_terminal_access(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    blocking(args, audit_terminal_access_blocking).await
+    // Loading and checking a board takes half a second or more: run it on
+    // the blocking pool, off the server's async workers.
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || audit_terminal_access_blocking(&args)).await?
 }
 
 async fn handle_plan_plane_vias(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    blocking(args, plan_plane_vias_blocking).await
+    // Loading and checking a board takes half a second or more: run it on
+    // the blocking pool, off the server's async workers.
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || plan_plane_vias_blocking(&args)).await?
 }
 
 async fn handle_check_route_rules(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    blocking(args, check_route_rules_blocking).await
+    // Loading and checking a board takes half a second or more: run it on
+    // the blocking pool, off the server's async workers.
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || check_route_rules_blocking(&args)).await?
 }
 
 fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
