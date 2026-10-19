@@ -339,7 +339,10 @@ fn clear_board(branch_pad: bool) -> RouteBoard {
     b.build()
 }
 
-fn routed_tracks(board: &RouteBoard, segs: &[((f64, f64), (f64, f64))]) -> RoutedCopper {
+/// A segment's two ends, mm.
+type Ends = ((f64, f64), (f64, f64));
+
+fn routed_tracks(board: &RouteBoard, segs: &[Ends]) -> RoutedCopper {
     let net = board.net_by_name("A").expect("net A");
     let mm = |v: f64| (v * 1e6).round() as konnect_geom::Coord;
     RoutedCopper {
