@@ -660,28 +660,19 @@ fn build_tasks(
                 }
                 Some(cor) => {
                     if let Some(g) = grid {
-                        let slots: Vec<LayerId> = g.layers.iter().collect();
-                        let per_layer = g.cols * g.rows;
+                        // `cell_bbox` decodes base and refined (fine) cell
+                        // ids alike; an id the grid does not know is skipped.
                         for &cell in &cor.cells {
-                            if per_layer == 0 {
-                                break;
-                            }
-                            let slot = (cell / per_layer) as usize;
-                            let rem = cell % per_layer;
-                            let (row, col) = (rem / g.cols, rem % g.cols);
+                            let Some((layer, b)) = g.cell_bbox(cell) else {
+                                continue;
+                            };
                             let p = Point::new(
-                                (i64::from(g.bbox.min.x)
-                                    + i64::from(g.pitch) * i64::from(col)
-                                    + i64::from(g.pitch) / 2)
-                                    as Coord,
-                                (i64::from(g.bbox.min.y)
-                                    + i64::from(g.pitch) * i64::from(row)
-                                    + i64::from(g.pitch) / 2)
-                                    as Coord,
+                                ((i64::from(b.min.x) + i64::from(b.max.x)) / 2) as Coord,
+                                ((i64::from(b.min.y) + i64::from(b.max.y)) / 2) as Coord,
                             );
                             if line.last() != Some(&p) {
                                 line.push(p);
-                                hints.push(slots.get(slot).copied());
+                                hints.push(Some(layer));
                             }
                         }
                     }
