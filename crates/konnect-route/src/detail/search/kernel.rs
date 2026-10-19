@@ -766,7 +766,9 @@ pub(crate) fn run<G: Grid>(
     let inv_pitch: u64 = (1u64 << 32) / pitch as u64;
     // The sources' box in nm, for the backward search's heuristic.
     let mut sbox = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    let mut src_layers = 0u64;
     for n in p.sources.iter().filter(|n| usable(n)) {
+        src_layers |= 1 << n.layer;
         let (x, y) = (
             i64::from(grid.x(n.col.into())),
             i64::from(grid.y(n.row.into())),
@@ -781,12 +783,18 @@ pub(crate) fn run<G: Grid>(
         gaps.extend((r0..r0 + rh).map(|r| axis_gap(i64::from(grid.y(r)), sbox.2, sbox.3)));
     }
     let gaps = gaps;
-    let to_sources = |c: u32, r: u32| {
-        octile(
+    // A node-layer off every source's layer needs at least one via more.
+    let to_sources = |c: u32, r: u32, l: u32| {
+        let o = octile(
             gaps[(c - c0) as usize],
             gaps[(rw + r - r0) as usize],
             inv_pitch,
-        )
+        );
+        if src_layers & (1 << l) == 0 {
+            o.saturating_add(params.via.0)
+        } else {
+            o
+        }
     };
     let mut fmap = std::mem::take(&mut s.field);
     let mut fbound = FieldBound {
@@ -821,7 +829,7 @@ pub(crate) fn run<G: Grid>(
         } else if fbound.complete {
             u32::MAX
         } else {
-            fbound.stop.saturating_sub(to_sources(c, r))
+            fbound.stop.saturating_sub(to_sources(c, r, l))
         }
     };
 
@@ -1360,10 +1368,11 @@ struct FieldBound {
 /// node-layer's `fd` is a lower bound on the real cost to a target from any
 /// state there. It runs until a source closes and the open keys pass that
 /// source's cost by a slack; an unclosed node-layer then has
-/// `d >= stop - octile to the sources` ([`FieldBound`]). Both bounds are
+/// `d >= stop - h`, `h` the octile to the sources plus a via off their
+/// layers ([`FieldBound`]). Both bounds are
 /// consistent, so the forward search's path cost is unchanged.
 #[allow(clippy::too_many_arguments)]
-fn relaxed_field<G: Grid, F: Fn(u32, u32) -> u32>(
+fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
     grid: &G,
     lay: &Layout,
     views: &[View<'_>; MAX_LAYERS],
@@ -1394,7 +1403,7 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32) -> u32>(
         let nl = lay.local(c, r) as usize * nl_layers + l as usize;
         if fd.get(nl) != 0 {
             fd.set(nl, 0);
-            heap.push(to_sources(c, r), nl as u32);
+            heap.push(to_sources(c, r, l), nl as u32);
         }
     }
     let pf = u64::from(params.present_factor);
@@ -1451,12 +1460,18 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32) -> u32>(
             if let Ok(i) = through.binary_search_by_key(&pnl, |t| t.0) {
                 if nd < through[i].1 {
                     through[i].1 = nd;
-                    heap.push(nd.saturating_add(to_sources(pc, pr)), pnl as u32 | THROUGH);
+                    heap.push(
+                        nd.saturating_add(to_sources(pc, pr, (pnl % nl_layers) as u32)),
+                        pnl as u32 | THROUGH,
+                    );
                 }
             }
         } else if nd < cur {
             fd.set(pnl, nd);
-            heap.push(nd.saturating_add(to_sources(pc, pr)), pnl as u32);
+            heap.push(
+                nd.saturating_add(to_sources(pc, pr, (pnl % nl_layers) as u32)),
+                pnl as u32,
+            );
         }
     };
     while let Some((key, id)) = heap.pop() {
