@@ -323,6 +323,43 @@ runs the stages in order, on WS-D1's kernel (`route_board_with` takes any
 9. S8 one `RoutePlan` (fanout first), and the connections still open on the
    board with the plan applied.
 
+Tuning round 2 (merged together; all additive):
+
+- **`PipelineSettings`** gained `use_access` (hand S4's access points to
+  negotiation as pad stubs, default on), `neck_down: Option<NeckDown>`
+  (default `None`), `class_fallback: BTreeMap<ClassId, ClassFallback>`
+  (default empty) and `search_min_run` (**default on**, changed by INT at
+  the round-2 merge).
+  - The default negotiation schedule is 10 iterations, present-factor
+    growth 2,000 (×1000) and a history step of 3, not
+    `NegotiationSettings::default()`'s gentler stand-alone schedule.
+  - `search_min_run` asks the kernel for a minimum run only on nets with a
+    `track_segment_length` rule (`backend::min_run_nets`), at the longest
+    such minimum, which then replaces any `min_run_nm` in `search`. A job
+    that finds no path under its minimum run is searched again without it
+    (`KernelBackend::min_run_retry`, default on), so the rule never costs a
+    connection by itself. Measured at the merge on a dense real board: no
+    short segment from detail and no S7 finding after S6, against a few of
+    each with it off, for about as many routed connections (the difference
+    was within the run-to-run spread that any small change causes).
+- **`ClassFallback { layers, reference: Option<ReferencePlane> }`** and
+  **`ReferencePlane { plane, over, margin }`**: after negotiation (step 6),
+  the connections of such a class that are still failed are routed again
+  on `layers`, around every copper routed so far. Tracks on `over` must lie
+  over one filled piece of `plane` grown by `margin`; a net whose tracks
+  leave it is dropped again. KiCad's fills are fractured, so antipads, pad
+  clearances and voids count as off the reference. Counter:
+  `pipeline_fallback_routed`; its time is charged to `Stage::Detail`.
+- **`optimize_guarded(work, rules, routed, opts, guard, tel)`** is step 7 on
+  its own and **`add_locked(board, copper)`** is public, so saved copper can
+  be re-optimized offline exactly as the pipeline does.
+- **`pipeline::backend`**: `KernelBackend` gained the public field
+  `min_run_nets: Option<Arc<Vec<bool>>>` (by `NetId` index; `None` flags
+  every job when `min_run` is on) and `min_run_retry: bool` (default on).
+  Build it with `KernelBackend::new` rather than a struct literal. `min_run_nets(board, rules)` returns the flagged
+  nets and the longest minimum. `FIELD_AFTER = 2_000`, which
+  `KernelBackend::negotiation_config()` sets as `SearchConfig::field_after`.
+
 Every stage records its time in the result's `Telemetry` (`Stage::Audit` for
 connectivity, `Fanout`, `Access`, `Global`, `Detail`, `Optimize`, `Check`
 for the guard and the check, `Plan`) plus `pipeline_*` counters. The
@@ -370,6 +407,61 @@ and part of the plan.
   corridors by connection id from `connections` and decodes their cells
   (base and refined) with `GCellGrid::cell_bbox`.
 
+- **Relaxed cost-to-go field (WS-D1/T3).** `SearchConfig.field_after:
+  u64` (serde default 0 = off): after that many expansions the search
+  restarts with a relaxed cost-to-go field in its heuristic. The field also
+  bounds passing through a target whose entry mask refuses the arrival
+  heading, so it is consistent: path costs are unchanged and only ties may
+  differ. `SearchStats` gained `field_runs` and `field_settled` (telemetry
+  `search_field_runs`, `search_field_settled`; `KernelBackend` does not
+  forward them yet). `search_batch_with` runs a one-job batch on the
+  calling thread with the same result.
+- **`NegotiationTuning`** gained:
+  - `grid_core: (Coord, Coord)` (default `TILE_CORE_NM`), snapped to the
+    base lattice and never below two halos plus 0.5 mm per side; the
+    odd-iteration half-tile shift is snapped too, which changes nothing at
+    the default size;
+  - `fill_passes` (default 2): after the last iteration, every connection
+    still failed (not for lack of access or corridor) is routed again with
+    all other routed copper as a hard wall, alternating the tiling; a fill
+    pass never undoes routed copper;
+  - `present_factor_max` (default 1,000,000; costs saturate at 32 bits, so
+    an unbounded factor turns other nets into walls);
+  - `stub_reach` (default 0.5 mm), the longest full-width pad stub to a
+    lattice node;
+  - `shift_iterations` (default 6): odd iterations below it use the shifted
+    tiling, later ones keep the unshifted tiling so conflicts reroute only
+    their pieces;
+  - `partial_tries` (default 3): piece-only reroutes before a connection is
+    cut again whole;
+  - `stall_iterations` (default 0, off): stop once the conflict count has
+    not improved for that many iterations.
+- **`negotiate_connections_with(…, inputs: &NegotiationInputs, …)`**, with
+  `NegotiationInputs { access: Vec<PadAccess>, neck_down: Option<NeckDown> }`;
+  `negotiate_connections` keeps its signature and passes empty inputs.
+  `NeckDown { width, reach, excluded }` (defaults 0.10 mm within 1 mm, no
+  classes excluded) narrows tracks near pads for every class not excluded.
+- **`DetailResult.congestion_lost`**: connections that lost a negotiation
+  before the fill passes. **`IterationReport.fill`** marks fill passes.
+  Unresolved conflicts keep a greedy independent set (fewest conflicts
+  first); the losers are reported as `DetailFailure::Congestion { against }`,
+  and a loser that a fill pass cannot route still reports `Congestion`, not
+  `Unreachable`, `NoPin` or `BudgetExhausted`. Callers of the job runner and
+  the MCP tools therefore see `congestion` where they used to see
+  `no_corridor` for those connections.
+- **Terminal headings.** S4 access headings, the kernel's masks and
+  `TileRaster::heading_mask` share one encoding: 0 = +x, counter-clockwise
+  in the Y-up sense; `detail::search::heading_delta(h)` is the board step
+  (rows grow with board y). Negotiation's pad stubs and tile pins use it.
+  A connection ending on a fixed track's end gets only the headings that
+  keep the joint within the net's `track_angle` minimum (a source leaves in
+  them, a target is arrived at in the reverse ones; no rule allows all).
+- `ConflictSet::pieces_of(pair)` gives the (task, piece) of each side;
+  `PinRegistry::marks` and `PinRegistry::add` are public.
+- Telemetry: a `us_tile_search` counter (search time inside tiles).
+  `KONNECT_DAG_TRACE=1` prints each iteration's tile critical path to
+  stderr.
+
 ### Global routing (WS-C)
 
 - **`GlobalSettings`**, `PresentSchedule`, `GlobalCosts` and `LayerPolicy`
@@ -415,6 +507,14 @@ and part of the plan.
   does not hold the stack); `route_plan(board)` and the pipeline fill in
   every copper layer.
 
+- `FanoutSettings` gained `exclude_escaped_arrays` (default on),
+  `array_min_pads` and `partial_plane_fallback` (default on);
+  `FanoutStats` gained `escaped_arrays` and `partial_plane_sites`.
+  `fanout::escaped_arrays(board, connectivity, min_pads)` lists ball-grid
+  footprints whose escapes are drawn by hand; the fanout leaves every pad of
+  them alone. The partial-plane pass places a via on a plane piece that
+  covers only part of a pad's reach.
+
 ### Optimizer and job runner (WS-E)
 
 - `optimize::record_counters(&OptimizeReport, &mut Telemetry)`.
@@ -422,6 +522,19 @@ and part of the plan.
   straight shortcut must be exactly octilinear.
 - `konnect-core::native_route_job`: `StopKind` (typed stop reasons),
   `PipelineReport.stop_kind`/`resumed`, `CheckSummary.check_routed_error`.
+- `OptimizeOptions` gained `prune_stubs` (**default on**): delete a track
+  that makes an acute bend, or a dangling single-track branch off a
+  junction, pad or via, when everything it touched stays joined without
+  it. A dangling run of two or more tracks is never eaten back. The job
+  runner uses the default, so imported (for example Freerouting) plans now
+  change visibly in S6. `OptimizeReport::stubs_pruned` is
+  `#[serde(default)]`, so old checkpoints still load.
+- `OptimizeOptions::max_skew_deg` now defaults to 0.0: only exact
+  octilinear pieces, since a skewed run meeting a right angle makes an
+  interior angle just under 90°. The optimizer never accepts an edit that
+  trades one DRC-reported defect for another.
+- `lint::DefectKind::is_drc_kind()`: whether KiCad's DRC reports the kind
+  too (`track_angle`, `track_segment_length`).
 - The live apply path: `apply_route_plan` (the `native_routing` toolset)
   creates a plan of any size in the open board through
   `route_native_apply::apply_plan_with` (net-whole chunks, `strict_geometry`
@@ -472,6 +585,12 @@ and part of the plan.
   it does not fail. Such a test asserts only invariants that hold for any
   KiCad-authored board, and prints its counts. See
   `crates/konnect-route/tests/real_board_fixture.rs`.
+- `tests/pipeline_real_fixture.rs` reads its knobs from
+  `KONNECT_PIPELINE_*` variables (listed in its module docs, including
+  `KONNECT_PIPELINE_GRID_CORE_MM`). `tests/pipeline_tail_fixture.rs` re-runs
+  S6–S8 on copper a previous run saved. `tests/search_replay.rs` is a gated
+  capture/replay pair; the capture refuses a directory inside any git work
+  tree, because captures hold board data.
 - **Keep generated runs in ignored build or cache locations.**
 - **Gate before merging:** `cargo clippy -p <crate> --all-targets -- -D
   warnings`, `cargo test -p <crate>` and `cargo fmt --check` for every crate
