@@ -460,8 +460,10 @@ fn route_native(
         nets: nets.cloned(),
         region,
     };
+    // The job runs S6, the clear stage and S7 itself.
     let settings = PipelineSettings {
         optimize: None,
+        clear_findings: false,
         ..PipelineSettings::default()
     };
     let r = guarded("route", || route_board(board, rules, &scope, &settings))?

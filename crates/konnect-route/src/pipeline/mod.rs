@@ -888,6 +888,9 @@ pub struct ClearReport {
     /// Dangling routed tracks removed at the end, anywhere on the board.
     #[serde(default)]
     pub spurs: u32,
+    /// Routed vias joined on one layer or none, removed at the end.
+    #[serde(default)]
+    pub lone_vias: u32,
     /// Joined pieces of routed copper removed (findings that name only vias).
     pub pieces: u32,
     pub tracks: u32,
@@ -905,6 +908,7 @@ impl ClearReport {
         tel.count("pipeline_cleared_cut", u64::from(self.cut_tracks));
         tel.count("pipeline_cleared_dangling", u64::from(self.dangling_tracks));
         tel.count("pipeline_cleared_spurs", u64::from(self.spurs));
+        tel.count("pipeline_cleared_lone_vias", u64::from(self.lone_vias));
         tel.count("pipeline_cleared_pieces", u64::from(self.pieces));
         tel.count("pipeline_cleared_tracks", u64::from(self.tracks));
         tel.count("pipeline_cleared_vias", u64::from(self.vias));
@@ -927,7 +931,9 @@ impl ClearReport {
 ///    left open.
 ///
 /// Repeats until the check names no routed copper, then removes routed
-/// tracks that dangle anywhere (an end touching no copper of their net).
+/// tracks that dangle anywhere (an end touching no copper of their net) and
+/// routed vias joined on one layer or none, whenever the net's pads stay as
+/// joined without them.
 pub fn clear_findings(
     work: &RouteBoard,
     rules: &dyn RuleTable,
@@ -956,11 +962,16 @@ pub fn clear_findings(
             .map(|(net, mut cands)| {
                 cands.sort_by_key(|&i| (snapshot.tracks[i].seg.length(), i));
                 cands.dedup();
-                let base = net_pad_islands(work, net, snapshot, &BTreeSet::new());
+                let base = net_pad_islands(work, net, snapshot, &Skip::default());
                 let (cost, pick) = cands
                     .iter()
                     .map(|&i| {
-                        let after = net_pad_islands(work, net, snapshot, &BTreeSet::from([i]));
+                        let after = net_pad_islands(
+                            work,
+                            net,
+                            snapshot,
+                            &Skip::tracks(BTreeSet::from([i])),
+                        );
                         (after.saturating_sub(base), i)
                     })
                     .min_by_key(|&(cost, i)| (cost, snapshot.tracks[i].seg.length(), i))
@@ -1062,6 +1073,40 @@ pub fn clear_findings(
         k += 1;
         !spurs.contains(&(k - 1))
     });
+    // Then routed vias left joined on one layer or none, and what dangles
+    // once they are gone.
+    let via_nets: BTreeSet<NetId> = routed.vias.iter().map(|v| v.net).collect();
+    let snapshot: &RoutedCopper = routed;
+    let lone: BTreeSet<usize> = via_nets
+        .into_par_iter()
+        .map(|net| dangling_vias(work, net, snapshot))
+        .reduce(BTreeSet::new, |mut a, b| {
+            a.extend(b);
+            a
+        });
+    out.lone_vias = lone.len() as u32;
+    let mut k = 0;
+    routed.vias.retain(|_| {
+        k += 1;
+        !lone.contains(&(k - 1))
+    });
+    if !lone.is_empty() {
+        let routed_nets: BTreeSet<NetId> = routed.tracks.iter().map(|t| t.net).collect();
+        let snapshot: &RoutedCopper = routed;
+        let more: BTreeSet<usize> = routed_nets
+            .into_par_iter()
+            .map(|net| dangling_tracks(work, net, snapshot, &BTreeSet::new()))
+            .reduce(BTreeSet::new, |mut a, b| {
+                a.extend(b);
+                a
+            });
+        out.spurs += more.len() as u32;
+        let mut k = 0;
+        routed.tracks.retain(|_| {
+            k += 1;
+            !more.contains(&(k - 1))
+        });
+    }
     out
 }
 
@@ -1135,17 +1180,33 @@ enum NetNode {
     Pad,
     Board,
     RoutedTrack(usize),
-    RoutedVia,
+    RoutedVia(usize),
 }
 
-/// One net's copper on `work` with `routed` applied (routed tracks in
+/// The routed copper a net graph leaves out: track and via indices.
+#[derive(Debug, Clone, Default)]
+struct Skip {
+    tracks: BTreeSet<usize>,
+    vias: BTreeSet<usize>,
+}
+
+impl Skip {
+    fn tracks(tracks: BTreeSet<usize>) -> Self {
+        Skip {
+            tracks,
+            vias: BTreeSet::new(),
+        }
+    }
+}
+
+/// One net's copper on `work` with `routed` applied (the routed items in
 /// `skip` left out): its nodes and, per layer, their shapes.
 #[allow(clippy::type_complexity)]
 fn net_copper(
     work: &RouteBoard,
     net: NetId,
     routed: &RoutedCopper,
-    skip: &BTreeSet<usize>,
+    skip: &Skip,
 ) -> (Vec<NetNode>, BTreeMap<LayerId, Vec<(u32, Shape)>>) {
     let policy = ArcPolicy::default();
     let mut nodes: Vec<NetNode> = Vec::new();
@@ -1192,7 +1253,7 @@ fn net_copper(
             .push((n, Shape::Polygon(z.region.clone())));
     }
     for (i, t) in routed.tracks.iter().enumerate() {
-        if t.net == net && !skip.contains(&i) {
+        if t.net == net && !skip.tracks.contains(&i) {
             let n = node(NetNode::RoutedTrack(i));
             per_layer
                 .entry(t.layer)
@@ -1200,8 +1261,11 @@ fn net_copper(
                 .push((n, Shape::Segment(t.seg)));
         }
     }
-    for v in routed.vias.iter().filter(|v| v.net == net) {
-        let n = node(NetNode::RoutedVia);
+    for (i, v) in routed.vias.iter().enumerate() {
+        if v.net != net || skip.vias.contains(&i) {
+            continue;
+        }
+        let n = node(NetNode::RoutedVia(i));
         let shape = Shape::Circle(konnect_geom::Circle::from_diameter(v.center, v.diameter));
         for layer in v.layers.iter() {
             per_layer.entry(layer).or_default().push((n, shape.clone()));
@@ -1211,13 +1275,8 @@ fn net_copper(
 }
 
 /// How many islands holding a pad `net` has on `work` with `routed` applied
-/// (routed tracks in `skip` left out): S1's union-find, for one net.
-fn net_pad_islands(
-    work: &RouteBoard,
-    net: NetId,
-    routed: &RoutedCopper,
-    skip: &BTreeSet<usize>,
-) -> usize {
+/// (the routed items in `skip` left out): S1's union-find, for one net.
+fn net_pad_islands(work: &RouteBoard, net: NetId, routed: &RoutedCopper, skip: &Skip) -> usize {
     use konnect_geom::{touches, IndexEntry, LayerIndex};
     let (nodes, per_layer) = net_copper(work, net, routed, skip);
     let mut uf = crate::connectivity::UnionFind::new(nodes.len());
@@ -1262,10 +1321,10 @@ fn dangling_tracks(
 ) -> BTreeSet<usize> {
     use konnect_geom::{touches, Circle, IndexEntry, LayerIndex, Point};
     let mut gone = skip.clone();
-    let base = net_pad_islands(work, net, routed, &gone);
+    let base = net_pad_islands(work, net, routed, &Skip::tracks(gone.clone()));
     let mut refused: BTreeSet<usize> = BTreeSet::new();
     loop {
-        let (nodes, per_layer) = net_copper(work, net, routed, &gone);
+        let (nodes, per_layer) = net_copper(work, net, routed, &Skip::tracks(gone.clone()));
         let mut fresh = Vec::new();
         for (layer, shapes) in &per_layer {
             let index = LayerIndex::bulk_load(
@@ -1297,7 +1356,7 @@ fn dangling_tracks(
         for t in fresh {
             let mut trial = gone.clone();
             trial.insert(t);
-            if net_pad_islands(work, net, routed, &trial) <= base {
+            if net_pad_islands(work, net, routed, &Skip::tracks(trial.clone())) <= base {
                 gone = trial;
                 took = true;
             } else {
@@ -1309,6 +1368,50 @@ fn dangling_tracks(
         }
     }
     gone.retain(|i| !skip.contains(i));
+    gone
+}
+
+/// The routed vias of `net` that join copper on at most one layer (what
+/// KiCad warns of as a dangling via), whose removal leaves the net's pads
+/// as joined.
+fn dangling_vias(work: &RouteBoard, net: NetId, routed: &RoutedCopper) -> BTreeSet<usize> {
+    use konnect_geom::{touches, IndexEntry, LayerIndex};
+    let mut gone: BTreeSet<usize> = BTreeSet::new();
+    let base = net_pad_islands(work, net, routed, &Skip::default());
+    let (nodes, per_layer) = net_copper(work, net, routed, &Skip::default());
+    let mut layers_used: BTreeMap<usize, usize> = BTreeMap::new();
+    for shapes in per_layer.values() {
+        let index = LayerIndex::bulk_load(
+            shapes
+                .iter()
+                .enumerate()
+                .map(|(i, (_, s))| IndexEntry::new(i as u32, s.bbox()))
+                .collect(),
+        );
+        for (ni, si) in shapes {
+            let NetNode::RoutedVia(v) = nodes[*ni as usize] else {
+                continue;
+            };
+            let joined = index.query(&si.bbox()).into_iter().any(|j| {
+                let (nj, sj) = &shapes[j as usize];
+                nj != ni && touches(si, sj)
+            });
+            *layers_used.entry(v).or_default() += usize::from(joined);
+        }
+    }
+    for (i, v) in routed.vias.iter().enumerate() {
+        if v.net != net || layers_used.get(&i).copied().unwrap_or(0) > 1 {
+            continue;
+        }
+        let mut trial = Skip {
+            tracks: BTreeSet::new(),
+            vias: gone.clone(),
+        };
+        trial.vias.insert(i);
+        if net_pad_islands(work, net, routed, &trial) <= base {
+            gone.insert(i);
+        }
+    }
     gone
 }
 

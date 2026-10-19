@@ -435,3 +435,26 @@ fn clear_findings_removes_spurs_but_not_tracks_that_carry_a_join() {
     assert_eq!(routed.tracks.len(), 3);
     assert!(routed.tracks.iter().all(|t| t.seg.a.x != 6_000_000));
 }
+
+#[test]
+fn clear_findings_removes_a_via_joined_on_one_layer_and_its_spur() {
+    let board = clear_board(false);
+    let rules = angle_rules();
+    let mut routed = routed_tracks(
+        &board,
+        &[((2.0, 5.0), (18.0, 5.0)), ((6.0, 5.0), (6.0, 8.0))],
+    );
+    let net = routed.tracks[0].net;
+    routed.vias.push(RoutedVia {
+        net,
+        center: Point::new(6_000_000, 8_000_000),
+        diameter: 600_000,
+        drill: 300_000,
+        layers: LayerMask::single(LayerId(0)).with(LayerId(1)),
+        gen: crate::api::Generation(0),
+    });
+    let r = clear_findings(&board, &rules, &mut routed);
+    assert_eq!((r.lone_vias, r.spurs), (1, 1), "{r:?}");
+    assert_eq!(routed.tracks.len(), 1);
+    assert!(routed.vias.is_empty());
+}

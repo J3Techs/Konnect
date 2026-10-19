@@ -90,6 +90,10 @@ use std::time::Instant;
 
 pub mod junction;
 
+/// How far inside a pad's outline a track junction must lie for the
+/// track-angle checks to treat it as on the pad (KiCad skips those).
+const PAD_HIT_INSET_NM: Coord = 5_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViolationKind {
@@ -1938,9 +1942,20 @@ impl<'c, 'b> Ctx<'c, 'b> {
             .collect()
     }
 
-    /// Whether pad copper on `layer` covers `at`.
+    /// Whether pad copper on `layer` covers `at` with [`PAD_HIT_INSET_NM`] to
+    /// spare on every side: KiCad finds the pad under a junction on the
+    /// pad's polygon, approximated inside its true outline, so a junction on
+    /// the very edge is not on the pad for it, and its bend is reported.
     fn on_pad(&self, layer: LayerId, at: Point) -> bool {
         let q = BBox::point(at);
+        let e = PAD_HIT_INSET_NM;
+        let probes = [
+            at,
+            Point::new(at.x.saturating_sub(e), at.y),
+            Point::new(at.x.saturating_add(e), at.y),
+            Point::new(at.x, at.y.saturating_sub(e)),
+            Point::new(at.x, at.y.saturating_add(e)),
+        ];
         self.c
             .layers
             .get(layer.index())
@@ -1951,10 +1966,10 @@ impl<'c, 'b> Ctx<'c, 'b> {
                     let o = &set.objs[e.id as usize];
                     o.src.kind() == ItemKind::Pad
                         && match &o.geom {
-                            Geom::Shape(s) => {
-                                konnect_geom::point_shape_distance_cmp(at, 0, s, 0)
+                            Geom::Shape(s) => probes.iter().all(|&p| {
+                                konnect_geom::point_shape_distance_cmp(p, 0, s, 0)
                                     != Ordering::Greater
-                            }
+                            }),
                             Geom::Zone(_) => false,
                         }
                 })
