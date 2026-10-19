@@ -173,9 +173,12 @@ fn collinear_pieces_merge_and_t_junctions_split() {
         tracks,
         vias: vec![],
     };
+    // The pieces float (no pad is under them), so pruning would delete
+    // them all as dead ends; this test is about merging and splitting.
     let opts = OptimizeOptions {
         pull_tight: false,
         corner_cuts: false,
+        prune_stubs: false,
         ..OptimizeOptions::default()
     };
     let report = optimize_with(
@@ -558,9 +561,19 @@ fn octilinear_with_skew_and_jog_smoothing_off_draws_only_45_degree_copper() {
         tracks: staircase(net, 0, p(5.0, 5.0), p(20.0, 5.3), 50_000),
         vias: vec![],
     };
-    // By default the 1.1 degree run is one straight piece off 45 degrees.
+    // With a 2 degree skew allowance the 1.1 degree run is one straight
+    // piece off 45 degrees.
     let mut loose = start.clone();
-    optimize(&board, &rules, &mut loose);
+    optimize_with(
+        &board,
+        &rules,
+        &mut loose,
+        &OptimizeOptions {
+            max_skew_deg: 2.0,
+            ..OptimizeOptions::default()
+        },
+        &mut Telemetry::default(),
+    );
     assert!(loose
         .tracks
         .iter()
@@ -626,6 +639,12 @@ fn a_junction_on_a_diagonal_run_is_squared_only_when_the_branch_stays_octilinear
     for t in new_tracks(&start, &strict) {
         assert!(is_octilinear(t.seg.b - t.seg.a), "{t:?}");
     }
+    // Off the lattice the T is a hair under 90 degrees: a new acute bend
+    // under a 90 degree rule (refused), legal under an 89 degree one.
+    let rules = UniformRules {
+        min_track_angle_deg: Some(89.0),
+        ..UniformRules::default()
+    };
     let mut loose = start.clone();
     let r = optimize_with(
         &board,
@@ -639,4 +658,140 @@ fn a_junction_on_a_diagonal_run_is_squared_only_when_the_branch_stays_octilinear
     );
     assert_eq!(r.junctions_squared, 1, "{r:?}");
     assert_eq!(islands(&board, &loose), 0);
+}
+
+fn three_pads(middle: (f64, f64)) -> RouteBoard {
+    let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu", "B.Cu"]);
+    let u = b.footprint("U1", (5.0, 5.3));
+    b.smd_pad(u, "1", "SIG", (5.0, 5.3), (0.6, 0.6), "F.Cu");
+    let m = b.footprint("U2", middle);
+    b.smd_pad(m, "1", "SIG", middle, (1.0, 1.0), "F.Cu");
+    let v = b.footprint("U3", (15.0, 5.3));
+    b.smd_pad(v, "1", "SIG", (15.0, 5.3), (0.6, 0.6), "F.Cu");
+    b.build()
+}
+
+#[test]
+fn a_spur_doubling_back_from_a_joint_is_pruned() {
+    let board = board_two_pads();
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    // Pad to pad along x then y, with a 50 µm spur leaving the corner back
+    // at 45°: an acute bend KiCad reports, on copper nothing needs.
+    let corner = p(20.0, 5.0);
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.0), corner),
+            track(net, 0, corner, p(20.0, 12.0)),
+            track(net, 0, corner, p(19.95, 4.95)),
+        ],
+        vias: vec![],
+    };
+    let report = optimize(&board, &rules, &mut copper);
+    assert!(report.stubs_pruned >= 1, "{report:?}");
+    assert_eq!(report.defects_after, 0, "{report:?}");
+    assert!(copper
+        .tracks
+        .iter()
+        .all(|t| t.seg.a != p(19.95, 4.95) && t.seg.b != p(19.95, 4.95)));
+    assert_eq!(islands(&board, &copper), 0, "still connected");
+}
+
+#[test]
+fn a_branch_that_joins_a_pad_is_never_pruned() {
+    // The run from U1 to U3 passes U2; a short branch at 45° from a joint
+    // on the run ends in U2. It makes an acute bend, but it is U2's only
+    // join, so it must stay (squaring may move it, never drop it).
+    let board = three_pads((10.0, 6.0));
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let joint = p(9.5, 5.3);
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.3), joint),
+            track(net, 0, joint, p(15.0, 5.3)),
+            track(net, 0, joint, p(10.0, 5.8)),
+        ],
+        vias: vec![],
+    };
+    assert_eq!(islands(&board, &copper), 0);
+    optimize(&board, &rules, &mut copper);
+    assert_eq!(islands(&board, &copper), 0, "U2 stays joined");
+    let u2 = BBox::new(p(9.5, 5.5), p(10.5, 6.5));
+    assert!(
+        copper
+            .tracks
+            .iter()
+            .any(|t| u2.contains(t.seg.a) || u2.contains(t.seg.b)),
+        "a track still ends in U2: {:?}",
+        copper.tracks
+    );
+}
+
+#[test]
+fn collinear_tracks_joined_inside_a_pad_off_its_centre_stay_split() {
+    // U1 to U3 in a straight line through U2's copper, 0.3 mm off U2's
+    // centre, with the joint inside U2: that end is what joins U2. One
+    // merged track would only pass through U2's copper, which KiCad does
+    // not count as a join.
+    let board = three_pads((10.0, 5.0));
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let joint = p(10.2, 5.3);
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.3), joint),
+            track(net, 0, joint, p(15.0, 5.3)),
+        ],
+        vias: vec![],
+    };
+    optimize(&board, &rules, &mut copper);
+    let u2 = BBox::new(p(9.5, 4.5), p(10.5, 5.5));
+    assert!(
+        copper
+            .tracks
+            .iter()
+            .any(|t| u2.contains(t.seg.a) || u2.contains(t.seg.b)),
+        "a track end stays inside U2: {:?}",
+        copper.tracks
+    );
+}
+
+#[test]
+fn edits_never_move_an_acute_bend_to_a_new_place() {
+    // A geometry gate that only counted acute bends would let an edit
+    // trade one for another elsewhere; the position rule refuses that.
+    let pts =
+        |v: &[(i32, i32)]| -> Vec<Point> { v.iter().map(|&(x, y)| Point::new(x, y)).collect() };
+    let a = pts(&[(0, 0), (5, 5)]);
+    let b = pts(&[(0, 0), (5, 5), (7, 7)]);
+    assert!(sorted_subset(&a, &b));
+    assert!(sorted_subset(&a, &a));
+    assert!(!sorted_subset(&b, &a));
+    assert!(!sorted_subset(&pts(&[(1, 1)]), &a));
+    assert!(!sorted_subset(&pts(&[(0, 0), (0, 0)]), &a));
+    assert!(sorted_subset(&[], &a));
+}
+
+#[test]
+fn an_unfinished_route_is_never_eaten_back() {
+    // A run from U1 that stops short of U2: its free end is a dead end,
+    // but it continues a single run, so pruning leaves it.
+    let board = board_two_pads();
+    let rules = UniformRules::default();
+    let net = board.net_by_name("SIG").unwrap();
+    let mut copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.0), p(9.0, 5.0)),
+            track(net, 0, p(9.0, 5.0), p(12.0, 8.0)),
+        ],
+        vias: vec![],
+    };
+    let report = optimize(&board, &rules, &mut copper);
+    assert_eq!(report.stubs_pruned, 0, "{report:?}");
+    assert!(!copper.tracks.is_empty());
+    assert!(copper
+        .tracks
+        .iter()
+        .any(|t| t.seg.a == p(12.0, 8.0) || t.seg.b == p(12.0, 8.0)));
 }

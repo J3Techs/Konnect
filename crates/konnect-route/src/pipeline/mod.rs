@@ -96,7 +96,12 @@ pub struct PipelineSettings {
     pub tuning: NegotiationTuning,
     /// The detailed search kernel's tuning.
     pub search: SearchConfig,
-    /// Ask the kernel for its minimum run between turns on every job.
+    /// Ask the kernel for a minimum straight run between turns on the jobs
+    /// of nets with a `track_segment_length` rule, at the longest such
+    /// minimum ([`backend::min_run_nets`]), so detail draws no segment the
+    /// rule refuses. When any net has such a rule, that longest minimum
+    /// replaces any `min_run_nm` set in [`Self::search`]. Off: S6 merges and
+    /// straightens short segments instead.
     pub search_min_run: bool,
     /// S6; `None` keeps the routed copper as negotiation drew it.
     pub optimize: Option<OptimizeOptions>,
@@ -181,10 +186,14 @@ pub fn route_board(
     scope: &PipelineScope,
     settings: &PipelineSettings,
 ) -> Result<PipelineResult, PipelineError> {
-    let mut backend = KernelBackend {
-        config: settings.search.clone(),
-        min_run: settings.search_min_run,
-    };
+    let mut backend = KernelBackend::new(settings.search.clone());
+    if settings.search_min_run {
+        if let Some((nets, min)) = backend::min_run_nets(board, rules) {
+            backend.min_run = true;
+            backend.min_run_nets = Some(std::sync::Arc::new(nets));
+            backend.config.min_run_nm = min;
+        }
+    }
     route_board_with(board, rules, scope, settings, &mut backend)
 }
 
@@ -343,21 +352,15 @@ fn run(
 
     // 7. Optimize, guarded by the S7 checker.
     if let Some(opts) = &settings.optimize {
-        let t = Instant::now();
-        let checker = ExactChecker::new(&work, rules, opts.checker);
-        let original = routed.clone();
-        let report = optimize_checked(&checker, &mut routed, opts);
-        record_counters(&report, tel);
-        tel.add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
-        if settings.guard_optimize {
-            let t = Instant::now();
-            out.optimize_reverted = guard(&work, rules, &original, &mut routed);
-            tel.count(
-                "pipeline_optimize_reverted",
-                out.optimize_reverted.len() as u64,
-            );
-            tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
-        }
+        let (report, reverted) = optimize_guarded(
+            &work,
+            rules,
+            &mut routed,
+            opts,
+            settings.guard_optimize,
+            tel,
+        );
+        out.optimize_reverted = reverted;
         out.optimize = Some(report);
     }
 
@@ -420,8 +423,39 @@ pub fn select_connections(
         .collect()
 }
 
-/// Append `copper` to `board` as locked copper.
-fn add_locked(board: &mut RouteBoard, copper: &RoutedCopper) {
+/// Step 7 on its own: S6 over `routed` against `work` (the board with the
+/// fanout as locked copper), then, when `guard_optimize` is set, the S7
+/// guard that puts back every net the optimizer left with more findings.
+/// Returns the optimizer's report and the nets put back. [`route_board`]
+/// runs exactly this; it is public so a run's routed copper can be
+/// re-optimized offline.
+pub fn optimize_guarded(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    routed: &mut RoutedCopper,
+    opts: &OptimizeOptions,
+    guard_optimize: bool,
+    tel: &mut Telemetry,
+) -> (OptimizeReport, Vec<NetId>) {
+    let t = Instant::now();
+    let checker = ExactChecker::new(work, rules, opts.checker);
+    let original = routed.clone();
+    let report = optimize_checked(&checker, routed, opts);
+    record_counters(&report, tel);
+    tel.add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
+    let mut reverted = Vec::new();
+    if guard_optimize {
+        let t = Instant::now();
+        reverted = guard(work, rules, &original, routed);
+        tel.count("pipeline_optimize_reverted", reverted.len() as u64);
+        tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
+    }
+    (report, reverted)
+}
+
+/// Append `copper` to `board` as locked copper (what the pipeline does with
+/// the fanout before routing).
+pub fn add_locked(board: &mut RouteBoard, copper: &RoutedCopper) {
     for t in &copper.tracks {
         board.tracks.push(Track {
             id: TrackId(board.tracks.len() as u32),

@@ -24,8 +24,9 @@
 //! - `KONNECT_PIPELINE_MIN_RUN=1`: ask the kernel for minimum runs;
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
-//! - `KONNECT_PIPELINE_OUT=dir`: write `summary.json` and `plan.json` there
-//!   (keep it in an ignored build location).
+//! - `KONNECT_PIPELINE_OUT=dir`: write `summary.json`, `plan.json` and the
+//!   copper (`fanout.json`, `routed.json`) there (keep it in an ignored
+//!   build location).
 
 use konnect_geom::{BBox, Point};
 use konnect_route::api::Stage;
@@ -268,6 +269,18 @@ fn pipeline_real_board_fixture() {
         )
         .expect("summary written");
         std::fs::write(out.join("plan.json"), r.plan.to_routing_file_json()).expect("plan written");
+        // The copper itself, for `pipeline_tail_fixture` to re-optimize
+        // offline (with `KONNECT_PIPELINE_NO_OPTIMIZE=1` it is negotiation's).
+        std::fs::write(
+            out.join("fanout.json"),
+            serde_json::to_string(&r.fanout_copper).unwrap(),
+        )
+        .expect("fanout copper written");
+        std::fs::write(
+            out.join("routed.json"),
+            serde_json::to_string(&r.routed).unwrap(),
+        )
+        .expect("routed copper written");
         println!("wrote {}", out.display());
     }
 }

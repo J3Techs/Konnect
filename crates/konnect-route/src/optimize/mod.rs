@@ -9,27 +9,34 @@
 //! 2. **Junction splitting.** A routed track ending on the middle of another
 //!    of its net splits that track there, so every joint is a vertex.
 //! 3. **Collinear merging.** Two tracks meeting end to end in a straight line,
-//!    same width, nothing else at the joint, become one.
-//! 4. **Redundant-via removal.** A routed via whose copper connects to its
+//!    same width, nothing else at the joint, become one, unless the joint
+//!    is what joins a pad (an end inside it, off its centre).
+//! 4. **Stub pruning.** A track making an acute bend, or ending in nothing,
+//!    is deleted when everything it touched stays joined without it (two
+//!    connections sharing copper leave such spurs once one is straightened).
+//!    It runs again at the end of each pass.
+//! 5. **Redundant-via removal.** A routed via whose copper connects to its
 //!    net on one layer only, through track ends at its centre, goes.
-//! 5. **Pull-tight.** Along each chain of degree-2 joints, a run of segments
+//! 6. **Pull-tight.** Along each chain of degree-2 joints, a run of segments
 //!    is replaced by the shortest octilinear connection (a straight piece,
 //!    or one straight and one 45° piece), or by one straight piece within
 //!    `max_skew_deg` of octilinear, when that is shorter and legal.
-//! 6. **45° corner cuts.** A right-angle bend left after pull-tight is
+//! 7. **45° corner cuts.** A right-angle bend left after pull-tight is
 //!    chamfered, as large as the neighbourhood allows.
-//! 7. **Jog smoothing.** A short step between two parallel runs (a jog the
+//! 8. **Jog smoothing.** A short step between two parallel runs (a jog the
 //!    lint refuses) becomes one slant whose bends stay under 20°.
-//! 8. **Junction squaring.** A branch meeting a run at a sharp angle moves
+//! 9. **Junction squaring.** A branch meeting a run at a sharp angle moves
 //!    to the foot of its perpendicular: a right-angle T.
-//! 9. **Pad-entry trimming.** Two tracks meeting sharply inside a pad or via
-//!    of their net: one ends short, still inside it.
+//! 10. **Pad-entry trimming.** Two tracks meeting sharply inside a pad or
+//!     via of their net: one ends short, still inside it.
 //!
 //! Every candidate edit passes three gates before it is taken: the geometry
 //! guard ([`lint`]: it may not add a jog, hairpin, acute bend, T-junction,
-//! near joint or short segment near the edit), connectivity (every same-net
-//! item the old copper touched, the new copper still reaches, directly or
-//! through a pad or via both touch), and the exact checker
+//! near joint or short segment near the edit, and the kinds KiCad's DRC
+//! reports are never traded: no more short segments, and no acute bend
+//! where there was none), connectivity (every same-net item the old copper
+//! touched, the new copper still reaches, directly or through a pad or via
+//! both touch), and the exact checker
 //! ([`exact::ExactChecker`]) against the board and every other net.
 //!
 //! # Checking
@@ -86,6 +93,10 @@ pub struct OptimizeReport {
     pub jogs_smoothed: u32,
     /// Sharp Y junctions turned into right-angle T junctions.
     pub junctions_squared: u32,
+    /// Tracks deleted whole: a spur making an acute bend, or a dead end,
+    /// whose neighbours stay joined without it.
+    #[serde(default)]
+    pub stubs_pruned: u32,
     /// Exact checks run (one per candidate segment).
     pub exact_checks: u64,
     /// Nets whose copper changed.
@@ -119,6 +130,9 @@ pub struct OptimizeOptions {
     pub smooth_jogs: bool,
     /// Move a branch meeting a run at a sharp angle to a right-angle T.
     pub square_junctions: bool,
+    /// Delete a track that makes an acute bend, or ends in nothing, when
+    /// everything it touched stays joined without it.
+    pub prune_stubs: bool,
     /// Draw new copper octilinear (multiples of 45°). On, a pull-tight
     /// shortcut is a straight piece or a dogleg of one straight and one 45°
     /// piece, and junction squaring never adds a branch off 45°; two
@@ -137,7 +151,9 @@ pub struct OptimizeOptions {
     pub window: usize,
     /// A shortcut this close to octilinear (degrees), or within 1 µm of it,
     /// may be one straight piece at its own angle rather than a dogleg.
-    /// 0 allows only exact octilinear pieces.
+    /// 0 (the default) allows only exact octilinear pieces: a skewed run
+    /// meeting a right-angle bend makes an interior angle just under 90°,
+    /// which an 89° `track_angle` rule refuses.
     pub max_skew_deg: f64,
     /// Passes of the whole edit sequence per net.
     pub max_passes: u32,
@@ -148,7 +164,8 @@ pub struct OptimizeOptions {
 
 impl Default for OptimizeOptions {
     /// Everything on; 89° bends (the plan's strict-lint setting), 0.25 mm
-    /// jogs, 48-segment windows, three passes, two commit rounds.
+    /// jogs, 48-segment windows, exact octilinear shortcuts, three passes,
+    /// two commit rounds.
     fn default() -> Self {
         OptimizeOptions {
             split_junctions: true,
@@ -159,11 +176,12 @@ impl Default for OptimizeOptions {
             trim_pad_entries: true,
             smooth_jogs: true,
             square_junctions: true,
+            prune_stubs: true,
             octilinear: true,
             min_bend_angle_deg: 89.0,
             jog_length_nm: 250_000,
             window: 48,
-            max_skew_deg: 2.0,
+            max_skew_deg: 0.0,
             max_passes: 3,
             rounds: 2,
             checker: CheckerOptions::default(),
@@ -362,6 +380,7 @@ pub fn optimize_checked(
             report.pad_entries_trimmed += outcome.stats.trimmed;
             report.jogs_smoothed += outcome.stats.jogs_smoothed;
             report.junctions_squared += outcome.stats.squared;
+            report.stubs_pruned += outcome.stats.pruned;
             changed.insert(net);
             current.insert(net, (outcome.tracks, outcome.vias));
         }
@@ -448,6 +467,7 @@ struct NetStats {
     trimmed: u32,
     jogs_smoothed: u32,
     squared: u32,
+    pruned: u32,
     exact_checks: u64,
 }
 
@@ -482,6 +502,31 @@ struct NetWork<'c, 'b> {
     /// Accept an edit only if it removes a geometry defect (jog smoothing
     /// trades length for shape, so it must buy something).
     require_fewer_defects: bool,
+}
+
+/// Geometry defects near an edit: how many, and those KiCad's DRC reports
+/// too ([`lint::DefectKind::is_drc_kind`]): acute bends by position (sorted)
+/// and short segments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DefectCount {
+    total: usize,
+    acute: Vec<Point>,
+    short: usize,
+}
+
+/// Whether every item of sorted `a` is in sorted `b` (as multisets).
+fn sorted_subset(a: &[Point], b: &[Point]) -> bool {
+    let mut j = 0;
+    for x in a {
+        while j < b.len() && b[j] < *x {
+            j += 1;
+        }
+        if j == b.len() || b[j] != *x {
+            return false;
+        }
+        j += 1;
+    }
+    true
 }
 
 fn is_octilinear(v: Vector) -> bool {
@@ -568,6 +613,9 @@ impl<'c, 'b> NetWork<'c, 'b> {
             if self.opts.merge_collinear {
                 self.merge_collinear();
             }
+            if self.opts.prune_stubs && self.prune_stubs() && self.opts.merge_collinear {
+                self.merge_collinear();
+            }
             if self.opts.remove_vias {
                 self.remove_redundant_vias();
                 if self.opts.merge_collinear {
@@ -594,6 +642,9 @@ impl<'c, 'b> NetWork<'c, 'b> {
             }
             if self.opts.trim_pad_entries {
                 self.trim_pad_entries();
+            }
+            if self.opts.prune_stubs && self.prune_stubs() && self.opts.merge_collinear {
+                self.merge_collinear();
             }
             if self.signature() == before {
                 break;
@@ -734,7 +785,9 @@ impl<'c, 'b> NetWork<'c, 'b> {
             }
             let Some((i, j, union)) = found else { break };
             let layer = self.tracks[i].expect("live").layer;
-            if !self.geometry_ok(layer, &[i, j], &[union]) {
+            if !self.geometry_ok(layer, &[i, j], &[union])
+                || !self.anchors_kept(layer, &[i, j], &[union])
+            {
                 refused.insert((i, j));
                 continue;
             }
@@ -801,9 +854,14 @@ impl<'c, 'b> NetWork<'c, 'b> {
                     seg: Segment::new(q, r, ti.seg.width),
                     ..ti
                 };
-                // The union is unchanged; only the geometry guard decides
-                // (a near joint could become a T-junction).
-                if !self.geometry_ok(*layer, &[i, j], &[merged.seg]) {
+                // The union is unchanged, so clearance cannot suffer; the
+                // geometry guard decides (a near joint could become a
+                // T-junction), and so do the anchors: a joint inside a pad
+                // may be what joins the pad, and a track merely passing
+                // through pad copper does not join it.
+                if !self.geometry_ok(*layer, &[i, j], &[merged.seg])
+                    || !self.anchors_kept(*layer, &[i, j], &[merged.seg])
+                {
                     continue;
                 }
                 self.tracks[i] = Some(merged);
@@ -962,7 +1020,7 @@ impl<'c, 'b> NetWork<'c, 'b> {
         removed: &[usize],
         added: &[Segment],
         limits: &LintLimits,
-    ) -> usize {
+    ) -> DefectCount {
         let wide = region.inflate(limits.jog_length_nm.saturating_add(NEAR_JOINT_NM as Coord));
         let mut segs: Vec<LintSeg> = Vec::new();
         for (i, t) in self.tracks.iter().enumerate() {
@@ -995,10 +1053,20 @@ impl<'c, 'b> NetWork<'c, 'b> {
                 });
             }
         }
-        lint_group(&segs, limits)
+        let mut count = DefectCount::default();
+        for d in lint_group(&segs, limits)
             .iter()
             .filter(|d| region.contains(d.at))
-            .count()
+        {
+            count.total += 1;
+            match d.kind {
+                lint::DefectKind::AcuteBend => count.acute.push(d.at),
+                lint::DefectKind::ShortSegment => count.short += 1,
+                _ => {}
+            }
+        }
+        count.acute.sort_unstable();
+        count
     }
 
     fn region(&self, removed: &[usize], added: &[Segment], limits: &LintLimits) -> BBox {
@@ -1024,10 +1092,18 @@ impl<'c, 'b> NetWork<'c, 'b> {
         let region = self.region(removed, added, &limits);
         let before = self.defects_in(layer, &region, &[], &[], &limits);
         let after = self.defects_in(layer, &region, removed, added, &limits);
+        // What KiCad's DRC reports may never grow, even in trade for other
+        // defects, because S7 judges each net by it: no more short
+        // segments, and no acute bend where there was none (moving one
+        // could move it off a pad, where KiCad ignores it, onto bare
+        // copper, where it does not).
+        if after.short > before.short || !sorted_subset(&after.acute, &before.acute) {
+            return false;
+        }
         if self.require_fewer_defects {
-            after < before
+            after.total < before.total
         } else {
-            after <= before
+            after.total <= before.total
         }
     }
 
@@ -1545,6 +1621,142 @@ impl<'c, 'b> NetWork<'c, 'b> {
                 }
             }
         }
+    }
+
+    // ─── Stub pruning ────────────────────────────────────────────────────
+
+    /// Delete whole tracks that only hurt: one of two tracks meeting at an
+    /// acute bend (the shorter first), or a spur with an end that touches
+    /// nothing, hanging off a junction, pad or via. Taken only when every
+    /// same-net item the track touched is still joined to the others without
+    /// it ([`Self::removal_keeps_joins`]) and the geometry gate passes. Two
+    /// connections of a net often share copper; when the optimizer
+    /// straightens one, the other's last lattice step is left as a spur
+    /// doubling back along it. Returns whether any track went.
+    fn prune_stubs(&mut self) -> bool {
+        let mut any = false;
+        let mut refused: BTreeSet<usize> = BTreeSet::new();
+        loop {
+            let joints = self.joints();
+            let mut candidates: Vec<(i64, usize)> = Vec::new();
+            for ((layer, p), ends) in &joints {
+                let live: Vec<(usize, Point)> = ends
+                    .iter()
+                    .filter_map(|&(s, at_a)| {
+                        let t = self.tracks[s]?;
+                        (t.seg.a != t.seg.b).then(|| (s, self.other_end(s, at_a)))
+                    })
+                    .collect();
+                if live.len() == 1 {
+                    // A dead end: only a spur hanging off a junction, a pad,
+                    // a via or a fixed track's end. A track continuing a
+                    // single run is left alone, so a dangling run of two or
+                    // more tracks is never eaten back; a dangling branch of
+                    // exactly one track off a junction is pruned, as it joins
+                    // nothing.
+                    let (s, far) = live[0];
+                    let others = joints.get(&(*layer, far)).map_or(0, |e| {
+                        e.iter()
+                            .filter(|&&(o, _)| o != s && self.tracks[o].is_some())
+                            .count()
+                    });
+                    let dot = Shape::Circle(konnect_geom::Circle::new(far, 0));
+                    if others >= 2
+                        || self.pinned(*layer).contains(&far)
+                        || !self
+                            .anchors_touching(*layer, std::slice::from_ref(&dot))
+                            .is_empty()
+                    {
+                        candidates.push((self.tracks[s].expect("live").seg.length(), s));
+                    }
+                    continue;
+                }
+                let limits = self.limits(*layer);
+                for x in 0..live.len() {
+                    for y in x + 1..live.len() {
+                        if lint::interior_angle_deg(*p, live[x].1, live[y].1)
+                            >= limits.min_bend_angle_deg - 1e-9
+                        {
+                            continue;
+                        }
+                        for (s, _) in [live[x], live[y]] {
+                            candidates.push((self.tracks[s].expect("live").seg.length(), s));
+                        }
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut done = false;
+            for (_, slot) in candidates {
+                if refused.contains(&slot) {
+                    continue;
+                }
+                let t = self.tracks[slot].expect("live");
+                // Removing copper cannot hurt clearance; the geometry gate
+                // and the joins decide.
+                if self.geometry_ok(t.layer, &[slot], &[]) && self.removal_keeps_joins(slot) {
+                    self.tracks[slot] = None;
+                    self.stats.pruned += 1;
+                    done = true;
+                    any = true;
+                    break;
+                }
+                self.stats.rejected += 1;
+                refused.insert(slot);
+            }
+            if !done {
+                break;
+            }
+        }
+        self.compact();
+        any
+    }
+
+    /// Whether every same-net item track `slot` touches on its layer is
+    /// joined, as KiCad's connectivity judges it, to all the others through
+    /// direct joins among them alone (so the track is redundant locally).
+    /// Conservative: copper joined only through items farther away counts
+    /// as cut.
+    fn removal_keeps_joins(&mut self, slot: usize) -> bool {
+        let t = self.tracks[slot].expect("live");
+        let shape = Shape::Segment(t.seg);
+        // Zone fills are KiCad's to redraw: a track touching one is never
+        // judged redundant by them (the refill may not keep the join).
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        self.ck
+            .same_net_touching(self.net, t.layer, &shape, &mut scratch);
+        let on_zone = scratch
+            .iter()
+            .any(|&id| matches!(self.ck.obstacle_item(id), crate::api::ItemRef::Zone(_)));
+        self.scratch = scratch;
+        if on_zone {
+            return false;
+        }
+        let nodes = self.nodes_touching(t.layer, &[shape], &[slot], false);
+        if nodes.len() <= 1 {
+            return true;
+        }
+        // Union-find over direct joins.
+        let mut parent: Vec<usize> = (0..nodes.len()).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for i in 0..nodes.len() {
+            for j in i + 1..nodes.len() {
+                if nodes[i].joins(&nodes[j], false) {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+            }
+        }
+        let root = find(&mut parent, 0);
+        (1..nodes.len()).all(|i| find(&mut parent, i) == root)
     }
 
     // ─── Pull-tight ──────────────────────────────────────────────────────

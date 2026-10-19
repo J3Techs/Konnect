@@ -76,6 +76,12 @@ impl DefectKind {
     pub fn is_lint_kind(self) -> bool {
         !matches!(self, DefectKind::NearJoint | DefectKind::ShortSegment)
     }
+
+    /// Whether KiCad's DRC reports this kind too (`track_angle`,
+    /// `track_segment_length`), so S7 does.
+    pub fn is_drc_kind(self) -> bool {
+        matches!(self, DefectKind::AcuteBend | DefectKind::ShortSegment)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

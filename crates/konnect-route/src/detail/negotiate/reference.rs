@@ -34,7 +34,7 @@ use crate::compute::{
     PathProposal, ProfileGeometry, RouteCompute, SearchBackend, SearchOutcome, TileRaster,
     TileStack,
 };
-use crate::detail::search::{turn_allowed, HEADINGS};
+use crate::detail::search::{heading_delta, turn_allowed, HEADINGS};
 use konnect_geom::Coord;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -389,7 +389,9 @@ impl Problem<'_> {
                 if source_mask & (1 << nh) == 0 {
                     continue;
                 }
-                let (dx, dy) = HEADINGS[nh as usize];
+                // Heading bits are Y-up (the raster contract); rows grow
+                // with board y, so the step is `heading_delta`'s.
+                let (dx, dy) = heading_delta(nh as u8);
                 let (nc, nr) = (c as i64 + i64::from(dx), r as i64 + i64::from(dy));
                 if nc < 0 || nr < 0 {
                     continue;
