@@ -1261,6 +1261,396 @@ fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, Uuid
     }
 }
 
+// ─── Zone regions and fills ──────────────────────────────────────────────────
+
+/// What a rule area (keepout zone) forbids; `true` means *not allowed*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeepoutRules {
+    pub tracks: bool,
+    pub vias: bool,
+    pub pads: bool,
+    pub copperpour: bool,
+    pub footprints: bool,
+}
+
+/// One `(filled_polygon …)`: the copper KiCad poured on one layer at the last
+/// refill. Fills are fractured — KiCad joins each hole to the outline with a
+/// zero-width slit — so a fill is a single ring with no separate holes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilledPolygon {
+    pub layer: String,
+    /// KiCad's `(island)` marker: a fill piece not connected to the zone's
+    /// net anywhere else.
+    pub island: bool,
+    /// Ring vertices in file order; at least 3.
+    pub points: Vec<(f64, f64)>,
+}
+
+/// A zone's complete geometry: the authored region (outline minus holes) and
+/// the fill from the last refill.
+///
+/// KiCad writes a zone outline with holes as several `(polygon …)` children:
+/// the first is the outline and every later one is a hole in it (KiCad's
+/// `ZONE::AddPolygon`). [`zones`] and [`lossless_zone_outlines`] read only the
+/// first; this reads all of them, plus every `(filled_polygon …)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneGeometry {
+    /// Resolved net name; `None` for the unconnected pseudo-net and for
+    /// net-less rule areas.
+    pub net: Option<String>,
+    /// The zone's `(name …)`, which DRC rules address with `enclosedByArea`.
+    pub name: Option<String>,
+    /// Layers as written, normalized across `(layer …)` and `(layers …)`.
+    /// Wildcards such as `*.Cu` are kept verbatim for the consumer to expand.
+    pub layers: Vec<String>,
+    /// `(priority N)`, 0 when absent.
+    pub priority: u32,
+    /// Present exactly when the zone is a rule area (`(keepout …)`).
+    pub keepout: Option<KeepoutRules>,
+    /// Exact authored outline.
+    pub outline: Vec<ZoneOutlineElement>,
+    /// Exact authored holes, in file order.
+    pub holes: Vec<Vec<ZoneOutlineElement>>,
+    /// Fill pieces, in file order; empty for an unfilled zone or a rule area.
+    pub fills: Vec<FilledPolygon>,
+}
+
+/// Every zone's authored region and fill.
+///
+/// Fails closed per zone, like [`lossless_zone_outlines`]: an unreadable
+/// outline, hole or fill skips the whole zone and counts it, because a plane
+/// that silently lost a hole or a fill piece reports copper where there is
+/// none.
+pub fn zone_geometry(tree: &SexpNode) -> Scan<ZoneGeometry> {
+    let table = top_level_net_table(tree);
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for zone in tree.find_all("zone") {
+        let parsed = (|| {
+            let layers: Vec<String> = match zone.find("layers") {
+                Some(node) => node
+                    .children()?
+                    .iter()
+                    .skip(1)
+                    .filter_map(|c| c.as_str())
+                    .map(str::to_string)
+                    .collect(),
+                None => vec![zone.find_str("layer")?.to_string()],
+            };
+            if layers.is_empty() {
+                return None;
+            }
+
+            let mut rings = Vec::new();
+            for polygon in zone.find_all("polygon") {
+                rings.push(outline_path(polygon.find("pts")?)?);
+            }
+            let mut rings = rings.into_iter();
+            let outline = rings.next()?;
+            let holes: Vec<_> = rings.collect();
+
+            let mut fills = Vec::new();
+            for fill in zone.find_all("filled_polygon") {
+                let layer = fill.find_str("layer")?.to_string();
+                let mut points = Vec::new();
+                for node in fill.find("pts")?.children()?.iter().skip(1) {
+                    if node.head()? != "xy" {
+                        return None;
+                    }
+                    points.push(exact_coordinate_pair(node)?);
+                }
+                if points.len() < 3 {
+                    return None;
+                }
+                fills.push(FilledPolygon {
+                    layer,
+                    island: fill.find("island").is_some(),
+                    points,
+                });
+            }
+
+            let priority = match zone.find("priority") {
+                Some(node) => node.get(1)?.as_str()?.parse::<u32>().ok()?,
+                None => 0,
+            };
+            let keepout = zone.find("keepout").map(|k| {
+                let forbids = |tag: &str| k.find_str(tag) == Some("not_allowed");
+                KeepoutRules {
+                    tracks: forbids("tracks"),
+                    vias: forbids("vias"),
+                    pads: forbids("pads"),
+                    copperpour: forbids("copperpour"),
+                    footprints: forbids("footprints"),
+                }
+            });
+
+            Some(ZoneGeometry {
+                net: resolve_net(zone, &table),
+                name: zone.find_str("name").map(str::to_string),
+                layers,
+                priority,
+                keepout,
+                outline,
+                holes,
+                fills,
+            })
+        })();
+        match parsed {
+            Some(z) => items.push(z),
+            None => skipped += 1,
+        }
+    }
+    Scan { items, skipped }
+}
+
+/// One `(pts …)` path of exact `xy` and `arc` elements, with at least three
+/// defining coordinates (fewer cannot enclose area).
+fn outline_path(pts: &SexpNode) -> Option<Vec<ZoneOutlineElement>> {
+    let mut elements = Vec::new();
+    let mut defining_coordinate_count = 0usize;
+    for node in pts.children()?.iter().skip(1) {
+        let element = match node.head()? {
+            "xy" => {
+                defining_coordinate_count += 1;
+                ZoneOutlineElement::Point(exact_coordinate_pair(node)?)
+            }
+            "arc" => {
+                defining_coordinate_count += 3;
+                exact_outline_arc(node)?
+            }
+            _ => return None,
+        };
+        elements.push(element);
+    }
+    (defining_coordinate_count >= 3).then_some(elements)
+}
+
+// ─── Courtyard outlines ──────────────────────────────────────────────────────
+
+/// One closed courtyard outline in **board** coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CourtyardShape {
+    /// A closed path with the same element semantics as a zone outline: a
+    /// `Point` is a vertex joined straight to the next element's start, an
+    /// `Arc` runs from its start through its mid to its end, and the last
+    /// element joins back to the first.
+    Path(Vec<ZoneOutlineElement>),
+    Circle {
+        center: (f64, f64),
+        radius: f64,
+    },
+}
+
+/// A courtyard outline and which courtyard layer drew it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CourtyardOutline {
+    pub side: Side,
+    pub shape: CourtyardShape,
+}
+
+/// One footprint's courtyard as closed outlines rather than a bbox — what
+/// `intersectsCourtyard()` rules and placement keepouts actually test.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FootprintCourtyardOutlines {
+    /// The reference designator, when the footprint carries one.
+    pub reference: Option<String>,
+    /// Board side, from the footprint's own `(layer …)`.
+    pub layer_side: Side,
+    /// Every closed outline on `F.CrtYd` or `B.CrtYd`: self-closed shapes
+    /// (`fp_rect`, `fp_poly`, `fp_circle`) in file order, then the loops
+    /// chained from `fp_line`/`fp_arc` pieces in order of their first piece.
+    /// Empty when the footprint draws no courtyard — a normal state, unlike
+    /// an open one.
+    pub outlines: Vec<CourtyardOutline>,
+}
+
+/// Every footprint's courtyard outlines in board coordinates, in file order.
+///
+/// `fp_rect`, `fp_poly` and `fp_circle` are closed on their own. `fp_line`
+/// and `fp_arc` pieces are chained end to end — in footprint-local
+/// coordinates, where KiCad wrote them exactly, before the rigid-body
+/// transform — into closed loops. A footprint whose pieces do not close, or
+/// whose root or any courtyard shape is unreadable, is skipped and counted:
+/// KiCad itself treats an open courtyard as missing, and a guessed closure
+/// would invent the area a clearance rule tests.
+pub fn footprint_courtyard_outlines(tree: &SexpNode) -> Scan<FootprintCourtyardOutlines> {
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for fp in footprints(tree) {
+        match footprint_courtyard_outline(fp) {
+            Some(c) => items.push(c),
+            None => skipped += 1,
+        }
+    }
+    Scan { items, skipped }
+}
+
+/// An open courtyard piece in footprint-local coordinates.
+struct CourtyardPiece {
+    side: Side,
+    start: (f64, f64),
+    end: (f64, f64),
+    /// `Some(mid)` for an arc.
+    mid: Option<(f64, f64)>,
+}
+
+/// One footprint's courtyard outlines — the per-footprint step of
+/// [`footprint_courtyard_outlines`], for callers already walking footprints
+/// that need the result aligned with their own iteration. `None` under the
+/// same skip rules.
+pub fn footprint_courtyard_outline(fp: &SexpNode) -> Option<FootprintCourtyardOutlines> {
+    let (fx, fy, rot) = footprint_root_at(fp)?;
+    let layer_side = footprint_side(fp)?;
+    let to_board = |(x, y): (f64, f64)| crate::geometry::transform_pad(x, y, fx, fy, rot);
+    let element_to_board = |e: ZoneOutlineElement| match e {
+        ZoneOutlineElement::Point(p) => ZoneOutlineElement::Point(to_board(p)),
+        ZoneOutlineElement::Arc { start, mid, end } => ZoneOutlineElement::Arc {
+            start: to_board(start),
+            mid: to_board(mid),
+            end: to_board(end),
+        },
+    };
+
+    let mut outlines = Vec::new();
+    let mut pieces = Vec::new();
+    for child in fp.children().unwrap_or(&[]) {
+        let Some(head) = child.head() else { continue };
+        if !FP_SHAPE_TAGS.contains(&head) {
+            continue;
+        }
+        let side = match child.find_str("layer") {
+            Some("F.CrtYd") => Side::Front,
+            Some("B.CrtYd") => Side::Back,
+            _ => continue,
+        };
+        match head {
+            "fp_rect" => {
+                let (x0, y0) = point(child, "start")?;
+                let (x1, y1) = point(child, "end")?;
+                let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+                outlines.push(CourtyardOutline {
+                    side,
+                    shape: CourtyardShape::Path(
+                        corners
+                            .into_iter()
+                            .map(|c| ZoneOutlineElement::Point(to_board(c)))
+                            .collect(),
+                    ),
+                });
+            }
+            "fp_poly" => {
+                let path = outline_path(child.find("pts")?)?;
+                outlines.push(CourtyardOutline {
+                    side,
+                    shape: CourtyardShape::Path(path.into_iter().map(element_to_board).collect()),
+                });
+            }
+            "fp_circle" => {
+                let center = point(child, "center")?;
+                let (ex, ey) = point(child, "end")?;
+                let radius = (ex - center.0).hypot(ey - center.1);
+                if !radius.is_finite() || radius <= 0.0 {
+                    return None;
+                }
+                outlines.push(CourtyardOutline {
+                    side,
+                    shape: CourtyardShape::Circle {
+                        center: to_board(center),
+                        radius,
+                    },
+                });
+            }
+            "fp_line" => pieces.push(CourtyardPiece {
+                side,
+                start: point(child, "start")?,
+                end: point(child, "end")?,
+                mid: None,
+            }),
+            "fp_arc" => pieces.push(CourtyardPiece {
+                side,
+                start: point(child, "start")?,
+                end: point(child, "end")?,
+                mid: Some(point(child, "mid")?),
+            }),
+            _ => {}
+        }
+    }
+
+    for (side, path) in chain_courtyard_pieces(&pieces)? {
+        outlines.push(CourtyardOutline {
+            side,
+            shape: CourtyardShape::Path(path.into_iter().map(element_to_board).collect()),
+        });
+    }
+
+    Some(FootprintCourtyardOutlines {
+        reference: footprint_reference(fp),
+        layer_side,
+        outlines,
+    })
+}
+
+/// Chain open pieces into closed loops, per courtyard side, in local
+/// coordinates. `None` when any loop fails to close.
+fn chain_courtyard_pieces(
+    pieces: &[CourtyardPiece],
+) -> Option<Vec<(Side, Vec<ZoneOutlineElement>)>> {
+    let element = |p: &CourtyardPiece, reversed: bool| {
+        let (start, end) = if reversed {
+            (p.end, p.start)
+        } else {
+            (p.start, p.end)
+        };
+        match p.mid {
+            None => (ZoneOutlineElement::Point(start), end),
+            Some(mid) => (ZoneOutlineElement::Arc { start, mid, end }, end),
+        }
+    };
+
+    let mut used = vec![false; pieces.len()];
+    let mut loops = Vec::new();
+    for first in 0..pieces.len() {
+        if used[first] {
+            continue;
+        }
+        used[first] = true;
+        let side = pieces[first].side;
+        let origin = pieces[first].start;
+        let (el, mut cursor) = element(&pieces[first], false);
+        let mut path = vec![el];
+        // Every piece joins at most one loop, so a loop can be no longer than
+        // the piece count; the bound also stops a malformed board spinning.
+        for _ in 0..pieces.len() {
+            if close(cursor, origin) {
+                break;
+            }
+            let next = (0..pieces.len()).find_map(|j| {
+                let p = &pieces[j];
+                if used[j] || p.side != side {
+                    return None;
+                }
+                if close(p.start, cursor) {
+                    Some((j, false))
+                } else if close(p.end, cursor) {
+                    Some((j, true))
+                } else {
+                    None
+                }
+            });
+            let (j, reversed) = next?;
+            used[j] = true;
+            let (el, end) = element(&pieces[j], reversed);
+            path.push(el);
+            cursor = end;
+        }
+        if !close(cursor, origin) {
+            return None;
+        }
+        loops.push((side, path));
+    }
+    Some(loops)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2240,5 +2630,139 @@ mod tests {
             .unwrap(),
             serde_json::json!({ "kind": "footprint" })
         );
+    }
+
+    /// A plane with one hole and two fill pieces, and a rule area — node for
+    /// node in KiCad 10's layout.
+    const ZONE_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(zone\n\
+        \t\t(net \"GND\")\n\
+        \t\t(layer \"In1.Cu\")\n\
+        \t\t(name \"GND plane\")\n\
+        \t\t(priority 2)\n\
+        \t\t(polygon (pts (xy 0 0) (xy 40 0) (xy 40 30) (xy 0 30)))\n\
+        \t\t(polygon (pts (xy 10 10) (xy 20 10) (xy 20 20) (xy 10 20)))\n\
+        \t\t(filled_polygon (layer \"In1.Cu\") (pts (xy 0.5 0.5) (xy 39.5 0.5) (xy 39.5 29.5)))\n\
+        \t\t(filled_polygon (layer \"In1.Cu\") (island) (pts (xy 12 12) (xy 18 12) (xy 18 18)))\n\
+        \t)\n\
+        \t(zone\n\
+        \t\t(net \"\")\n\
+        \t\t(layers \"F.Cu\" \"B.Cu\")\n\
+        \t\t(name \"no_vias\")\n\
+        \t\t(keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))\n\
+        \t\t(polygon (pts (xy 1 1) (xy 2 1) (xy 2 2)))\n\
+        \t)\n\
+        \t(zone\n\
+        \t\t(net \"GND\")\n\
+        \t\t(layer \"B.Cu\")\n\
+        \t\t(polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))\n\
+        \t\t(filled_polygon (layer \"B.Cu\") (pts (xy 0 0) (xy 1 0)))\n\
+        \t)\n\
+        )";
+
+    #[test]
+    fn zone_geometry_reads_holes_fills_and_rule_areas() {
+        let tree = parse_sexp(ZONE_BOARD).unwrap();
+        let scan = zone_geometry(&tree);
+        // The third zone's fill has two points: the whole zone is refused.
+        assert_eq!(scan.skipped, 1);
+        assert_eq!(scan.items.len(), 2);
+
+        let plane = &scan.items[0];
+        assert_eq!(plane.net.as_deref(), Some("GND"));
+        assert_eq!(plane.name.as_deref(), Some("GND plane"));
+        assert_eq!(plane.priority, 2);
+        assert_eq!(plane.keepout, None);
+        assert_eq!(plane.outline.len(), 4);
+        assert_eq!(plane.holes.len(), 1);
+        assert_eq!(plane.holes[0][0], ZoneOutlineElement::Point((10.0, 10.0)));
+        assert_eq!(plane.fills.len(), 2);
+        assert!(!plane.fills[0].island);
+        assert!(plane.fills[1].island);
+        assert_eq!(plane.fills[0].points[2], (39.5, 29.5));
+
+        let area = &scan.items[1];
+        assert_eq!(area.net, None);
+        assert_eq!(area.layers, vec!["F.Cu".to_string(), "B.Cu".to_string()]);
+        assert_eq!(
+            area.keepout,
+            Some(KeepoutRules {
+                tracks: false,
+                vias: true,
+                pads: false,
+                copperpour: true,
+                footprints: false,
+            })
+        );
+        assert!(area.fills.is_empty());
+    }
+
+    /// A footprint rotated 90° whose courtyard is four `fp_line`s written out
+    /// of order and one of them reversed, as KiCad's footprint wizards do,
+    /// plus a back-side circle.
+    const COURTYARD_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(footprint \"R\"\n\
+        \t\t(layer \"F.Cu\")\n\
+        \t\t(at 100 50 90)\n\
+        \t\t(property \"Reference\" \"R1\")\n\
+        \t\t(fp_line (start -1 -0.5) (end 1 -0.5) (layer \"F.CrtYd\"))\n\
+        \t\t(fp_line (start 1 0.5) (end -1 0.5) (layer \"F.CrtYd\"))\n\
+        \t\t(fp_line (start 1 -0.5) (end 1 0.5) (layer \"F.CrtYd\"))\n\
+        \t\t(fp_line (start -1 -0.5) (end -1 0.5) (layer \"F.CrtYd\"))\n\
+        \t\t(fp_line (start -5 -5) (end 5 5) (layer \"F.SilkS\"))\n\
+        \t\t(fp_circle (center 0 0) (end 0.25 0) (layer \"B.CrtYd\"))\n\
+        \t)\n\
+        \t(footprint \"Open\"\n\
+        \t\t(layer \"F.Cu\")\n\
+        \t\t(at 0 0)\n\
+        \t\t(fp_line (start 0 0) (end 1 0) (layer \"F.CrtYd\"))\n\
+        \t\t(fp_line (start 1 0) (end 1 1) (layer \"F.CrtYd\"))\n\
+        \t)\n\
+        \t(footprint \"Bare\"\n\
+        \t\t(layer \"B.Cu\")\n\
+        \t\t(at 5 5)\n\
+        \t)\n\
+        )";
+
+    #[test]
+    fn courtyard_lines_chain_into_one_closed_loop_in_board_space() {
+        let tree = parse_sexp(COURTYARD_BOARD).unwrap();
+        let scan = footprint_courtyard_outlines(&tree);
+        // The open courtyard is refused; the bare footprint is not.
+        assert_eq!(scan.skipped, 1);
+        assert_eq!(scan.items.len(), 2);
+
+        let r1 = &scan.items[0];
+        assert_eq!(r1.reference.as_deref(), Some("R1"));
+        assert_eq!(r1.outlines.len(), 2);
+        let CourtyardShape::Circle { center, radius } = r1.outlines[0].shape else {
+            panic!("closed shapes come first: {:?}", r1.outlines[0]);
+        };
+        assert_eq!(r1.outlines[0].side, Side::Back);
+        assert!((center.0 - 100.0).abs() < 1e-9 && (center.1 - 50.0).abs() < 1e-9);
+        assert!((radius - 0.25).abs() < 1e-12);
+
+        let CourtyardShape::Path(path) = &r1.outlines[1].shape else {
+            panic!("expected the chained loop: {:?}", r1.outlines[1]);
+        };
+        assert_eq!(r1.outlines[1].side, Side::Front);
+        assert_eq!(path.len(), 4);
+        // Local (-1,-0.5) (1,-0.5) (1,0.5) (-1,0.5) through rot 90 about
+        // (100, 50): (x, y) → (y, -x), translated.
+        let expected = [(99.5, 51.0), (99.5, 49.0), (100.5, 49.0), (100.5, 51.0)];
+        for (el, want) in path.iter().zip(expected) {
+            let ZoneOutlineElement::Point((x, y)) = *el else {
+                panic!("lines chain into points: {el:?}");
+            };
+            assert!(
+                (x - want.0).abs() < 1e-9 && (y - want.1).abs() < 1e-9,
+                "({x}, {y}) vs {want:?}"
+            );
+        }
+
+        assert!(scan.items[1].outlines.is_empty());
+        assert_eq!(scan.items[1].layer_side, Side::Back);
     }
 }
