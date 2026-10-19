@@ -141,7 +141,7 @@ impl BoardBuilder {
         diameter: f64,
         layer: &str,
     ) -> &mut Self {
-        let shape = Shape::Circle(Circle::new(p(center), nm(diameter / 2.0)));
+        let shape = Shape::Circle(Circle::from_diameter(p(center), nm(diameter)));
         self.push_pad(
             footprint,
             number,
@@ -164,8 +164,8 @@ impl BoardBuilder {
         diameter: f64,
         drill: f64,
     ) -> &mut Self {
-        let shape = Shape::Circle(Circle::new(p(center), nm(diameter / 2.0)));
-        let hole = Shape::Circle(Circle::new(p(center), nm(drill / 2.0)));
+        let shape = Shape::Circle(Circle::from_diameter(p(center), nm(diameter)));
+        let hole = Shape::Circle(Circle::from_diameter(p(center), nm(drill)));
         self.push_pad(
             footprint,
             number,
@@ -418,7 +418,7 @@ impl BoardBuilder {
             })
             .collect();
         let outline_poly = rect_mm(0.0, 0.0, self.width, self.height);
-        let ring = outline_poly.outline.clone();
+        let ring = outline_poly.outline().to_vec();
         let edges = (0..ring.len())
             .map(|i| Segment::new(ring[i], ring[(i + 1) % ring.len()], 0))
             .collect();

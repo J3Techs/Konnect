@@ -52,6 +52,12 @@ impl Circle {
         Circle { center, radius }
     }
 
+    /// A disc of `diameter` nm. An odd diameter rounds the radius up, so the
+    /// disc never under-covers what it stands for.
+    pub fn from_diameter(center: Point, diameter: Coord) -> Self {
+        Circle::new(center, half_up(diameter))
+    }
+
     pub fn bbox(&self) -> BBox {
         BBox::point(self.center).inflate(self.radius)
     }
@@ -66,11 +72,28 @@ pub type Ring = Vec<Point>;
 ///
 /// The constructor normalizes the winding to a positive signed area (in the
 /// `Vector::cross` sense) and refuses non-convex input, so consumers may rely
-/// on both.
+/// on both. Deserializing runs the same checks.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ConvexPolyData")]
 pub struct ConvexPoly {
     pts: Ring,
     radius: Coord,
+}
+
+/// The unchecked serialized form of a [`ConvexPoly`].
+#[derive(Deserialize)]
+struct ConvexPolyData {
+    pts: Ring,
+    radius: Coord,
+}
+
+impl TryFrom<ConvexPolyData> for ConvexPoly {
+    type Error = String;
+
+    fn try_from(d: ConvexPolyData) -> Result<Self, String> {
+        ConvexPoly::new(d.pts, d.radius)
+            .ok_or_else(|| "not a convex polygon with a non-negative radius".to_string())
+    }
 }
 
 impl ConvexPoly {
@@ -136,11 +159,29 @@ impl ConvexPoly {
 /// Holes are assumed to lie inside the outline and not to overlap each other
 /// (KiCad's fractured fills and zone outlines satisfy this). Windings are
 /// normalized — outline positive, holes negative — but predicates do not
-/// depend on them.
+/// depend on them. The rings are private so every polygon passed the
+/// constructor's checks; deserializing runs them too.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "PolygonData")]
 pub struct Polygon {
-    pub outline: Ring,
-    pub holes: Vec<Ring>,
+    outline: Ring,
+    holes: Vec<Ring>,
+}
+
+/// The unchecked serialized form of a [`Polygon`].
+#[derive(Deserialize)]
+struct PolygonData {
+    outline: Ring,
+    holes: Vec<Ring>,
+}
+
+impl TryFrom<PolygonData> for Polygon {
+    type Error = String;
+
+    fn try_from(d: PolygonData) -> Result<Self, String> {
+        Polygon::new(d.outline, d.holes)
+            .ok_or_else(|| "polygon outline has under three points or no area".to_string())
+    }
 }
 
 impl Polygon {
@@ -174,6 +215,14 @@ impl Polygon {
             })
             .collect();
         Some(Polygon { outline, holes })
+    }
+
+    pub fn outline(&self) -> &[Point] {
+        &self.outline
+    }
+
+    pub fn holes(&self) -> &[Ring] {
+        &self.holes
     }
 
     /// Every ring, outline first.
@@ -298,7 +347,27 @@ mod tests {
     #[test]
     fn closing_duplicate_is_dropped() {
         let poly = Polygon::new(vec![p(0, 0), p(10, 0), p(10, 10), p(0, 0)], vec![]).unwrap();
-        assert_eq!(poly.outline.len(), 3);
+        assert_eq!(poly.outline().len(), 3);
+    }
+
+    #[test]
+    fn deserializing_runs_the_constructor_checks() {
+        let poly = Polygon::new(vec![p(0, 0), p(10, 0), p(10, 10)], vec![]).unwrap();
+        let json = serde_json::to_string(&Shape::Polygon(poly.clone())).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Shape>(&json).unwrap(),
+            Shape::Polygon(poly)
+        );
+        let empty = r#"{"Polygon":{"outline":[],"holes":[]}}"#;
+        assert!(serde_json::from_str::<Shape>(empty).is_err());
+        let concave = r#"{"pts":[{"x":0,"y":0},{"x":10,"y":0},{"x":5,"y":2},{"x":10,"y":10},{"x":0,"y":10}],"radius":0}"#;
+        assert!(serde_json::from_str::<ConvexPoly>(concave).is_err());
+    }
+
+    #[test]
+    fn odd_diameters_round_the_radius_up() {
+        assert_eq!(Circle::from_diameter(p(0, 0), 451).radius, 226);
+        assert_eq!(Circle::from_diameter(p(0, 0), 450).radius, 225);
     }
 
     #[test]
