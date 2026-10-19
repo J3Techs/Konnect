@@ -256,6 +256,15 @@ pub struct SearchConfig {
     /// off from every source (0: never). Catches enclosed terminals before
     /// the search floods the whole window from the open side.
     pub dead_end_check_after: u64,
+    /// Price a via by the routed-copper congestion (`present`, `history`)
+    /// under it, sampled on every stack layer at its node and, on a uniform
+    /// lattice, at eight points this far out (a via is wider than the track
+    /// the planes are painted for); the worst sample scales the via cost
+    /// like an edge's, `(1 + h·hf) · (1 + p·pf)`. `None` (the default) leaves vias
+    /// congestion-blind. Negotiation needs it: without it a via may sit on
+    /// another net's routed track at no cost and the conflict never clears.
+    #[serde(default)]
+    pub via_congestion_reach_nm: Option<Coord>,
 }
 
 impl Default for SearchConfig {
@@ -276,6 +285,7 @@ impl Default for SearchConfig {
             use_heading_mask: true,
             check_free_vias: true,
             dead_end_check_after: 20_000,
+            via_congestion_reach_nm: None,
         }
     }
 }

@@ -735,6 +735,16 @@ pub(crate) fn run<G: Grid>(
     let corr_pen = u64::from(cfg.corridor_penalty.0);
     let pf = u64::from(params.present_factor);
     let hf = u64::from(params.history_factor);
+    // Via congestion sampling offsets in nodes (straight, diagonal); off
+    // the uniform lattice only the via's own node is sampled.
+    let via_reach: Option<(i64, i64)> = cfg.via_congestion_reach_nm.map(|r| {
+        if !grid.uniform() {
+            return (0, 0);
+        }
+        let d = (i64::from(r.max(0)) + i64::from(pitch) / 2) / i64::from(pitch);
+        let e = (d as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i64;
+        (d, e)
+    });
     let max_exp = cfg.max_expansions.saturating_sub(p.spent);
     let mut dead_end_checked = cfg.dead_end_check_after == 0;
 
@@ -991,6 +1001,17 @@ pub(crate) fn run<G: Grid>(
                 ok = false;
             }
             let mut vcost = via_cost;
+            if let Some((d, e)) = via_reach {
+                vcost = via_congestion_cost(
+                    &views[..nl_layers],
+                    col,
+                    row,
+                    (d, e),
+                    (grid.cols(), grid.rows()),
+                    vcost,
+                    (hf, pf),
+                );
+            }
             if check && p.checker.is_none() {
                 vcost = vcost.saturating_add(near_step);
             }
@@ -1022,6 +1043,51 @@ pub(crate) fn run<G: Grid>(
     s.tboxes = tboxes;
     stats.expansions += expansions;
     outcome
+}
+
+/// A via's cost scaled by the worst routed-copper congestion under it: the
+/// largest `present` and `history` over every layer view, at the via's node
+/// and at eight points `(d, e)` nodes out (straight, diagonal), priced
+/// PathFinder-style like an edge, `b · (1 + h·hf) · (1 + p·pf)`. Saturates.
+#[allow(clippy::too_many_arguments)]
+fn via_congestion_cost(
+    views: &[View<'_>],
+    col: u32,
+    row: u32,
+    (d, e): (i64, i64),
+    (cols, rows): (u32, u32),
+    base: u32,
+    (hf, pf): (u64, u64),
+) -> u32 {
+    let offsets = [
+        (0, 0),
+        (d, 0),
+        (-d, 0),
+        (0, d),
+        (0, -d),
+        (e, e),
+        (e, -e),
+        (-e, e),
+        (-e, -e),
+    ];
+    let (mut pres, mut hist) = (0u64, 0u64);
+    for v in views {
+        for (dx, dy) in offsets {
+            let (c, r) = (i64::from(col) + dx, i64::from(row) + dy);
+            if c < 0 || r < 0 || c >= i64::from(cols) || r >= i64::from(rows) {
+                continue;
+            }
+            let i = r as usize * v.s16 + c as usize;
+            pres = pres.max(u64::from(v.present[i]));
+            hist = hist.max(u64::from(v.history[i]));
+        }
+    }
+    if base == u32::MAX || pres | hist == 0 {
+        return base;
+    }
+    let b = u64::from(base).saturating_mul(1000u64.saturating_add(hist.saturating_mul(hf))) / 1000;
+    let c = b.saturating_mul(1000u64.saturating_add(pres.saturating_mul(pf))) / 1000;
+    c.min(u64::from(u32::MAX - 1)) as u32
 }
 
 /// Whether the targets sit in a pocket no source can reach: a breadth-first

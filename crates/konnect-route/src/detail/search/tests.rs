@@ -1053,3 +1053,40 @@ fn search_stats_read_telemetry_written_before_new_counters() {
     assert_eq!(s.expansions, 7);
     assert_eq!(s.min_run_rejects, 0);
 }
+
+#[test]
+fn via_congestion_prices_vias_by_the_routed_copper_around_them() {
+    // A wall on layer 0 forces two vias. Routed copper of other nets sits
+    // on layer 0 five rows above and below the straight line: tracks along
+    // row 10 never touch it, but a via on row 10 samples it.
+    let mut st = stack(30, 21, 2);
+    block(&mut st, 0, 15..=15, 0..=20);
+    for col in 0..30 {
+        *st.layers[0].present.get_mut(col, 5) = 5;
+        *st.layers[0].present.get_mut(col, 15) = 5;
+    }
+    rederive(&mut st);
+    let params = CostParams::default();
+    let via = params.via.0 + params.near_step.0;
+    let (pool, i) = pool_with(job(JOB_ALLOW_VIA), &[node(5, 10, 0)], &[node(25, 10, 0)]);
+    let blind = SearchConfig::default();
+    let (o, _) = run_ctx(&SearchContext::new(&st, &blind), &pool, i);
+    assert_eq!(found(&o).cost, Cost(20_000 + 2 * via), "off by default");
+    let priced = SearchConfig {
+        via_congestion_reach_nm: Some(5 * PITCH),
+        ..SearchConfig::default()
+    };
+    let (o, _) = run_ctx(&SearchContext::new(&st, &priced), &pool, i);
+    let p = found(&o);
+    let geo = path_geometry(&p.nodes, None, &st.window);
+    assert_eq!(geo.vias.len(), 2);
+    // Both vias moved off row 10, where every via would pay the congestion.
+    assert!(
+        geo.vias.iter().all(|&(_, _, at)| at.y != 10 * PITCH),
+        "{geo:?}"
+    );
+    assert!(p.cost.0 > 20_000 + 2 * via, "the detour costs something");
+    let congested_via =
+        u64::from(params.via.0) * (1000 + 5 * u64::from(params.present_factor)) / 1000;
+    assert!(u64::from(p.cost.0) < 20_000 + 2 * congested_via);
+}
