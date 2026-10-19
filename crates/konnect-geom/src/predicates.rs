@@ -101,6 +101,96 @@ pub fn touches(a: &Shape, b: &Shape) -> bool {
     gap_cmp(a, b, 0) != Ordering::Greater
 }
 
+/// Compare the distance from `p` to the shape's edge with `distance` (nm).
+/// `Less` means `p` is strictly within `distance` of the shape's copper (or
+/// strictly inside it): the test a raster uses to decide whether a lattice
+/// node lies in an obstacle inflated by `distance`.
+pub fn point_shape_distance_cmp(p: Point, shape: &Shape, distance: i64) -> Ordering {
+    let t = 2 * i128::from(distance) + i128::from(shape.sweep2());
+    if t < 0 {
+        return Ordering::Greater;
+    }
+    with_core(shape, |c| core_cmp(&Core::Point(dbl(p)), c, t))
+}
+
+/// Compare the distance from the zero-width segment `a`–`b` to the shape
+/// (edge to edge) with `distance` (nm). With `distance` = clearance plus
+/// half a track width this is the swept-track test: whether a track of that
+/// width along `a`–`b` would violate the clearance to the shape. It is
+/// [`gap_cmp`] without building a [`Shape`] for the segment.
+pub fn segment_shape_distance_cmp(a: Point, b: Point, shape: &Shape, distance: i64) -> Ordering {
+    let t = 2 * i128::from(distance) + i128::from(shape.sweep2());
+    if t < 0 {
+        return Ordering::Greater;
+    }
+    with_core(shape, |c| core_cmp(&Core::Seg(dbl(a), dbl(b)), c, t))
+}
+
+/// Whether `shape` lies entirely inside the closed region of `poly`
+/// (outline minus holes): KiCad's `enclosedByArea()` test, where the item
+/// minus the area must be empty. Touching the boundary from inside counts as
+/// inside.
+///
+/// Exact for points, swept segments and swept polygons with a positive
+/// sweep radius. For zero-radius cores the test is: every core vertex (and a
+/// segment's midpoint) not outside, no proper crossing between core and
+/// region edges, and no region vertex strictly inside a core polygon.
+pub fn shape_within_polygon(shape: &Shape, poly: &Polygon) -> bool {
+    let rings: Vec<&[Point]> = poly.rings().collect();
+    let r2 = i128::from(shape.sweep2());
+    with_core(shape, |core| {
+        let probe = match core {
+            Core::Point(p) => *p,
+            Core::Seg(a, _) => *a,
+            Core::Region(r) => dbl(r[0][0]),
+        };
+        if point_in_rings(probe, &rings) == Containment::Outside {
+            return false;
+        }
+        // A swept shape pokes out wherever the boundary comes nearer than
+        // its radius (doubled units: the threshold is the doubled radius).
+        if r2 > 0
+            && edges(&rings).any(|(c, d)| core_cmp(core, &Core::Seg(c, d), r2) == Ordering::Less)
+        {
+            return false;
+        }
+        match core {
+            Core::Point(_) => true,
+            Core::Seg(a, b) => {
+                if r2 > 0 {
+                    return true;
+                }
+                let mid = P2 {
+                    x: (a.x + b.x) / 2,
+                    y: (a.y + b.y) / 2,
+                };
+                point_in_rings(*b, &rings) != Containment::Outside
+                    && point_in_rings(mid, &rings) != Containment::Outside
+                    && !edges(&rings).any(|(c, d)| crosses_properly(*a, *b, c, d))
+            }
+            Core::Region(cr) => {
+                if edges(cr).any(|(v, _)| point_in_rings(v, &rings) == Containment::Outside) {
+                    return false;
+                }
+                if edges(cr).any(|(a, b)| edges(&rings).any(|(c, d)| crosses_properly(a, b, c, d)))
+                {
+                    return false;
+                }
+                !edges(&rings).any(|(v, _)| point_in_rings(v, cr) == Containment::Inside)
+            }
+        }
+    })
+}
+
+/// Whether two segments cross at one interior point of both.
+pub(crate) fn crosses_properly(a: P2, b: P2, c: P2, d: P2) -> bool {
+    let d1 = orient(c, d, a).signum();
+    let d2 = orient(c, d, b).signum();
+    let d3 = orient(a, b, c).signum();
+    let d4 = orient(a, b, d).signum();
+    d1 * d2 < 0 && d3 * d4 < 0
+}
+
 /// Exact squared distance between two points.
 pub fn dist2_point_point(a: Point, b: Point) -> i128 {
     (b - a).length2()
@@ -110,12 +200,12 @@ pub fn dist2_point_point(a: Point, b: Point) -> i128 {
 
 /// A point with doubled coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct P2 {
-    x: i64,
-    y: i64,
+pub(crate) struct P2 {
+    pub(crate) x: i64,
+    pub(crate) y: i64,
 }
 
-fn dbl(p: Point) -> P2 {
+pub(crate) fn dbl(p: Point) -> P2 {
     P2 {
         x: 2 * i64::from(p.x),
         y: 2 * i64::from(p.y),
@@ -126,14 +216,14 @@ fn dbl(p: Point) -> P2 {
 /// doubled distance is below 2^34), so anything this large is simply `Less`.
 const T_CAP: i128 = 1 << 40;
 
-enum Core<'a> {
+pub(crate) enum Core<'a> {
     Point(P2),
     Seg(P2, P2),
     /// Outline first, then holes; the closed region between them.
     Region(&'a [&'a [Point]]),
 }
 
-fn with_core<R>(s: &Shape, f: impl FnOnce(&Core<'_>) -> R) -> R {
+pub(crate) fn with_core<R>(s: &Shape, f: impl FnOnce(&Core<'_>) -> R) -> R {
     match s {
         Shape::Segment(seg) => f(&Core::Seg(dbl(seg.a), dbl(seg.b))),
         Shape::Circle(c) => f(&Core::Point(dbl(c.center))),
@@ -149,7 +239,7 @@ fn with_core<R>(s: &Shape, f: impl FnOnce(&Core<'_>) -> R) -> R {
 }
 
 /// Compare the distance between two cores with the doubled threshold `t >= 0`.
-fn core_cmp(a: &Core<'_>, b: &Core<'_>, t: i128) -> Ordering {
+pub(crate) fn core_cmp(a: &Core<'_>, b: &Core<'_>, t: i128) -> Ordering {
     use Core::*;
     match (a, b) {
         (Point(p), Point(q)) => cmp_dist2(dist2(*p, *q), t),
@@ -191,7 +281,7 @@ fn core_cmp(a: &Core<'_>, b: &Core<'_>, t: i128) -> Ordering {
 }
 
 /// Every edge of every ring, in doubled coordinates.
-fn edges<'a>(rings: &'a [&'a [Point]]) -> impl Iterator<Item = (P2, P2)> + 'a {
+pub(crate) fn edges<'a>(rings: &'a [&'a [Point]]) -> impl Iterator<Item = (P2, P2)> + 'a {
     rings.iter().flat_map(|ring| {
         let n = ring.len();
         (0..n).map(move |i| (dbl(ring[i]), dbl(ring[(i + 1) % n])))
@@ -200,7 +290,7 @@ fn edges<'a>(rings: &'a [&'a [Point]]) -> impl Iterator<Item = (P2, P2)> + 'a {
 
 /// The smallest of several comparisons against the same threshold:
 /// `Less` if any is, else `Equal` if any is, else `Greater` (also for none).
-fn min_cmp(iter: impl Iterator<Item = Ordering>) -> Ordering {
+pub(crate) fn min_cmp(iter: impl Iterator<Item = Ordering>) -> Ordering {
     let mut best = Ordering::Greater;
     for o in iter {
         if o == Ordering::Less {
@@ -211,7 +301,7 @@ fn min_cmp(iter: impl Iterator<Item = Ordering>) -> Ordering {
     best
 }
 
-fn zero_cmp(t: i128) -> Ordering {
+pub(crate) fn zero_cmp(t: i128) -> Ordering {
     0.cmp(&t)
 }
 
@@ -228,7 +318,7 @@ fn cmp_dist2(d2: u128, t: i128) -> Ordering {
     d2.cmp(&((t * t) as u128))
 }
 
-fn orient(a: P2, b: P2, c: P2) -> i128 {
+pub(crate) fn orient(a: P2, b: P2, c: P2) -> i128 {
     let (abx, aby) = (i128::from(b.x - a.x), i128::from(b.y - a.y));
     let (acx, acy) = (i128::from(c.x - a.x), i128::from(c.y - a.y));
     abx * acy - aby * acx
@@ -239,7 +329,7 @@ fn within_box(a: P2, b: P2, p: P2) -> bool {
     a.x.min(b.x) <= p.x && p.x <= a.x.max(b.x) && a.y.min(b.y) <= p.y && p.y <= a.y.max(b.y)
 }
 
-fn seg_intersect(a: P2, b: P2, c: P2, d: P2) -> bool {
+pub(crate) fn seg_intersect(a: P2, b: P2, c: P2, d: P2) -> bool {
     let d1 = orient(c, d, a).signum();
     let d2 = orient(c, d, b).signum();
     let d3 = orient(a, b, c).signum();
@@ -254,7 +344,7 @@ fn seg_intersect(a: P2, b: P2, c: P2, d: P2) -> bool {
 }
 
 /// Distance from `p` to segment `a`–`b` against the doubled threshold.
-fn point_seg_cmp(p: P2, a: P2, b: P2, t: i128) -> Ordering {
+pub(crate) fn point_seg_cmp(p: P2, a: P2, b: P2, t: i128) -> Ordering {
     if t >= T_CAP {
         return Ordering::Less;
     }
@@ -275,7 +365,7 @@ fn point_seg_cmp(p: P2, a: P2, b: P2, t: i128) -> Ordering {
     cmp_products(cross, cross, tt, l2 as u128)
 }
 
-fn seg_seg_cmp(a: P2, b: P2, c: P2, d: P2, t: i128) -> Ordering {
+pub(crate) fn seg_seg_cmp(a: P2, b: P2, c: P2, d: P2, t: i128) -> Ordering {
     if seg_intersect(a, b, c, d) {
         return zero_cmp(t);
     }
@@ -291,7 +381,7 @@ fn seg_seg_cmp(a: P2, b: P2, c: P2, d: P2, t: i128) -> Ordering {
 }
 
 /// Crossing-number containment over all rings; boundary hits are exact.
-fn point_in_rings(p: P2, rings: &[&[Point]]) -> Containment {
+pub(crate) fn point_in_rings(p: P2, rings: &[&[Point]]) -> Containment {
     let mut inside = false;
     for (a, b) in edges(rings) {
         let o = orient(a, b, p);
@@ -503,6 +593,51 @@ mod tests {
         let in_hole = Shape::from(Circle::new(p(50, 50), 5));
         assert!(!touches(&plane, &in_hole));
         assert_eq!(gap_cmp(&plane, &in_hole, 5), Equal);
+    }
+
+    #[test]
+    fn point_and_swept_segment_distances_to_shapes() {
+        let pad = Shape::from(ConvexPoly::axis_rect(BBox::new(p(0, 0), p(100, 100)), 10).unwrap());
+        // 30 from the sharp edge, 20 from the rounded copper.
+        assert_eq!(point_shape_distance_cmp(p(130, 50), &pad, 20), Equal);
+        assert_eq!(point_shape_distance_cmp(p(130, 50), &pad, 21), Less);
+        // Inside the swept copper is strictly closer than any distance.
+        assert_eq!(point_shape_distance_cmp(p(50, 50), &pad, 0), Less);
+        // A track centre line 60 above the pad: half width 25 + clearance 25.
+        assert_eq!(
+            segment_shape_distance_cmp(p(-50, 160), p(150, 160), &pad, 50),
+            Equal
+        );
+        assert_eq!(
+            segment_shape_distance_cmp(p(-50, 160), p(150, 160), &pad, 51),
+            Less
+        );
+        // Same answer as gap_cmp with a real track of width 50.
+        let track = Shape::from(Segment::new(p(-50, 160), p(150, 160), 50));
+        assert_eq!(gap_cmp(&track, &pad, 25), Equal);
+    }
+
+    #[test]
+    fn shapes_within_a_polygon_with_a_hole() {
+        let area = square_with_hole();
+        let inside = |s: Shape| shape_within_polygon(&s, &area);
+        assert!(inside(Shape::from(Circle::new(p(20, 20), 10))));
+        // Touching the outline from inside still counts.
+        assert!(inside(Shape::from(Circle::new(p(10, 50), 10))));
+        assert!(!inside(Shape::from(Circle::new(p(10, 50), 11))));
+        // Over the hole.
+        assert!(!inside(Shape::from(Circle::new(p(35, 50), 6))));
+        assert!(inside(Shape::from(Segment::new(p(10, 10), p(90, 10), 10))));
+        assert!(!inside(Shape::from(Segment::new(p(10, 10), p(90, 90), 2))));
+        let rect = |x0, y0, x1, y1| {
+            Shape::from(ConvexPoly::axis_rect(BBox::new(p(x0, y0), p(x1, y1)), 0).unwrap())
+        };
+        assert!(inside(rect(0, 0, 30, 30)));
+        assert!(!inside(rect(30, 30, 70, 70)));
+        // Surrounds the hole entirely: no vertex outside, no crossing.
+        assert!(!inside(rect(35, 35, 65, 65)));
+        assert!(!inside(rect(-5, 10, 20, 20)));
+        assert!(!inside(Shape::from(Circle::new(p(500, 500), 1))));
     }
 
     #[test]
