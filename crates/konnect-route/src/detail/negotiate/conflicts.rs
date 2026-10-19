@@ -95,6 +95,14 @@ impl RoutedIndex {
         }
     }
 
+    /// The hole of a via item.
+    fn hole_of(&self, item: u32) -> Option<Shape> {
+        let it = self.items[item as usize];
+        it.seg
+            .is_none()
+            .then(|| Shape::Circle(self.piece_of(item).vias[it.via as usize].hole()))
+    }
+
     fn courtyards_of(&self, item: u32) -> &[crate::api::FootprintId] {
         let it = self.items[item as usize];
         let p = self.piece_of(item);
@@ -121,18 +129,26 @@ impl RoutedIndex {
         if pa.net == pb.net {
             return false;
         }
+        // A through hole spaces other nets' copper on every layer.
+        let hc = i64::from(rules.hole_clearance());
+        let hole_hit = |hole: Option<Shape>, other: &Shape| {
+            hole.is_some_and(|h| gap_cmp(&h, other, hc) == Ordering::Less)
+        };
+        if hole_hit(self.hole_of(a), &sb) || hole_hit(self.hole_of(b), &sa) {
+            return true;
+        }
         let subj_a = pa.subject(ka, self.courtyards_of(a));
         let subj_b = pb.subject(kb, self.courtyards_of(b));
-        let layers: Vec<LayerId> = match (la, lb) {
-            (Some(x), Some(y)) if x == y => vec![x],
-            (Some(_), Some(_)) => return false,
-            (Some(x), None) | (None, Some(x)) => vec![x],
-            (None, None) => all.iter().collect(),
-        };
-        layers.into_iter().any(|l| {
+        let near = |l: LayerId| {
             let c = rules.clearance(&subj_a, &subj_b, l);
             gap_cmp(&sa, &sb, i64::from(c)) == Ordering::Less
-        })
+        };
+        match (la, lb) {
+            (Some(x), Some(y)) if x == y => near(x),
+            (Some(_), Some(_)) => false,
+            (Some(x), None) | (None, Some(x)) => near(x),
+            (None, None) => all.iter().any(near),
+        }
     }
 
     /// Conflicting item pairs `(a, b)`, `a < b`, where `a` belongs to a piece
@@ -260,6 +276,7 @@ impl RoutedIndex {
         };
         let subject =
             crate::rules::RuleSubject::new(ItemKind::Track, Some(net)).with_courtyards(courtyards);
+        let hc = i64::from(rules.hole_clearance());
         ix.query(&q).into_iter().all(|j| {
             let pj = self.piece_of(j);
             if pj.net == net {
@@ -268,6 +285,9 @@ impl RoutedIndex {
             let (sj, kj, _) = self.shape_of(j);
             let c = rules.clearance(&pj.subject(kj, self.courtyards_of(j)), &subject, layer);
             gap_cmp(&sj, &dot, i64::from(c)) != Ordering::Less
+                && self
+                    .hole_of(j)
+                    .is_none_or(|h| gap_cmp(&h, &dot, hc) != Ordering::Less)
         })
     }
 }
@@ -305,7 +325,8 @@ impl HistoryMap {
     }
 
     /// Copy the history under `window` into `plane` (each node takes its
-    /// 50 µm cell's value).
+    /// 50 µm cell's value; cells without history are left as they are).
+    /// One chunk lookup per (row, chunk column), not per node.
     pub fn fill(&self, layer: LayerId, window: &Window, plane: &mut Plane<u16>) {
         if self.chunks.is_empty() {
             return;
@@ -320,14 +341,35 @@ impl HistoryMap {
         if !any {
             return;
         }
+        let cols = window.cols as usize;
+        let cells: Vec<i32> = (0..window.cols)
+            .map(|c| cell(window.node(c, 0).x))
+            .collect();
+        // Runs of columns within one chunk column: (first, end, chunk x).
+        let mut runs: Vec<(usize, usize, i32)> = Vec::new();
+        for (c, &cx) in cells.iter().enumerate() {
+            let kx = cx.div_euclid(CHUNK);
+            match runs.last_mut() {
+                Some(r) if r.2 == kx => r.1 = c + 1,
+                _ => runs.push((c, c + 1, kx)),
+            }
+        }
+        let stride = plane.stride() as usize;
+        let data = plane.as_mut_slice();
         for row in 0..window.rows {
-            let p = window.node(0, row);
-            let cy = cell(p.y);
-            for col in 0..window.cols {
-                let x = window.node(col, row).x;
-                let h = self.get(layer.0, cell(x), cy);
-                if h > 0 {
-                    plane.set(col, row, h);
+            let cy = cell(window.node(0, row).y);
+            let (ky, iy) = (cy.div_euclid(CHUNK), cy.rem_euclid(CHUNK));
+            let base = (iy * CHUNK) as usize;
+            let line = &mut data[row as usize * stride..row as usize * stride + cols];
+            for &(c0, c1, kx) in &runs {
+                let Some(chunk) = self.chunks.get(&(layer.0, kx, ky)) else {
+                    continue;
+                };
+                for c in c0..c1 {
+                    let h = chunk[base + cells[c].rem_euclid(CHUNK) as usize];
+                    if h > 0 {
+                        line[c] = h;
+                    }
                 }
             }
         }

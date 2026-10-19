@@ -160,6 +160,12 @@ impl<T: Copy + Default> Plane<T> {
         &self.data
     }
 
+    /// The whole padded buffer, mutable: row `r` starts at `r * stride()`.
+    /// For bulk writes (copying a cached plane, painting row bands).
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+
     pub fn fill(&mut self, v: T) {
         self.data.iter_mut().for_each(|x| *x = v);
     }

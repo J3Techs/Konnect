@@ -9,6 +9,7 @@ use crate::compute::{Plane, TileRaster, Window};
 use crate::plan::RoutePlan;
 use crate::synthetic::{bga_field, two_pin_nets, BoardBuilder, UniformRules};
 use konnect_geom::{gap_cmp, Circle, Segment, Shape};
+use obstacles::Obstacles;
 use std::cmp::Ordering;
 
 fn route_with(
@@ -16,13 +17,21 @@ fn route_with(
     settings: NegotiationSettings,
     tuning: NegotiationTuning,
 ) -> (DetailResult, Telemetry) {
-    let rules = UniformRules::default();
+    route_with_rules(board, &UniformRules::default(), settings, tuning)
+}
+
+fn route_with_rules(
+    board: &RouteBoard,
+    rules: &UniformRules,
+    settings: NegotiationSettings,
+    tuning: NegotiationTuning,
+) -> (DetailResult, Telemetry) {
     let connections = ConnectivityReport::build(board, &ArcPolicy::default()).connections(board);
     let mut backend = ReferenceSearch::new(settings.threads);
     let mut telemetry = Telemetry::default();
     let result = negotiate_connections(
         board,
-        &rules,
+        rules,
         &connections,
         &GlobalResult::default(),
         None,
@@ -86,12 +95,20 @@ fn with_copper(board: &RouteBoard, copper: &RoutedCopper) -> RouteBoard {
     b
 }
 
-/// An independent brute-force DRC of routed copper under `UniformRules`:
-/// clearance to other nets' fixed and routed copper, edge clearance, and
-/// hole-to-hole for new vias. Returns the violations found.
+/// An independent brute-force DRC of routed copper under the default
+/// `UniformRules`.
 fn violations(board: &RouteBoard, copper: &RoutedCopper) -> Vec<String> {
-    let rules = UniformRules::default();
+    violations_with(board, copper, &UniformRules::default())
+}
+
+/// An independent brute-force DRC of routed copper under `rules`:
+/// clearance to other nets' fixed and routed copper, edge clearance,
+/// hole clearance between holes (plated holes of other nets, non-plated
+/// holes) and copper, and hole-to-hole for new vias. Returns the
+/// violations found.
+fn violations_with(board: &RouteBoard, copper: &RoutedCopper, rules: &UniformRules) -> Vec<String> {
     let c = i64::from(rules.class.clearance);
+    let hc = i64::from(rules.hole_clearance);
     let mut fixed: Vec<(Option<NetId>, LayerMask, Shape)> = Vec::new();
     for p in &board.pads {
         for s in &p.shapes {
@@ -141,12 +158,39 @@ fn violations(board: &RouteBoard, copper: &RoutedCopper) -> Vec<String> {
             }
         }
     }
-    let drills: Vec<Shape> = board
-        .pads
-        .iter()
-        .filter_map(|p| p.drill.as_ref().map(|d| d.shape.clone()))
-        .chain(board.vias.iter().map(|v| v.hole()))
-        .collect();
+    // Fixed holes with the net they belong to; `None` (non-plated, or no
+    // net) constrains every net.
+    let mut fixed_holes: Vec<(Option<NetId>, Shape)> = Vec::new();
+    for p in &board.pads {
+        if let Some(d) = &p.drill {
+            let plated = d.plated && p.kind != crate::board::PadKind::NpThroughHole;
+            fixed_holes.push((if plated { p.net } else { None }, d.shape.clone()));
+        }
+    }
+    for v in &board.vias {
+        fixed_holes.push((v.net, v.hole()));
+    }
+    for (i, (net, _, shape)) in new.iter().enumerate() {
+        for (hnet, hole) in &fixed_holes {
+            if *hnet != Some(*net) && gap_cmp(shape, hole, hc) == Ordering::Less {
+                out.push(format!("new {i} vs fixed hole {hole:?}"));
+            }
+        }
+    }
+    for (i, v) in copper.vias.iter().enumerate() {
+        let hole = Shape::Circle(Circle::from_diameter(v.center, v.drill));
+        for (fnet, _, fshape) in &fixed {
+            if *fnet != Some(v.net) && gap_cmp(&hole, fshape, hc) == Ordering::Less {
+                out.push(format!("via {i} hole vs fixed {fshape:?}"));
+            }
+        }
+        for (j, (onet, _, oshape)) in new.iter().enumerate() {
+            if *onet != v.net && gap_cmp(&hole, oshape, hc) == Ordering::Less {
+                out.push(format!("via {i} hole vs new {j}"));
+            }
+        }
+    }
+    let drills: Vec<Shape> = fixed_holes.iter().map(|(_, h)| h.clone()).collect();
     for (i, v) in copper.vias.iter().enumerate() {
         let hole = Shape::Circle(Circle::from_diameter(v.center, v.drill));
         for d in &drills {
@@ -284,6 +328,17 @@ fn bga_fields_are_split_into_fine_sub_tiles_scheduled_first() {
     // A sparse connector-like footprint is not a field.
     let board = two_pin_nets(30, false);
     assert!(detect_bga_fields(&board, &NegotiationTuning::default()).is_empty());
+    // Nor is a fine-pitch perimeter package: 16 pads a side at 0.5 mm.
+    let mut b = BoardBuilder::new(20.0, 20.0, &["F.Cu", "B.Cu"]);
+    let q = b.footprint("U1", (10.0, 10.0));
+    for i in 0..16 {
+        let t = 6.25 + 0.5 * f64::from(i);
+        for (side, at) in [(0, (t, 5.5)), (1, (t, 14.5)), (2, (5.5, t)), (3, (14.5, t))] {
+            b.smd_pad(q, &format!("{side}_{i}"), "", at, (0.25, 0.8), "F.Cu");
+        }
+    }
+    let quad = b.build();
+    assert!(detect_bga_fields(&quad, &NegotiationTuning::default()).is_empty());
 }
 
 #[test]
@@ -494,7 +549,8 @@ fn results_do_not_depend_on_thread_count() {
             let b = RoutePlan::from_routed(&board, &many.copper).unwrap();
             assert_eq!(a.to_routing_file_json(), b.to_routing_file_json());
         }
-        // Chunking (how many tiles are alive at once) never matters either.
+        // Chunking (how many tiles are alive at once, which only the
+        // lockstep path reads) never matters either.
         let chunked = route_with(
             &board,
             NegotiationSettings {
@@ -504,11 +560,27 @@ fn results_do_not_depend_on_thread_count() {
             },
             NegotiationTuning {
                 chunk_tiles: 1,
+                lockstep_rounds: true,
                 ..tuning
             },
         )
         .0;
         assert_eq!(one, chunked);
+        // Nor does reusing hard raster state across iterations.
+        let uncached = route_with(
+            &board,
+            NegotiationSettings {
+                threads: 3,
+                max_iterations: 12,
+                ..NegotiationSettings::default()
+            },
+            NegotiationTuning {
+                raster_cache_mb: 0,
+                ..tuning
+            },
+        )
+        .0;
+        assert_eq!(one, uncached);
         // Nor does lockstep batching versus per-tile backend copies.
         let lockstep = route_with(
             &board,
@@ -841,4 +913,250 @@ fn diag_crossing_bundle() {
             result.failure_details
         );
     }
+}
+
+/// Rules where a plated hole's clearance reaches well past its copper's.
+fn hole_rules() -> UniformRules {
+    let mut rules = UniformRules {
+        hole_clearance: 300_000,
+        ..UniformRules::default()
+    };
+    rules.class.clearance = 100_000;
+    rules
+}
+
+#[test]
+fn plated_holes_keep_hole_clearance_from_other_nets() {
+    // A fence of other nets' vias with thin annular rings: copper
+    // clearance alone leaves a lane between every two, hole clearance
+    // closes them, so the route must go round the fence.
+    let mut b = BoardBuilder::new(20.0, 12.0, &["F.Cu", "B.Cu"]);
+    let l = b.footprint("J1", (3.0, 6.0));
+    let r = b.footprint("J2", (17.0, 6.0));
+    b.smd_pad(l, "1", "A", (3.0, 6.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(r, "1", "A", (17.0, 6.0), (0.6, 0.6), "F.Cu");
+    let fence: Vec<f64> = (0..9).map(|i| 2.4 + 0.9 * f64::from(i)).collect();
+    for (i, &y) in fence.iter().enumerate() {
+        b.via(&format!("F{i}"), (10.0, y), 0.45, 0.4, true);
+    }
+    let board = b.build();
+    let rules = hole_rules();
+    let (result, _) = route_with_rules(
+        &board,
+        &rules,
+        NegotiationSettings {
+            threads: 2,
+            ..NegotiationSettings::default()
+        },
+        NegotiationTuning::default(),
+    );
+    assert!(result.failed.is_empty(), "{:?}", result.failure_details);
+    let v = violations_with(&board, &result.copper, &rules);
+    assert!(v.is_empty(), "violations: {v:?}");
+    // It crosses the fence's line beyond the fence's ends.
+    let (lo, hi) = (fence[0] * 1e6, fence[fence.len() - 1] * 1e6);
+    let x = 10_000_000i64;
+    let crossings: Vec<f64> = result
+        .copper
+        .tracks
+        .iter()
+        .filter_map(|t| {
+            let (a, b) = (t.seg.a, t.seg.b);
+            let (ax, bx) = (i64::from(a.x), i64::from(b.x));
+            ((ax - x) * (bx - x) <= 0 && ax != bx).then(|| {
+                f64::from(a.y)
+                    + (f64::from(b.y) - f64::from(a.y)) * (x - ax) as f64 / (bx - ax) as f64
+            })
+        })
+        .collect();
+    assert!(!crossings.is_empty());
+    assert!(
+        crossings.iter().all(|&y| y < lo || y > hi),
+        "{crossings:?} within the fence"
+    );
+}
+
+#[test]
+fn hole_clearance_decides_via_and_routed_conflicts() {
+    use super::copper::{PieceCopper, SegCopper, ViaCopper};
+    let mut b = BoardBuilder::new(12.0, 10.0, &["F.Cu", "B.Cu"]);
+    b.net("A");
+    // Another net's locked track 0.45 mm from where a via goes: its copper
+    // keeps 0.15 mm from the via's disc, but only 0.175 mm from its hole.
+    b.track("B", "F.Cu", (4.0, 5.45), (8.0, 5.45), 0.15, true);
+    let board = b.build();
+    let net_a = board.net_by_name("A").unwrap();
+    let net_b = board.net_by_name("B").unwrap();
+    let at = Point::new(6_000_000, 5_000_000);
+    let disc = Circle::from_diameter(at, 450_000);
+    let hole = Circle::from_diameter(at, 400_000);
+    let tight = hole_rules();
+    let loose = UniformRules {
+        hole_clearance: 150_000,
+        ..tight.clone()
+    };
+    let obstacles = Obstacles::build(&board, &tight);
+    assert!(obstacles
+        .check_via(&tight, net_a, &disc, &hole, &[])
+        .is_some());
+    let obstacles = Obstacles::build(&board, &loose);
+    assert!(obstacles
+        .check_via(&loose, net_a, &disc, &hole, &[])
+        .is_none());
+
+    // The same geometry between two routed connections.
+    let via = PieceCopper::new(
+        0,
+        0,
+        net_a,
+        Vec::new(),
+        vec![ViaCopper {
+            center: at,
+            diameter: 450_000,
+            drill: 400_000,
+            courtyards: Vec::new(),
+        }],
+    );
+    let track = PieceCopper::new(
+        1,
+        0,
+        net_b,
+        vec![SegCopper {
+            layer: LayerId(0),
+            seg: Segment::new(
+                Point::new(4_000_000, 5_450_000),
+                Point::new(8_000_000, 5_450_000),
+                150_000,
+            ),
+            courtyards: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    for (rules, expect) in [(&tight, 1), (&loose, 0)] {
+        let index = RoutedIndex::build(
+            vec![Arc::new(via.clone()), Arc::new(track.clone())],
+            2,
+            rules.max_clearance() + 1,
+        );
+        let pairs = index.conflicts(rules, board.layers.all(), &|_: &PieceCopper| true);
+        assert_eq!(pairs.len(), expect, "{pairs:?}");
+    }
+}
+
+#[test]
+fn a_panicking_tile_stops_the_run_instead_of_hanging() {
+    use crate::compute::{CostField, JobPool, PaintShape, SearchBackend};
+    /// A backend whose every search panics, on every fork.
+    struct Panicky;
+    impl SearchBackend for Panicky {
+        fn search_batch(
+            &mut self,
+            _: &Batch,
+            _: &JobPool,
+            _: &[crate::compute::TileStack],
+            _: &CostParams,
+        ) -> Vec<SearchOutcome> {
+            panic!("search failed")
+        }
+        fn cost_field(
+            &mut self,
+            _: &crate::compute::TileStack,
+            _: &[crate::compute::JobNode],
+            _: &CostParams,
+        ) -> CostField {
+            unreachable!()
+        }
+    }
+    impl RouteCompute for Panicky {
+        fn paint(&mut self, r: &mut TileRaster, s: &[PaintShape], p: &ProfileGeometry) {
+            crate::compute::CpuCompute::new().paint(r, s, p);
+        }
+        fn unpaint(&mut self, r: &mut TileRaster, s: &[PaintShape], p: &ProfileGeometry) {
+            crate::compute::CpuCompute::new().unpaint(r, s, p);
+        }
+        fn derive_masks(&mut self, r: &mut TileRaster) {
+            ReferenceSearch::new(1).derive_masks(r);
+        }
+        fn update_costs(&mut self, _: &mut TileRaster, _: &CostParams) {}
+        fn fork(&self) -> Option<Box<dyn RouteCompute + Send>> {
+            Some(Box::new(Panicky))
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let board = long_board();
+        let rules = UniformRules::default();
+        let connections =
+            ConnectivityReport::build(&board, &ArcPolicy::default()).connections(&board);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            negotiate_connections(
+                &board,
+                &rules,
+                &connections,
+                &GlobalResult::default(),
+                None,
+                &NegotiationSettings {
+                    threads: 4,
+                    ..NegotiationSettings::default()
+                },
+                &NegotiationTuning::default(),
+                &mut Panicky,
+                &mut Telemetry::default(),
+            )
+        }));
+        let _ = tx.send(outcome.is_err());
+    });
+    let panicked = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the run finishes instead of hanging");
+    assert!(panicked, "the tile's panic reaches the caller");
+}
+
+#[test]
+fn no_routable_layers_fail_as_no_corridor() {
+    let mut board = two_pin_nets(3, false);
+    board.routable = LayerMask::default();
+    let (result, _) = route(&board);
+    assert_eq!(result.failed.len(), 3);
+    assert!(result
+        .failure_details
+        .iter()
+        .all(|(_, f)| *f == DetailFailure::NoCorridor));
+}
+
+#[test]
+fn pinned_runs_are_merged_and_short_segments_are_reported() {
+    let board = long_board();
+    let rules = UniformRules {
+        min_segment_length: Some(1_000_000),
+        ..UniformRules::default()
+    };
+    let (result, telemetry) = route_with_rules(
+        &board,
+        &rules,
+        NegotiationSettings {
+            threads: 2,
+            ..NegotiationSettings::default()
+        },
+        NegotiationTuning::default(),
+    );
+    assert!(result.failed.is_empty(), "{:?}", result.failure_details);
+    assert_clean_and_connected(&board, &result);
+    // Straight runs through tile pins come back as one track each.
+    assert!(telemetry.counters["merged_segments"] > 0);
+    let short = |s: &Segment| (s.b - s.a).length2() < 1_000_000i128 * 1_000_000;
+    let expected = result
+        .copper
+        .tracks
+        .iter()
+        .filter(|t| short(&t.seg))
+        .count();
+    assert_eq!(result.short_segments.len(), expected);
+    assert!(result
+        .short_segments
+        .iter()
+        .all(|s| short(&s.seg) && s.min_length == 1_000_000));
+    // Without the rule nothing is reported.
+    let (plain, _) = route(&board);
+    assert!(plain.short_segments.is_empty());
 }

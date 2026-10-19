@@ -287,11 +287,8 @@ fn choose_pin(
         let slot = ctx.slot_of(layer)?;
         let width = ctx.width(task.conn.net, slot);
         'steps: for step in 0..=max_steps {
-            for k in if step == 0 {
-                vec![0]
-            } else {
-                vec![step, -step]
-            } {
+            let offsets = [step, -step];
+            for &k in &offsets[..if step == 0 { 1 } else { 2 }] {
                 // Distance and layer rank are a lower bound on the score;
                 // history (never negative) is added once the point is known.
                 let bound = k.abs() * i64::from(pitch) + li as i64 * layer_penalty;

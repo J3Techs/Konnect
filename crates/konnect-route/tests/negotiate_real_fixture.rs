@@ -2,8 +2,9 @@
 //! from outside the repository and prints what happened. Nothing about the
 //! board is committed: the directory comes from `KONNECT_DB1_FIXTURE_DIR`,
 //! files are found by extension, and only board-independent invariants are
-//! asserted (every connection is routed or failed with a reason; the plan
-//! validates; optionally, 1 and N threads agree).
+//! asserted (every connection is routed or failed with a reason; routed
+//! copper joins each routed connection's terminals; the plan validates;
+//! optionally, 1 and N threads agree).
 //!
 //! ```text
 //! KONNECT_DB1_FIXTURE_DIR=/path/to/fixture cargo test -p konnect-route --release \
@@ -26,7 +27,8 @@
 //! Nets that own a zone piece (planes) are left out: S2 fanout joins them.
 
 use konnect_geom::{ArcPolicy, Point};
-use konnect_route::api::Stage;
+use konnect_route::api::{ItemRef, Ownership, Stage, TrackId, ViaId};
+use konnect_route::board::{RouteBoard, Track, Via};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::detail::negotiate::{
     negotiate_connections, DetailResult, NegotiationSettings, NegotiationTuning, ReferenceSearch,
@@ -46,6 +48,40 @@ fn only_file(dir: &Path, ext: &str) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext));
     let first = found.next()?;
     found.next().is_none().then_some(first)
+}
+
+/// The board with routed copper added as ordinary items.
+fn with_copper(board: &RouteBoard, copper: &konnect_route::RoutedCopper) -> RouteBoard {
+    let mut b = board.clone();
+    for t in &copper.tracks {
+        b.tracks.push(Track {
+            id: TrackId(b.tracks.len() as u32),
+            net: Some(t.net),
+            layer: t.layer,
+            seg: t.seg,
+            ownership: Ownership::Routed {
+                net: t.net,
+                gen: t.gen,
+            },
+            uuid: None,
+        });
+    }
+    for v in &copper.vias {
+        b.vias.push(Via {
+            id: ViaId(b.vias.len() as u32),
+            net: Some(v.net),
+            center: v.center,
+            diameter: v.diameter,
+            drill: v.drill,
+            layers: v.layers,
+            ownership: Ownership::Routed {
+                net: v.net,
+                gen: v.gen,
+            },
+            uuid: None,
+        });
+    }
+    b
 }
 
 fn env_num(name: &str, default: usize) -> usize {
@@ -217,6 +253,15 @@ fn negotiate_real_board_fixture() {
             }
             other => format!("{other:?}"),
         };
+        for f in &result.bga_fields {
+            let fp = &board.footprints[f.footprint.index()];
+            println!(
+                "  FIELD {} pads {} pitch {} nm",
+                fp.reference.as_deref().unwrap_or("?"),
+                f.pads,
+                f.pitch
+            );
+        }
         for (id, f) in &result.failure_details {
             let c = connections
                 .iter()
@@ -259,6 +304,63 @@ fn negotiate_real_board_fixture() {
                 .len()
         );
     }
+    // Routed copper joins what it claims to: each routed connection's two
+    // terminals end up in one island of the board with the copper added.
+    let t_conn = Instant::now();
+    let joined = with_copper(&board, &result.copper);
+    let report = ConnectivityReport::build(&joined, &ArcPolicy::default());
+    let mut island_of: std::collections::HashMap<ItemRef, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (n, net) in report.nets.iter().enumerate() {
+        for (i, island) in net.islands.iter().enumerate() {
+            for item in &island.items {
+                island_of.insert(*item, (n, i));
+            }
+        }
+    }
+    let routed_ids: BTreeSet<_> = result.routed.iter().copied().collect();
+    let open: Vec<_> = connections
+        .iter()
+        .filter(|c| routed_ids.contains(&c.id))
+        .filter(|c| {
+            let (a, b) = (island_of.get(&c.from), island_of.get(&c.to));
+            a.is_none() || a != b
+        })
+        .map(|c| c.id)
+        .collect();
+    let before = ConnectivityReport::build(&board, &ArcPolicy::default()).connection_count();
+    let after = report.connection_count();
+    println!(
+        "connectivity: {} routed connections all joined: {}; board connections {} -> {} ({} ms)",
+        routed_ids.len(),
+        open.is_empty(),
+        before,
+        after,
+        t_conn.elapsed().as_millis()
+    );
+    assert!(
+        open.is_empty(),
+        "{} routed connections are not joined by their copper: {:?}",
+        open.len(),
+        &open[..open.len().min(20)]
+    );
+    assert!(
+        after + routed_ids.len() <= before,
+        "each routed connection closes at least one board connection"
+    );
+    let short: BTreeMap<i32, usize> =
+        result
+            .short_segments
+            .iter()
+            .fold(BTreeMap::new(), |mut m, s| {
+                *m.entry(s.min_length).or_default() += 1;
+                m
+            });
+    println!(
+        "short segments (below track_segment_length, left for S6): {} (by minimum, nm: {short:?})",
+        result.short_segments.len()
+    );
+
     if std::env::var("KONNECT_NEGOTIATE_DETERMINISM").as_deref() == Ok("1") {
         let one = NegotiationSettings {
             threads: 1,

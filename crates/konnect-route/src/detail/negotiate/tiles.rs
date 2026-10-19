@@ -91,6 +91,12 @@ pub fn detect_bga_fields(board: &RouteBoard, tuning: &NegotiationTuning) -> Vec<
         if xs.len() < tuning.bga_min_rows as usize || ys.len() < tuning.bga_min_rows as usize {
             continue;
         }
+        // An array fills its grid; a perimeter package only its edges.
+        if (pads.len() as u64) * 1000
+            < u64::from(tuning.bga_min_fill) * (xs.len() * ys.len()) as u64
+        {
+            continue;
+        }
         // Smallest neighbour distance, from sorted pad centres (a sweep in
         // x with an early break keeps it near-linear).
         let mut centres: Vec<Point> = pads.iter().map(|p| p.center).collect();

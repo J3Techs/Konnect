@@ -9,9 +9,9 @@
 //! net never pays for, or is blocked by, itself; the same shapes are painted
 //! back afterwards (counters make that exact).
 
+use super::cache::{HardLayer, RasterCache, RasterPool, TileStatic};
 use super::conflicts::HistoryMap;
 use super::copper::{PieceCopper, SegCopper, ViaCopper};
-use super::obstacles::ObstacleKind;
 use super::pieces::{PieceJob, Terminal};
 use super::tiles::TileSpec;
 use super::{Ctx, DetailFailure, Task};
@@ -23,7 +23,7 @@ use crate::compute::{
 };
 use crate::rules::RuleSubject;
 use crate::telemetry::Telemetry;
-use konnect_geom::{gap_cmp, touches, Circle, Point, Segment, Shape};
+use konnect_geom::{gap_cmp, touches, Circle, Coord, Point, Segment, Shape};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -51,8 +51,11 @@ pub(crate) struct TileRun {
     lattice: Window,
     profiles: Vec<u16>,
     stacks: Vec<Option<TileStack>>,
-    /// Per net: (stack layer slot, obstacle id) of its painted fixed copper.
-    hard_own: BTreeMap<NetId, Vec<(u8, u32)>>,
+    /// Stacks whose hard state was just painted (masks still to derive).
+    fresh: Vec<bool>,
+    /// The tile's obstacle lists, and per net the (slot, obstacle id) of
+    /// its painted fixed copper.
+    stat: Arc<TileStatic>,
     /// Per net: routed pieces painted into this tile.
     soft: BTreeMap<NetId, Vec<Arc<PieceCopper>>>,
     queue: VecDeque<PieceJob>,
@@ -63,7 +66,7 @@ pub(crate) struct TileRun {
     pub busy_us: u64,
 }
 
-fn half_diag(pitch: i32) -> i32 {
+pub(crate) fn half_diag(pitch: i32) -> i32 {
     ((f64::from(pitch) * std::f64::consts::FRAC_1_SQRT_2).ceil()) as i32
 }
 
@@ -73,14 +76,22 @@ impl TileRun {
         spec.tile.window.inflate(ctx.margin + ctx.obstacles.reach)
     }
 
+    /// Build the tile's hard state: one stack per profile its jobs need,
+    /// with CORE/HALO from fixed copper and the commit-zone wall, copied
+    /// from `cache` when another build already computed it. Stacks built
+    /// fresh still need [`TileRun::derive_masks`] and
+    /// [`TileRun::narrow_vias`]; then [`TileRun::paint_context`] adds
+    /// history and routed copper. Every build computes the same planes
+    /// whether or not the cache hits.
     pub fn build(
         ctx: &Ctx<'_>,
         spec: &TileSpec,
         jobs: Vec<PieceJob>,
         tasks: &[Task],
-        store: &[Arc<PieceCopper>],
-        history: &HistoryMap,
+        cache: &RasterCache,
+        pool: &mut RasterPool,
     ) -> TileRun {
+        let t_build = std::time::Instant::now();
         let lattice = spec.lattice;
         let mut profiles: Vec<u16> = jobs
             .iter()
@@ -89,64 +100,58 @@ impl TileRun {
         profiles.sort_unstable();
         profiles.dedup();
         let mut telemetry = Telemetry::default();
-        let max_hw = profiles
-            .iter()
-            .flat_map(|&p| ctx.profiles[p as usize].widths.iter())
-            .map(|w| w / 2 + w % 2)
-            .max()
-            .unwrap_or(0);
-        let query = lattice
-            .bbox()
-            .inflate(max_hw + half_diag(lattice.pitch_nm) + lattice.pitch_nm);
-        // The same obstacle list per layer serves every profile.
-        let per_slot: Vec<Vec<u32>> = ctx
-            .slots
-            .iter()
-            .map(|&l| ctx.obstacles.track_obstacles(l, &query))
-            .collect();
-        let mut hard_own: BTreeMap<NetId, Vec<(u8, u32)>> = BTreeMap::new();
-        for (slot, ids) in per_slot.iter().enumerate() {
-            for &id in ids {
-                let o = &ctx.obstacles.items[id as usize];
-                if let (ObstacleKind::Copper(_), Some(n)) = (o.kind, o.net) {
-                    if o.layers.contains(ctx.slots[slot]) {
-                        hard_own.entry(n).or_default().push((slot as u8, id));
-                    }
-                }
-            }
-        }
+        let stat = cache.tile_static(ctx, &lattice);
 
         let mut stacks = Vec::with_capacity(profiles.len());
+        let mut fresh = Vec::with_capacity(profiles.len());
+        let (mut us_hard, mut us_wall, mut us_copy) = (0u64, 0u64, 0u64);
         for &p in &profiles {
             let profile = &ctx.profiles[p as usize];
             let pid = ProfileId(p);
+            let cached = cache.hard(&lattice, p);
             let mut layers = Vec::with_capacity(ctx.slots.len());
             for (slot, &layer) in ctx.slots.iter().enumerate() {
-                let mut r = TileRaster::new(spec.tile.id, layer, pid, lattice);
-                let geom = ctx.geometry(p, slot);
-                let rep = RuleSubject::new(ItemKind::Track, Some(profile.rep));
-                for &id in &per_slot[slot] {
-                    let o = &ctx.obstacles.items[id as usize];
-                    let track = rep.with_courtyards(&o.courtyards);
-                    if let Some(c) = ctx.obstacles.track_clearance(ctx.rules, o, &track, layer) {
-                        CpuCompute::paint_shape(&mut r, &o.shape, c, PaintKind::Hard, &geom, true);
-                    }
+                let t = std::time::Instant::now();
+                let (mut r, recycled) = pool.take(spec.tile.id, layer, pid, lattice);
+                if recycled {
+                    r.present.fill(0);
                 }
-                history.fill(layer, &lattice, &mut r.history);
-                // Wall off everything outside the commit zone.
-                for row in 0..lattice.rows {
-                    for col in 0..lattice.cols {
-                        if !spec.commit.contains(lattice.node(col, row)) {
-                            let c = r.core.get_mut(col, row);
-                            *c = c.saturating_add(1);
-                            let h = r.halo.get_mut(col, row);
-                            *h = h.saturating_add(1);
+                if let Some(c) = &cached {
+                    c[slot].restore(&mut r);
+                    us_copy += t.elapsed().as_micros() as u64;
+                } else {
+                    if recycled {
+                        r.core.fill(0);
+                        r.halo.fill(0);
+                        r.heading_mask.fill(0);
+                        r.via_site.fill(0);
+                    }
+                    let geom = ctx.geometry(p, slot);
+                    let rep = RuleSubject::new(ItemKind::Track, Some(profile.rep));
+                    for &id in &stat.per_slot[slot] {
+                        let o = &ctx.obstacles.items[id as usize];
+                        let track = rep.with_courtyards(&o.courtyards);
+                        if let Some(c) = ctx.obstacles.track_clearance(ctx.rules, o, &track, layer)
+                        {
+                            CpuCompute::paint_shape(
+                                &mut r,
+                                &o.shape,
+                                c,
+                                PaintKind::Hard,
+                                &geom,
+                                true,
+                            );
                         }
                     }
+                    let t1 = std::time::Instant::now();
+                    us_hard += (t1 - t).as_micros() as u64;
+                    wall_off(&mut r, &spec.commit);
+                    us_wall += t1.elapsed().as_micros() as u64;
                 }
                 telemetry.window_nodes.record(lattice.node_count() as u64);
                 layers.push(r);
             }
+            fresh.push(cached.is_none());
             stacks.push(Some(TileStack {
                 tile: spec.tile.id,
                 profile: pid,
@@ -154,61 +159,73 @@ impl TileRun {
                 layers,
             }));
         }
-        let mut run = TileRun {
+        telemetry.count("us_build_hard", us_hard);
+        telemetry.count("us_build_wall", us_wall);
+        telemetry.count("us_build_copy", us_copy);
+        telemetry.count("us_build", t_build.elapsed().as_micros() as u64);
+        telemetry.count("tiles_built", 1);
+        TileRun {
             id: spec.tile.id.0,
             phase: if spec.tile.phase == 0 { "bga" } else { "grid" },
             lattice,
             profiles,
             stacks,
-            hard_own,
+            fresh,
+            stat,
             soft: BTreeMap::new(),
             queue: jobs.into(),
             active: None,
             done: Vec::new(),
             telemetry,
             busy_us: 0,
-        };
-        let reach = Self::reach(ctx, spec);
-        for piece in store {
-            if piece.bbox.is_some_and(|b| b.intersects(&reach)) {
-                for k in 0..run.stacks.len() {
-                    run.paint_soft(ctx, k, piece, true);
-                }
-                run.soft.entry(piece.net).or_default().push(piece.clone());
-            }
         }
-        run.telemetry.count("tiles_built", 1);
-        run
     }
 
-    /// Let the backend derive heading and via masks from the counters.
+    /// Let the backend derive heading and via masks from the hard counters
+    /// of every freshly built stack (cached stacks carry theirs).
     pub fn derive_masks(&mut self, backend: &mut dyn RouteCompute) {
-        for s in self.stacks.iter_mut().flatten() {
-            for r in &mut s.layers {
-                backend.derive_masks(r);
+        let t = std::time::Instant::now();
+        for (s, &fresh) in self.stacks.iter_mut().zip(&self.fresh) {
+            if fresh {
+                for r in &mut s.as_mut().expect("stack at home").layers {
+                    backend.derive_masks(r);
+                }
             }
         }
+        self.telemetry
+            .count("us_build_masks", t.elapsed().as_micros() as u64);
     }
 
-    /// Narrow `via_site` to where the profile's whole via fits: every node
-    /// within the via's reach must be clear of HALO (a square erosion,
-    /// which over-covers the disc), and no via keepout may touch it.
-    pub fn narrow_vias(&mut self, ctx: &Ctx<'_>) {
+    /// Narrow `via_site` of every freshly built stack to where the
+    /// profile's whole via fits — every node within the via's reach must be
+    /// clear of HALO (a square erosion, which over-covers the disc), and no
+    /// via keepout may touch it — then offer the finished hard state to the
+    /// cache.
+    pub fn narrow_vias(&mut self, ctx: &Ctx<'_>, cache: &RasterCache) {
+        let t = std::time::Instant::now();
         let w = self.lattice;
         let hd = half_diag(w.pitch_nm);
         for (k, s) in self.stacks.iter_mut().enumerate() {
+            if !self.fresh[k] {
+                continue;
+            }
             let s = s.as_mut().expect("stacks are home between rounds");
             let profile = &ctx.profiles[self.profiles[k] as usize];
             let rv = profile.via_diameter / 2 + profile.via_diameter % 2;
             for (slot, r) in s.layers.iter_mut().enumerate() {
                 let hw = profile.widths[slot] / 2 + profile.widths[slot] % 2;
                 let rho = (rv - hw).max(0) + hd;
-                let k = ((rho + w.pitch_nm - 1) / w.pitch_nm) as usize;
-                erode_into(r, k);
+                let reach = ((rho + w.pitch_nm - 1) / w.pitch_nm) as usize;
+                erode_into(r, reach);
                 for id in ctx.obstacles.via_keepouts(r.layer, &w.bbox().inflate(rv)) {
                     let o = &ctx.obstacles.items[id as usize];
-                    for row in 0..w.rows {
-                        for col in 0..w.cols {
+                    // Only nodes whose disc can reach the keepout's box.
+                    let b = o.shape.bbox().inflate(rv.saturating_add(w.pitch_nm));
+                    let Some((c0, r0, c1, r1)) = node_range(&w, &b) else {
+                        continue;
+                    };
+                    for row in r0..=r1 {
+                        for col in c0..=c1 {
                             if r.via_site.get(col, row) != 0 {
                                 let disc = Shape::Circle(Circle::new(w.node(col, row), rv));
                                 if gap_cmp(&o.shape, &disc, 1) == Ordering::Less {
@@ -218,6 +235,64 @@ impl TileRun {
                         }
                     }
                 }
+            }
+            cache.offer(&w, self.profiles[k], || {
+                s.layers.iter().map(HardLayer::capture).collect()
+            });
+            self.fresh[k] = false;
+        }
+        self.telemetry
+            .count("us_build_narrow", t.elapsed().as_micros() as u64);
+    }
+
+    /// Add the soft state: history under the window (read once per layer,
+    /// copied to every profile) and every routed piece within reach.
+    pub fn paint_context(
+        &mut self,
+        ctx: &Ctx<'_>,
+        spec: &TileSpec,
+        store: &[Arc<PieceCopper>],
+        history: &HistoryMap,
+    ) {
+        let t = std::time::Instant::now();
+        let lattice = self.lattice;
+        if let Some((first, rest)) = self.stacks.split_first_mut() {
+            let first = first.as_mut().expect("stack at home");
+            for (slot, &layer) in ctx.slots.iter().enumerate() {
+                let h = &mut first.layers[slot].history;
+                h.fill(0);
+                history.fill(layer, &lattice, h);
+            }
+            for s in rest {
+                let s = s.as_mut().expect("stack at home");
+                for (slot, r) in s.layers.iter_mut().enumerate() {
+                    r.history
+                        .as_mut_slice()
+                        .copy_from_slice(first.layers[slot].history.as_slice());
+                }
+            }
+        }
+        let t_soft = std::time::Instant::now();
+        self.telemetry
+            .count("us_build_history", (t_soft - t).as_micros() as u64);
+        let reach = Self::reach(ctx, spec);
+        for piece in store {
+            if piece.bbox.is_some_and(|b| b.intersects(&reach)) {
+                for k in 0..self.stacks.len() {
+                    self.paint_soft(ctx, k, piece, true);
+                }
+                self.soft.entry(piece.net).or_default().push(piece.clone());
+            }
+        }
+        self.telemetry
+            .count("us_build_soft", t_soft.elapsed().as_micros() as u64);
+    }
+
+    /// Hand the rasters back for reuse.
+    pub fn recycle(&mut self, pool: &mut RasterPool) {
+        for s in self.stacks.iter_mut().filter_map(Option::take) {
+            for r in s.layers {
+                pool.give(r);
             }
         }
     }
@@ -244,6 +319,20 @@ impl TileRun {
                 let c = ctx.rules.clearance(&piece.subject(kind, cy), &me, layer);
                 CpuCompute::paint_shape(r, &shape, c, PaintKind::Soft, &geom, up);
             }
+            // A via's hole, where `hole_clearance` reaches past the copper
+            // clearance of its disc.
+            let hc = ctx.rules.hole_clearance();
+            for v in &piece.vias {
+                let me =
+                    RuleSubject::new(ItemKind::Track, Some(rep)).with_courtyards(&v.courtyards);
+                let c =
+                    ctx.rules
+                        .clearance(&piece.subject(ItemKind::Via, &v.courtyards), &me, layer);
+                if v.drill / 2 + hc > v.diameter / 2 + c {
+                    let hole = Shape::Circle(v.hole());
+                    CpuCompute::paint_shape(r, &hole, hc, PaintKind::Soft, &geom, up);
+                }
+            }
         }
     }
 
@@ -251,7 +340,7 @@ impl TileRun {
     fn lift(&mut self, ctx: &Ctx<'_>, net: NetId, k: usize, up: bool) {
         let p = self.profiles[k];
         let rep = RuleSubject::new(ItemKind::Track, Some(ctx.profiles[p as usize].rep));
-        if let Some(list) = self.hard_own.get(&net) {
+        if let Some(list) = self.stat.hard_own.get(&net) {
             let stack = self.stacks[k].as_mut().expect("stack at home");
             for &(slot, id) in list {
                 let o = &ctx.obstacles.items[id as usize];
@@ -475,10 +564,17 @@ impl TileRun {
             SearchOutcome::Unreachable { expansions, .. } => (*expansions, "unreachable"),
             SearchOutcome::BudgetExhausted { expansions, .. } => (*expansions, "budget"),
         };
-        let phase = self.phase;
-        self.telemetry
-            .count(&format!("expansions_{phase}"), expanded);
-        self.telemetry.count(&format!("search_{kind}_{phase}"), 1);
+        let bga = self.phase == "bga";
+        let (exp_key, kind_key) = match (kind, bga) {
+            ("found", true) => ("expansions_bga", "search_found_bga"),
+            ("found", false) => ("expansions_grid", "search_found_grid"),
+            ("unreachable", true) => ("expansions_bga", "search_unreachable_bga"),
+            ("unreachable", false) => ("expansions_grid", "search_unreachable_grid"),
+            (_, true) => ("expansions_bga", "search_budget_bga"),
+            (_, false) => ("expansions_grid", "search_budget_grid"),
+        };
+        self.telemetry.count(exp_key, expanded);
+        self.telemetry.count(kind_key, 1);
         let fail = |run: &mut TileRun, job: &PieceJob, f: DetailFailure| {
             run.done.push(PieceDone {
                 task: job.task,
@@ -487,6 +583,12 @@ impl TileRun {
             });
         };
         match outcome {
+            SearchOutcome::Found(p) if p.nodes.is_empty() => {
+                // A backend contract violation; never commit it.
+                self.telemetry.count("empty_paths", 1);
+                self.lift(ctx, net, k, true);
+                fail(self, &job, DetailFailure::Unreachable);
+            }
             SearchOutcome::Found(p) => {
                 self.telemetry
                     .expansions_per_connection
@@ -711,36 +813,101 @@ impl TileRun {
     }
 }
 
+/// The node range `(c0, r0, c1, r1)` (inclusive) whose positions lie in
+/// `b`, or `None` when no node does.
+pub(crate) fn node_range(w: &Window, b: &konnect_geom::BBox) -> Option<(u32, u32, u32, u32)> {
+    let p = i64::from(w.pitch_nm);
+    let first = |lo: Coord, o: Coord| (i64::from(lo) - i64::from(o) + p - 1).div_euclid(p).max(0);
+    let last = |hi: Coord, o: Coord, n: u32| {
+        (i64::from(hi) - i64::from(o))
+            .div_euclid(p)
+            .min(i64::from(n) - 1)
+    };
+    let (c0, c1) = (
+        first(b.min.x, w.origin.x),
+        last(b.max.x, w.origin.x, w.cols),
+    );
+    let (r0, r1) = (
+        first(b.min.y, w.origin.y),
+        last(b.max.y, w.origin.y, w.rows),
+    );
+    (c0 <= c1 && r0 <= r1).then_some((c0 as u32, r0 as u32, c1 as u32, r1 as u32))
+}
+
+/// Count one wall into CORE and HALO of every node outside `commit`: whole
+/// rows above and below it, and the bands left and right of it.
+fn wall_off(r: &mut TileRaster, commit: &konnect_geom::BBox) {
+    let w = r.window;
+    let inside = node_range(&w, commit);
+    let stride = r.core.stride() as usize;
+    let (cols, rows) = (w.cols as usize, w.rows as usize);
+    let bump = |v: &mut u8| *v = v.saturating_add(1);
+    for plane in [&mut r.core, &mut r.halo] {
+        let data = plane.as_mut_slice();
+        for row in 0..rows {
+            let line = &mut data[row * stride..row * stride + cols];
+            match inside {
+                Some((c0, r0, c1, r1)) if (r0 as usize..=r1 as usize).contains(&row) => {
+                    line[..c0 as usize].iter_mut().for_each(bump);
+                    line[c1 as usize + 1..].iter_mut().for_each(bump);
+                }
+                _ => line.iter_mut().for_each(bump),
+            }
+        }
+    }
+}
+
 /// `via_site &= (no HALO within Chebyshev radius k)`, by two separable
-/// sliding-window passes over prefix sums. Nodes whose square leaves the
-/// window are refused (their context is unknown).
+/// sliding-window passes (prefix sums along rows, a running column sum down
+/// the rows). Nodes whose square leaves the window are refused (their
+/// context is unknown).
 fn erode_into(r: &mut TileRaster, k: usize) {
     let w = r.window;
     let (cols, rows) = (w.cols as usize, w.rows as usize);
-    let blocked: Vec<u8> = (0..rows)
-        .flat_map(|row| (0..cols).map(move |col| (row, col)))
-        .map(|(row, col)| u8::from(r.halo.get(col as u32, row as u32) > 0))
-        .collect();
+    let stride = r.halo.stride() as usize;
+    let halo = r.halo.as_slice();
+    // horiz = some HALO within k columns (1 where the square leaves the row).
     let mut horiz = vec![1u8; cols * rows];
-    let mut prefix = vec![0u32; cols.max(rows) + 1];
+    let mut prefix = vec![0u32; cols + 1];
     for row in 0..rows {
-        for col in 0..cols {
-            prefix[col + 1] = prefix[col] + u32::from(blocked[row * cols + col]);
+        let line = &halo[row * stride..row * stride + cols];
+        for (col, &h) in line.iter().enumerate() {
+            prefix[col + 1] = prefix[col] + u32::from(h > 0);
         }
+        let out = &mut horiz[row * cols..(row + 1) * cols];
         for col in k..cols.saturating_sub(k) {
-            let s = prefix[col + k + 1] - prefix[col - k];
-            horiz[row * cols + col] = u8::from(s > 0);
+            out[col] = u8::from(prefix[col + k + 1] - prefix[col - k] > 0);
         }
     }
-    for col in 0..cols {
-        for row in 0..rows {
-            prefix[row + 1] = prefix[row] + u32::from(horiz[row * cols + col]);
+    let vstride = r.via_site.stride() as usize;
+    let via = r.via_site.as_mut_slice();
+    let mut refuse = |row: usize| via[row * vstride..row * vstride + cols].fill(0);
+    if rows < 2 * k + 1 {
+        (0..rows).for_each(&mut refuse);
+        return;
+    }
+    (0..k).chain(rows - k..rows).for_each(&mut refuse);
+    // count[col] = sum of horiz over rows row-k ..= row+k.
+    let mut count = vec![0u32; cols];
+    for rr in 0..2 * k {
+        for (c, &h) in count.iter_mut().zip(&horiz[rr * cols..(rr + 1) * cols]) {
+            *c += u32::from(h);
         }
-        for row in 0..rows {
-            let ok = row >= k && row + k < rows && prefix[row + k + 1] - prefix[row - k] == 0;
-            if !ok {
-                r.via_site.set(col as u32, row as u32, 0);
+    }
+    for row in k..rows - k {
+        let add = row + k;
+        for (c, &h) in count.iter_mut().zip(&horiz[add * cols..(add + 1) * cols]) {
+            *c += u32::from(h);
+        }
+        let line = &mut via[row * vstride..row * vstride + cols];
+        for (v, &c) in line.iter_mut().zip(&count) {
+            if c > 0 {
+                *v = 0;
             }
+        }
+        let sub = row - k;
+        for (c, &h) in count.iter_mut().zip(&horiz[sub * cols..(sub + 1) * cols]) {
+            *c -= u32::from(h);
         }
     }
 }

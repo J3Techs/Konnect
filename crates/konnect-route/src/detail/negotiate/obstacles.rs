@@ -24,7 +24,8 @@ pub(crate) enum ObstacleKind {
     Copper(ItemKind),
     /// A non-plated hole: `hole_clearance` to copper, `hole_to_hole` to drills.
     NpthHole,
-    /// A plated drill (its copper is a separate obstacle): `hole_to_hole`.
+    /// A plated drill (its copper is a separate obstacle): `hole_clearance`
+    /// to other nets' copper, `hole_to_hole` to drills.
     Drill,
     /// A board edge piece: `edge_clearance`.
     Edge,
@@ -313,12 +314,21 @@ impl Obstacles {
                 let fp = [o.footprint.unwrap_or_default()];
                 Some(rules.clearance(&self.subject(o, &fp), track, layer))
             }
-            ObstacleKind::NpthHole => Some(rules.hole_clearance()),
+            // A plated hole spaces other nets' copper by `hole_clearance`
+            // (KiCad's copper-to-hole rule) on every layer, independently of
+            // its annular ring; the caller skips the hole's own net.
+            ObstacleKind::NpthHole | ObstacleKind::Drill => Some(rules.hole_clearance()),
             ObstacleKind::Edge => Some(rules.edge_clearance()),
             // Any overlap is a violation: a 1 nm clearance makes touching count.
             ObstacleKind::KeepoutTracks => Some(1),
-            ObstacleKind::Drill | ObstacleKind::KeepoutVias => None,
+            ObstacleKind::KeepoutVias => None,
         }
+    }
+
+    /// Whether obstacle `o` belongs to `net` and so does not constrain it:
+    /// the net's own copper and plated holes.
+    fn own(o: &Obstacle, net: NetId) -> bool {
+        matches!(o.kind, ObstacleKind::Copper(_) | ObstacleKind::Drill) && o.net == Some(net)
     }
 
     /// Obstacle ids that constrain tracks on `layer` near `bbox`, sorted.
@@ -331,6 +341,12 @@ impl Obstacles {
             .unwrap_or_default();
         ids.retain(|&i| self.items[i as usize].kind != ObstacleKind::KeepoutVias);
         ids.extend(self.global.query(&q));
+        ids.extend(
+            self.holes
+                .query(&q)
+                .into_iter()
+                .filter(|&i| self.items[i as usize].kind == ObstacleKind::Drill),
+        );
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -351,7 +367,7 @@ impl Obstacles {
             .into_iter()
             .find(|&id| {
                 let o = &self.items[id as usize];
-                if matches!(o.kind, ObstacleKind::Copper(_)) && o.net == Some(net) {
+                if Self::own(o, net) {
                     return false;
                 }
                 self.track_clearance(rules, o, &subject, layer)
@@ -361,7 +377,10 @@ impl Obstacles {
 
     /// The first obstacle a through via of `net` violates: copper on every
     /// layer (other nets' zones on non-routable plane layers excepted — a
-    /// refill clears them), holes, edges and via keepouts.
+    /// refill clears them), by clearance to the via's copper and by
+    /// `hole_clearance` to its hole; other nets' plated holes by
+    /// `hole_clearance` to its copper; hole-to-hole to every drill; edges
+    /// and via keepouts.
     pub fn check_via(
         &self,
         rules: &dyn RuleTable,
@@ -374,6 +393,7 @@ impl Obstacles {
         let hole = Shape::Circle(*drill);
         let subject = RuleSubject::new(ItemKind::Via, Some(net)).with_courtyards(courtyards);
         let q = copper.bbox().inflate(self.reach);
+        let hc = i64::from(rules.hole_clearance());
         for layer in self.all.iter() {
             let Some(ix) = self.layers.get(layer.index()) else {
                 continue;
@@ -390,6 +410,7 @@ impl Obstacles {
                             let fp = [o.footprint.unwrap_or_default()];
                             let c = rules.clearance(&self.subject(o, &fp), &subject, layer);
                             gap_cmp(&o.shape, &copper, i64::from(c)) == Ordering::Less
+                                || gap_cmp(&o.shape, &hole, hc) == Ordering::Less
                         }
                     }
                     ObstacleKind::KeepoutVias => gap_cmp(&o.shape, &copper, 1) == Ordering::Less,
@@ -412,9 +433,12 @@ impl Obstacles {
             }
         }
         let h2h = rules.hole_to_hole();
-        for id in self.holes.query(&hole.bbox().inflate(self.reach)) {
+        for id in self.holes.query(&q) {
             let o = &self.items[id as usize];
-            if gap_cmp(&o.shape, &hole, i64::from(h2h)) == Ordering::Less {
+            let plated_other = o.kind == ObstacleKind::Drill && o.net != Some(net);
+            if gap_cmp(&o.shape, &hole, i64::from(h2h)) == Ordering::Less
+                || (plated_other && gap_cmp(&o.shape, &copper, hc) == Ordering::Less)
+            {
                 return Some(id);
             }
         }
