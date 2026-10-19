@@ -38,6 +38,7 @@ const SUBCOMMANDS: &[&str] = &[
     "hook",
     "transaction",
     konnect_core::freerouting_job::RUNNER_SUBCOMMAND,
+    konnect_core::native_route_job::RUNNER_SUBCOMMAND,
 ];
 
 fn classify(args: &[String]) -> Cli<'_> {
@@ -105,6 +106,10 @@ async fn main() -> Result<()> {
         // Internal: started by start_specctra_route_job, not by users.
         Cli::Subcommand(konnect_core::freerouting_job::RUNNER_SUBCOMMAND) => {
             return konnect_core::freerouting_job::run_runner(&args[2..]).await;
+        }
+        // Internal: started by start_native_route_job, not by users.
+        Cli::Subcommand(konnect_core::native_route_job::RUNNER_SUBCOMMAND) => {
+            return konnect_core::native_route_job::run_runner(&args[2..]);
         }
         Cli::Subcommand(_) | Cli::Server => {}
     }

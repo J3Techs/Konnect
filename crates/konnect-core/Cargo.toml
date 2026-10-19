@@ -8,6 +8,9 @@ license.workspace = true
 
 [dependencies]
 konnect-sexp.workspace = true
+konnect-geom.workspace = true
+konnect-route.workspace = true
+rayon.workspace = true
 konnect-render.workspace = true
 konnect-ipc.workspace = true
 konnect-schematic-editor.workspace = true

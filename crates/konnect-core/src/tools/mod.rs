@@ -41,6 +41,12 @@ pub mod project;
 mod project_file_writer_tests;
 mod route_geometry;
 mod routing_batch;
+// Native-router drafts: the tools in `route_native` and the apply path they
+// use. The integrator registers the tools in `router/registry.rs`.
+#[allow(dead_code)]
+pub(crate) mod route_native;
+#[allow(dead_code)]
+pub(crate) mod route_native_apply;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
