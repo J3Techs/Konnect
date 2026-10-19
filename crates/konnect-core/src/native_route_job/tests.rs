@@ -45,6 +45,7 @@ fn spec(root: &Path, out: &str, source: CopperSource) -> NativeJobSpec {
         threads: Some(2),
         optimize: true,
         zones_are_obstacles: true,
+        clear_findings: None,
         time_limit_seconds: None,
     }
 }

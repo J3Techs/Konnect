@@ -81,6 +81,7 @@ async fn several_runner_processes_route_at_once() {
             threads: Some(2),
             optimize: true,
             zones_are_obstacles: true,
+            clear_findings: None,
             time_limit_seconds: None,
         })
         .collect();

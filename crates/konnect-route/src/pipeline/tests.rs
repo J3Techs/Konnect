@@ -323,3 +323,115 @@ fn a_class_fallback_routes_on_more_layers_over_its_reference() {
         }
     }
 }
+
+// ─── Clearing what S7 still finds ───────────────────────────────────────────
+
+/// Net `A` with pads at (2, 5) and (18, 5), and a third pad at (14, 9) when
+/// `branch_pad`; the board carries no copper of its own.
+fn clear_board(branch_pad: bool) -> RouteBoard {
+    let mut b = BoardBuilder::new(20.0, 12.0, &["F.Cu", "B.Cu"]);
+    let f = b.footprint("U1", (10.0, 6.0));
+    b.smd_pad(f, "1", "A", (2.0, 5.0), (0.8, 0.5), "F.Cu");
+    b.smd_pad(f, "2", "A", (18.0, 5.0), (0.8, 0.5), "F.Cu");
+    if branch_pad {
+        b.smd_pad(f, "3", "A", (14.0, 9.0), (0.5, 0.5), "F.Cu");
+    }
+    b.build()
+}
+
+fn routed_tracks(board: &RouteBoard, segs: &[((f64, f64), (f64, f64))]) -> RoutedCopper {
+    let net = board.net_by_name("A").expect("net A");
+    let mm = |v: f64| (v * 1e6).round() as konnect_geom::Coord;
+    RoutedCopper {
+        tracks: segs
+            .iter()
+            .map(|&(a, b)| RoutedTrack {
+                net,
+                layer: LayerId(0),
+                seg: Segment::new(
+                    Point::new(mm(a.0), mm(a.1)),
+                    Point::new(mm(b.0), mm(b.1)),
+                    150_000,
+                ),
+                gen: crate::api::Generation(0),
+            })
+            .collect(),
+        vias: Vec::new(),
+    }
+}
+
+fn angle_rules() -> UniformRules {
+    UniformRules {
+        min_track_angle_deg: Some(89.0),
+        ..UniformRules::default()
+    }
+}
+
+#[test]
+fn clear_findings_drops_a_spare_track_that_crosses_its_net() {
+    let board = clear_board(false);
+    let rules = angle_rules();
+    // A run joining the pads, crossed at 45° by a piece that joins nothing.
+    let mut routed = routed_tracks(
+        &board,
+        &[((2.0, 5.0), (18.0, 5.0)), ((9.0, 4.0), (11.0, 6.0))],
+    );
+    let checker = BoardChecker::new(&board, &rules, CheckOptions::for_routed());
+    assert!(checker
+        .check_routed(&routed)
+        .violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::TrackAngle));
+    let r = clear_findings(&board, &rules, &mut routed);
+    assert_eq!(
+        (r.single_tracks, r.cut_tracks, r.pieces),
+        (1, 0, 0),
+        "{r:?}"
+    );
+    assert_eq!(routed.tracks.len(), 1);
+    assert!(checker.check_routed(&routed).violations.is_empty());
+}
+
+#[test]
+fn clear_findings_cuts_the_track_that_opens_fewest_joins() {
+    let board = clear_board(true);
+    let rules = angle_rules();
+    // The third pad's branch lands on the run's middle at 45°: neither is
+    // spare, and cutting the branch opens one join where the run opens two.
+    let mut routed = routed_tracks(
+        &board,
+        &[((2.0, 5.0), (18.0, 5.0)), ((14.0, 9.0), (10.0, 5.0))],
+    );
+    let r = clear_findings(&board, &rules, &mut routed);
+    assert_eq!(
+        (r.single_tracks, r.cut_tracks, r.opened),
+        (0, 1, 1),
+        "{r:?}"
+    );
+    assert_eq!(routed.tracks.len(), 1);
+    assert_eq!(routed.tracks[0].seg.length(), 16_000_000);
+    let checker = BoardChecker::new(&board, &rules, CheckOptions::for_routed());
+    assert!(checker.check_routed(&routed).violations.is_empty());
+}
+
+#[test]
+fn clear_findings_removes_spurs_but_not_tracks_that_carry_a_join() {
+    let board = clear_board(true);
+    let rules = angle_rules();
+    // Right-angle spur off the run with a free end: it joins nothing. The
+    // third pad's run (free at neither end) stays, as does the main run,
+    // whose ends are on pads.
+    let mut routed = routed_tracks(
+        &board,
+        &[
+            ((2.0, 5.0), (14.0, 5.0)),
+            ((14.0, 5.0), (18.0, 5.0)),
+            ((14.0, 5.0), (14.0, 9.0)),
+            ((6.0, 5.0), (6.0, 8.0)),
+        ],
+    );
+    let r = clear_findings(&board, &rules, &mut routed);
+    assert_eq!(r.spurs, 1, "{r:?}");
+    assert_eq!(routed.tracks.len(), 3);
+    assert!(routed.tracks.iter().all(|t| t.seg.a.x != 6_000_000));
+}

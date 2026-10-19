@@ -25,7 +25,7 @@ use konnect_route::api::{Generation, NetId, Stage};
 use konnect_route::check::{CheckReport, ViolationKind};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
-use konnect_route::optimize::{optimize_checked, OptimizeOptions, OptimizeReport};
+use konnect_route::optimize::{OptimizeOptions, OptimizeReport};
 use konnect_route::plan::{RoutedCopper, ADD_ROUTING_MAX_ITEMS};
 use konnect_route::telemetry::Telemetry;
 use konnect_route::{LoadOptions, ProjectRuleTable, RouteBoard, RoutePlan, RuleTable};
@@ -98,6 +98,12 @@ pub struct NativeJobSpec {
     /// Treat other nets' zone fills as copper in the optimizer and check.
     #[serde(default = "yes")]
     pub zones_are_obstacles: bool,
+    /// After S6, take out each piece of routed copper S7 still finds a
+    /// defect in ([`konnect_route::pipeline::clear_findings`]), leaving its
+    /// connections open. Unset: on for native routing, off for copper taken
+    /// from a plan or the board (which is checked, not edited away).
+    #[serde(default)]
+    pub clear_findings: Option<bool>,
     /// Stop at the next stage boundary after this long.
     #[serde(default)]
     pub time_limit_seconds: Option<u64>,
@@ -255,6 +261,12 @@ pub struct PipelineReport {
     #[serde(default)]
     pub fanout_vias: usize,
     pub optimize: Option<OptimizeReport>,
+    /// Nets S6's guard put back to their routed copper.
+    #[serde(default)]
+    pub optimize_reverted: usize,
+    /// What the clear stage took out (`None` when it did not run).
+    #[serde(default)]
+    pub cleared: Option<konnect_route::pipeline::ClearReport>,
     pub check: Option<CheckSummary>,
     pub plan_items: Option<usize>,
     pub plan_chunks: Option<usize>,
@@ -708,14 +720,23 @@ pub fn run_pipeline(
         observer.event("optimize", "start", &json!({}));
         let opts = OptimizeOptions {
             checker: checker_opts,
+            sliver_floor_nm: konnect_route::optimize::sliver_floor(&board, &rules),
             ..OptimizeOptions::default()
         };
-        let r = pool.install(|| optimize_checked(&checker, &mut work, &opts));
-        report
-            .telemetry
-            .add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
+        // S6 then the pipeline's guard: a net the optimizer left with more
+        // S7 findings goes back to the copper it was routed with.
+        let (r, reverted) = pool.install(|| {
+            konnect_route::pipeline::optimize_guarded(
+                &board,
+                &rules,
+                &mut work,
+                &opts,
+                true,
+                &mut report.telemetry,
+            )
+        });
         report.telemetry.count("optimize_index_us", index_us);
-        konnect_route::optimize::record_counters(&r, &mut report.telemetry);
+        report.optimize_reverted = reverted.len();
         report.optimize = Some(r);
         checkpoint.optimize = Some(r);
         checkpoint.copper = work.clone();
@@ -734,6 +755,41 @@ pub fn run_pipeline(
     if let Some((kind, why)) = stop_check(observer) {
         report.stop(kind, why);
         return Ok(report);
+    }
+
+    // Clear: copper S7 still finds a defect in is taken out, so the plan
+    // carries none KiCad would report; its connections stay open.
+    if spec
+        .clear_findings
+        .unwrap_or(spec.source == CopperSource::Native)
+    {
+        let t = Instant::now();
+        let cleared = pool.install(|| {
+            guarded("clear", || {
+                konnect_route::pipeline::clear_findings(&board, &rules, &mut work)
+            })
+        });
+        match cleared {
+            Ok(c) => {
+                c.record(&mut report.telemetry);
+                report
+                    .telemetry
+                    .add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
+                let detail = serde_json::to_value(&c).unwrap_or_default();
+                report.cleared = Some(c);
+                record(&mut report, observer, "clear", "done", t, detail);
+            }
+            Err(e) => {
+                record(
+                    &mut report,
+                    observer,
+                    "clear",
+                    "failed",
+                    t,
+                    json!({ "error": e.to_string() }),
+                );
+            }
+        }
     }
 
     // S7: check.
@@ -1074,6 +1130,7 @@ fn report(dir: &Path, status: &JobStatus) -> Value {
     {
         body["report"] = json!({
             "stages": r["stages"], "optimize": r["optimize"], "check": r["check"],
+            "optimize_reverted": r["optimize_reverted"], "cleared": r["cleared"],
             "plan_items": r["plan_items"], "plan_chunks": r["plan_chunks"],
             "stopped": r["stopped"],
             "stage_wall_us": r["telemetry"]["stages"], "threads": r["telemetry"]["threads"],

@@ -21,6 +21,8 @@
 //!   `KONNECT_PIPELINE_NO_OPTIMIZE=1`;
 //! - `KONNECT_PIPELINE_REFERENCE=1`: negotiation's reference search instead
 //!   of the kernel, for comparison;
+//! - `KONNECT_PIPELINE_CLEAR=0|1`: take out routed copper S7 still finds a
+//!   defect in (default on);
 //! - `KONNECT_PIPELINE_MIN_RUN=0|1`: minimum runs on rule nets (default on);
 //! - `KONNECT_PIPELINE_MAX_EXPANSIONS`: the kernel's budget per search;
 //! - `KONNECT_PIPELINE_ASTAR`: the kernel's heuristic weight, ×1000;
@@ -142,6 +144,9 @@ fn pipeline_real_board_fixture() {
         "KONNECT_PIPELINE_ASTAR",
         u64::from(settings.search.astar_factor),
     ) as u32;
+    if let Ok(v) = std::env::var("KONNECT_PIPELINE_CLEAR") {
+        settings.clear_findings = v == "1";
+    }
     if let Ok(v) = std::env::var("KONNECT_PIPELINE_MIN_RUN") {
         settings.search_min_run = v.trim() == "1";
     }
@@ -392,6 +397,19 @@ fn pipeline_real_board_fixture() {
             r.optimize_reverted.len()
         );
     }
+    println!(
+        "clear: {} spare tracks, {} cut ({} joins opened), {} dangling behind them, {} spurs; {} pieces, {} tracks, {} vias; {} nets; findings {:?}",
+        r.cleared.single_tracks,
+        r.cleared.cut_tracks,
+        r.cleared.opened,
+        r.cleared.dangling_tracks,
+        r.cleared.spurs,
+        r.cleared.pieces,
+        r.cleared.tracks,
+        r.cleared.vias,
+        r.cleared.nets.len(),
+        r.cleared.findings
+    );
     let by_kind = r.check.counts();
     println!("check: {} findings {:?}", r.check.violations.len(), by_kind);
     println!(
@@ -442,6 +460,7 @@ fn pipeline_real_board_fixture() {
             "plan_tracks": r.plan.tracks.len(),
             "plan_vias": r.plan.vias.len(),
             "optimize": r.optimize,
+            "cleared": r.cleared,
             "telemetry": r.telemetry,
         });
         std::fs::write(

@@ -123,6 +123,10 @@ pub struct PipelineSettings {
     pub optimize: Option<OptimizeOptions>,
     /// Put back any net the optimizer left with more S7 findings.
     pub guard_optimize: bool,
+    /// After S6 and its guard, take out every piece of routed copper that
+    /// still carries an S7 finding ([`clear_findings`]): the connections it
+    /// made stay open, and the plan is S7-clean. Default on.
+    pub clear_findings: bool,
     /// Worker threads for the whole run (0: the current rayon pool). Also
     /// the negotiation thread count when that is 0.
     pub threads: usize,
@@ -152,6 +156,7 @@ impl Default for PipelineSettings {
             search_min_run: true,
             optimize: Some(OptimizeOptions::default()),
             guard_optimize: true,
+            clear_findings: true,
             threads: 0,
         }
     }
@@ -206,6 +211,8 @@ pub struct PipelineResult {
     pub optimize: Option<OptimizeReport>,
     /// Nets the guard put back to their routed copper.
     pub optimize_reverted: Vec<NetId>,
+    /// What [`clear_findings`] took out (empty when it did not run).
+    pub cleared: ClearReport,
     /// S7 over the fanout and routed copper together (indices follow
     /// [`Self::all_copper`]).
     pub check: CheckReport,
@@ -431,16 +438,26 @@ fn run(
 
     // 7. Optimize, guarded by the S7 checker.
     if let Some(opts) = &settings.optimize {
+        let mut opts = *opts;
+        if opts.sliver_floor_nm.is_none() {
+            opts.sliver_floor_nm = crate::optimize::sliver_floor(board, rules);
+        }
         let (report, reverted) = optimize_guarded(
             &work,
             rules,
             &mut routed,
-            opts,
+            &opts,
             settings.guard_optimize,
             tel,
         );
         out.optimize_reverted = reverted;
         out.optimize = Some(report);
+    }
+    if settings.clear_findings {
+        let t = Instant::now();
+        out.cleared = clear_findings(&work, rules, &mut routed);
+        out.cleared.record(tel);
+        tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
     }
 
     // 8. Check everything new against the board as loaded.
@@ -851,6 +868,448 @@ fn with_fallback_corridors(
     }
     g.corridors.sort_by_key(|c| c.connection);
     g
+}
+
+/// What [`clear_findings`] took out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearReport {
+    /// Single routed tracks removed because their net stayed as joined
+    /// without them (a crossing or overlap inside a loop of the net).
+    #[serde(default)]
+    pub single_tracks: u32,
+    /// Named tracks cut although their net lost a join, and the joins lost.
+    #[serde(default)]
+    pub cut_tracks: u32,
+    #[serde(default)]
+    pub opened: u32,
+    /// Tracks left dangling by those removals, removed with them.
+    #[serde(default)]
+    pub dangling_tracks: u32,
+    /// Dangling routed tracks removed at the end, anywhere on the board.
+    #[serde(default)]
+    pub spurs: u32,
+    /// Joined pieces of routed copper removed (findings that name only vias).
+    pub pieces: u32,
+    pub tracks: u32,
+    pub vias: u32,
+    /// The nets they belonged to.
+    pub nets: Vec<NetId>,
+    /// The S7 findings, by kind, that named them.
+    pub findings: BTreeMap<String, u32>,
+}
+
+impl ClearReport {
+    /// The `pipeline_cleared_*` counters.
+    pub fn record(&self, tel: &mut Telemetry) {
+        tel.count("pipeline_cleared_single", u64::from(self.single_tracks));
+        tel.count("pipeline_cleared_cut", u64::from(self.cut_tracks));
+        tel.count("pipeline_cleared_dangling", u64::from(self.dangling_tracks));
+        tel.count("pipeline_cleared_spurs", u64::from(self.spurs));
+        tel.count("pipeline_cleared_pieces", u64::from(self.pieces));
+        tel.count("pipeline_cleared_tracks", u64::from(self.tracks));
+        tel.count("pipeline_cleared_vias", u64::from(self.vias));
+    }
+}
+
+/// Take out of `routed` the copper an S7 finding names, checked against
+/// `work` (the board the copper was routed on, fanout included), so the
+/// plan carries no defect KiCad will report:
+///
+/// 1. per net, one named routed track: one whose removal leaves the net's
+///    pads as joined as before if there is one (two runs of a net crossing
+///    or overlapping usually close a loop, so one of them is spare, and the
+///    shortest such goes);
+///    otherwise the named track whose removal opens the fewest joins, with
+///    whatever routed copper then dangles;
+/// 2. when a finding names only routed vias, every joined piece of routed
+///    copper (tracks and vias of one net touching one another, judged
+///    without pads or board copper) it names: the connections it made are
+///    left open.
+///
+/// Repeats until the check names no routed copper, then removes routed
+/// tracks that dangle anywhere (an end touching no copper of their net).
+pub fn clear_findings(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    routed: &mut RoutedCopper,
+) -> ClearReport {
+    use rayon::prelude::*;
+    let checker = BoardChecker::new(work, rules, CheckOptions::for_routed());
+    let mut out = ClearReport::default();
+    let mut nets: BTreeSet<NetId> = BTreeSet::new();
+    for _ in 0..16 {
+        let report = checker.check_routed(routed);
+        // Step 1: per net, the named track whose removal opens the fewest
+        // connections (none, when it is spare), and what then dangles.
+        let mut by_net: BTreeMap<NetId, Vec<usize>> = BTreeMap::new();
+        for v in &report.violations {
+            for item in std::iter::once(v.a).chain(v.b) {
+                if let CheckedItem::RoutedTrack { index } = item {
+                    let i = index as usize;
+                    by_net.entry(routed.tracks[i].net).or_default().push(i);
+                }
+            }
+        }
+        let snapshot: &RoutedCopper = routed;
+        let cuts: Vec<(NetId, usize, usize, BTreeSet<usize>)> = by_net
+            .into_par_iter()
+            .map(|(net, mut cands)| {
+                cands.sort_by_key(|&i| (snapshot.tracks[i].seg.length(), i));
+                cands.dedup();
+                let base = net_pad_islands(work, net, snapshot, &BTreeSet::new());
+                let (cost, pick) = cands
+                    .iter()
+                    .map(|&i| {
+                        let after = net_pad_islands(work, net, snapshot, &BTreeSet::from([i]));
+                        (after.saturating_sub(base), i)
+                    })
+                    .min_by_key(|&(cost, i)| (cost, snapshot.tracks[i].seg.length(), i))
+                    .expect("a net with a named track");
+                let behind = dangling_tracks(work, net, snapshot, &BTreeSet::from([pick]));
+                (net, pick, cost, behind)
+            })
+            .collect();
+        if !cuts.is_empty() {
+            let mut drop: BTreeSet<usize> = BTreeSet::new();
+            for (net, pick, cost, behind) in &cuts {
+                nets.insert(*net);
+                if *cost == 0 {
+                    out.single_tracks += 1;
+                } else {
+                    out.cut_tracks += 1;
+                    out.opened += *cost as u32;
+                }
+                out.dangling_tracks += behind.len() as u32;
+                drop.insert(*pick);
+                drop.extend(behind.iter().copied());
+            }
+            for v in &report.violations {
+                let names = |item: CheckedItem| matches!(item, CheckedItem::RoutedTrack { index } if drop.contains(&(index as usize)));
+                if names(v.a) || v.b.is_some_and(names) {
+                    *out.findings.entry(format!("{:?}", v.kind)).or_default() += 1;
+                }
+            }
+            let mut k = 0;
+            routed.tracks.retain(|_| {
+                k += 1;
+                !drop.contains(&(k - 1))
+            });
+            continue;
+        }
+        // Step 2: whole pieces.
+        let nt = routed.tracks.len();
+        let mut named: BTreeSet<usize> = BTreeSet::new();
+        for v in &report.violations {
+            let mut hit = false;
+            for item in std::iter::once(v.a).chain(v.b) {
+                match item {
+                    CheckedItem::RoutedTrack { index } => {
+                        named.insert(index as usize);
+                        hit = true;
+                    }
+                    CheckedItem::RoutedVia { index } => {
+                        named.insert(nt + index as usize);
+                        hit = true;
+                    }
+                    _ => {}
+                }
+            }
+            if hit {
+                *out.findings.entry(format!("{:?}", v.kind)).or_default() += 1;
+            }
+        }
+        if named.is_empty() {
+            break;
+        }
+        let piece = copper_pieces(routed);
+        let doomed: BTreeSet<usize> = named.iter().map(|&i| piece[i]).collect();
+        out.pieces += doomed.len() as u32;
+        let mut k = 0;
+        routed.tracks.retain(|t| {
+            let keep = !doomed.contains(&piece[k]);
+            k += 1;
+            if !keep {
+                nets.insert(t.net);
+                out.tracks += 1;
+            }
+            keep
+        });
+        routed.vias.retain(|v| {
+            let keep = !doomed.contains(&piece[k]);
+            k += 1;
+            if !keep {
+                nets.insert(v.net);
+                out.vias += 1;
+            }
+            keep
+        });
+    }
+    out.nets = nets.into_iter().collect();
+    // Last, routed copper that dangles anywhere (a spur S6 could not prune,
+    // or what a cut above left): it joins nothing.
+    let routed_nets: BTreeSet<NetId> = routed.tracks.iter().map(|t| t.net).collect();
+    let snapshot: &RoutedCopper = routed;
+    let spurs: BTreeSet<usize> = routed_nets
+        .into_par_iter()
+        .map(|net| dangling_tracks(work, net, snapshot, &BTreeSet::new()))
+        .reduce(BTreeSet::new, |mut a, b| {
+            a.extend(b);
+            a
+        });
+    out.spurs = spurs.len() as u32;
+    let mut k = 0;
+    routed.tracks.retain(|_| {
+        k += 1;
+        !spurs.contains(&(k - 1))
+    });
+    out
+}
+
+/// For each routed track, then each routed via, the id of the joined piece
+/// it belongs to: items of one net whose copper touches on a shared layer.
+fn copper_pieces(copper: &RoutedCopper) -> Vec<usize> {
+    use konnect_geom::{touches, Circle, IndexEntry, LayerIndex};
+    let nt = copper.tracks.len();
+    let n = nt + copper.vias.len();
+    let shape = |i: usize| -> Shape {
+        if i < nt {
+            Shape::Segment(copper.tracks[i].seg)
+        } else {
+            let v = &copper.vias[i - nt];
+            Shape::Circle(Circle::from_diameter(v.center, v.diameter))
+        }
+    };
+    let net = |i: usize| {
+        if i < nt {
+            copper.tracks[i].net
+        } else {
+            copper.vias[i - nt].net
+        }
+    };
+    let mut per_layer: BTreeMap<LayerId, Vec<IndexEntry>> = BTreeMap::new();
+    for (i, t) in copper.tracks.iter().enumerate() {
+        per_layer
+            .entry(t.layer)
+            .or_default()
+            .push(IndexEntry::new(i as u32, t.seg.bbox()));
+    }
+    for (j, v) in copper.vias.iter().enumerate() {
+        let b = shape(nt + j).bbox();
+        for layer in v.layers.iter() {
+            per_layer
+                .entry(layer)
+                .or_default()
+                .push(IndexEntry::new((nt + j) as u32, b));
+        }
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for entries in per_layer.into_values() {
+        let ids: Vec<(u32, BBox)> = entries.iter().map(|e| (e.id, e.bbox)).collect();
+        let index = LayerIndex::bulk_load(entries);
+        for (id, bbox) in ids {
+            let i = id as usize;
+            let si = shape(i);
+            for o in index.query(&bbox) {
+                let j = o as usize;
+                if j <= i || net(j) != net(i) || !touches(&si, &shape(j)) {
+                    continue;
+                }
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+    }
+    (0..n).map(|i| find(&mut parent, i)).collect()
+}
+
+/// What a node of one net's copper graph is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetNode {
+    Pad,
+    Board,
+    RoutedTrack(usize),
+    RoutedVia,
+}
+
+/// One net's copper on `work` with `routed` applied (routed tracks in
+/// `skip` left out): its nodes and, per layer, their shapes.
+#[allow(clippy::type_complexity)]
+fn net_copper(
+    work: &RouteBoard,
+    net: NetId,
+    routed: &RoutedCopper,
+    skip: &BTreeSet<usize>,
+) -> (Vec<NetNode>, BTreeMap<LayerId, Vec<(u32, Shape)>>) {
+    let policy = ArcPolicy::default();
+    let mut nodes: Vec<NetNode> = Vec::new();
+    let mut per_layer: BTreeMap<LayerId, Vec<(u32, Shape)>> = BTreeMap::new();
+    let mut node = |kind: NetNode| {
+        nodes.push(kind);
+        (nodes.len() - 1) as u32
+    };
+    for p in work.pads.iter().filter(|p| p.net == Some(net)) {
+        let n = node(NetNode::Pad);
+        for layer in p.layers.iter() {
+            for s in &p.shapes {
+                per_layer.entry(layer).or_default().push((n, s.clone()));
+            }
+        }
+    }
+    for t in work.tracks.iter().filter(|t| t.net == Some(net)) {
+        let n = node(NetNode::Board);
+        per_layer
+            .entry(t.layer)
+            .or_default()
+            .push((n, Shape::Segment(t.seg)));
+    }
+    for a in work.arcs.iter().filter(|a| a.net == Some(net)) {
+        let n = node(NetNode::Board);
+        for s in a.segments(&policy) {
+            per_layer
+                .entry(a.layer)
+                .or_default()
+                .push((n, Shape::Segment(s)));
+        }
+    }
+    for v in work.vias.iter().filter(|v| v.net == Some(net)) {
+        let n = node(NetNode::Board);
+        for layer in v.layers.iter() {
+            per_layer.entry(layer).or_default().push((n, v.shape()));
+        }
+    }
+    for z in work.zones.iter().filter(|z| z.filled && z.net == Some(net)) {
+        let n = node(NetNode::Board);
+        per_layer
+            .entry(z.layer)
+            .or_default()
+            .push((n, Shape::Polygon(z.region.clone())));
+    }
+    for (i, t) in routed.tracks.iter().enumerate() {
+        if t.net == net && !skip.contains(&i) {
+            let n = node(NetNode::RoutedTrack(i));
+            per_layer
+                .entry(t.layer)
+                .or_default()
+                .push((n, Shape::Segment(t.seg)));
+        }
+    }
+    for v in routed.vias.iter().filter(|v| v.net == net) {
+        let n = node(NetNode::RoutedVia);
+        let shape = Shape::Circle(konnect_geom::Circle::from_diameter(v.center, v.diameter));
+        for layer in v.layers.iter() {
+            per_layer.entry(layer).or_default().push((n, shape.clone()));
+        }
+    }
+    (nodes, per_layer)
+}
+
+/// How many islands holding a pad `net` has on `work` with `routed` applied
+/// (routed tracks in `skip` left out): S1's union-find, for one net.
+fn net_pad_islands(
+    work: &RouteBoard,
+    net: NetId,
+    routed: &RoutedCopper,
+    skip: &BTreeSet<usize>,
+) -> usize {
+    use konnect_geom::{touches, IndexEntry, LayerIndex};
+    let (nodes, per_layer) = net_copper(work, net, routed, skip);
+    let mut uf = crate::connectivity::UnionFind::new(nodes.len());
+    for shapes in per_layer.values() {
+        let index = LayerIndex::bulk_load(
+            shapes
+                .iter()
+                .enumerate()
+                .map(|(i, (_, s))| IndexEntry::new(i as u32, s.bbox()))
+                .collect(),
+        );
+        for (i, (ni, si)) in shapes.iter().enumerate() {
+            for j in index.query(&si.bbox()) {
+                let (nj, sj) = &shapes[j as usize];
+                if (j as usize) <= i || uf.same(*ni, *nj) {
+                    continue;
+                }
+                if touches(si, sj) {
+                    uf.union(*ni, *nj);
+                }
+            }
+        }
+    }
+    let roots: BTreeSet<u32> = (0..nodes.len() as u32)
+        .filter(|&i| nodes[i as usize] == NetNode::Pad)
+        .map(|i| uf.find(i))
+        .collect();
+    roots.len()
+}
+
+/// The routed tracks of `net` that dangle once the tracks in `skip` are
+/// gone, repeatedly: a track with an end touching no other copper of the
+/// net (pad, board copper, zone fill, routed via or track) whose removal
+/// leaves the net's pads as joined (its body may still carry a branch or
+/// touch a pad), so it and whatever then dangles behind it can go without
+/// opening any connection.
+fn dangling_tracks(
+    work: &RouteBoard,
+    net: NetId,
+    routed: &RoutedCopper,
+    skip: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    use konnect_geom::{touches, Circle, IndexEntry, LayerIndex, Point};
+    let mut gone = skip.clone();
+    let base = net_pad_islands(work, net, routed, &gone);
+    let mut refused: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        let (nodes, per_layer) = net_copper(work, net, routed, &gone);
+        let mut fresh = Vec::new();
+        for (layer, shapes) in &per_layer {
+            let index = LayerIndex::bulk_load(
+                shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, s))| IndexEntry::new(i as u32, s.bbox()))
+                    .collect(),
+            );
+            for (ni, _) in shapes {
+                let NetNode::RoutedTrack(t) = nodes[*ni as usize] else {
+                    continue;
+                };
+                let seg = routed.tracks[t].seg;
+                debug_assert_eq!(routed.tracks[t].layer, *layer);
+                let free = |p: Point| {
+                    let dot = Shape::Circle(Circle::new(p, 0));
+                    !index.query(&BBox::point(p)).into_iter().any(|j| {
+                        let (nj, sj) = &shapes[j as usize];
+                        nj != ni && touches(&dot, sj)
+                    })
+                };
+                if !refused.contains(&t) && (free(seg.a) || free(seg.b)) {
+                    fresh.push(t);
+                }
+            }
+        }
+        let mut took = false;
+        for t in fresh {
+            let mut trial = gone.clone();
+            trial.insert(t);
+            if net_pad_islands(work, net, routed, &trial) <= base {
+                gone = trial;
+                took = true;
+            } else {
+                refused.insert(t);
+            }
+        }
+        if !took {
+            break;
+        }
+    }
+    gone.retain(|i| !skip.contains(i));
+    gone
 }
 
 /// Per routed net, the S7 findings that name its copper.

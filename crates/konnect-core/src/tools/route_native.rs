@@ -68,7 +68,8 @@ fn job_props() -> Value {
         "nets": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Work only on these nets" },
         "threads": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Worker threads (all cores by default)" },
         "optimize": { "type": "boolean", "default": true, "description": "Run the exact-checked optimizer (S6)" },
-        "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Treat other nets' zone fills as copper" }
+        "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Treat other nets' zone fills as copper" },
+        "clear_findings": { "type": "boolean", "description": "After the optimizer, remove each piece of routed copper the exact check still finds a defect in, leaving its connections open (default: on for native routing, off for a plan or the board's own copper)" }
     })
 }
 
@@ -298,6 +299,7 @@ fn base_spec(args: &Value, output_plan: PathBuf) -> anyhow::Result<Result<Native
         threads: None,
         optimize: true,
         zones_are_obstacles: true,
+        clear_findings: None,
         time_limit_seconds: None,
     }))
 }
@@ -338,6 +340,11 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
         };
         spec.optimize = opt_bool(args, "optimize", true)?;
         spec.zones_are_obstacles = opt_bool(args, "zones_are_obstacles", true)?;
+        spec.clear_findings = match args.get("clear_findings") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => return Err(invalid("clear_findings", "must be a boolean")),
+        };
         spec.time_limit_seconds = match args.get("time_limit_seconds") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_u64() {
