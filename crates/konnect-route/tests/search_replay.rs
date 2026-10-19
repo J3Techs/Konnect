@@ -460,9 +460,11 @@ impl SearchBackend for CaptureBackend {
             let stack = &stacks[job.window as usize];
             // The job's own minimum-run flag, as the backend set it.
             let min_run = self.inner.min_run
-                && self.inner.min_run_nets.as_ref().is_none_or(|nets| {
-                    nets.get(job.net as usize).copied().unwrap_or(false)
-                });
+                && self
+                    .inner
+                    .min_run_nets
+                    .as_ref()
+                    .is_none_or(|nets| nets.get(job.net as usize).copied().unwrap_or(false));
             let bytes = encode(
                 &self.inner.config,
                 min_run,

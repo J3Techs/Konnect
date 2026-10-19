@@ -1522,6 +1522,61 @@ fn a_squeezed_pad_necks_down_only_when_allowed() {
     assert_eq!(islands, 1);
 }
 
+/// The squeezed pad's only exit is towards board +y (Y-down), which is
+/// heading 6 in the raster's Y-up encoding. The search must leave the stub
+/// within 45 degrees of it, never fold back towards the pad.
+#[test]
+fn a_stub_off_a_vertical_exit_continues_away_from_the_pad() {
+    let board = squeezed_pad();
+    let wide = UniformRules {
+        class: crate::rules::NetClassRules {
+            track_width: 300_000,
+            ..UniformRules::default().class
+        },
+        ..UniformRules::default()
+    };
+    let rules = NeckRules(wide, 100_000);
+    let n = board.net_by_name("N").unwrap();
+    let pad = board.pads.iter().find(|p| p.net == Some(n)).unwrap().center;
+    let necked = NegotiationInputs {
+        neck_down: Some(NeckDown::default()),
+        ..NegotiationInputs::default()
+    };
+    let r = negotiate_inputs(&board, &rules, &necked);
+    let tracks: Vec<_> = r.copper.tracks.iter().filter(|t| t.net == n).collect();
+    let stub = tracks
+        .iter()
+        .find(|t| t.seg.width < 300_000)
+        .expect("a narrow stub");
+    let (near, far) = if (stub.seg.a - pad).length2() <= (stub.seg.b - pad).length2() {
+        (stub.seg.a, stub.seg.b)
+    } else {
+        (stub.seg.b, stub.seg.a)
+    };
+    assert!(far.y > near.y, "the stub leaves along board +y: {stub:?}");
+    let back = near - far;
+    let mut joined = 0;
+    for t in &tracks {
+        let next = if t.seg.a == far && t.seg.b != near {
+            t.seg.b - far
+        } else if t.seg.b == far && t.seg.a != near {
+            t.seg.a - far
+        } else {
+            continue;
+        };
+        joined += 1;
+        // Interior angle at the joint of at least 135 degrees: the cosine
+        // between the way back to the pad and the way on is at most -1/sqrt2.
+        let dot = back.x as f64 * next.x as f64 + back.y as f64 * next.y as f64;
+        let len = ((back.x as f64).hypot(back.y as f64)) * ((next.x as f64).hypot(next.y as f64));
+        assert!(
+            dot / len <= -std::f64::consts::FRAC_1_SQRT_2 + 1e-9,
+            "the route folds back at the stub: {tracks:?}"
+        );
+    }
+    assert_eq!(joined, 1, "{tracks:?}");
+}
+
 /// [`crossing_bundle`] stretched over several tiles, so every connection is
 /// cut into pieces at tile crossings.
 fn wide_crossing_bundle(n: usize, width: f64) -> RouteBoard {

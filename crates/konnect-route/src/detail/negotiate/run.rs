@@ -101,28 +101,6 @@ pub(crate) fn half_diag(pitch: i32) -> i32 {
     ((f64::from(pitch) * std::f64::consts::FRAC_1_SQRT_2).ceil()) as i32
 }
 
-/// S4 exit headings (0 = +x, counter-clockwise in the Y-up sense) as the
-/// kernel's headings ([`crate::detail::search::HEADINGS`], lattice steps in
-/// the Y-down board frame).
-fn access_to_kernel(mask: u8) -> u8 {
-    let mut out = 0u8;
-    for h in 0..8u8 {
-        if mask & (1 << h) != 0 {
-            // S4 heading h points at angle h * 45 degrees with y up, i.e.
-            // (cos, -sin) in board coordinates.
-            let a = f64::from(h) * std::f64::consts::FRAC_PI_4;
-            let (dx, dy) = (a.cos().round() as i32, (-a.sin()).round() as i32);
-            if let Some(k) = crate::detail::search::HEADINGS
-                .iter()
-                .position(|&d| d == (dx, dy))
-            {
-                out |= 1 << k;
-            }
-        }
-    }
-    out
-}
-
 /// The Chebyshev radius, in nodes, a via site of `profile` on layer `slot`
 /// must keep free of HALO: the via's reach past a track's half width, plus
 /// a node's half-diagonal.
@@ -794,7 +772,7 @@ impl TileRun {
             .into_iter()
             .flatten()
             .filter(|a| a.layer == layer && a.headings != 0)
-            .map(|a| (a.point, access_to_kernel(a.headings)))
+            .map(|a| (a.point, a.headings))
             .collect();
         let anchor = ctx.board.pads[pad.index()].center;
         if !origins.iter().any(|(p, _)| *p == anchor) {
@@ -813,7 +791,9 @@ impl TileRun {
                     if headings & (1 << h) == 0 {
                         continue;
                     }
-                    let (dx, dy) = crate::detail::search::HEADINGS[h as usize];
+                    // S4's exit bits use the raster's Y-up encoding, as the
+                    // kernel's masks do; the board step is `heading_delta`'s.
+                    let (dx, dy) = crate::detail::search::heading_delta(h);
                     let diag = dx != 0 && dy != 0;
                     let mut t = (2 * pitch).max(i64::from(min_len));
                     while t <= i64::from(reach) {
