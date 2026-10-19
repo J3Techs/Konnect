@@ -275,6 +275,33 @@ pub fn lint_group(segs: &[LintSeg], limits: &LintLimits) -> Vec<Defect> {
             }
         }
     }
+    // Pairs KiCad measures away from a shared end: a branch on a run's
+    // middle, a crossing, a collinear overlap ([`crate::check::junction`]).
+    // KiCad reports these as track angles too. Two fixed pieces are the
+    // board's own and are left out.
+    for (i, s) in segs.iter().enumerate() {
+        candidates.clear();
+        match &index {
+            Some(index) => candidates.extend(index.query(&BBox::new(s.a, s.b))),
+            None => candidates.extend(0..segs.len() as u32),
+        }
+        for &k in &candidates {
+            let o = &segs[k as usize];
+            if (k as usize) <= i || (s.fixed && o.fixed) {
+                continue;
+            }
+            if let Some(pa) = crate::check::junction::pair_angle((s.a, s.b), (o.a, o.b)) {
+                if pa.reported((s.a, s.b), (o.a, o.b))
+                    && pa.angle_deg < limits.min_bend_angle_deg - 1e-9
+                {
+                    out.push(Defect {
+                        kind: DefectKind::AcuteBend,
+                        at: pa.at,
+                    });
+                }
+            }
+        }
+    }
     out
 }
 
@@ -373,5 +400,24 @@ mod tests {
                 .count(),
             59
         );
+    }
+
+    #[test]
+    fn crossings_and_overlaps_are_acute_bends_as_kicad_measures_them() {
+        // Two runs of one net crossing at 45 degrees.
+        let cross = [s((0, 0), (4 * MM, 0)), s((MM, -MM), (3 * MM, MM))];
+        assert_eq!(kinds(&cross), [DefectKind::AcuteBend]);
+        // At a right angle they pass.
+        let square = [s((0, 0), (4 * MM, 0)), s((2 * MM, -MM), (2 * MM, MM))];
+        assert!(kinds(&square).is_empty());
+        // A run lying along another the same way meets it at 0 degrees.
+        // (each end also rests on the other's middle).
+        let along = [s((0, 0), (2 * MM, 0)), s((MM, 0), (3 * MM, 0))];
+        assert!(kinds(&along).contains(&DefectKind::AcuteBend));
+        // Two fixed pieces are the board's own.
+        let mut fixed = cross;
+        fixed[0].fixed = true;
+        fixed[1].fixed = true;
+        assert!(kinds(&fixed).is_empty());
     }
 }

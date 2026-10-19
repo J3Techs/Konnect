@@ -14,6 +14,7 @@
 //! | via size | each via: diameter, drill, annular ring | [`RuleTable::via`] floors |
 //! | segment length | each track and arc | [`RuleTable::min_segment_length`] |
 //! | track angle | every pair of track ends of one net meeting at one point on one layer, off pads | [`RuleTable::min_track_angle_deg`] |
+//! | track angle (KiCad pairs) | every pair of tracks of one net on one layer whose centre lines meet away from a shared end (a branch on a run's middle, a crossing, a collinear overlap), off pads, measured as KiCad does ([`junction`]) | [`RuleTable::min_track_angle_deg`] |
 //!
 //! # Exactness and margins
 //!
@@ -86,6 +87,8 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
+
+pub mod junction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1100,6 +1103,7 @@ impl<'b> BoardChecker<'b> {
         found.extend(ctx.keepouts());
         found.extend(ctx.single_items(routed));
         found.extend(ctx.track_angles(routed));
+        found.extend(ctx.track_pair_angles(routed));
 
         stats.objects = self
             .layers
@@ -1836,6 +1840,97 @@ impl<'c, 'b> Ctx<'c, 'b> {
                                 required: (min * 10.0).round() as Coord,
                             });
                         }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// KiCad's pairwise half of the track-angle test ([`junction`]): two
+    /// tracks of one net on one layer whose centre lines meet away from an
+    /// end they share (a branch landing on a run's middle, a crossing, a
+    /// collinear overlap), off pads, against the stricter of their rules.
+    /// Ends meeting exactly are [`Self::track_angles`]'s. Arcs are left out,
+    /// as KiCad leaves them out of this test.
+    fn track_pair_angles(&self, routed: &RoutedCopper) -> Vec<Violation> {
+        let board = self.c.board;
+        // (src, net, layer, a, b) for every track that takes part.
+        let mut segs: Vec<(Src, NetId, LayerId, Point, Point)> = Vec::new();
+        for t in &board.tracks {
+            if let Some(net) = t.net {
+                segs.push((
+                    Src::Board(ItemRef::Track(t.id)),
+                    net,
+                    t.layer,
+                    t.seg.a,
+                    t.seg.b,
+                ));
+            }
+        }
+        for (i, t) in routed.tracks.iter().enumerate() {
+            segs.push((Src::RoutedTrack(i as u32), t.net, t.layer, t.seg.a, t.seg.b));
+        }
+        segs.retain(|s| s.3 != s.4);
+        let mut by_layer: BTreeMap<LayerId, Vec<u32>> = BTreeMap::new();
+        for (k, s) in segs.iter().enumerate() {
+            by_layer.entry(s.2).or_default().push(k as u32);
+        }
+        let index: BTreeMap<LayerId, LayerIndex> = by_layer
+            .iter()
+            .map(|(&l, ids)| {
+                let entries = ids
+                    .iter()
+                    .map(|&k| {
+                        let s = &segs[k as usize];
+                        IndexEntry::new(k, BBox::new(s.3, s.4))
+                    })
+                    .collect();
+                (l, LayerIndex::bulk_load(entries))
+            })
+            .collect();
+        (0..segs.len())
+            .into_par_iter()
+            .filter(|&k| !self.routed || segs[k].0.is_routed())
+            .flat_map_iter(|k| {
+                let (src, net, layer, a, b) = segs[k];
+                let mut out = Vec::new();
+                for o in index[&layer].query(&BBox::new(a, b)) {
+                    let (osrc, onet, _, oa, ob) = segs[o as usize];
+                    // Each pair once: a routed track against every board
+                    // track, and against the routed tracks after it.
+                    if onet != net
+                        || (osrc.is_routed() == src.is_routed() && (o as usize) <= k)
+                        || (self.routed && osrc.is_routed() && !src.is_routed())
+                    {
+                        continue;
+                    }
+                    let Some(pa) = junction::pair_angle((a, b), (oa, ob)) else {
+                        continue;
+                    };
+                    if !pa.reported((a, b), (oa, ob)) || self.on_pad(layer, pa.at) {
+                        continue;
+                    }
+                    let rule = |s: Src| {
+                        self.c
+                            .rules
+                            .min_track_angle_deg(&self.src_subject(s).view(), layer)
+                    };
+                    let min = match (rule(src), rule(osrc)) {
+                        (Some(x), Some(y)) => x.max(y),
+                        (Some(x), None) | (None, Some(x)) => x,
+                        (None, None) => continue,
+                    };
+                    if pa.angle_deg < min - 1e-9 {
+                        let (sa, sb) = Self::orient(src, osrc);
+                        out.push(Violation {
+                            kind: ViolationKind::TrackAngle,
+                            a: sa.checked(),
+                            b: Some(sb.checked()),
+                            layer: Some(layer),
+                            at: pa.at,
+                            required: (min * 10.0).round() as Coord,
+                        });
                     }
                 }
                 out

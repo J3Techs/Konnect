@@ -160,6 +160,14 @@ pub struct OptimizeOptions {
     /// Commit rounds (a reverted net is retried in the next).
     pub rounds: u32,
     pub checker: CheckerOptions,
+    /// On a net with no `track_segment_length` rule, a segment shorter than
+    /// this counts as a short segment for the geometry gate, so no edit
+    /// adds one (a sliver is junk copper whatever the net's class says, and
+    /// KiCad's class resolution can put a net under a rule the rule table
+    /// does not see). `None`: rule nets only; the pipeline and the job
+    /// runner fill it with [`sliver_floor`], the board's smallest rule
+    /// minimum. `Some(0)` turns it off.
+    pub sliver_floor_nm: Option<Coord>,
 }
 
 impl Default for OptimizeOptions {
@@ -185,8 +193,27 @@ impl Default for OptimizeOptions {
             max_passes: 3,
             rounds: 2,
             checker: CheckerOptions::default(),
+            sliver_floor_nm: None,
         }
     }
+}
+
+/// The smallest `track_segment_length` minimum the rules set for any net of
+/// `board` on any of its copper layers: a board-derived floor for
+/// [`OptimizeOptions::sliver_floor_nm`].
+pub fn sliver_floor(board: &RouteBoard, rules: &dyn RuleTable) -> Option<Coord> {
+    let layers = board.layer_count();
+    board
+        .nets
+        .iter()
+        .flat_map(|n| {
+            let subject = RuleSubject::new(crate::api::ItemKind::Track, Some(n.id));
+            (0..layers)
+                .filter_map(|l| rules.min_segment_length(&subject, LayerId(l as u8)))
+                .collect::<Vec<_>>()
+        })
+        .filter(|&m| m > 0)
+        .min()
 }
 
 /// Improve `copper` in place without introducing any violation.
@@ -246,7 +273,9 @@ pub fn lint_limits(
         min_bend_angle_deg: opts
             .min_bend_angle_deg
             .max(rules.min_track_angle_deg(&subject, layer).unwrap_or(0.0)),
-        min_segment_length_nm: rules.min_segment_length(&subject, layer),
+        min_segment_length_nm: rules
+            .min_segment_length(&subject, layer)
+            .or(opts.sliver_floor_nm),
     }
 }
 
@@ -1685,6 +1714,12 @@ impl<'c, 'b> NetWork<'c, 'b> {
                     }
                 }
             }
+            // Tracks KiCad measures at an acute angle against another track
+            // of the net away from a shared end (a crossing, a branch on a
+            // run's middle, an overlap along a run or a fixed track).
+            for slot in self.pair_angle_slots() {
+                candidates.push((self.tracks[slot].expect("live").seg.length(), slot));
+            }
             candidates.sort_unstable();
             candidates.dedup();
             let mut done = false;
@@ -1711,6 +1746,44 @@ impl<'c, 'b> NetWork<'c, 'b> {
         }
         self.compact();
         any
+    }
+
+    /// Live routed tracks that meet another track of the net (routed or
+    /// fixed) away from an end they share at an angle under the layer's
+    /// minimum bend, as KiCad's track-angle test measures it
+    /// ([`crate::check::junction::pair_angle`]).
+    fn pair_angle_slots(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for layer in self.layers() {
+            let min = self.limits(layer).min_bend_angle_deg;
+            let live: Vec<(usize, Segment)> = self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t.filter(|t| t.layer == layer).map(|t| (i, t.seg)))
+                .collect();
+            let acute = |a: &Segment, b: &Segment| {
+                crate::check::junction::pair_angle((a.a, a.b), (b.a, b.b)).is_some_and(|pa| {
+                    pa.reported((a.a, a.b), (b.a, b.b)) && pa.angle_deg < min - 1e-9
+                })
+            };
+            for (x, (i, si)) in live.iter().enumerate() {
+                for (j, sj) in &live[x + 1..] {
+                    if si.bbox().intersects(&sj.bbox()) && acute(si, sj) {
+                        out.push(*i);
+                        out.push(*j);
+                    }
+                }
+                for (l, f) in self.fixed {
+                    if *l == layer && si.bbox().intersects(&f.bbox()) && acute(si, f) {
+                        out.push(*i);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Whether every same-net item track `slot` touches on its layer is

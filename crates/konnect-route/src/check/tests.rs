@@ -250,7 +250,8 @@ fn track_angles_pair_up_three_way_junctions_and_skip_pads() {
     b.via("C", (20.0, 6.0), 0.6, 0.3, false);
     b.track("C", "F.Cu", (16.0, 6.0), (20.0, 6.0), 0.15, false);
     b.track("C", "F.Cu", (20.0, 6.0), (17.0, 9.0), 0.15, false);
-    // An overlapping same-direction run is not a bend.
+    // An overlapping same-direction run is no bend at its shared end, but
+    // KiCad measures the pair at the overlap's middle: 0°.
     b.track("D", "F.Cu", (2.0, 25.0), (6.0, 25.0), 0.15, false);
     b.track("D", "F.Cu", (2.0, 25.0), (4.0, 25.0), 0.15, false);
     let r = board_check(&b.build(), &rules);
@@ -260,7 +261,12 @@ fn track_angles_pair_up_three_way_junctions_and_skip_pads() {
         .filter(|v| v.kind == ViolationKind::TrackAngle)
         .map(|v| v.at)
         .collect();
-    assert_eq!(at, vec![pt(6.0, 6.0), pt(20.0, 6.0)], "{:?}", r.violations);
+    assert_eq!(
+        at,
+        vec![pt(6.0, 6.0), pt(20.0, 6.0), pt(3.0, 25.0)],
+        "{:?}",
+        r.violations
+    );
 }
 
 #[test]
