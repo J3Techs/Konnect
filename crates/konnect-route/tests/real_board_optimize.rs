@@ -13,6 +13,8 @@
 //!     --test real_board_optimize -- --nocapture
 //! ```
 
+mod common;
+
 use konnect_geom::ArcPolicy;
 use konnect_route::api::Generation;
 use konnect_route::connectivity::ConnectivityReport;
@@ -161,6 +163,14 @@ fn optimizer_on_a_real_routed_board() {
         ConnectivityReport::build(&joined(&board, &many), &ArcPolicy::default()).connection_count();
     println!("connections still needed: {conn_before} before, {conn_after} after");
     assert!(conn_after <= conn_before, "no connection was lost");
+    // The same, judged by anchors as KiCad joins copper (overlap alone can
+    // hide a track end that left a pad).
+    let split_nets = common::nets_split(
+        &common::anchor_islands(&board, &copper),
+        &common::anchor_islands(&board, &many),
+    );
+    println!("nets split by anchors: {}", split_nets.len());
+    assert!(split_nets.is_empty(), "anchor joins lost: {split_nets:?}");
 
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let defects = geometry_defects(&rules, &opts, &many);

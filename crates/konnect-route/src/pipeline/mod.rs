@@ -343,21 +343,15 @@ fn run(
 
     // 7. Optimize, guarded by the S7 checker.
     if let Some(opts) = &settings.optimize {
-        let t = Instant::now();
-        let checker = ExactChecker::new(&work, rules, opts.checker);
-        let original = routed.clone();
-        let report = optimize_checked(&checker, &mut routed, opts);
-        record_counters(&report, tel);
-        tel.add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
-        if settings.guard_optimize {
-            let t = Instant::now();
-            out.optimize_reverted = guard(&work, rules, &original, &mut routed);
-            tel.count(
-                "pipeline_optimize_reverted",
-                out.optimize_reverted.len() as u64,
-            );
-            tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
-        }
+        let (report, reverted) = optimize_guarded(
+            &work,
+            rules,
+            &mut routed,
+            opts,
+            settings.guard_optimize,
+            tel,
+        );
+        out.optimize_reverted = reverted;
         out.optimize = Some(report);
     }
 
@@ -420,8 +414,39 @@ pub fn select_connections(
         .collect()
 }
 
-/// Append `copper` to `board` as locked copper.
-fn add_locked(board: &mut RouteBoard, copper: &RoutedCopper) {
+/// Step 7 on its own: S6 over `routed` against `work` (the board with the
+/// fanout as locked copper), then, when `guard_optimize` is set, the S7
+/// guard that puts back every net the optimizer left with more findings.
+/// Returns the optimizer's report and the nets put back. [`route_board`]
+/// runs exactly this; it is public so a run's routed copper can be
+/// re-optimized offline.
+pub fn optimize_guarded(
+    work: &RouteBoard,
+    rules: &dyn RuleTable,
+    routed: &mut RoutedCopper,
+    opts: &OptimizeOptions,
+    guard_optimize: bool,
+    tel: &mut Telemetry,
+) -> (OptimizeReport, Vec<NetId>) {
+    let t = Instant::now();
+    let checker = ExactChecker::new(work, rules, opts.checker);
+    let original = routed.clone();
+    let report = optimize_checked(&checker, routed, opts);
+    record_counters(&report, tel);
+    tel.add_stage_time(Stage::Optimize, t.elapsed().as_micros() as u64);
+    let mut reverted = Vec::new();
+    if guard_optimize {
+        let t = Instant::now();
+        reverted = guard(work, rules, &original, routed);
+        tel.count("pipeline_optimize_reverted", reverted.len() as u64);
+        tel.add_stage_time(Stage::Check, t.elapsed().as_micros() as u64);
+    }
+    (report, reverted)
+}
+
+/// Append `copper` to `board` as locked copper (what the pipeline does with
+/// the fanout before routing).
+pub fn add_locked(board: &mut RouteBoard, copper: &RoutedCopper) {
     for t in &copper.tracks {
         board.tracks.push(Track {
             id: TrackId(board.tracks.len() as u32),
