@@ -457,9 +457,11 @@ fn negotiation_converges_on_a_crossing_bundle() {
 #[test]
 fn unresolved_conflicts_keep_copper_greedily_and_fail_the_rest() {
     let board = crossing_bundle(6);
-    // One iteration blind to congestion leaves conflicts unresolved.
+    // One iteration blind to congestion leaves conflicts unresolved (and no
+    // fill pass routes the losers).
     let tuning = NegotiationTuning {
         initial_present_factor: 0,
+        fill_passes: 0,
         ..NegotiationTuning::default()
     };
     let (result, _) = route_with(
@@ -668,8 +670,12 @@ fn unroutable_connections_get_named_reasons() {
         reason("INNER"),
         Some(FailureReason::NoAccess { .. })
     ));
-    // A hard failure is retried once in the shifted tiling, then given up.
-    assert_eq!(result.iterations, 2, "{:?}", result.reports);
+    // A hard failure is retried once in the shifted tiling, then given up
+    // by negotiation; the fill passes try it once more in each tiling.
+    let negotiated = result.reports.iter().filter(|r| !r.fill).count();
+    assert_eq!(negotiated, 2, "{:?}", result.reports);
+    let fills = result.reports.iter().filter(|r| r.fill).count();
+    assert_eq!(fills, 2, "{:?}", result.reports);
     assert_clean_and_connected(&board, &result);
 }
 
@@ -1161,4 +1167,251 @@ fn pinned_runs_are_merged_and_short_segments_are_reported() {
     // Without the rule nothing is reported.
     let (plain, _) = route(&board);
     assert!(plain.short_segments.is_empty());
+}
+
+#[test]
+fn reopened_via_sites_match_a_full_erosion() {
+    // Re-deriving a node range from the live counters gives exactly what
+    // the full erosion gives there.
+    let w = Window::new(Point::new(0, 0), 50_000, 37, 29).unwrap();
+    let mut r = TileRaster::new(TileId(0), LayerId(0), crate::api::ProfileId(0), w);
+    let mut seed = 12_345u32;
+    for row in 0..29u32 {
+        for col in 0..37u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if (seed >> 16).is_multiple_of(23) {
+                *r.halo.get_mut(col, row) = 1;
+            }
+            if (seed >> 16).is_multiple_of(97) {
+                *r.core.get_mut(col, row) = 1;
+                *r.halo.get_mut(col, row) = 1;
+            }
+        }
+    }
+    for k in [0usize, 1, 2, 3] {
+        let mut full = r.clone();
+        for row in 0..29u32 {
+            for col in 0..37u32 {
+                let v = u8::from(full.core.get(col, row) == 0);
+                full.via_site.set(col, row, v);
+            }
+        }
+        run::erode_for_test(&mut full, k);
+        let mut part = r.clone();
+        part.via_site.fill(7);
+        run::rederive_for_test(&mut part, (3, 2, 30, 25), k);
+        for row in 0..29u32 {
+            for col in 0..37u32 {
+                let inside = (3..=30).contains(&col) && (2..=25).contains(&row);
+                let want = if inside {
+                    full.via_site.get(col, row)
+                } else {
+                    7
+                };
+                assert_eq!(part.via_site.get(col, row), want, "k {k} ({col}, {row})");
+            }
+        }
+    }
+}
+
+#[test]
+fn fill_passes_route_more_and_stay_legal() {
+    let board = crossing_bundle(6);
+    let blind = |fill_passes| NegotiationTuning {
+        initial_present_factor: 0,
+        fill_passes,
+        ..NegotiationTuning::default()
+    };
+    let settings = NegotiationSettings {
+        threads: 2,
+        max_iterations: 1,
+        ..NegotiationSettings::default()
+    };
+    let (without, _) = route_with(&board, settings, blind(0));
+    let (with, _) = route_with(&board, settings, blind(2));
+    assert!(!without.failed.is_empty());
+    assert!(
+        with.routed.len() > without.routed.len(),
+        "{} vs {}",
+        with.routed.len(),
+        without.routed.len()
+    );
+    assert!(with.reports.iter().any(|r| r.fill));
+    // Fill copper never conflicts with what was already kept.
+    assert_clean_and_connected(&board, &with);
+}
+
+/// [`UniformRules`] with a smaller minimum track width than the preferred.
+struct NeckRules(UniformRules, Coord);
+
+impl RuleTable for NeckRules {
+    fn class_of(&self, net: Option<NetId>) -> crate::api::ClassId {
+        self.0.class_of(net)
+    }
+    fn class(&self, class: crate::api::ClassId) -> &crate::rules::NetClassRules {
+        self.0.class(class)
+    }
+    fn clearance(&self, a: &RuleSubject<'_>, b: &RuleSubject<'_>, layer: LayerId) -> Coord {
+        self.0.clearance(a, b, layer)
+    }
+    fn track_width(&self, s: &RuleSubject<'_>, layer: LayerId) -> crate::rules::WidthRule {
+        crate::rules::WidthRule {
+            min: self.1,
+            ..self.0.track_width(s, layer)
+        }
+    }
+    fn via(&self, s: &RuleSubject<'_>) -> ViaRule {
+        self.0.via(s)
+    }
+    fn min_track_angle_deg(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<f64> {
+        self.0.min_track_angle_deg(s, layer)
+    }
+    fn min_segment_length(&self, s: &RuleSubject<'_>, layer: LayerId) -> Option<Coord> {
+        self.0.min_segment_length(s, layer)
+    }
+    fn edge_clearance(&self) -> Coord {
+        self.0.edge_clearance()
+    }
+    fn hole_clearance(&self) -> Coord {
+        self.0.hole_clearance()
+    }
+    fn hole_to_hole(&self) -> Coord {
+        self.0.hole_to_hole()
+    }
+    fn max_clearance(&self) -> Coord {
+        self.0.max_clearance()
+    }
+    fn inert_rules(&self) -> &[crate::rules::InertRule] {
+        self.0.inert_rules()
+    }
+}
+
+fn negotiate_inputs(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    inputs: &NegotiationInputs,
+) -> DetailResult {
+    let connections = ConnectivityReport::build(board, &ArcPolicy::default()).connections(board);
+    let mut backend = ReferenceSearch::new(1);
+    let r = negotiate_connections_with(
+        board,
+        rules,
+        &connections,
+        &GlobalResult::default(),
+        None,
+        &NegotiationSettings {
+            threads: 1,
+            ..NegotiationSettings::default()
+        },
+        &NegotiationTuning::default(),
+        inputs,
+        &mut backend,
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.routed.len() + r.failed.len(), connections.len());
+    r
+}
+
+#[test]
+fn a_pad_off_the_lattice_is_entered_by_a_stub() {
+    let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu"]);
+    let u = b.footprint("U1", (5.0, 5.0));
+    // Smaller than a lattice pitch and between nodes: no node touches it.
+    b.smd_pad(u, "1", "S", (5.025, 5.025), (0.03, 0.03), "F.Cu");
+    let j = b.footprint("J1", (15.0, 5.0));
+    b.smd_pad(j, "1", "S", (15.0, 5.0), (0.6, 0.6), "F.Cu");
+    let board = b.build();
+    let r = negotiate_inputs(
+        &board,
+        &UniformRules::default(),
+        &NegotiationInputs::default(),
+    );
+    assert!(r.failed.is_empty(), "{:?}", r.failure_details);
+    let v = violations(&board, &r.copper);
+    assert!(v.is_empty(), "{v:?}");
+    let routed = with_copper(&board, &r.copper);
+    assert_eq!(
+        ConnectivityReport::build(&routed, &ArcPolicy::default()).connection_count(),
+        0
+    );
+}
+
+/// A pad squeezed between pads of another net: at the preferred width no
+/// track can leave it, at the neck-down width one can.
+fn squeezed_pad() -> RouteBoard {
+    let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu"]);
+    let u = b.footprint("U1", (10.0, 10.0));
+    b.smd_pad(u, "1", "N", (10.0, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "2", "X", (9.5, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "3", "X", (10.5, 10.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(u, "4", "X", (10.0, 9.5), (0.4, 0.4), "F.Cu");
+    let j = b.footprint("J1", (22.0, 14.0));
+    b.smd_pad(j, "1", "N", (22.0, 14.0), (0.6, 0.6), "F.Cu");
+    b.build()
+}
+
+#[test]
+fn a_squeezed_pad_necks_down_only_when_allowed() {
+    let board = squeezed_pad();
+    let wide = UniformRules {
+        class: crate::rules::NetClassRules {
+            track_width: 300_000,
+            ..UniformRules::default().class
+        },
+        ..UniformRules::default()
+    };
+    let rules = NeckRules(wide.clone(), 100_000);
+    let n = board.net_by_name("N").unwrap();
+    let conns = ConnectivityReport::build(&board, &ArcPolicy::default()).connections(&board);
+    let conn_n = conns.iter().find(|c| c.net == n).unwrap().id;
+
+    let plain = negotiate_inputs(&board, &rules, &NegotiationInputs::default());
+    assert!(
+        plain
+            .failure_details
+            .iter()
+            .any(|(c, f)| *c == conn_n && matches!(f, DetailFailure::NoAccess { .. })),
+        "{:?}",
+        plain.failure_details
+    );
+    let excluded = NegotiationInputs {
+        neck_down: Some(NeckDown {
+            excluded: [crate::api::ClassId(0)].into_iter().collect(),
+            ..NeckDown::default()
+        }),
+        ..NegotiationInputs::default()
+    };
+    let r = negotiate_inputs(&board, &rules, &excluded);
+    assert!(!r.routed.contains(&conn_n), "an excluded class never necks");
+
+    let necked = NegotiationInputs {
+        neck_down: Some(NeckDown::default()),
+        ..NegotiationInputs::default()
+    };
+    let r = negotiate_inputs(&board, &rules, &necked);
+    assert!(r.routed.contains(&conn_n), "{:?}", r.failure_details);
+    let v = violations_with(&board, &r.copper, &wide);
+    assert!(v.is_empty(), "{v:?}");
+    // One narrow stub within the neck-down reach of the pad; the rest of
+    // the route is at the preferred width.
+    let pad = board.pads.iter().find(|p| p.net == Some(n)).unwrap().center;
+    let narrow: Vec<_> = r
+        .copper
+        .tracks
+        .iter()
+        .filter(|t| t.net == n && t.seg.width < 300_000)
+        .collect();
+    assert_eq!(narrow.len(), 1, "{:?}", r.copper.tracks);
+    assert_eq!(narrow[0].seg.width, 100_000);
+    for p in [narrow[0].seg.a, narrow[0].seg.b] {
+        assert!((p - pad).length2() <= 1_000_000i128 * 1_000_000);
+    }
+    let routed = with_copper(&board, &r.copper);
+    let left = ConnectivityReport::build(&routed, &ArcPolicy::default());
+    let islands = left.nets[n.index()]
+        .islands
+        .iter()
+        .filter(|i| i.has_pad())
+        .count();
+    assert_eq!(islands, 1);
 }

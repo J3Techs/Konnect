@@ -12,6 +12,7 @@
 use super::cache::{HardLayer, RasterCache, RasterPool, TileStatic};
 use super::conflicts::HistoryMap;
 use super::copper::{PieceCopper, SegCopper, ViaCopper};
+use super::obstacles::ObstacleKind;
 use super::pieces::{PieceJob, Terminal};
 use super::tiles::TileSpec;
 use super::{Ctx, DetailFailure, Task};
@@ -64,10 +65,118 @@ pub(crate) struct TileRun {
     pub telemetry: Telemetry,
     /// Wall time `route_all` took.
     pub busy_us: u64,
+    /// Fill mode: other nets' routed copper is painted as a hard wall (CORE
+    /// and HALO), not as soft congestion, so a fill pass can only commit
+    /// copper that keeps clear of it.
+    hard_routed: bool,
+    /// Via sites overwritten while a net's own copper is lifted, put back
+    /// when it is painted again.
+    saved_sites: Vec<SavedSites>,
+    /// The active job's pad stubs: terminal nodes reached through a short
+    /// exact-checked track from a point in a pad.
+    stubs: Vec<Stub>,
+}
+
+/// A terminal node outside a pad, joined to it by a stub track.
+#[derive(Debug, Clone, Copy)]
+struct Stub {
+    col: u16,
+    row: u16,
+    slot: u8,
+    /// The stub's end inside the pad.
+    from: Point,
+    width: Coord,
+}
+
+/// Via sites of one stack layer over a node range, saved before the net
+/// being routed reopened them.
+struct SavedSites {
+    stack: usize,
+    slot: usize,
+    range: (u32, u32, u32, u32),
+    values: Vec<u8>,
 }
 
 pub(crate) fn half_diag(pitch: i32) -> i32 {
     ((f64::from(pitch) * std::f64::consts::FRAC_1_SQRT_2).ceil()) as i32
+}
+
+/// S4 exit headings (0 = +x, counter-clockwise in the Y-up sense) as the
+/// kernel's headings ([`crate::detail::search::HEADINGS`], lattice steps in
+/// the Y-down board frame).
+fn access_to_kernel(mask: u8) -> u8 {
+    let mut out = 0u8;
+    for h in 0..8u8 {
+        if mask & (1 << h) != 0 {
+            // S4 heading h points at angle h * 45 degrees with y up, i.e.
+            // (cos, -sin) in board coordinates.
+            let a = f64::from(h) * std::f64::consts::FRAC_PI_4;
+            let (dx, dy) = (a.cos().round() as i32, (-a.sin()).round() as i32);
+            if let Some(k) = crate::detail::search::HEADINGS
+                .iter()
+                .position(|&d| d == (dx, dy))
+            {
+                out |= 1 << k;
+            }
+        }
+    }
+    out
+}
+
+/// The Chebyshev radius, in nodes, a via site of `profile` on layer `slot`
+/// must keep free of HALO: the via's reach past a track's half width, plus
+/// a node's half-diagonal.
+fn via_reach_nodes(profile: &super::Profile, slot: usize, pitch: Coord) -> usize {
+    let rv = profile.via_diameter / 2 + profile.via_diameter % 2;
+    let hw = profile.widths[slot] / 2 + profile.widths[slot] % 2;
+    let rho = (rv - hw).max(0) + half_diag(pitch);
+    ((rho + pitch - 1) / pitch) as usize
+}
+
+/// Recompute `via_site` over the node range from the live counters: a node
+/// is a site (`VIA_CHECK`) when its CORE is clear and no node within
+/// Chebyshev radius `k` carries HALO; nodes whose square leaves the window
+/// are refused, as [`erode_into`] refuses them.
+fn rederive_sites(r: &mut TileRaster, range: (u32, u32, u32, u32), k: usize) {
+    let (c0, r0, c1, r1) = range;
+    let w = r.window;
+    let (cols, rows, k) = (i64::from(w.cols), i64::from(w.rows), k as i64);
+    let x0 = (i64::from(c0) - k).max(0);
+    let x1 = (i64::from(c1) + k).min(cols - 1);
+    let y0 = (i64::from(r0) - k).max(0);
+    let y1 = (i64::from(r1) + k).min(rows - 1);
+    let pw = (x1 - x0 + 2) as usize;
+    let ph = (y1 - y0 + 2) as usize;
+    // pre[(y + 1) * pw + (x + 1)]: HALO nodes in [x0, x] x [y0, y].
+    let mut pre = vec![0u32; pw * ph];
+    for y in y0..=y1 {
+        let yi = (y - y0 + 1) as usize;
+        for x in x0..=x1 {
+            let xi = (x - x0 + 1) as usize;
+            let v = u32::from(r.halo.get(x as u32, y as u32) > 0);
+            pre[yi * pw + xi] =
+                v + pre[yi * pw + xi - 1] + pre[(yi - 1) * pw + xi] - pre[(yi - 1) * pw + xi - 1];
+        }
+    }
+    let sum = |xa: i64, ya: i64, xb: i64, yb: i64| {
+        let (xa, xb) = ((xa - x0) as usize, (xb - x0 + 1) as usize);
+        let (ya, yb) = ((ya - y0) as usize, (yb - y0 + 1) as usize);
+        pre[yb * pw + xb] + pre[ya * pw + xa] - pre[ya * pw + xb] - pre[yb * pw + xa]
+    };
+    for row in r0..=r1 {
+        let y = i64::from(row);
+        for col in c0..=c1 {
+            let x = i64::from(col);
+            let inside = x - k >= 0 && x + k < cols && y - k >= 0 && y + k < rows;
+            let ok = inside && r.core.get(col, row) == 0 && sum(x - k, y - k, x + k, y + k) == 0;
+            let site = if ok {
+                crate::detail::search::VIA_CHECK
+            } else {
+                0
+            };
+            r.via_site.set(col, row, site);
+        }
+    }
 }
 
 impl TileRun {
@@ -178,6 +287,9 @@ impl TileRun {
             done: Vec::new(),
             telemetry,
             busy_us: 0,
+            hard_routed: false,
+            saved_sites: Vec::new(),
+            stubs: Vec::new(),
         }
     }
 
@@ -204,7 +316,6 @@ impl TileRun {
     pub fn narrow_vias(&mut self, ctx: &Ctx<'_>, cache: &RasterCache) {
         let t = std::time::Instant::now();
         let w = self.lattice;
-        let hd = half_diag(w.pitch_nm);
         for (k, s) in self.stacks.iter_mut().enumerate() {
             if !self.fresh[k] {
                 continue;
@@ -213,9 +324,7 @@ impl TileRun {
             let profile = &ctx.profiles[self.profiles[k] as usize];
             let rv = profile.via_diameter / 2 + profile.via_diameter % 2;
             for (slot, r) in s.layers.iter_mut().enumerate() {
-                let hw = profile.widths[slot] / 2 + profile.widths[slot] % 2;
-                let rho = (rv - hw).max(0) + hd;
-                let reach = ((rho + w.pitch_nm - 1) / w.pitch_nm) as usize;
+                let reach = via_reach_nodes(profile, slot, w.pitch_nm);
                 erode_into(r, reach);
                 for id in ctx.obstacles.via_keepouts(r.layer, &w.bbox().inflate(rv)) {
                     let o = &ctx.obstacles.items[id as usize];
@@ -253,8 +362,10 @@ impl TileRun {
         spec: &TileSpec,
         store: &[Arc<PieceCopper>],
         history: &HistoryMap,
+        fill: bool,
     ) {
         let t = std::time::Instant::now();
+        self.hard_routed = fill;
         let lattice = self.lattice;
         if let Some((first, rest)) = self.stacks.split_first_mut() {
             let first = first.as_mut().expect("stack at home");
@@ -284,6 +395,17 @@ impl TileRun {
                 self.soft.entry(piece.net).or_default().push(piece.clone());
             }
         }
+        if fill {
+            // Routed copper is a wall now: no via may sit within it either.
+            let pitch = self.lattice.pitch_nm;
+            for (k, s) in self.stacks.iter_mut().enumerate() {
+                let profile = &ctx.profiles[self.profiles[k] as usize];
+                let s = s.as_mut().expect("stack at home");
+                for (slot, r) in s.layers.iter_mut().enumerate() {
+                    erode_into(r, via_reach_nodes(profile, slot, pitch));
+                }
+            }
+        }
         self.telemetry
             .count("us_build_soft", t_soft.elapsed().as_micros() as u64);
     }
@@ -310,6 +432,11 @@ impl TileRun {
     fn paint_soft(&mut self, ctx: &Ctx<'_>, k: usize, piece: &PieceCopper, up: bool) {
         let p = self.profiles[k];
         let rep = ctx.profiles[p as usize].rep;
+        let paint = if self.hard_routed {
+            PaintKind::Hard
+        } else {
+            PaintKind::Soft
+        };
         let stack = self.stacks[k].as_mut().expect("stack at home");
         for (slot, &layer) in ctx.slots.iter().enumerate() {
             let geom = ctx.geometry(p, slot);
@@ -317,7 +444,7 @@ impl TileRun {
             for (shape, kind, cy) in piece.items_on(layer) {
                 let me = RuleSubject::new(ItemKind::Track, Some(rep)).with_courtyards(cy);
                 let c = ctx.rules.clearance(&piece.subject(kind, cy), &me, layer);
-                CpuCompute::paint_shape(r, &shape, c, PaintKind::Soft, &geom, up);
+                CpuCompute::paint_shape(r, &shape, c, paint, &geom, up);
             }
             // A via's hole, where `hole_clearance` reaches past the copper
             // clearance of its disc.
@@ -330,7 +457,7 @@ impl TileRun {
                         .clearance(&piece.subject(ItemKind::Via, &v.courtyards), &me, layer);
                 if v.drill / 2 + hc > v.diameter / 2 + c {
                     let hole = Shape::Circle(v.hole());
-                    CpuCompute::paint_shape(r, &hole, hc, PaintKind::Soft, &geom, up);
+                    CpuCompute::paint_shape(r, &hole, hc, paint, &geom, up);
                 }
             }
         }
@@ -338,6 +465,122 @@ impl TileRun {
 
     /// Unpaint (`up == false`) or repaint `net`'s own copper in stack `k`.
     fn lift(&mut self, ctx: &Ctx<'_>, net: NetId, k: usize, up: bool) {
+        if up {
+            self.restore_sites();
+        }
+        self.paint_own(ctx, net, k, up);
+        if !up {
+            self.reopen_sites(ctx, net, k);
+        }
+    }
+
+    /// Put back the via sites [`Self::reopen_sites`] overwrote.
+    fn restore_sites(&mut self) {
+        for saved in std::mem::take(&mut self.saved_sites) {
+            let stack = self.stacks[saved.stack].as_mut().expect("stack at home");
+            let r = &mut stack.layers[saved.slot];
+            let (c0, r0, c1, r1) = saved.range;
+            let mut it = saved.values.into_iter();
+            for row in r0..=r1 {
+                for col in c0..=c1 {
+                    r.via_site
+                        .set(col, row, it.next().expect("one value per node"));
+                }
+            }
+        }
+    }
+
+    /// Re-derive via sites around `net`'s own copper once it is lifted from
+    /// stack `k`. Sites are narrowed with every net's fixed copper painted
+    /// (the cached hard state), so without this a net could never drop a
+    /// via beside its own pads. A reopened site still keeps the whole via
+    /// clear of every other net's HALO and of via keepouts, and never lets
+    /// the via overlap one of the net's own pads (no via-in-pad).
+    fn reopen_sites(&mut self, ctx: &Ctx<'_>, net: NetId, k: usize) {
+        let w = self.lattice;
+        let mut region: Option<konnect_geom::BBox> = None;
+        let mut own_pads: Vec<u32> = Vec::new();
+        if let Some(list) = self.stat.hard_own.get(&net) {
+            for &(_, id) in list {
+                let o = &ctx.obstacles.items[id as usize];
+                let b = o.shape.bbox();
+                region = Some(region.map_or(b, |r| r.union(b)));
+                if o.kind == ObstacleKind::Copper(ItemKind::Pad) {
+                    own_pads.push(id);
+                }
+            }
+        }
+        if self.hard_routed {
+            for piece in self.soft.get(&net).into_iter().flatten() {
+                if let Some(b) = piece.bbox {
+                    region = Some(region.map_or(b, |r| r.union(b)));
+                }
+            }
+        }
+        let Some(region) = region else {
+            return;
+        };
+        own_pads.sort_unstable();
+        own_pads.dedup();
+        let profile = &ctx.profiles[self.profiles[k] as usize];
+        let rv = profile.via_diameter / 2 + profile.via_diameter % 2;
+        let grow = ctx
+            .obstacles
+            .reach
+            .saturating_add(ctx.max_half_width)
+            .saturating_add(rv)
+            .saturating_add(2 * w.pitch_nm);
+        let Some(range) = node_range(&w, &region.inflate(grow)) else {
+            return;
+        };
+        let (c0, r0, c1, r1) = range;
+        let span = konnect_geom::BBox::new(w.node(c0, r0), w.node(c1, r1));
+        let stack = self.stacks[k].as_mut().expect("stack at home");
+        for (slot, r) in stack.layers.iter_mut().enumerate() {
+            let mut values = Vec::with_capacity(((c1 - c0 + 1) * (r1 - r0 + 1)) as usize);
+            for row in r0..=r1 {
+                for col in c0..=c1 {
+                    values.push(r.via_site.get(col, row));
+                }
+            }
+            self.saved_sites.push(SavedSites {
+                stack: k,
+                slot,
+                range,
+                values,
+            });
+            rederive_sites(r, range, via_reach_nodes(profile, slot, w.pitch_nm));
+            let mut refuse = |shape: &Shape| {
+                let b = shape.bbox().inflate(rv.saturating_add(w.pitch_nm));
+                let Some((a0, b0, a1, b1)) = node_range(&w, &b) else {
+                    return;
+                };
+                for row in b0.max(r0)..=b1.min(r1) {
+                    for col in a0.max(c0)..=a1.min(c1) {
+                        if r.via_site.get(col, row) != 0 {
+                            let disc = Shape::Circle(Circle::new(w.node(col, row), rv));
+                            if gap_cmp(shape, &disc, 1) == Ordering::Less {
+                                r.via_site.set(col, row, 0);
+                            }
+                        }
+                    }
+                }
+            };
+            for id in ctx.obstacles.via_keepouts(r.layer, &span.inflate(rv)) {
+                refuse(&ctx.obstacles.items[id as usize].shape);
+            }
+            for &id in &own_pads {
+                let o = &ctx.obstacles.items[id as usize];
+                if o.layers.contains(r.layer) {
+                    refuse(&o.shape);
+                }
+            }
+        }
+    }
+
+    /// Paint (`up`) or unpaint `net`'s own fixed and routed copper in stack
+    /// `k`.
+    fn paint_own(&mut self, ctx: &Ctx<'_>, net: NetId, k: usize, up: bool) {
         let p = self.profiles[k];
         let rep = RuleSubject::new(ItemKind::Track, Some(ctx.profiles[p as usize].rep));
         if let Some(list) = self.stat.hard_own.get(&net) {
@@ -367,7 +610,14 @@ impl TileRun {
     }
 
     /// Lattice nodes a terminal offers in stack `k`, or empty.
-    fn terminal_nodes(&self, ctx: &Ctx<'_>, task: &Task, t: &Terminal, k: usize) -> Vec<JobNode> {
+    fn terminal_nodes(
+        &mut self,
+        ctx: &Ctx<'_>,
+        task: &Task,
+        t: &Terminal,
+        k: usize,
+        source: bool,
+    ) -> Vec<JobNode> {
         let stack = self.stacks[k].as_ref().expect("stack at home");
         let w = self.lattice;
         let node = |c: u32, r: u32, slot: usize, mask: u8| JobNode {
@@ -395,7 +645,7 @@ impl TileRun {
                     &task.to_island
                 };
                 for item in island {
-                    self.item_nodes(ctx, task, *item, k, &mut out);
+                    self.item_nodes(ctx, task, *item, k, source, &mut out);
                 }
             }
         }
@@ -404,13 +654,15 @@ impl TileRun {
 
     /// Open lattice nodes on one terminal item, appended to `out`.
     fn item_nodes(
-        &self,
+        &mut self,
         ctx: &Ctx<'_>,
         task: &Task,
         item: ItemRef,
         k: usize,
+        source: bool,
         out: &mut Vec<JobNode>,
     ) {
+        let mut stub_slots: Vec<usize> = Vec::new();
         let stack = self.stacks[k].as_ref().expect("stack at home");
         let w = self.lattice;
         let node = |c: u32, r: u32, slot: usize| JobNode {
@@ -483,11 +735,160 @@ impl TileRun {
                     }
                     cand.sort_unstable();
                     cand.dedup();
+                    if cand.is_empty() && !shapes.is_empty() {
+                        stub_slots.push(slot);
+                    }
                     for &(_, r, c) in cand.iter().take(ctx.tuning.max_terminal_nodes as usize) {
                         out.push(node(c, r, slot));
                     }
                 }
             }
+        }
+        if let ItemRef::Pad(pad) = item {
+            for slot in stub_slots {
+                self.stub_nodes(ctx, task, pad, slot, k, source, out);
+            }
+        }
+    }
+
+    /// Terminal nodes for a pad with no open node of its own on `slot`: from
+    /// each S4 access point on the layer (else the pad's anchor), along each
+    /// open exit heading, the first open node a stub track reaches that
+    /// passes the exact check. The stub is the class's width when that
+    /// works within [`NegotiationTuning::stub_reach`], else the neck-down
+    /// width within [`super::NeckDown::reach`] when the class may neck down.
+    /// The search must leave a stub's node within 45° of the stub, so the
+    /// joint is never sharper than 135°.
+    #[allow(clippy::too_many_arguments)]
+    fn stub_nodes(
+        &mut self,
+        ctx: &Ctx<'_>,
+        task: &Task,
+        pad: crate::api::PadId,
+        slot: usize,
+        k: usize,
+        source: bool,
+        out: &mut Vec<JobNode>,
+    ) {
+        let w = self.lattice;
+        let layer = ctx.slots[slot];
+        let net = task.conn.net;
+        let class = ctx.rules.class_of(Some(net));
+        let stack = self.stacks[k].as_ref().expect("stack at home");
+        let core = &stack.layers[slot].core;
+        let full = ctx.width(net, slot);
+        let mut widths = vec![(full, ctx.tuning.stub_reach)];
+        if let Some(n) = ctx.neck.as_ref().filter(|n| !n.excluded.contains(&class)) {
+            let min = ctx
+                .rules
+                .track_width(&RuleSubject::new(ItemKind::Track, Some(net)), layer)
+                .min;
+            let neck = n.width.max(min);
+            if neck < full {
+                widths.push((neck, n.reach));
+            }
+        }
+        let mut origins: Vec<(Point, u8)> = ctx
+            .access
+            .get(&(pad, class))
+            .into_iter()
+            .flatten()
+            .filter(|a| a.layer == layer && a.headings != 0)
+            .map(|a| (a.point, access_to_kernel(a.headings)))
+            .collect();
+        let anchor = ctx.board.pads[pad.index()].center;
+        if !origins.iter().any(|(p, _)| *p == anchor) {
+            origins.push((anchor, 0xff));
+        }
+        let pitch = i64::from(w.pitch_nm);
+        let mut found: Vec<(i128, u32, u32, u8, Point, Coord)> = Vec::new();
+        for &(width, reach) in &widths {
+            for &(o, headings) in &origins {
+                for h in 0..8u8 {
+                    if headings & (1 << h) == 0 {
+                        continue;
+                    }
+                    let (dx, dy) = crate::detail::search::HEADINGS[h as usize];
+                    let diag = dx != 0 && dy != 0;
+                    let mut t = 2 * pitch;
+                    while t <= i64::from(reach) {
+                        let d = if diag {
+                            (t as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i64
+                        } else {
+                            t
+                        };
+                        let e = Point::new(
+                            (i64::from(o.x) + i64::from(dx) * d) as Coord,
+                            (i64::from(o.y) + i64::from(dy) * d) as Coord,
+                        );
+                        t += pitch;
+                        let Some((c, r)) = w.nearest(e) else {
+                            break;
+                        };
+                        if core.get(c, r) != 0 {
+                            continue;
+                        }
+                        let q = w.node(c, r);
+                        let len2 = (q - o).length2();
+                        if len2 > i128::from(reach) * i128::from(reach) {
+                            break;
+                        }
+                        let seg = Segment::new(o, q, width);
+                        let cy = ctx.obstacles.courtyards.hits(&Shape::Segment(seg));
+                        if ctx
+                            .obstacles
+                            .check_segment(ctx.rules, net, layer, &seg, &cy)
+                            .is_none()
+                        {
+                            found.push((len2, c, r, h, o, width));
+                        }
+                        break;
+                    }
+                }
+            }
+            if !found.is_empty() {
+                break;
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        self.telemetry.count("stub_terminals", 1);
+        if found.iter().any(|f| f.5 < full) {
+            self.telemetry.count("stub_necked", 1);
+        }
+        found.sort_unstable_by_key(|f| (f.0, f.1, f.2, f.3));
+        let mut taken = 0;
+        for (_, c, r, h, o, width) in found {
+            if taken >= ctx.tuning.max_terminal_nodes as usize {
+                break;
+            }
+            if self
+                .stubs
+                .iter()
+                .any(|s| (s.col, s.row, s.slot) == (c as u16, r as u16, slot as u8))
+            {
+                continue;
+            }
+            // Leaving (source) or arriving (target) within 45 degrees of the
+            // stub's direction away from the pad.
+            let along = if source { h } else { (h + 4) % 8 };
+            let mask = (1u8 << along) | (1u8 << ((along + 1) % 8)) | (1u8 << ((along + 7) % 8));
+            out.push(JobNode {
+                col: c as u16,
+                row: r as u16,
+                layer: slot as u8,
+                heading_mask: mask,
+                reserved: 0,
+            });
+            self.stubs.push(Stub {
+                col: c as u16,
+                row: r as u16,
+                slot: slot as u8,
+                from: o,
+                width,
+            });
+            taken += 1;
         }
     }
 
@@ -503,8 +904,9 @@ impl TileRun {
                 .expect("every queued task's profile has a stack");
             let net = task.conn.net;
             self.lift(ctx, net, k, false);
-            let sources = self.terminal_nodes(ctx, task, &job.from, k);
-            let targets = self.terminal_nodes(ctx, task, &job.to, k);
+            self.stubs.clear();
+            let sources = self.terminal_nodes(ctx, task, &job.from, k, true);
+            let targets = self.terminal_nodes(ctx, task, &job.to, k, false);
             if sources.is_empty() || targets.is_empty() {
                 self.lift(ctx, net, k, true);
                 let end = if sources.is_empty() { job.from } else { job.to };
@@ -597,7 +999,7 @@ impl TileRun {
                 let (piece, steps) = self.geometry(ctx, task, job.task, job.piece, &p.nodes);
                 let vetoes = self.exact_check(ctx, net, &piece, &steps, &p.nodes, k);
                 if vetoes == 0 {
-                    let piece = Arc::new(piece);
+                    let piece = Arc::new(self.with_stubs(ctx, piece, &p.nodes));
                     for other in 0..self.stacks.len() {
                         if other != k {
                             self.paint_soft(ctx, other, &piece, true);
@@ -635,6 +1037,44 @@ impl TileRun {
                 fail(self, &job, DetailFailure::BudgetExhausted);
             }
         }
+    }
+
+    /// `piece` with the stub tracks of the path's end nodes, if they are
+    /// stub terminals: the source's first, the target's last.
+    fn with_stubs(&self, ctx: &Ctx<'_>, piece: PieceCopper, nodes: &[JobNode]) -> PieceCopper {
+        if self.stubs.is_empty() {
+            return piece;
+        }
+        let w = self.lattice;
+        let stub_at = |n: &JobNode| {
+            self.stubs
+                .iter()
+                .find(|s| (s.col, s.row, s.slot) == (n.col, n.row, n.layer))
+                .copied()
+        };
+        let seg_of = |s: Stub| {
+            let q = w.node(u32::from(s.col), u32::from(s.row));
+            let seg = Segment::new(s.from, q, s.width);
+            SegCopper {
+                layer: ctx.slots[s.slot as usize],
+                seg,
+                courtyards: ctx.obstacles.courtyards.hits(&Shape::Segment(seg)),
+            }
+        };
+        let (first, last) = match (nodes.first(), nodes.last()) {
+            (Some(a), Some(b)) => (stub_at(a), stub_at(b)),
+            _ => return piece,
+        };
+        if first.is_none() && last.is_none() {
+            return piece;
+        }
+        let mut segs = Vec::with_capacity(piece.segs.len() + 2);
+        segs.extend(first.map(seg_of));
+        segs.extend(piece.segs);
+        if nodes.len() > 1 || first.is_none() {
+            segs.extend(last.map(seg_of));
+        }
+        PieceCopper::new(piece.task, piece.piece, piece.net, segs, piece.vias)
     }
 
     /// Lattice path to copper: straight runs merged into segments, layer
@@ -915,4 +1355,9 @@ fn erode_into(r: &mut TileRaster, k: usize) {
 #[cfg(test)]
 pub(crate) fn erode_for_test(r: &mut TileRaster, k: usize) {
     erode_into(r, k)
+}
+
+#[cfg(test)]
+pub(crate) fn rederive_for_test(r: &mut TileRaster, range: (u32, u32, u32, u32), k: usize) {
+    rederive_sites(r, range, k)
 }
