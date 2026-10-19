@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a refill or save may wait out KiCad's AS_BUSY: a zone fill on a
+/// large board runs for minutes, and KiCad refuses saves until it ends.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The schema fragment both DRC tools share for narrowing what they return.
 pub(crate) fn selection_schema(default_limit: Option<u64>) -> Value {
@@ -208,7 +211,7 @@ pub(crate) async fn refill(
     let path = board.to_path_buf();
     let result = with_board_ipc_classified(ctx, board, move |client, _| {
         Ok(client
-            .refill_zones()
+            .refill_zones_when_ready(BUSY_TIMEOUT)
             .and_then(|()| client.wait_for_board_ready(READY_TIMEOUT))
             .map_err(|error| uncertain(&path, "refill_zones", error)))
     })
@@ -272,10 +275,12 @@ pub(crate) async fn run(
         let synchronized = with_board_ipc_classified(ctx, board, move |client, _| {
             let operation = || -> anyhow::Result<String> {
                 if refill {
-                    client.refill_zones()?;
+                    client.refill_zones_when_ready(BUSY_TIMEOUT)?;
                     client.wait_for_board_ready(READY_TIMEOUT)?;
                 }
-                client.save_board()?;
+                // KiCad answers reads during a fill but refuses the save
+                // with AS_BUSY until the fill ends.
+                client.save_board_when_ready(BUSY_TIMEOUT)?;
                 client.wait_for_board_ready(READY_TIMEOUT)?;
                 let live = client.save_document_to_string()?;
                 let saved = std::fs::read_to_string(&path)?;
@@ -531,6 +536,8 @@ mod tests {
     fn mock(board: &Path, commands: Arc<Mutex<Vec<String>>>, mode: &'static str) -> MockIpcServer {
         let path = board.to_path_buf();
         let busy = Arc::new(Mutex::new(false));
+        // KiCad 10 during a fill: reads answer, saves are refused AS_BUSY.
+        let saves_refused = Arc::new(Mutex::new(0u32));
         MockIpcServer::spawn("drc-sync", move |request| {
             let command = request.message.unwrap();
             let name = command.type_url.rsplit('/').next().unwrap().to_string();
@@ -583,8 +590,16 @@ mod tests {
                             kiapi::common::ApiStatusCode::AsBadRequest as i32;
                         return rejected;
                     }
-                    *busy.lock().unwrap() = true;
+                    if mode == "save-busy" {
+                        *saves_refused.lock().unwrap() = 3;
+                    } else {
+                        *busy.lock().unwrap() = true;
+                    }
                     response(None, false)
+                }
+                "kiapi.common.commands.SaveDocument" if *saves_refused.lock().unwrap() > 0 => {
+                    *saves_refused.lock().unwrap() -= 1;
+                    response(None, true)
                 }
                 "kiapi.common.commands.SaveDocument" => {
                     let cmd =
@@ -674,6 +689,36 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn served_drc_waits_out_a_save_refused_busy_during_the_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("clock.kicad_pcb");
+        std::fs::write(&board, OLD).unwrap();
+        let executable = cli_fixture(dir.path(), &board);
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let server = mock(&board, commands.clone(), "save-busy");
+        let result = call(
+            "run_drc",
+            &board,
+            server.address(),
+            &executable,
+            json!({"sync_live_board":true,"refill_zones":true}),
+        )
+        .await;
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["live_board_synced"], true);
+        let seen = commands.lock().unwrap();
+        assert_eq!(
+            seen.iter().filter(|s| s.ends_with("RefillZones")).count(),
+            1
+        );
+        // Three refusals, then the save that KiCad handled.
+        assert_eq!(
+            seen.iter().filter(|s| s.ends_with("SaveDocument")).count(),
+            4
+        );
     }
 
     #[tokio::test]

@@ -796,6 +796,40 @@ impl ApiStatusError {
         self.code == kiapi::common::ApiStatusCode::AsUnhandled as i32
             || self.code == kiapi::common::ApiStatusCode::AsUnimplemented as i32
     }
+
+    /// KiCad refused the request with AS_BUSY, before handling it.
+    pub fn is_busy(&self) -> bool {
+        self.code == kiapi::common::ApiStatusCode::AsBusy as i32
+    }
+}
+
+/// Run `request` again while KiCad refuses it with AS_BUSY, until `timeout`.
+///
+/// KiCad answers AS_BUSY before it handles a request, so sending it again
+/// never repeats work KiCad did. Any other error ends the wait at once.
+/// KiCad 10 keeps answering reads (open documents, items) during a zone
+/// fill and refuses only edits and saves, so a read is no readiness probe:
+/// retry the request that needs the editor instead.
+pub fn retry_while_busy<T>(
+    timeout: std::time::Duration,
+    mut request: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pause = std::time::Duration::from_millis(50);
+    loop {
+        match request() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let busy = ApiStatusError::from_error(&error).is_some_and(ApiStatusError::is_busy);
+                let now = std::time::Instant::now();
+                if !busy || now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(std::time::Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ApiStatusError {
@@ -2525,6 +2559,18 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
         Ok(())
+    }
+
+    /// Save the open board, waiting out AS_BUSY (a zone fill in progress)
+    /// for up to `timeout`. See [`retry_while_busy`].
+    pub fn save_board_when_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        retry_while_busy(timeout, || self.save_board())
+    }
+
+    /// Ask for a zone refill, waiting out AS_BUSY (an earlier fill still
+    /// running) for up to `timeout`. The fill itself runs on in KiCad.
+    pub fn refill_zones_when_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        retry_while_busy(timeout, || self.refill_zones())
     }
 
     /// Begin a commit (undo group).
@@ -7727,5 +7773,54 @@ mod stackup_tests {
         assert!(core.dielectric.is_empty());
         assert_eq!(core.thickness_nm, 1_510_000);
         assert_eq!(stackup.layers[0].epsilon_r, None);
+    }
+}
+
+#[cfg(test)]
+mod busy_retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn status(code: kiapi::common::ApiStatusCode) -> anyhow::Error {
+        anyhow::Error::new(ApiStatusError {
+            code: code as i32,
+            code_name: code.as_str_name().to_string(),
+            message: "test".to_string(),
+        })
+        .context("SaveDocument")
+    }
+
+    #[test]
+    fn a_request_refused_busy_is_sent_again_until_it_is_handled() {
+        let mut calls = 0;
+        let out = retry_while_busy(Duration::from_secs(10), || {
+            calls += 1;
+            if calls < 3 {
+                Err(status(kiapi::common::ApiStatusCode::AsBusy))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
+
+    #[test]
+    fn any_other_error_and_the_deadline_end_the_wait() {
+        let mut calls = 0;
+        let out: Result<()> = retry_while_busy(Duration::from_secs(10), || {
+            calls += 1;
+            Err(status(kiapi::common::ApiStatusCode::AsBadRequest))
+        });
+        assert!(out.is_err());
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let out: Result<()> = retry_while_busy(Duration::ZERO, || {
+            calls += 1;
+            Err(status(kiapi::common::ApiStatusCode::AsBusy))
+        });
+        let error = out.unwrap_err();
+        assert!(ApiStatusError::from_error(&error).is_some_and(ApiStatusError::is_busy));
+        assert_eq!(calls, 1);
     }
 }
