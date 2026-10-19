@@ -27,11 +27,12 @@
 //! - `KONNECT_GLOBAL_DEBUG=1` prints where the overflow sits.
 
 use konnect_geom::ArcPolicy;
-use konnect_route::api::{ClassId, LayerMask, NetId, Stage};
+use konnect_route::api::{ClassId, Connection, LayerMask, NetId, Stage};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::global::{
     build_grid_with, route_global_with, GCellGrid, GlobalResult, GlobalSettings, LayerPolicy,
 };
+use konnect_route::rules::RuleTable;
 use konnect_route::telemetry::Telemetry;
 use konnect_route::{load_board_file, LoadOptions, ProjectRuleTable};
 use std::collections::BTreeSet;
@@ -97,12 +98,13 @@ fn summarize(label: &str, grid: &GCellGrid, r: &GlobalResult, tel: &Telemetry, w
         r.stats.access_overuse
     );
     println!(
-        "[{label}] wirelength {:.1} m, vias {}, pattern seeds {}, maze seeds {}, full-grid searches {}",
+        "[{label}] wirelength {:.1} m, vias {}, pattern seeds {}, maze seeds {}, full-grid searches {}, best iteration {}",
         r.stats.wirelength_nm as f64 / 1e9,
         r.stats.vias,
         r.stats.pattern_seeds,
         r.stats.maze_seeds,
-        r.stats.full_grid_searches
+        r.stats.full_grid_searches,
+        r.stats.best_iteration
     );
     for it in &r.stats.per_iteration {
         println!(
@@ -136,6 +138,65 @@ fn summarize(label: &str, grid: &GCellGrid, r: &GlobalResult, tel: &Telemetry, w
         tel.congested_iteration_us / 1000
     );
     println!("[{label}] counters: {:?}", tel.counters);
+}
+
+/// Invariants of any result: every connection is routed or failed, every
+/// corridor walks edge-adjacent cells or changes layer in place, on layers
+/// its class allows, and the reported totals are the best iteration's.
+fn check_result(
+    rules: &ProjectRuleTable,
+    grid: &GCellGrid,
+    connections: &[Connection],
+    policy: &LayerPolicy,
+    r: &GlobalResult,
+) {
+    assert_eq!(r.corridors.len() + r.failed.len(), connections.len());
+    assert_eq!(r.overflow.len(), grid.cell_count() as usize);
+    let by_id: std::collections::BTreeMap<_, _> = connections.iter().map(|c| (c.id, c)).collect();
+    for cor in &r.corridors {
+        let conn = by_id[&cor.connection];
+        let class = rules.class_of(Some(conn.net));
+        let allowed = policy
+            .class_layers
+            .get(&class)
+            .map(|m| LayerMask(m.0 & grid.layers.0))
+            .filter(|m| m.0 != 0)
+            .unwrap_or(grid.layers);
+        assert_eq!(cor.layers, allowed, "corridor layers are the class's");
+        assert!(!cor.cells.is_empty());
+        let mut used = LayerMask::EMPTY;
+        for &id in &cor.cells {
+            let (layer, _) = grid.cell_bbox(id).expect("corridor ids are valid");
+            used = used.with(layer);
+        }
+        assert_eq!(used, cor.assigned, "assigned layers are the cells' layers");
+        assert_eq!(
+            cor.assigned.0 & !cor.layers.0,
+            0,
+            "assigned layers are allowed"
+        );
+        for w in cor.cells.windows(2) {
+            let (la, a) = grid.cell_bbox(w[0]).unwrap();
+            let (lb, b) = grid.cell_bbox(w[1]).unwrap();
+            if la == lb {
+                let shared_x = a.max.x.min(b.max.x) - a.min.x.max(b.min.x);
+                let shared_y = a.max.y.min(b.max.y) - a.min.y.max(b.min.y);
+                assert!(
+                    (shared_x == 0 && shared_y > 0) || (shared_y == 0 && shared_x > 0),
+                    "cells {} and {} are not adjacent",
+                    w[0],
+                    w[1]
+                );
+            } else {
+                assert_eq!(a, b, "a layer change stays in one cell");
+            }
+        }
+    }
+    let routed: BTreeSet<_> = r.corridors.iter().map(|c| c.connection).collect();
+    assert!(r.overflowed.iter().all(|c| routed.contains(c)));
+    assert!(r.stats.best_iteration <= r.iterations);
+    let best = &r.stats.per_iteration[r.stats.best_iteration as usize];
+    assert_eq!(best.overflow, r.stats.total_overflow);
 }
 
 #[test]
@@ -322,6 +383,9 @@ fn global_routing_on_the_real_fixture() {
         }
     }
 
+    // Invariants that hold for any board.
+    check_result(&rules, &grid_n, &connections, &policy, &r_n);
+
     if std::env::var("KONNECT_GLOBAL_QUICK").is_ok_and(|v| v == "1") {
         println!("quick mode: skipping the 1-thread comparison");
         return;
@@ -341,15 +405,6 @@ fn global_routing_on_the_real_fixture() {
     assert_eq!(grid_1, grid_n, "the grid does not depend on threads");
     assert_eq!(r_1, r_n, "the result does not depend on threads");
     assert_eq!(json_1, json_n);
-
-    // Invariants that hold for any board.
-    assert_eq!(r_n.corridors.len() + r_n.failed.len(), connections.len());
-    assert_eq!(r_n.overflow.len(), grid_n.cell_count() as usize);
-    for c in &r_n.corridors {
-        assert!(!c.cells.is_empty());
-        assert!(c.cells.iter().all(|&id| id < grid_n.cell_count()));
-        assert!(c.layers.0 & !grid_n.layers.0 == 0);
-    }
 
     // Generated evidence goes to the build's temp dir, never the repo.
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("global-real-fixture");

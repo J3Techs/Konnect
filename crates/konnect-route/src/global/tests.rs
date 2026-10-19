@@ -10,8 +10,9 @@ fn connections(board: &RouteBoard) -> Vec<Connection> {
     ConnectivityReport::build(board, &ArcPolicy::default()).connections(board)
 }
 
-/// Every corridor walks adjacent cells (or changes layer in place) from its
-/// `from` terminal's cell to its `to` terminal's cell.
+/// Every corridor walks adjacent cells (or changes layer in place, by one
+/// through via between two allowed layers) from its `from` terminal's cell
+/// to its `to` terminal's cell, on layers its class allows.
 fn check_corridors(board: &RouteBoard, grid: &GCellGrid, conns: &[Connection], r: &GlobalResult) {
     for cor in &r.corridors {
         assert!(!cor.cells.is_empty());
@@ -42,14 +43,18 @@ fn check_corridors(board: &RouteBoard, grid: &GCellGrid, conns: &[Connection], r
                 );
             } else {
                 assert_eq!(a, b, "a layer change stays in one cell");
-                let (sa, sb) = (grid.layer_slot(la).unwrap(), grid.layer_slot(lb).unwrap());
-                assert_eq!(sa.abs_diff(sb), 1);
             }
         }
         if cor.cells.len() == 1 {
             layers = area(cor.cells[0]).0.into_mask();
         }
-        assert_eq!(layers, cor.layers);
+        assert_eq!(layers, cor.assigned);
+        assert_eq!(
+            cor.assigned.0 & !cor.layers.0,
+            0,
+            "assigned layers are allowed"
+        );
+        assert_eq!(cor.layers.0 & !grid.layers.0, 0);
     }
 }
 
@@ -244,7 +249,8 @@ fn two_pin_nets_route_without_overflow() {
     check_corridors(&board, &grid, &conns, &r);
     // Straight horizontal runs on the horizontal layer: 16 cells each.
     for c in &r.corridors {
-        assert_eq!(c.layers, LayerMask::single(LayerId(0)));
+        assert_eq!(c.assigned, LayerMask::single(LayerId(0)));
+        assert_eq!(c.layers, grid.layers);
         assert_eq!(c.cells.len(), 17);
     }
     assert!(tel.stage_us(crate::api::Stage::Global) > 0);
@@ -434,6 +440,11 @@ fn overflow_map_sums_per_layer() {
     assert!(planar_and_via >= r.stats.total_overflow.min(1));
     assert_eq!(r.iterations, 3);
     assert_eq!(r.stats.per_iteration.len(), 4);
+    // The result is the best iteration, not the last.
+    let least = r.stats.per_iteration.iter().map(|i| i.overflow).min();
+    assert_eq!(Some(r.stats.total_overflow), least);
+    let best = &r.stats.per_iteration[r.stats.best_iteration as usize];
+    assert_eq!(best.overflow, r.stats.total_overflow);
 }
 
 #[test]
@@ -464,4 +475,174 @@ fn a_pitch_too_fine_for_the_board_is_coarsened() {
     assert!(grid.pitch > 1_000);
     assert!(grid.refined.is_empty());
     assert!(i64::from(grid.cols) * i64::from(grid.pitch) >= 200_000_000);
+}
+
+/// A three-layer board joining an F.Cu pad to a B.Cu pad, optionally with a
+/// wall on every layer that only a detour far outside the pattern set
+/// passes.
+fn top_to_bottom(wall: bool) -> RouteBoard {
+    let mut b = BoardBuilder::new(40.0, 20.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+    if wall {
+        b.keepout(
+            "W",
+            &["F.Cu", "In1.Cu", "B.Cu"],
+            (19.0, 0.0, 21.0, 17.0),
+            KeepoutRules {
+                tracks: true,
+                vias: true,
+                ..Default::default()
+            },
+        );
+    }
+    let f = b.footprint("J1", (20.0, 10.0));
+    b.smd_pad(f, "1", "A", (4.0, 10.0), (0.5, 0.5), "F.Cu");
+    b.smd_pad(f, "2", "A", (36.0, 10.0), (0.5, 0.5), "B.Cu");
+    b.build()
+}
+
+#[test]
+fn a_class_mask_with_a_gap_routes_through_vias_across_it() {
+    // The class may use F.Cu and B.Cu but not In1.Cu between them: a via
+    // joins the two directly, and no corridor cell lies on In1.Cu.
+    let rules = UniformRules::default();
+    let settings = GlobalSettings::default();
+    let outer = LayerMask::single(LayerId(0)).with(LayerId(2));
+    let mut policy = LayerPolicy::default();
+    policy.class_layers.insert(ClassId(0), outer);
+    for wall in [false, true] {
+        let board = top_to_bottom(wall);
+        let grid = build_grid(&board, &rules, &settings);
+        let conns = connections(&board);
+        assert_eq!(conns.len(), 1);
+        let r = route_global_with(
+            &board,
+            &rules,
+            &grid,
+            &conns,
+            &settings,
+            &policy,
+            &mut crate::telemetry::Telemetry::default(),
+        );
+        assert!(r.failed.is_empty(), "wall {wall}: {:?}", r.failed);
+        assert!(r.stats.converged);
+        check_corridors(&board, &grid, &conns, &r);
+        let c = &r.corridors[0];
+        assert_eq!(c.layers, outer);
+        assert_eq!(c.assigned, outer, "wall {wall}");
+        // The wall forces the maze search; without it a pattern serves.
+        assert_eq!(r.stats.pattern_seeds, u32::from(!wall));
+        // One via, from F.Cu straight to B.Cu.
+        assert_eq!(r.stats.vias, 1);
+        let changes = c
+            .cells
+            .windows(2)
+            .filter(|w| grid.cell_bbox(w[0]).unwrap().0 != grid.cell_bbox(w[1]).unwrap().0)
+            .count();
+        assert_eq!(changes, 1);
+    }
+}
+
+#[test]
+fn a_through_via_costs_one_via_whatever_it_spans() {
+    // All layers allowed: a straight top-to-bottom connection runs on the
+    // two horizontal layers and changes layer once, F.Cu to B.Cu, without
+    // stepping through In1.Cu.
+    let board = top_to_bottom(false);
+    let rules = UniformRules::default();
+    let settings = GlobalSettings::default();
+    let grid = build_grid(&board, &rules, &settings);
+    let conns = connections(&board);
+    let r = route_global(&board, &rules, &grid, &conns, &settings);
+    assert!(r.failed.is_empty());
+    check_corridors(&board, &grid, &conns, &r);
+    assert_eq!(r.stats.vias, 1);
+    assert_eq!(
+        r.corridors[0].assigned,
+        LayerMask::single(LayerId(0)).with(LayerId(2))
+    );
+}
+
+#[test]
+fn thirty_two_copper_layers_route() {
+    let mut names = vec!["F.Cu".to_string()];
+    names.extend((1..=30).map(|i| format!("In{i}.Cu")));
+    names.push("B.Cu".to_string());
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut b = BoardBuilder::new(12.0, 6.0, &names);
+    let f = b.footprint("J1", (6.0, 3.0));
+    b.smd_pad(f, "1", "A", (1.5, 3.0), (0.4, 0.4), "F.Cu");
+    b.smd_pad(f, "2", "A", (10.5, 3.0), (0.4, 0.4), "B.Cu");
+    let board = b.build();
+    assert_eq!(board.routable.count(), 32);
+    let rules = UniformRules::default();
+    let settings = GlobalSettings::default();
+    let grid = build_grid(&board, &rules, &settings);
+    assert_eq!(grid.layer_slots(), 32);
+    assert_eq!(super::router::all_slots(32), u32::MAX);
+    assert_eq!(super::router::all_slots(0), 0);
+    assert_eq!(super::router::all_slots(3), 0b111);
+    let conns = connections(&board);
+    let r = route_global(&board, &rules, &grid, &conns, &settings);
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!(r.corridors[0].layers, grid.layers);
+    check_corridors(&board, &grid, &conns, &r);
+}
+
+#[test]
+fn a_fine_pitch_on_a_large_board_is_bounded_in_total() {
+    // 200 × 200 mm at 1 µm would be 4·10^10 cells per layer; each side
+    // alone fits 65,000 cells, so only the node budget catches it.
+    let board = BoardBuilder::new(200.0, 200.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]).build();
+    let settings = GlobalSettings {
+        gcell_pitch: 1_000,
+        fine_pitch: 500,
+        ..Default::default()
+    };
+    let grid = super::grid::lay_out(&board, &settings);
+    let nodes = u64::from(grid.cols) * u64::from(grid.rows) * u64::from(grid.layer_slots());
+    assert!(nodes <= super::grid::MAX_NODES, "{nodes} nodes");
+    assert!(
+        nodes > super::grid::MAX_NODES / 2,
+        "coarsened no more than needed"
+    );
+    assert!(super::grid::fits(&grid));
+    assert!(i64::from(grid.cols) * i64::from(grid.pitch) >= 200_000_000);
+    assert!(i64::from(grid.rows) * i64::from(grid.pitch) >= 200_000_000);
+}
+
+#[test]
+fn an_oversized_grid_from_elsewhere_is_refused() {
+    let board = synthetic::two_pin_nets(2, false);
+    let rules = UniformRules::default();
+    let settings = GlobalSettings::default();
+    let mut grid = build_grid(&board, &rules, &settings);
+    grid.cols = 65_000;
+    grid.rows = 65_000;
+    let conns = connections(&board);
+    let r = route_global(&board, &rules, &grid, &conns, &settings);
+    assert!(r.corridors.is_empty());
+    assert_eq!(r.failed.len(), conns.len());
+    assert!(r
+        .failed
+        .iter()
+        .all(|(_, f)| *f == FailureReason::NoCorridor));
+    assert!(!r.stats.converged);
+}
+
+#[test]
+fn no_routable_layer_reports_no_access_and_no_convergence() {
+    let mut board = synthetic::two_pin_nets(2, false);
+    board.routable = LayerMask::EMPTY;
+    let rules = UniformRules::default();
+    let settings = GlobalSettings::default();
+    let grid = build_grid(&board, &rules, &settings);
+    let conns = connections(&board);
+    let r = route_global(&board, &rules, &grid, &conns, &settings);
+    assert!(r.corridors.is_empty());
+    assert_eq!(r.failed.len(), conns.len());
+    for ((id, f), c) in r.failed.iter().zip(&conns) {
+        assert_eq!(*id, c.id);
+        assert_eq!(*f, FailureReason::NoAccess { item: c.from });
+    }
+    assert!(!r.stats.converged);
 }

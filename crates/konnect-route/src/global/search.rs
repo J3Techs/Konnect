@@ -2,8 +2,9 @@
 
 use super::grid::{Topology, Win, NONE};
 use super::lookahead::Lookahead;
+use super::pattern::PatternBufs;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// Cost factor of a zero-capacity resource at a terminal cell.
 pub(crate) const ACCESS_FACTOR: f32 = 2.0;
@@ -83,12 +84,13 @@ pub(crate) struct Request<'a> {
     /// connection's own terminal cells).
     pub term_cells: &'a [u32],
     pub win: Win,
-    /// Allowed slots, bit per slot.
+    /// Allowed slots, bit per slot (`topo.slots` ≤ 32).
     pub slots: u32,
     pub weight: u16,
     pub via_weight: u16,
-    /// Resources the net already holds through its other connections.
-    pub owned: &'a [u32],
+    /// Resources the net already holds through its other connections
+    /// (resource → connections of the net using it).
+    pub owned: &'a BTreeMap<u32, u16>,
     /// Bounding box of the target cell centres and their slots, for the
     /// heuristic.
     pub tbox: (i32, i32, i32, i32),
@@ -110,6 +112,7 @@ pub(crate) struct Scratch {
     hseen: Vec<u32>,
     epoch: u32,
     heap: BinaryHeap<Reverse<(u32, u32, u32)>>,
+    pub(crate) pat: PatternBufs,
 }
 
 impl Scratch {
@@ -126,11 +129,12 @@ impl Scratch {
             hseen: vec![0; nodes],
             epoch: 0,
             heap: BinaryHeap::new(),
+            pat: PatternBufs::default(),
         }
     }
 
     /// Start a new search and stamp its owned resources and terminal cells.
-    pub(crate) fn begin(&mut self, owned: &[u32], term_cells: &[u32]) -> u32 {
+    pub(crate) fn begin(&mut self, owned: &BTreeMap<u32, u16>, term_cells: &[u32]) -> u32 {
         if self.epoch == u32::MAX {
             self.seen.fill(0);
             self.closed.fill(0);
@@ -142,7 +146,7 @@ impl Scratch {
         }
         self.epoch += 1;
         let ep = self.epoch;
-        for &r in owned {
+        for &r in owned.keys() {
             self.owned[r as usize] = ep;
         }
         for &c in term_cells {
@@ -236,11 +240,15 @@ pub(crate) fn astar(c: &Costs, req: &Request, s: &mut Scratch) -> (Option<Found>
         if c.cap[r as usize] == 0 && !owned && !cell_term {
             continue;
         }
+        // A via is a through via: one step reaches every other allowed
+        // slot, crossing any layers between that the connection may not
+        // use, at the cost of one via.
         let vc = c.resource(r as usize, via_base, req.via_weight, owned);
-        for ns in [slot.wrapping_sub(1), slot + 1] {
-            if ns < topo.slots && req.slots & (1 << ns) != 0 {
-                relax(c, req, s, ep, n, topo.node(ns, cell), g + vc);
-            }
+        let mut m = req.slots & !(1u32 << slot);
+        while m != 0 {
+            let ns = m.trailing_zeros();
+            m &= m - 1;
+            relax(c, req, s, ep, n, topo.node(ns, cell), g + vc);
         }
     }
     (None, expansions)

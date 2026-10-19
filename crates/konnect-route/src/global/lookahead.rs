@@ -2,12 +2,14 @@
 //! any other over an offset of `(dx, dy)` base cells, on an empty grid.
 //!
 //! Base costs are translation invariant (each layer has a fixed cost per mm
-//! along and across its preferred direction, and a via costs the same
-//! everywhere), so one table per (target slot, source slot) covers the
-//! whole board. Monotone paths are optimal on an empty grid, so a single
-//! dynamic-programming sweep per target slot fills it. Present and history
-//! costs only add, so the table is a lower bound on every real cost except
-//! a net's discounted reuse of its own resources.
+//! along and across its preferred direction, and a through via costs the
+//! same everywhere, whichever slots it joins), so one table per (target
+//! slot, source slot) covers the whole board. Monotone paths are optimal on
+//! an empty grid, so a single dynamic-programming sweep per target slot
+//! fills it. Present and history costs only add, so the table is a lower
+//! bound on every real cost except a net's discounted reuse of its own
+//! resources. The table may be smaller than the grid (a size budget):
+//! larger offsets read its edge, which only weakens the bound.
 
 use rayon::prelude::*;
 
@@ -22,7 +24,7 @@ pub(crate) struct Lookahead {
 
 impl Lookahead {
     /// `h[s]`, `v[s]`: cost per base cell of a horizontal or vertical step on
-    /// slot `s`; `via`: cost per slot change.
+    /// slot `s`; `via`: cost of one (through) via, whichever slots it joins.
     pub(crate) fn build(
         slots: usize,
         cols: usize,
@@ -41,7 +43,11 @@ impl Lookahead {
                     for dx in 0..cols {
                         for (s, c) in cur.iter_mut().enumerate() {
                             *c = if dx == 0 && dy == 0 {
-                                via * (s as f32 - t as f32).abs()
+                                if s == t {
+                                    0.0
+                                } else {
+                                    via
+                                }
                             } else {
                                 let mut best = f32::INFINITY;
                                 if dx > 0 {
@@ -53,11 +59,10 @@ impl Lookahead {
                                 best
                             };
                         }
-                        for s in 1..slots {
-                            cur[s] = cur[s].min(cur[s - 1] + via);
-                        }
-                        for s in (0..slots.saturating_sub(1)).rev() {
-                            cur[s] = cur[s].min(cur[s + 1] + via);
+                        // A through via reaches any slot from any other.
+                        let low = cur.iter().copied().fold(f32::INFINITY, f32::min);
+                        for c in cur.iter_mut() {
+                            *c = c.min(low + via);
                         }
                         for (s, c) in cur.iter().enumerate() {
                             out[s * plane + dy * cols + dx] = *c;
@@ -117,5 +122,9 @@ mod tests {
         // (5 + 1.5 + 5 + 1.5 = 13).
         assert_eq!(l.get(0, 0, 5, 5), 13.0);
         assert_eq!(l.to_any(0b11, 1, 0, 5), 5.0);
+        // One through via joins any two slots.
+        let l = Lookahead::build(4, 4, 4, &[1.0; 4], &[1.0; 4], 1.5);
+        assert_eq!(l.get(3, 0, 0, 0), 1.5);
+        assert_eq!(l.get(0, 3, 2, 0), 3.5);
     }
 }

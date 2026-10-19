@@ -332,7 +332,18 @@ pub(crate) fn compute(
     let policy = ArcPolicy::default();
     let via_rule = rules.via(&RuleSubject::new(ItemKind::Via, None));
     let via_r = f64::from(via_rule.diameter) / 2.0;
-    let step = (topo.fsize / 4).max(1);
+    // Lines a quarter of a fine cell apart, closer when the narrowest
+    // inflated obstacle (a zero-width one: twice the clearance plus a track)
+    // could fall between two lines; never closer than 1/32 of a fine cell.
+    let narrowest = layers
+        .iter()
+        .map(|&l| {
+            let sr = slot_rules(rules, l);
+            2 * sr.clearance.min(i64::from(rules.edge_clearance())) + sr.width
+        })
+        .min()
+        .unwrap_or(i64::MAX);
+    let step = (topo.fsize / 4).min(narrowest).max(topo.fsize / 32).max(1);
     let edge_cl = f64::from(rules.edge_clearance());
     let hole_cl = f64::from(rules.hole_clearance());
 
@@ -408,8 +419,12 @@ pub(crate) fn compute(
             }
         });
 
-    let via_pitch =
-        f64::from(via_rule.diameter) + slots.first().map_or(0.0, |s| s.rules.clearance as f64);
+    // A via spans every layer, so the largest clearance spaces via sites.
+    let via_pitch = f64::from(via_rule.diameter)
+        + slots
+            .iter()
+            .map(|s| s.rules.clearance as f64)
+            .fold(0.0, f64::max);
     let via_lines: Vec<&LineSet> = slots.iter().map(|s| &s.via).collect();
     via_caps
         .par_chunks_mut(4096)

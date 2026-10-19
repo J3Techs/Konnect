@@ -45,8 +45,9 @@ struct Task {
     access: Vec<u32>,
     /// The base-cell box of the two primary terminals.
     core: Win,
-    /// False when a terminal has no cell on the grid.
-    ok: bool,
+    /// Why the connection cannot be routed at all (a terminal with no
+    /// cell on the grid), else `None`.
+    unroutable: Option<FailureReason>,
 }
 
 /// How a job ended.
@@ -142,6 +143,9 @@ fn nodes_box(t: &Topology, nodes: &[u32]) -> Win {
 
 /// Steps kept around the overused stretch of a partial re-route.
 const SECTION_PAD: usize = 3;
+
+/// Most entries of the lookahead table (64 MB of `f32`).
+const LOOKAHEAD_ENTRIES: u64 = 1 << 24;
 
 struct State {
     /// Resources from here on are via sites.
@@ -285,6 +289,24 @@ fn slot_mask(grid: &GCellGrid, layers: LayerMask) -> u32 {
     m
 }
 
+/// Every slot of an `n`-slot grid (`n` ≤ 32, as a [`LayerMask`] holds).
+pub(super) fn all_slots(n: u32) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        u32::MAX >> (32 - n.min(32))
+    }
+}
+
+/// The layer mask of a slot bitmask on this grid.
+fn slot_layers(grid: &GCellGrid, slots: u32) -> LayerMask {
+    grid.layers
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| slots & (1u32 << slot) != 0)
+        .fold(LayerMask::EMPTY, |m, (_, l)| m.with(l))
+}
+
 /// Points and layers of one copper item, for terminals.
 fn item_points(board: &RouteBoard, item: ItemRef, step: i64, out: &mut Vec<(Point, LayerMask)>) {
     match item {
@@ -395,7 +417,7 @@ fn prepare(
             }
         }
     }
-    let all = (1u32 << topo.slots) - 1;
+    let all = all_slots(topo.slots);
     let layer0 = grid.slot_layer(0);
     let default_pitch = layer0.map_or(1, |l| slot_rules(rules, l).pitch());
     let via_pitch = |net: Option<NetId>| {
@@ -426,6 +448,7 @@ fn prepare(
                 ((via_pitch(Some(c.net)) / default_via).powi(2).round() as u16).clamp(1, 16);
             let from = terminals(board, grid, topo, &islands, &conn, c.from, allowed);
             let to = terminals(board, grid, topo, &islands, &conn, c.to, allowed);
+            let off_grid = if from.is_none() { c.from } else { c.to };
             let (Some((src, sc, ss)), Some((dst, dc, ds))) = (from, to) else {
                 return Task {
                     net: c.net.0,
@@ -445,7 +468,7 @@ fn prepare(
                         c1: 0,
                         r1: 0,
                     },
-                    ok: false,
+                    unroutable: Some(FailureReason::NoAccess { item: off_grid }),
                 };
             };
             let (a, b) = (sc as usize, dc as usize);
@@ -479,7 +502,7 @@ fn prepare(
                 src_slots: ss,
                 dst_slots: ds,
                 core,
-                ok: true,
+                unroutable: None,
             }
         })
         .collect()
@@ -526,7 +549,7 @@ fn route_one(
 ) -> JobResult {
     let t = sh.topo;
     let task = &sh.tasks[i];
-    let owned: Vec<u32> = state.net_res[task.net as usize].keys().copied().collect();
+    let owned = &state.net_res[task.net as usize];
     let term_cells: &[u32] = &task.access;
     if seed {
         let req = PatternReq {
@@ -538,7 +561,7 @@ fn route_one(
             win,
             weight: task.weight,
             via_weight: task.via_weight,
-            owned: &owned,
+            owned,
             term_cells,
         };
         if let Some((path, _)) = best_pattern(costs, &req, s) {
@@ -616,7 +639,7 @@ fn route_one(
         slots: task.slots,
         weight: task.weight,
         via_weight: task.via_weight,
-        owned: &owned,
+        owned,
         tbox,
         tslots,
     };
@@ -877,6 +900,18 @@ pub(super) fn run(
     tel: &mut Telemetry,
 ) -> GlobalResult {
     let t0 = Instant::now();
+    if !super::grid::fits(grid) {
+        // A grid from elsewhere too large for u32 ids or the memory budget
+        // (build_grid never makes one): nothing can be routed on it.
+        tel.count("global_grid_rejected", 1);
+        return GlobalResult {
+            failed: connections
+                .iter()
+                .map(|c| (c.id, FailureReason::NoCorridor))
+                .collect(),
+            ..Default::default()
+        };
+    }
     let topo = Topology::new(grid);
     let mut owned_grid;
     let grid = if grid.capacity.len() == topo.resources() {
@@ -889,14 +924,15 @@ pub(super) fn run(
     };
     let slots = topo.slots as usize;
     if slots == 0 || connections.is_empty() {
+        // With no routable layer, no terminal has an exit.
         return GlobalResult {
             overflow: vec![0; grid.cell_count() as usize],
             failed: connections
                 .iter()
-                .map(|c| (c.id, FailureReason::NoCorridor))
+                .map(|c| (c.id, FailureReason::NoAccess { item: c.from }))
                 .collect(),
             stats: GlobalStats {
-                converged: true,
+                converged: connections.is_empty(),
                 ..Default::default()
             },
             ..Default::default()
@@ -925,7 +961,22 @@ pub(super) fn run(
     let vc: Vec<f32> = dir.iter().map(|d| d[1] * pitch_mm).collect();
     let via = settings.costs.via as f32 / 1000.0;
     let tl = Instant::now();
-    let look = Lookahead::build(slots, topo.cols as usize, topo.rows as usize, &hc, &vc, via);
+    // The table holds slots² planes; past the budget it covers a smaller
+    // offset range (larger offsets read its edge, a weaker bound).
+    let plane = (LOOKAHEAD_ENTRIES / (slots * slots) as u64).max(1);
+    let (lc, lr) = {
+        let (c, r) = (u64::from(topo.cols), u64::from(topo.rows));
+        if c * r <= plane {
+            (c, r)
+        } else {
+            let f = (plane as f64 / (c * r) as f64).sqrt();
+            (
+                ((c as f64 * f) as u64).clamp(1, c),
+                ((r as f64 * f) as u64).clamp(1, r),
+            )
+        }
+    };
+    let look = Lookahead::build(slots, lc as usize, lr as usize, &hc, &vc, via);
     tel.count("global_lookahead_us", tl.elapsed().as_micros() as u64);
 
     let tp = Instant::now();
@@ -952,7 +1003,7 @@ pub(super) fn run(
         path: vec![Vec::new(); n],
         res: vec![Vec::new(); n],
         routed: vec![false; n],
-        failed: tasks.iter().map(|t| !t.ok).collect(),
+        failed: tasks.iter().map(|t| t.unroutable.is_some()).collect(),
         reroutes: vec![0; n],
     };
     let pool = Mutex::new(Vec::new());
@@ -979,7 +1030,7 @@ pub(super) fn run(
 
     // Seed.
     let ts = Instant::now();
-    let list: Vec<usize> = (0..n).filter(|&i| tasks[i].ok).collect();
+    let list: Vec<usize> = (0..n).filter(|&i| tasks[i].unroutable.is_none()).collect();
     let first = settings.schedule.first_iter_pres_fac as f32 / 1000.0;
     let o = iterate(&cx, &mut state, &list, 0, first, true, tel);
     stats.pattern_seeds = o.pattern;
@@ -994,6 +1045,7 @@ pub(super) fn run(
         overused: count,
     });
     update_history(&mut state);
+    let mut keep = Snapshot::take(&state, cap, 0);
     tel.count("global_seed_us", ts.elapsed().as_micros() as u64);
 
     // Negotiation.
@@ -1037,6 +1089,9 @@ pub(super) fn run(
         });
         tel.count("global_reroutes", u64::from(o.routed));
         update_history(&mut state);
+        if Snapshot::key(&state, cap) < keep.key {
+            keep = Snapshot::take(&state, cap, iterations);
+        }
         pres = (pres * mult).min(max_pres);
         converged = total == 0;
         if total + (best / 100).max(1) <= best {
@@ -1048,9 +1103,14 @@ pub(super) fn run(
         tel.congested_iteration_us += ti.elapsed().as_micros() as u64;
     }
 
-    // Result.
+    // Result: the best iteration (fewest unrouted, then least overflow;
+    // the earliest on a tie), not necessarily the last.
+    stats.best_iteration = keep.iteration;
+    if keep.iteration != iterations {
+        keep.restore(&mut state);
+    }
     let (total, max, count, access) = overuse(cap, &state.occ);
-    stats.converged = total == 0;
+    stats.converged = total == 0 && state.routed.iter().all(|&r| r);
     stats.total_overflow = total;
     stats.max_overflow = max;
     stats.overused_resources = count;
@@ -1058,17 +1118,22 @@ pub(super) fn run(
     let mut corridors = Vec::new();
     let mut failed = Vec::new();
     let mut overflowed = Vec::new();
+    let mut net_vias: BTreeSet<(u32, u32)> = BTreeSet::new();
     for (i, c) in connections.iter().enumerate() {
         if !state.routed[i] {
-            failed.push((c.id, FailureReason::NoCorridor));
+            let reason = tasks[i]
+                .unroutable
+                .clone()
+                .unwrap_or(FailureReason::NoCorridor);
+            failed.push((c.id, reason));
             continue;
         }
         let path = &state.path[i];
-        let mut layers = LayerMask::EMPTY;
+        let mut assigned = LayerMask::EMPTY;
         let mut cells = Vec::with_capacity(path.len());
         for w in 0..path.len() {
             let (slot, cell) = topo.split(path[w]);
-            layers = layers.with(grid.slot_layer(slot).expect("slot is on the grid"));
+            assigned = assigned.with(grid.slot_layer(slot).expect("slot is on the grid"));
             cells.push(topo.gcell_id(slot, cell));
             if w + 1 < path.len() {
                 let (s2, c2) = topo.split(path[w + 1]);
@@ -1080,19 +1145,23 @@ pub(super) fn run(
                 }
             }
         }
-        stats.vias += state.res[i]
-            .iter()
-            .filter(|&&r| r as usize >= slots * topo.edges as usize)
-            .count() as u64;
+        // A via site a net's connections share holds one via of that net.
+        for &r in &state.res[i] {
+            if r >= state.via_from {
+                net_vias.insert((tasks[i].net, r));
+            }
+        }
         if state.res[i].iter().any(|&r| state.overused(cap, r)) {
             overflowed.push(c.id);
         }
         corridors.push(Corridor {
             connection: c.id,
             cells,
-            layers,
+            layers: slot_layers(grid, tasks[i].slots),
+            assigned,
         });
     }
+    stats.vias = net_vias.len() as u64;
     let mut overflow = vec![0u16; grid.cell_count() as usize];
     for slot in 0..topo.slots {
         for e in 0..topo.edges {
@@ -1138,5 +1207,46 @@ pub(super) fn run(
         failed,
         iterations,
         stats,
+    }
+}
+
+/// The routing state of one iteration, kept to return the best.
+struct Snapshot {
+    iteration: u32,
+    /// Connections without a path, then total overflow.
+    key: (usize, u64),
+    path: Vec<Vec<u32>>,
+    res: Vec<Vec<u32>>,
+    routed: Vec<bool>,
+    failed: Vec<bool>,
+    occ: Vec<u16>,
+}
+
+impl Snapshot {
+    fn key(state: &State, cap: &[u16]) -> (usize, u64) {
+        let unrouted = state.routed.iter().filter(|&&r| !r).count();
+        (unrouted, overuse(cap, &state.occ).0)
+    }
+
+    fn take(state: &State, cap: &[u16], iteration: u32) -> Snapshot {
+        Snapshot {
+            iteration,
+            key: Snapshot::key(state, cap),
+            path: state.path.clone(),
+            res: state.res.clone(),
+            routed: state.routed.clone(),
+            failed: state.failed.clone(),
+            occ: state.occ.clone(),
+        }
+    }
+
+    /// Put the kept paths and occupancy back (history and the per-net maps
+    /// are not needed after the last iteration).
+    fn restore(self, state: &mut State) {
+        state.path = self.path;
+        state.res = self.res;
+        state.routed = self.routed;
+        state.failed = self.failed;
+        state.occ = self.occ;
     }
 }

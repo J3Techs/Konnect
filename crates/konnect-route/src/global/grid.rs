@@ -11,6 +11,44 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// Most base cells along one side of the grid.
 const MAX_SIDE: i64 = 65_000;
 
+/// Most search nodes (layer slots × planar cells, fine cells included) a
+/// grid may hold. Keeps GCell ids, node and resource numbers far inside
+/// `u32`, and per-thread search scratch near 0.25 GB.
+pub(crate) const MAX_NODES: u64 = 1 << 23;
+
+/// Most fine cells per side of a refined base cell.
+pub(crate) const MAX_REFINE: u32 = 16;
+
+/// Whether `grid` stays inside the size limits the router's `u32` ids and
+/// memory budget assume: what [`lay_out`] builds always does; a grid read
+/// from elsewhere may not.
+pub(crate) fn fits(grid: &GCellGrid) -> bool {
+    let side = |n: u32| n >= 1 && i64::from(n) <= MAX_SIDE;
+    if !side(grid.cols) || !side(grid.rows) || grid.pitch <= 0 {
+        return false;
+    }
+    let base = u64::from(grid.cols) * u64::from(grid.rows);
+    let k = u64::from(grid.refine_factor());
+    if k > u64::from(MAX_REFINE) {
+        return false;
+    }
+    let fine = if k > 1 {
+        let ascending = grid.refined.windows(2).all(|w| w[0] < w[1]);
+        if !ascending || grid.refined.last().is_some_and(|&b| u64::from(b) >= base) {
+            return false;
+        }
+        grid.refined.len() as u64 * k * k
+    } else {
+        0
+    };
+    u64::from(grid.layer_slots()) * (base + fine) <= MAX_NODES
+}
+
+/// Cells needed to cover `w` nm at `pitch`.
+fn span(w: i64, pitch: i64) -> u32 {
+    ((w.max(1) + pitch - 1) / pitch).max(1) as u32
+}
+
 /// The board area to grid: the outline's box, else every pad's.
 fn board_bbox(board: &RouteBoard) -> BBox {
     if let Some(b) = board.outline.bbox {
@@ -33,14 +71,25 @@ fn board_bbox(board: &RouteBoard) -> BBox {
 /// Lay out the grid: the base cells over the board and the refined set.
 pub(crate) fn lay_out(board: &RouteBoard, settings: &GlobalSettings) -> GCellGrid {
     let area = board_bbox(board);
-    // Cell coordinates are u16: a pitch too fine for the board is coarsened
-    // so neither side exceeds MAX_SIDE cells.
+    // A pitch too fine for the board is coarsened: cell coordinates are
+    // u16, so neither side may exceed MAX_SIDE cells, and the whole grid
+    // must fit the node budget on every routable layer.
     let extent = area.width().max(area.height()).max(1);
     let min_pitch = (extent + MAX_SIDE - 1) / MAX_SIDE;
-    let pitch = i64::from(settings.gcell_pitch.max(1)).max(min_pitch) as Coord;
-    let span = |w: i64| ((w.max(1) + i64::from(pitch) - 1) / i64::from(pitch)).max(1) as u32;
-    let cols = span(area.width());
-    let rows = span(area.height());
+    let slots = u64::from(board.routable.count().max(1));
+    let mut pitch = i64::from(settings.gcell_pitch.max(1)).max(min_pitch);
+    loop {
+        let nodes =
+            u64::from(span(area.width(), pitch)) * u64::from(span(area.height(), pitch)) * slots;
+        if nodes <= MAX_NODES {
+            break;
+        }
+        let grow = (pitch as f64 * (nodes as f64 / MAX_NODES as f64).sqrt()).ceil() as i64;
+        pitch = grow.max(pitch + 1);
+    }
+    let pitch = pitch.min(i64::from(Coord::MAX)) as Coord;
+    let cols = span(area.width(), i64::from(pitch));
+    let rows = span(area.height(), i64::from(pitch));
     let max = Point::new(
         (i64::from(area.min.x) + i64::from(cols) * i64::from(pitch)).min(i64::from(i32::MAX))
             as Coord,
@@ -63,6 +112,7 @@ pub(crate) fn lay_out(board: &RouteBoard, settings: &GlobalSettings) -> GCellGri
         || fine <= 0
         || fine >= pitch
         || pitch % fine != 0
+        || (pitch / fine) as u32 > MAX_REFINE
     {
         return grid;
     }
@@ -98,6 +148,13 @@ pub(crate) fn lay_out(board: &RouteBoard, settings: &GlobalSettings) -> GCellGri
                 refined.push(row * cols + col);
             }
         }
+    }
+    // Refinement that would break the node budget is dropped whole (a
+    // partial set would depend on scan order, not density).
+    let k = u64::from((pitch / fine) as u32);
+    let fine_cells = refined.len() as u64 * k * k;
+    if (u64::from(cols) * u64::from(rows) + fine_cells) * slots > MAX_NODES {
+        return grid;
     }
     grid.fine_pitch = fine;
     grid.refined = refined;

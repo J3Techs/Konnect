@@ -95,8 +95,22 @@ impl<'a> Obstacle<'a> {
                 }
             }
             Obstacle::Convex { pts, r } => {
-                let pts: Vec<(f64, f64)> = pts.iter().map(|&p| s(p)).collect();
-                if let Some(iv) = rounded_convex(&pts, *r, x) {
+                // Swapped points go in a stack buffer: this runs once per
+                // obstacle and sample line, so it must not allocate.
+                const STACK: usize = 32;
+                let iv = if !swap {
+                    rounded_convex(pts, *r, x)
+                } else if pts.len() <= STACK {
+                    let mut buf = [(0.0, 0.0); STACK];
+                    for (b, &p) in buf.iter_mut().zip(pts.iter()) {
+                        *b = s(p);
+                    }
+                    rounded_convex(&buf[..pts.len()], *r, x)
+                } else {
+                    let v: Vec<(f64, f64)> = pts.iter().map(|&p| s(p)).collect();
+                    rounded_convex(&v, *r, x)
+                };
+                if let Some(iv) = iv {
                     out.push(iv);
                 }
             }

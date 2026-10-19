@@ -4,8 +4,8 @@
 //! routable layers ([`crate::api::GCELL_PITCH_NM`]), refined to 0.5 mm in
 //! dense fields. Edge capacity is the free track pitches left after fixed
 //! copper and fanout. Connections are seeded with pattern routes (L, Z,
-//! 3-bend), then negotiated with cost `(b + h) · p` for a bounded number of
-//! iterations in deterministic bbox-disjoint batches. The output is one
+//! 3-bend), then negotiated with cost `b · (1 + h) · p` for a bounded number
+//! of iterations in deterministic bbox-disjoint batches. The output is one
 //! corridor and layer assignment per connection, plus the overflow map.
 //!
 //! # Grid
@@ -19,25 +19,34 @@
 //!   cell's id is never used;
 //! - fine cells follow every base id: see [`GCellGrid::fine_id`].
 //!
+//! A pitch too fine for the board is coarsened until no side exceeds 65,000
+//! cells and the layer slots times the cells (fine cells included) stay
+//! within 2^23 nodes; refinement that would break that budget is dropped.
+//! [`route_global`] refuses a grid from elsewhere beyond those limits (every
+//! connection fails with `NoCorridor`).
+//!
 //! [`GCellGrid::cell_bbox`] and [`GCellGrid::locate`] map ids to areas and
 //! back, so S5 can read a corridor without knowing the layout.
 //!
 //! # Capacity
 //!
 //! For each layer the board is cut by sample lines a quarter of a fine cell
-//! apart. Each obstacle (pads, fixed tracks and vias, drills, keepouts, the
-//! board edge and everything outside the outline) is inflated by the
-//! layer's default clearance plus half the default track width and
-//! intersected with every line. Edges whose tracks cross the same strip
+//! apart, or closer when an obstacle inflated by the rules (twice the
+//! clearance plus a track) is narrower than that, so none falls between
+//! two lines. Each obstacle (pads, fixed tracks and vias, drills,
+//! keepouts, the board edge and everything outside the outline) is
+//! inflated by the layer's default clearance plus half the default track
+//! width and intersected with every line. Edges whose tracks cross the same strip
 //! (between the same two centre lines) are counted together: the blocked
 //! stretches of every line in the strip are merged, tracks at the default
 //! track pitch are packed from the start of each free stretch, and each
 //! edge counts the track centres on its boundary, so a gap that straddles
 //! two cells keeps all its tracks. Via sites are counted from a 4 × 4
 //! sample of each cell where the via (inflated by clearance plus its
-//! radius) is free on every routable layer, in default via pitches. Zone fills do not block unless
-//! [`GlobalSettings::zones_block`] is set, because they are refilled around
-//! new copper.
+//! radius) is free on every routable layer, in default via pitches (the
+//! default via diameter plus the largest layer clearance). Zone fills do
+//! not block unless [`GlobalSettings::zones_block`] is set, because they are
+//! refilled around new copper.
 //!
 //! # Routing
 //!
@@ -65,7 +74,9 @@
 //!    rip-up as in VPR and nextpnr router2): far cheaper for long
 //!    connections that leave a congested field. Negotiation stops when no
 //!    resource is overused, after [`GlobalSettings::max_iterations`], or
-//!    after [`GlobalSettings::stall_iterations`] without progress.
+//!    after [`GlobalSettings::stall_iterations`] without progress. The
+//!    result is the best iteration ([`GlobalStats::best_iteration`]), not
+//!    necessarily the last.
 //! 3. **Schedule**: each iteration's jobs go through
 //!    [`crate::compute::BatchBuilder`]. A batch's windows are disjoint, its
 //!    rip-ups run first, its searches run in parallel against that frozen
@@ -80,12 +91,20 @@
 //! a via site, the square of its via diameter plus clearance over the
 //! default via's, rounded (at least 1 each).
 //!
-//! A cell edge or via site with no capacity is a wall, except within one
-//! cell of a connection's own terminal cells: a 1 mm grid cannot resolve pin
-//! access (S2 and S4 decide it). Such *access* resources cost twice their
-//! base cost, carry no congestion cost, and are reported in
-//! [`GlobalStats::access_overuse`] but neither count as overflow nor trigger
-//! rip-up.
+//! A layer change is one through via: it joins any two slots the connection
+//! may use for one via cost and one via-site demand, crossing the slots
+//! between, so a class confined to F.Cu and B.Cu routes like any other.
+//! The lookahead and the seed's dynamic program charge it the same way.
+//!
+//! A cell edge or via site with no capacity is a wall, except at a
+//! connection's own *access* cells (its terminal cells and their
+//! neighbours): a 1 mm grid cannot resolve pin access (S2 and S4 decide it).
+//! An edge with either end in an access cell, and the via site of an access
+//! cell, stay passable, so the exemption reaches two cells out from a
+//! terminal. Such access resources cost twice their base cost and carry no
+//! congestion cost (any number of nets may share one); their demand is
+//! reported in [`GlobalStats::access_overuse`] but neither counts as
+//! overflow nor triggers rip-up.
 //!
 //! The maze search is A* bounded to the job's window with a closed set, the
 //! lookahead bound weighted by [`GlobalCosts::astar_fac`], epoch-stamped
@@ -393,10 +412,17 @@ impl GCellGrid {
 pub struct Corridor {
     pub connection: ConnectionId,
     /// From the `from` terminal's cell to the `to` terminal's cell. A layer
-    /// change is two consecutive ids of one area on adjacent layers.
+    /// change is two consecutive ids of one area on two layers of
+    /// `layers`: one through via, which also crosses every layer between
+    /// them (allowed or not) without running track there.
     pub cells: Vec<u32>,
-    /// The layers the path uses (its layer assignment).
+    /// The layers it may use: its net class's layers on the grid (every grid
+    /// layer when the class is unrestricted).
     pub layers: LayerMask,
+    /// The layers the corridor's cells are on (its layer assignment), a
+    /// subset of `layers`.
+    #[serde(default)]
+    pub assigned: LayerMask,
 }
 
 /// One negotiation iteration, for reports.
@@ -425,18 +451,23 @@ pub struct GlobalStats {
     pub access_overuse: u64,
     /// Total corridor length between cell centres, nm.
     pub wirelength_nm: u64,
+    /// Via sites in use, counting a site a net's connections share once.
     pub vias: u64,
     pub pattern_seeds: u32,
     pub maze_seeds: u32,
     /// Searches that needed the whole grid after their window failed.
     pub full_grid_searches: u32,
+    /// The iteration the result comes from (0 is the seed): the one with
+    /// the fewest unrouted connections, then the least overflow.
+    #[serde(default)]
+    pub best_iteration: u32,
     pub per_iteration: Vec<IterationStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GlobalResult {
     pub corridors: Vec<Corridor>,
-    /// Connections left overflowed after the last iteration.
+    /// Connections left overflowed in the returned (best) iteration.
     pub overflowed: Vec<ConnectionId>,
     /// Per-GCell overflow (demand − capacity, floored at 0), by GCell id.
     /// A cell carries the overflow of its east and south edges on its layer
