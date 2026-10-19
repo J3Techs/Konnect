@@ -1796,7 +1796,7 @@ impl<'c, 'b> Ctx<'c, 'b> {
                     o.src.kind() == ItemKind::Pad
                         && match &o.geom {
                             Geom::Shape(s) => {
-                                konnect_geom::point_shape_distance_cmp(at, s, 0)
+                                konnect_geom::point_shape_distance_cmp(at, 0, s, 0)
                                     != Ordering::Greater
                             }
                             Geom::Zone(_) => false,

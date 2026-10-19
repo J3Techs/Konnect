@@ -19,8 +19,9 @@ use crate::index::{IndexEntry, LayerIndex};
 use crate::measure::{closest, Closest};
 use crate::point::Point;
 use crate::predicates::{
-    core_cmp, crosses_properly, dbl, orient, point_in_rings, point_seg_cmp, seg_seg_cmp, with_core,
-    zero_cmp, Containment, Core, P2,
+    core_cmp, dbl, orient, perturbed_in_edges, point_seg_cmp, region_within, seg_seg_cmp,
+    shape_within, undbl, with_core, within_box, zero_cmp, Containment, Core, Perturbed, RegionView,
+    P2,
 };
 use crate::shape::{Polygon, Segment, Shape};
 use std::cmp::Ordering;
@@ -170,102 +171,14 @@ impl IndexedPolygon {
     /// [`crate::shape_within_polygon`], visiting only the edges near the
     /// shape.
     pub fn contains(&self, shape: &Shape) -> bool {
-        let bbox = shape.bbox();
-        if !self.bbox.contains_bbox(&bbox) {
-            return false;
-        }
-        let r2 = i128::from(shape.sweep2());
-        let near: Vec<(P2, P2)> = self
-            .tree
-            .query_entries(&bbox)
-            .map(|e| {
-                let (a, b) = self.edges[e.id as usize];
-                (dbl(a), dbl(b))
-            })
-            .collect();
-        let inside = |p: P2| self.containment(undbl(p)) != Containment::Outside;
-        with_core(shape, |core| {
-            let probe = match core {
-                Core::Point(p) => *p,
-                Core::Seg(a, _) => *a,
-                Core::Region(r) => dbl(r[0][0]),
-            };
-            if !inside(probe) {
-                return false;
-            }
-            if r2 > 0
-                && near
-                    .iter()
-                    .any(|&(c, d)| core_cmp(core, &Core::Seg(c, d), r2) == Ordering::Less)
-            {
-                return false;
-            }
-            match core {
-                Core::Point(_) => true,
-                Core::Seg(a, b) => {
-                    if r2 > 0 {
-                        return true;
-                    }
-                    let mid = P2 {
-                        x: (a.x + b.x) / 2,
-                        y: (a.y + b.y) / 2,
-                    };
-                    inside(*b)
-                        && inside(mid)
-                        && !near.iter().any(|&(c, d)| crosses_properly(*a, *b, c, d))
-                }
-                Core::Region(cr) => {
-                    let ring_edges = || {
-                        cr.iter().flat_map(|ring| {
-                            let n = ring.len();
-                            (0..n).map(move |i| (dbl(ring[i]), dbl(ring[(i + 1) % n])))
-                        })
-                    };
-                    if ring_edges().any(|(v, _)| !inside(v)) {
-                        return false;
-                    }
-                    if ring_edges()
-                        .any(|(a, b)| near.iter().any(|&(c, d)| crosses_properly(a, b, c, d)))
-                    {
-                        return false;
-                    }
-                    !near
-                        .iter()
-                        .any(|&(v, _)| point_in_rings(v, cr) == Containment::Inside)
-                }
-            }
-        })
+        shape_within(shape, self)
     }
 
     /// Whether `other`'s region lies entirely inside this one (touching the
-    /// boundary from inside counts), using both edge indexes: every vertex
-    /// of `other` inside, no proper edge crossing, and no vertex of this
-    /// region strictly inside `other`.
+    /// boundary from inside counts), using both edge indexes; the same
+    /// answer as [`crate::shape_within_polygon`] on the two polygons.
     pub fn contains_polygon(&self, other: &IndexedPolygon) -> bool {
-        if !self.bbox.contains_bbox(&other.bbox) {
-            return false;
-        }
-        if other
-            .edges
-            .iter()
-            .any(|&(v, _)| self.containment(v) == Containment::Outside)
-        {
-            return false;
-        }
-        let crosses = other.edges.iter().any(|&(a, b)| {
-            let (pa, pb) = (dbl(a), dbl(b));
-            self.tree.query_entries(&BBox::new(a, b)).any(|e| {
-                let (c, d) = self.edges[e.id as usize];
-                crosses_properly(pa, pb, dbl(c), dbl(d))
-            })
-        });
-        if crosses {
-            return false;
-        }
-        !self
-            .tree
-            .query_entries(&other.bbox)
-            .any(|e| other.containment(self.edges[e.id as usize].0) == Containment::Inside)
+        region_within(other, self)
     }
 
     /// `true` when the region and `shape` touch or overlap; the same answer
@@ -359,18 +272,49 @@ impl IndexedPolygon {
     }
 }
 
+impl RegionView for IndexedPolygon {
+    fn region_bbox(&self) -> BBox {
+        self.bbox
+    }
+
+    fn contain(&self, p: P2) -> Containment {
+        self.containment(undbl(p))
+    }
+
+    fn contain_perturbed(&self, x: Perturbed) -> Containment {
+        let s = undbl(x.s);
+        if !self.bbox.contains(s) {
+            // At least 1 nm outside the box: so is every point near it.
+            return Containment::Outside;
+        }
+        // Every edge the ray from a point infinitesimally near `s` can meet,
+        // or that can pass through `s`, has a box meeting this ray from `s`.
+        let ray = BBox::new(s, Point::new(self.bbox.max.x, s.y));
+        perturbed_in_edges(
+            x,
+            self.tree.query_entries(&ray).map(|e| {
+                let (a, b) = self.edges[e.id as usize];
+                (dbl(a), dbl(b))
+            }),
+        )
+    }
+
+    fn any_edge_near(&self, q: BBox, f: &mut dyn FnMut(P2, P2) -> bool) -> bool {
+        self.tree.query_entries(&q).any(|e| {
+            let (a, b) = self.edges[e.id as usize];
+            f(dbl(a), dbl(b))
+        })
+    }
+
+    fn any_edge(&self, f: &mut dyn FnMut(P2, P2) -> bool) -> bool {
+        self.edges.iter().any(|&(a, b)| f(dbl(a), dbl(b)))
+    }
+}
+
 /// Inflation amounts beyond the coordinate range saturate (`BBox::inflate`
 /// saturates too), so a huge clearance simply covers everything.
 fn clamp_coord(v: i64) -> i32 {
     v.clamp(0, i64::from(i32::MAX)) as i32
-}
-
-fn undbl(p: P2) -> Point {
-    Point::new((p.x / 2) as i32, (p.y / 2) as i32)
-}
-
-fn within_box(a: P2, b: P2, p: P2) -> bool {
-    a.x.min(b.x) <= p.x && p.x <= a.x.max(b.x) && a.y.min(b.y) <= p.y && p.y <= a.y.max(b.y)
 }
 
 #[cfg(test)]

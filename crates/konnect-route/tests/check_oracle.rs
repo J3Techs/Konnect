@@ -300,7 +300,7 @@ fn items_at(
     out.push(format!("{tracks} track ends"));
     for v in &board.vias {
         if v.layers.contains(layer)
-            && point_shape_distance_cmp(at, &v.shape(), 0) != Ordering::Greater
+            && point_shape_distance_cmp(at, 0, &v.shape(), 0) != Ordering::Greater
         {
             out.push(format!(
                 "via{}",
@@ -312,7 +312,7 @@ fn items_at(
         if p.layers.contains(layer)
             && p.shapes
                 .iter()
-                .any(|s| point_shape_distance_cmp(at, s, 0) != Ordering::Greater)
+                .any(|s| point_shape_distance_cmp(at, 0, s, 0) != Ordering::Greater)
         {
             out.push(format!(
                 "pad{}",

@@ -16,8 +16,10 @@
 //! [`crate::shape`]). A gap is never negative here — overlapping shapes have
 //! gap "zero or less", and every threshold the router asks about is `>= 0`.
 
+use crate::bbox::BBox;
 use crate::point::Point;
 use crate::shape::{Polygon, Shape};
+use crate::units::Coord;
 use std::cmp::Ordering;
 
 /// Where a point lies relative to a closed region.
@@ -81,8 +83,10 @@ pub fn point_in_polygon(p: Point, poly: &Polygon) -> Containment {
 /// Compare the edge-to-edge gap between two shapes with `clearance` (nm).
 ///
 /// `Less` means the shapes are closer than `clearance` — a violation of a
-/// minimum-clearance rule. Overlapping or touching shapes compare as a gap of
-/// zero against a positive clearance (`Less`) and `Equal` against zero.
+/// minimum-clearance rule. Overlapping or touching shapes are `Less` than
+/// any positive clearance. Against zero, touching shapes and overlapping
+/// sharp cores (no sweep on either side) compare `Equal`, while swept shapes
+/// that overlap compare `Less`; [`touches`] (`!= Greater`) covers both.
 pub fn gap_cmp(a: &Shape, b: &Shape, clearance: i64) -> Ordering {
     let t = 2 * i128::from(clearance) + i128::from(a.sweep2()) + i128::from(b.sweep2());
     if t < 0 {
@@ -101,28 +105,44 @@ pub fn touches(a: &Shape, b: &Shape) -> bool {
     gap_cmp(a, b, 0) != Ordering::Greater
 }
 
-/// Compare the distance from `p` to the shape's edge with `distance` (nm).
-/// `Less` means `p` is strictly within `distance` of the shape's copper (or
-/// strictly inside it): the test a raster uses to decide whether a lattice
-/// node lies in an obstacle inflated by `distance`.
-pub fn point_shape_distance_cmp(p: Point, shape: &Shape, distance: i64) -> Ordering {
-    let t = 2 * i128::from(distance) + i128::from(shape.sweep2());
-    if t < 0 {
+/// Compare the distance from a disc of diameter `width` centred on `p` to
+/// the shape (edge to edge) with `clearance` (nm): whether a via or a
+/// track end of that width at `p` would violate the clearance to the
+/// shape. `width` 0 asks about the point itself. A raster uses it to decide
+/// whether a lattice node lies in an obstacle inflated by the clearance
+/// plus half a track width; passing the full width keeps odd widths exact.
+///
+/// `Less` means strictly closer. Overlap counts as a gap of zero or less:
+/// a point on or inside a shape without sweep (a sharp pad, a zone piece)
+/// compares `Equal` with `width` 0 and `clearance` 0, and `Less` only
+/// against a positive threshold; a point strictly within a swept shape's
+/// copper is `Less` even then. Test `!= Greater` to ask "touches or
+/// overlaps".
+pub fn point_shape_distance_cmp(p: Point, width: Coord, shape: &Shape, clearance: i64) -> Ordering {
+    if clearance < 0 || width < 0 {
         return Ordering::Greater;
     }
+    let t = 2 * i128::from(clearance) + i128::from(width) + i128::from(shape.sweep2());
     with_core(shape, |c| core_cmp(&Core::Point(dbl(p)), c, t))
 }
 
-/// Compare the distance from the zero-width segment `a`–`b` to the shape
-/// (edge to edge) with `distance` (nm). With `distance` = clearance plus
-/// half a track width this is the swept-track test: whether a track of that
-/// width along `a`–`b` would violate the clearance to the shape. It is
-/// [`gap_cmp`] without building a [`Shape`] for the segment.
-pub fn segment_shape_distance_cmp(a: Point, b: Point, shape: &Shape, distance: i64) -> Ordering {
-    let t = 2 * i128::from(distance) + i128::from(shape.sweep2());
-    if t < 0 {
+/// Compare the gap between a track of `width` along `a`–`b` (round ends)
+/// and the shape, edge to edge, with `clearance` (nm): the swept-track
+/// test, whether such a track would violate the clearance to the shape.
+/// It is [`gap_cmp`] of `Segment::new(a, b, width)` against `shape`
+/// without building the [`Shape`], and exact for odd widths (half widths
+/// are never rounded).
+pub fn segment_shape_distance_cmp(
+    a: Point,
+    b: Point,
+    width: Coord,
+    shape: &Shape,
+    clearance: i64,
+) -> Ordering {
+    if clearance < 0 || width < 0 {
         return Ordering::Greater;
     }
+    let t = 2 * i128::from(clearance) + i128::from(width) + i128::from(shape.sweep2());
     with_core(shape, |c| core_cmp(&Core::Seg(dbl(a), dbl(b)), c, t))
 }
 
@@ -131,55 +151,299 @@ pub fn segment_shape_distance_cmp(a: Point, b: Point, shape: &Shape, distance: i
 /// minus the area must be empty. Touching the boundary from inside counts as
 /// inside.
 ///
-/// Exact for points, swept segments and swept polygons with a positive
-/// sweep radius. For zero-radius cores the test is: every core vertex (and a
-/// segment's midpoint) not outside, no proper crossing between core and
-/// region edges, and no region vertex strictly inside a core polygon.
+/// Exact for every shape, given a valid `poly` (no two of its edges
+/// overlap; see [`Polygon`]):
+///
+/// - a swept shape (positive radius) is inside when one core point is and
+///   no region edge comes nearer the core than the radius;
+/// - a sharp segment is inside when its ends are, it crosses no region edge
+///   properly, and it does not leave the region just beside any region
+///   vertex on it or any end on the boundary;
+/// - a sharp region (a sharp pad, a zone piece) is inside when its vertices
+///   are, no edges cross properly, no region vertex lies strictly inside
+///   it, and no point just beside a vertex where the two boundaries meet is
+///   inside the shape but outside the region. Any part of the shape outside
+///   the region has such a corner, so nothing is missed.
+///
+/// "Just beside" is an infinitesimal displacement decided exactly by
+/// lexicographic signs, never a rounded sample point.
 pub fn shape_within_polygon(shape: &Shape, poly: &Polygon) -> bool {
     let rings: Vec<&[Point]> = poly.rings().collect();
+    shape_within(shape, &RingsView::new(&rings))
+}
+
+// ─── Containment kernel ──────────────────────────────────────────────────────
+
+/// A point displaced infinitesimally from `s`: `s + ε·d1 + ε²·d2` for an
+/// infinitesimal `ε > 0` (doubled units). Containment of such a point is
+/// decided exactly by comparing coefficients lexicographically.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Perturbed {
+    pub(crate) s: P2,
+    pub(crate) d1: (i128, i128),
+    pub(crate) d2: (i128, i128),
+}
+
+/// The sign of `t[0] + t[1]·ε + t[2]·ε²`.
+fn lex_sign(t: [i128; 3]) -> i128 {
+    t.into_iter().find(|v| *v != 0).map_or(0, i128::signum)
+}
+
+fn cross2(a: (i128, i128), b: (i128, i128)) -> i128 {
+    a.0 * b.1 - a.1 * b.0
+}
+
+fn dot2(a: (i128, i128), b: (i128, i128)) -> i128 {
+    a.0 * b.0 + a.1 * b.1
+}
+
+fn vec2(from: P2, to: P2) -> (i128, i128) {
+    (i128::from(to.x - from.x), i128::from(to.y - from.y))
+}
+
+/// Crossing-number containment of a perturbed point among `edges`, by the
+/// same rule as [`point_in_rings`]. Every product stays below 2^70.
+pub(crate) fn perturbed_in_edges(
+    x: Perturbed,
+    edges: impl Iterator<Item = (P2, P2)>,
+) -> Containment {
+    let above = |q: P2| lex_sign([i128::from(q.y - x.s.y), -x.d1.1, -x.d2.1]) > 0;
+    let mut inside = false;
+    for (a, b) in edges {
+        if a == b {
+            continue;
+        }
+        let e = vec2(a, b);
+        let o = lex_sign([orient(a, b, x.s), cross2(e, x.d1), cross2(e, x.d2)]);
+        if o == 0 {
+            // On the edge's line: on the edge when between its ends.
+            let t = [dot2(vec2(a, x.s), e), dot2(x.d1, e), dot2(x.d2, e)];
+            if lex_sign(t) >= 0 && lex_sign([dot2(e, e) - t[0], -t[1], -t[2]]) >= 0 {
+                return Containment::Boundary;
+            }
+            continue;
+        }
+        if above(a) != above(b) {
+            let left = if b.y > a.y { o > 0 } else { o < 0 };
+            if left {
+                inside = !inside;
+            }
+        }
+    }
+    if inside {
+        Containment::Inside
+    } else {
+        Containment::Outside
+    }
+}
+
+/// A closed polygonal region the containment kernel can query: plain rings
+/// or an [`crate::IndexedPolygon`]. Points are doubled vertices (even).
+pub(crate) trait RegionView {
+    fn region_bbox(&self) -> BBox;
+    fn contain(&self, p: P2) -> Containment;
+    fn contain_perturbed(&self, x: Perturbed) -> Containment;
+    /// Calls `f` on (at least) every edge whose box meets `q`, stopping and
+    /// returning `true` as soon as `f` does.
+    fn any_edge_near(&self, q: BBox, f: &mut dyn FnMut(P2, P2) -> bool) -> bool;
+    /// Calls `f` on every edge, stopping and returning `true` as soon as `f`
+    /// does.
+    fn any_edge(&self, f: &mut dyn FnMut(P2, P2) -> bool) -> bool;
+}
+
+/// Plain rings, scanned edge by edge.
+pub(crate) struct RingsView<'a> {
+    rings: &'a [&'a [Point]],
+    bbox: BBox,
+}
+
+impl<'a> RingsView<'a> {
+    pub(crate) fn new(rings: &'a [&'a [Point]]) -> Self {
+        let bbox = BBox::from_points(rings[0].iter().copied()).unwrap_or(BBox::point(rings[0][0]));
+        RingsView { rings, bbox }
+    }
+}
+
+impl RegionView for RingsView<'_> {
+    fn region_bbox(&self) -> BBox {
+        self.bbox
+    }
+
+    fn contain(&self, p: P2) -> Containment {
+        point_in_rings(p, self.rings)
+    }
+
+    fn contain_perturbed(&self, x: Perturbed) -> Containment {
+        perturbed_in_edges(x, edges(self.rings))
+    }
+
+    fn any_edge_near(&self, q: BBox, f: &mut dyn FnMut(P2, P2) -> bool) -> bool {
+        edges(self.rings).any(|(a, b)| edge_bbox(a, b).intersects(&q) && f(a, b))
+    }
+
+    fn any_edge(&self, f: &mut dyn FnMut(P2, P2) -> bool) -> bool {
+        edges(self.rings).any(|(a, b)| f(a, b))
+    }
+}
+
+/// Back from doubled to nm coordinates (exact for doubled vertices).
+pub(crate) fn undbl(p: P2) -> Point {
+    Point::new((p.x / 2) as i32, (p.y / 2) as i32)
+}
+
+/// The nm box of an edge between doubled vertices.
+pub(crate) fn edge_bbox(a: P2, b: P2) -> BBox {
+    BBox::new(undbl(a), undbl(b))
+}
+
+/// [`shape_within_polygon`] against any region view.
+pub(crate) fn shape_within(shape: &Shape, area: &dyn RegionView) -> bool {
+    let bbox = shape.bbox();
+    if !area.region_bbox().contains_bbox(&bbox) {
+        return false;
+    }
     let r2 = i128::from(shape.sweep2());
     with_core(shape, |core| {
-        let probe = match core {
-            Core::Point(p) => *p,
-            Core::Seg(a, _) => *a,
-            Core::Region(r) => dbl(r[0][0]),
-        };
-        if point_in_rings(probe, &rings) == Containment::Outside {
-            return false;
-        }
-        // A swept shape pokes out wherever the boundary comes nearer than
-        // its radius (doubled units: the threshold is the doubled radius).
-        if r2 > 0
-            && edges(&rings).any(|(c, d)| core_cmp(core, &Core::Seg(c, d), r2) == Ordering::Less)
-        {
-            return false;
+        if r2 > 0 {
+            // The core is connected: with no boundary nearer than the
+            // radius it is wholly inside or wholly outside, and one point
+            // decides which.
+            let probe = match core {
+                Core::Point(p) => *p,
+                Core::Seg(a, _) => *a,
+                Core::Region(r) => dbl(r[0][0]),
+            };
+            return area.contain(probe) != Containment::Outside
+                && !area.any_edge_near(bbox, &mut |c, d| {
+                    core_cmp(core, &Core::Seg(c, d), r2) == Ordering::Less
+                });
         }
         match core {
-            Core::Point(_) => true,
-            Core::Seg(a, b) => {
-                if r2 > 0 {
-                    return true;
-                }
-                let mid = P2 {
-                    x: (a.x + b.x) / 2,
-                    y: (a.y + b.y) / 2,
-                };
-                point_in_rings(*b, &rings) != Containment::Outside
-                    && point_in_rings(mid, &rings) != Containment::Outside
-                    && !edges(&rings).any(|(c, d)| crosses_properly(*a, *b, c, d))
+            Core::Point(p) => area.contain(*p) != Containment::Outside,
+            Core::Seg(a, b) => segment_within(*a, *b, area),
+            Core::Region(r) => region_within(&RingsView::new(r), area),
+        }
+    })
+}
+
+/// Whether the sharp segment `a`–`b` lies inside `area`.
+pub(crate) fn segment_within(a: P2, b: P2, area: &dyn RegionView) -> bool {
+    let (ca, cb) = (area.contain(a), area.contain(b));
+    if ca == Containment::Outside || cb == Containment::Outside {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let q = edge_bbox(a, b);
+    if area.any_edge_near(q, &mut |c, d| crosses_properly(a, b, c, d)) {
+        return false;
+    }
+    // Without a proper crossing the segment can leave the region only at a
+    // region vertex on it, or at an end on the boundary: look just beside
+    // each, along the segment.
+    let d = vec2(a, b);
+    let back = (-d.0, -d.1);
+    let mut probes: Vec<(P2, (i128, i128))> = Vec::new();
+    if ca == Containment::Boundary {
+        probes.push((a, d));
+    }
+    if cb == Containment::Boundary {
+        probes.push((b, back));
+    }
+    area.any_edge_near(q, &mut |v, _| {
+        if v != a && v != b && orient(a, b, v) == 0 && within_box(a, b, v) {
+            probes.push((v, d));
+            probes.push((v, back));
+        }
+        false
+    });
+    !probes.into_iter().any(|(s, dir)| {
+        area.contain_perturbed(Perturbed {
+            s,
+            d1: dir,
+            d2: (0, 0),
+        }) == Containment::Outside
+    })
+}
+
+/// Whether the sharp region `inner` lies inside `area`.
+///
+/// `inner` minus `area` is open; when it is not empty it has a corner, and
+/// with no proper edge crossing every corner is a vertex of one of the two
+/// boundaries. A vertex of `inner` outside `area`, or a vertex of `area`
+/// strictly inside `inner`, decides at once. Otherwise the corner is a
+/// vertex on both boundaries, and a point just to either side of each
+/// boundary ray leaving it lands in every sector around it.
+pub(crate) fn region_within(inner: &dyn RegionView, area: &dyn RegionView) -> bool {
+    let ib = inner.region_bbox();
+    if !area.region_bbox().contains_bbox(&ib) {
+        return false;
+    }
+    let mut events: Vec<P2> = Vec::new();
+    if inner.any_edge(&mut |v, _| match area.contain(v) {
+        Containment::Outside => true,
+        Containment::Boundary => {
+            events.push(v);
+            false
+        }
+        Containment::Inside => false,
+    }) {
+        return false;
+    }
+    if inner.any_edge(&mut |a, b| {
+        area.any_edge_near(edge_bbox(a, b), &mut |c, d| crosses_properly(a, b, c, d))
+    }) {
+        return false;
+    }
+    if area.any_edge_near(ib, &mut |v, _| match inner.contain(v) {
+        Containment::Inside => true,
+        Containment::Boundary => {
+            events.push(v);
+            false
+        }
+        Containment::Outside => false,
+    }) {
+        return false;
+    }
+    events.sort_unstable_by_key(|p| (p.x, p.y));
+    events.dedup();
+    let mut rays: Vec<(i128, i128)> = Vec::new();
+    for s in events {
+        rays.clear();
+        let q = BBox::point(undbl(s));
+        let mut collect = |u: P2, v: P2| {
+            if u == v {
+                return false;
             }
-            Core::Region(cr) => {
-                if edges(cr).any(|(v, _)| point_in_rings(v, &rings) == Containment::Outside) {
-                    return false;
-                }
-                if edges(cr).any(|(a, b)| edges(&rings).any(|(c, d)| crosses_properly(a, b, c, d)))
+            if s == u {
+                rays.push(vec2(u, v));
+            } else if s == v {
+                rays.push(vec2(v, u));
+            } else if orient(u, v, s) == 0 && within_box(u, v, s) {
+                rays.push(vec2(s, v));
+                rays.push(vec2(s, u));
+            }
+            false
+        };
+        inner.any_edge_near(q, &mut collect);
+        area.any_edge_near(q, &mut collect);
+        for &r in &rays {
+            for side in [1, -1] {
+                let x = Perturbed {
+                    s,
+                    d1: r,
+                    d2: (-r.1 * side, r.0 * side),
+                };
+                if inner.contain_perturbed(x) == Containment::Inside
+                    && area.contain_perturbed(x) == Containment::Outside
                 {
                     return false;
                 }
-                !edges(&rings).any(|(v, _)| point_in_rings(v, cr) == Containment::Inside)
             }
         }
-    })
+    }
+    true
 }
 
 /// Whether two segments cross at one interior point of both.
@@ -325,7 +589,7 @@ pub(crate) fn orient(a: P2, b: P2, c: P2) -> i128 {
 }
 
 /// `p` within the bounding box of `a`–`b` (meaningful when collinear).
-fn within_box(a: P2, b: P2, p: P2) -> bool {
+pub(crate) fn within_box(a: P2, b: P2, p: P2) -> bool {
     a.x.min(b.x) <= p.x && p.x <= a.x.max(b.x) && a.y.min(b.y) <= p.y && p.y <= a.y.max(b.y)
 }
 
@@ -599,17 +863,24 @@ mod tests {
     fn point_and_swept_segment_distances_to_shapes() {
         let pad = Shape::from(ConvexPoly::axis_rect(BBox::new(p(0, 0), p(100, 100)), 10).unwrap());
         // 30 from the sharp edge, 20 from the rounded copper.
-        assert_eq!(point_shape_distance_cmp(p(130, 50), &pad, 20), Equal);
-        assert_eq!(point_shape_distance_cmp(p(130, 50), &pad, 21), Less);
+        assert_eq!(point_shape_distance_cmp(p(130, 50), 0, &pad, 20), Equal);
+        assert_eq!(point_shape_distance_cmp(p(130, 50), 0, &pad, 21), Less);
+        // A via of diameter 10 there: 15 from the copper.
+        assert_eq!(point_shape_distance_cmp(p(130, 50), 10, &pad, 15), Equal);
         // Inside the swept copper is strictly closer than any distance.
-        assert_eq!(point_shape_distance_cmp(p(50, 50), &pad, 0), Less);
-        // A track centre line 60 above the pad: half width 25 + clearance 25.
+        assert_eq!(point_shape_distance_cmp(p(50, 50), 0, &pad, 0), Less);
+        // Inside a sharp core: distance zero, Equal at zero.
+        let sharp = Shape::from(ConvexPoly::axis_rect(BBox::new(p(0, 0), p(100, 100)), 0).unwrap());
+        assert_eq!(point_shape_distance_cmp(p(50, 50), 0, &sharp, 0), Equal);
+        assert_eq!(point_shape_distance_cmp(p(50, 50), 0, &sharp, 1), Less);
+        // A 50-wide track centre line 60 above the pad: half width 25 plus
+        // clearance 25.
         assert_eq!(
-            segment_shape_distance_cmp(p(-50, 160), p(150, 160), &pad, 50),
+            segment_shape_distance_cmp(p(-50, 160), p(150, 160), 50, &pad, 25),
             Equal
         );
         assert_eq!(
-            segment_shape_distance_cmp(p(-50, 160), p(150, 160), &pad, 51),
+            segment_shape_distance_cmp(p(-50, 160), p(150, 160), 50, &pad, 26),
             Less
         );
         // Same answer as gap_cmp with a real track of width 50.
@@ -646,5 +917,206 @@ mod tests {
         let inner = Shape::from(ConvexPoly::axis_rect(BBox::new(p(10, 10), p(20, 20)), 0).unwrap());
         assert!(touches(&outer, &inner));
         assert!(touches(&inner, &outer));
+    }
+
+    #[test]
+    fn swept_predicates_keep_odd_widths_exact() {
+        // Sharp pad up to y = 100; a 101-wide track centred on y = 160 has
+        // its edge at 109.5, a gap of 9.5. Flooring the half width would
+        // move the edge to 110 and call clearance 10 legal.
+        let pad = Shape::from(ConvexPoly::axis_rect(BBox::new(p(0, 0), p(100, 100)), 0).unwrap());
+        let (a, b) = (p(-50, 160), p(150, 160));
+        assert_eq!(segment_shape_distance_cmp(a, b, 101, &pad, 9), Greater);
+        assert_eq!(segment_shape_distance_cmp(a, b, 101, &pad, 10), Less);
+        let track = Shape::from(Segment::new(a, b, 101));
+        for c in [9, 10] {
+            assert_eq!(
+                segment_shape_distance_cmp(a, b, 101, &pad, c),
+                gap_cmp(&track, &pad, c)
+            );
+        }
+        // A 101-wide disc centred 60 above the pad: gap 9.5.
+        assert_eq!(point_shape_distance_cmp(p(50, 160), 101, &pad, 9), Greater);
+        assert_eq!(point_shape_distance_cmp(p(50, 160), 101, &pad, 10), Less);
+        // Negative inputs never report a violation.
+        assert_eq!(segment_shape_distance_cmp(a, b, 101, &pad, -1), Greater);
+        assert_eq!(point_shape_distance_cmp(p(50, 160), -2, &pad, 100), Greater);
+    }
+
+    fn rect_poly(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<Point> {
+        vec![p(x0, y0), p(x1, y0), p(x1, y1), p(x0, y1)]
+    }
+
+    fn sharp(pts: Vec<Point>) -> Shape {
+        Shape::from(ConvexPoly::new(pts, 0).unwrap())
+    }
+
+    #[test]
+    fn sharp_regions_touching_holes_are_not_inside() {
+        // (a) A diamond hole whose corners touch the rect's edges.
+        let area = Polygon::new(
+            rect_poly(0, 0, 100, 100),
+            vec![vec![p(50, 40), p(60, 50), p(50, 60), p(40, 50)]],
+        )
+        .unwrap();
+        assert!(!shape_within_polygon(
+            &sharp(rect_poly(40, 40, 60, 60)),
+            &area
+        ));
+        // (b) The rect is exactly a square hole.
+        let holed =
+            Polygon::new(rect_poly(0, 0, 100, 100), vec![rect_poly(40, 40, 60, 60)]).unwrap();
+        assert!(!shape_within_polygon(
+            &sharp(rect_poly(40, 40, 60, 60)),
+            &holed
+        ));
+        // A hole sharing three sides with the rect: its inner edge splits
+        // the rect between two boundary points.
+        let area = Polygon::new(rect_poly(-10, -10, 20, 20), vec![rect_poly(0, 0, 5, 10)]).unwrap();
+        assert!(!shape_within_polygon(
+            &sharp(rect_poly(0, 0, 10, 10)),
+            &area
+        ));
+        // An area edge running through two opposite corners of the rect.
+        let area = Polygon::new(vec![p(-5, -5), p(25, 25), p(-5, 25)], vec![]).unwrap();
+        assert!(!shape_within_polygon(
+            &sharp(rect_poly(0, 0, 10, 10)),
+            &area
+        ));
+        // Legal touching: equal to the outline, or sharing an edge or a
+        // corner with a hole from outside it.
+        let plain = Polygon::new(rect_poly(0, 0, 100, 100), vec![]).unwrap();
+        assert!(shape_within_polygon(
+            &sharp(rect_poly(0, 0, 100, 100)),
+            &plain
+        ));
+        assert!(!shape_within_polygon(
+            &sharp(rect_poly(0, 0, 100, 100)),
+            &holed
+        ));
+        assert!(shape_within_polygon(
+            &sharp(rect_poly(20, 40, 40, 60)),
+            &holed
+        ));
+        assert!(shape_within_polygon(
+            &sharp(rect_poly(20, 20, 40, 40)),
+            &holed
+        ));
+        assert!(shape_within_polygon(
+            &sharp(vec![p(60, 60), p(80, 60), p(60, 80)]),
+            &holed
+        ));
+        // The indexed answers agree.
+        let idx = crate::IndexedPolygon::new(holed.clone());
+        assert!(!idx.contains(&sharp(rect_poly(40, 40, 60, 60))));
+        assert!(idx.contains(&sharp(rect_poly(20, 40, 40, 60))));
+        let hole_sized =
+            crate::IndexedPolygon::new(Polygon::new(rect_poly(40, 40, 60, 60), vec![]).unwrap());
+        assert!(!idx.contains_polygon(&hole_sized));
+    }
+
+    #[test]
+    fn sharp_segments_through_hole_corners_are_not_inside() {
+        // A diamond hole whose left and right corners sit on the segment,
+        // away from its midpoint.
+        let area = Polygon::new(
+            rect_poly(-50, -50, 150, 50),
+            vec![vec![p(10, 0), p(20, 10), p(30, 0), p(20, -10)]],
+        )
+        .unwrap();
+        let seg = |a: Point, b: Point| Shape::from(Segment::new(a, b, 0));
+        assert!(!shape_within_polygon(&seg(p(0, 0), p(100, 0)), &area));
+        // Touching one corner only, or running along an edge, is inside.
+        assert!(shape_within_polygon(&seg(p(0, 0), p(10, 0)), &area));
+        assert!(shape_within_polygon(&seg(p(0, -10), p(100, -10)), &area));
+        assert!(shape_within_polygon(&seg(p(10, 0), p(20, 10)), &area));
+        // Along the outline, then out of it.
+        assert!(shape_within_polygon(&seg(p(-50, 0), p(-50, 50)), &area));
+        assert!(!shape_within_polygon(&seg(p(-50, 0), p(-50, 60)), &area));
+        let idx = crate::IndexedPolygon::new(area);
+        assert!(!idx.contains(&seg(p(0, 0), p(100, 0))));
+        assert!(idx.contains(&seg(p(0, -10), p(100, -10))));
+    }
+
+    /// Exhaustive cross-check on a small lattice: axis rects and 45°
+    /// diamonds with corners on multiples of 4 make arrangements whose every
+    /// face holds a lattice point, so "a lattice point strictly inside the
+    /// shape lies outside the area" decides containment exactly.
+    #[test]
+    fn sharp_containment_matches_lattice_sampling() {
+        let mut seed: u64 = 0x5eed_1234_abcd_0001;
+        let mut next = move |n: i32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % n as u64) as i32
+        };
+        fn shape_at(next: &mut dyn FnMut(i32) -> i32) -> Vec<Point> {
+            let (x, y) = (4 * next(10), 4 * next(10));
+            let w = 4 + 4 * next(4);
+            if next(2) == 0 {
+                let h = 4 + 4 * next(4);
+                rect_poly(x, y, x + w, y + h)
+            } else {
+                vec![
+                    p(x, y + w),
+                    p(x + w, y),
+                    p(x + 2 * w, y + w),
+                    p(x + w, y + 2 * w),
+                ]
+            }
+        }
+        let mut checked = (0, 0);
+        for _ in 0..400 {
+            let outline = rect_poly(4 * next(3), 4 * next(3), 28 + 4 * next(4), 28 + 4 * next(4));
+            let holes: Vec<Vec<Point>> = (0..next(3)).map(|_| shape_at(&mut next)).collect();
+            // Holes strictly inside the outline and apart from each other.
+            let out_poly = Polygon::new(outline.clone(), vec![]).unwrap();
+            let valid = holes.iter().all(|h| {
+                h.iter()
+                    .all(|q| point_in_polygon(*q, &out_poly) == Containment::Inside)
+            }) && holes.iter().enumerate().all(|(i, a)| {
+                holes[i + 1..].iter().all(|b| {
+                    let pa = Shape::Polygon(Polygon::new(a.clone(), vec![]).unwrap());
+                    let pb = Shape::Polygon(Polygon::new(b.clone(), vec![]).unwrap());
+                    gap_cmp(&pa, &pb, 0) == Greater
+                })
+            });
+            if !valid {
+                continue;
+            }
+            let Some(area) = Polygon::new(outline, holes) else {
+                continue;
+            };
+            let idx = crate::IndexedPolygon::new(area.clone());
+            for _ in 0..8 {
+                let c = shape_at(&mut next);
+                let cpoly = Polygon::new(c.clone(), vec![]).unwrap();
+                let bb = cpoly.bbox();
+                let mut witness = false;
+                'scan: for y in bb.min.y..=bb.max.y {
+                    for x in bb.min.x..=bb.max.x {
+                        let q = p(x, y);
+                        if point_in_polygon(q, &cpoly) == Containment::Inside
+                            && point_in_polygon(q, &area) == Containment::Outside
+                        {
+                            witness = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                let got = shape_within_polygon(&sharp(c.clone()), &area);
+                assert_eq!(got, !witness, "{c:?} in {area:?}");
+                assert_eq!(idx.contains(&sharp(c.clone())), got, "{c:?}");
+                let ic = crate::IndexedPolygon::new(cpoly);
+                assert_eq!(idx.contains_polygon(&ic), got, "{c:?}");
+                if got {
+                    checked.0 += 1;
+                } else {
+                    checked.1 += 1;
+                }
+            }
+        }
+        assert!(checked.0 > 50 && checked.1 > 50, "{checked:?}");
     }
 }
