@@ -80,6 +80,50 @@ pub struct PlanVia {
     pub diameter: f64,
 }
 
+/// One `add_routing` call's worth of a plan, and where its items came from:
+/// `plan.tracks[k]` is the parent plan's `tracks[tracks[k]]`, and likewise
+/// for vias. `add_routing` creates tracks first, then vias, in order, so
+/// the k-th created item of a chunk is known exactly.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PlanChunk {
+    pub plan: RoutePlan,
+    pub tracks: Vec<u32>,
+    pub vias: Vec<u32>,
+}
+
+impl PlanChunk {
+    /// The parent-plan item behind the chunk's `k`-th created item.
+    pub fn item(&self, k: usize) -> Option<PlanItemRef> {
+        match self.tracks.get(k) {
+            Some(&index) => Some(PlanItemRef {
+                kind: PlanItemKind::Track,
+                index,
+            }),
+            None => self
+                .vias
+                .get(k - self.tracks.len())
+                .map(|&index| PlanItemRef {
+                    kind: PlanItemKind::Via,
+                    index,
+                }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemKind {
+    Track,
+    Via,
+}
+
+/// An item of a [`RoutePlan`]: `tracks[index]` or `vias[index]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlanItemRef {
+    pub kind: PlanItemKind,
+    pub index: u32,
+}
+
 /// A `routing_file` body. Field order and names are `add_routing`'s.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +268,118 @@ impl RoutePlan {
     pub fn to_routing_file_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("a RoutePlan always serializes")
     }
+
+    /// Split for chunked `add_routing` calls, keeping every net whole: a
+    /// net's tracks and vias land in one chunk whenever the net fits, so the
+    /// geometry lint `add_routing` runs on each chunk sees each net's joints
+    /// exactly as the whole plan has them. Nets are packed in order of first
+    /// appearance (next fit); a net larger than `max_items` is split on its
+    /// own, tracks then vias. Each chunk lists where its items sit in this
+    /// plan, in the order they appear in the chunk (tracks, then vias),
+    /// which is the order `add_routing` creates them in.
+    pub fn chunks_by_net(&self, max_items: usize) -> Vec<PlanChunk> {
+        let max_items = max_items.max(1);
+        // Net order: first appearance across tracks, then vias.
+        let mut order: Vec<&str> = Vec::new();
+        let mut members: std::collections::BTreeMap<&str, (Vec<u32>, Vec<u32>)> =
+            std::collections::BTreeMap::new();
+        for (i, t) in self.tracks.iter().enumerate() {
+            let e = members.entry(t.net.as_str()).or_insert_with(|| {
+                order.push(t.net.as_str());
+                (Vec::new(), Vec::new())
+            });
+            e.0.push(i as u32);
+        }
+        for (i, v) in self.vias.iter().enumerate() {
+            let e = members.entry(v.net.as_str()).or_insert_with(|| {
+                order.push(v.net.as_str());
+                (Vec::new(), Vec::new())
+            });
+            e.1.push(i as u32);
+        }
+        let mut chunks: Vec<PlanChunk> = Vec::new();
+        let mut cur = PlanChunk::default();
+        let flush = |cur: &mut PlanChunk, chunks: &mut Vec<PlanChunk>| {
+            if cur.plan.item_count() > 0 {
+                chunks.push(std::mem::take(cur));
+            }
+        };
+        for net in order {
+            let (tracks, vias) = &members[net];
+            let size = tracks.len() + vias.len();
+            if cur.plan.item_count() + size > max_items {
+                flush(&mut cur, &mut chunks);
+            }
+            for &i in tracks {
+                if cur.plan.item_count() == max_items {
+                    flush(&mut cur, &mut chunks);
+                }
+                cur.plan.tracks.push(self.tracks[i as usize].clone());
+                cur.tracks.push(i);
+            }
+            for &i in vias {
+                if cur.plan.item_count() == max_items {
+                    flush(&mut cur, &mut chunks);
+                }
+                cur.plan.vias.push(self.vias[i as usize].clone());
+                cur.vias.push(i);
+            }
+        }
+        flush(&mut cur, &mut chunks);
+        chunks
+    }
+
+    /// The plan's copper back in board ids and nm: the inverse of
+    /// [`RoutePlan::from_routed`] for `board` (vias span every layer).
+    pub fn to_routed(
+        &self,
+        board: &RouteBoard,
+        gen: Generation,
+    ) -> Result<RoutedCopper, PlanError> {
+        self.validate()?;
+        let invalid = |field: String, reason: &str| PlanError::Invalid {
+            field,
+            reason: reason.to_string(),
+        };
+        let nm = |field: String, v: f64| {
+            konnect_geom::mm_to_nm(v).ok_or_else(|| invalid(field, "is not a representable length"))
+        };
+        let net = |field: String, name: &str| {
+            board
+                .net_by_name(name)
+                .ok_or_else(|| invalid(field, "names a net the board does not have"))
+        };
+        let mut copper = RoutedCopper::default();
+        for (i, t) in self.tracks.iter().enumerate() {
+            let at = format!("tracks[{i}]");
+            let layer = board.layers.by_name(&t.layer).ok_or_else(|| {
+                invalid(format!("{at}.layer"), "is not a copper layer of the board")
+            })?;
+            copper.tracks.push(RoutedTrack {
+                net: net(format!("{at}.net"), &t.net)?,
+                layer,
+                seg: Segment::new(
+                    Point::new(nm(at.clone(), t.x1)?, nm(at.clone(), t.y1)?),
+                    Point::new(nm(at.clone(), t.x2)?, nm(at.clone(), t.y2)?),
+                    nm(format!("{at}.width"), t.width)?,
+                ),
+                gen,
+            });
+        }
+        let all = board.layers.all();
+        for (i, v) in self.vias.iter().enumerate() {
+            let at = format!("vias[{i}]");
+            copper.vias.push(RoutedVia {
+                net: net(format!("{at}.net"), &v.net)?,
+                center: Point::new(nm(at.clone(), v.x)?, nm(at.clone(), v.y)?),
+                diameter: nm(at.clone(), v.diameter)?,
+                drill: nm(at.clone(), v.drill)?,
+                layers: all,
+                gen,
+            });
+        }
+        Ok(copper)
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +481,100 @@ mod tests {
         );
         assert_eq!(chunks[2].vias.len(), 1);
         assert_eq!(plan.chunks(ADD_ROUTING_MAX_ITEMS).len(), 1);
+    }
+
+    #[test]
+    fn chunks_by_net_keep_nets_whole_and_name_their_items() {
+        let mut b = BoardBuilder::new(10.0, 10.0, &["F.Cu", "B.Cu"]);
+        for n in ["A", "B", "C"] {
+            b.net(n);
+        }
+        let b = b.build();
+        let id = |n: &str| b.net_by_name(n).unwrap();
+        let t = |net: &str, i: i32| RoutedTrack {
+            net: id(net),
+            layer: LayerId(0),
+            seg: Segment::new(
+                Point::new(i * 1_000, 0),
+                Point::new(i * 1_000 + 500, 0),
+                100_000,
+            ),
+            gen: Generation(1),
+        };
+        let v = |net: &str, i: i32| RoutedVia {
+            net: id(net),
+            center: Point::new(i * 1_000, 5_000),
+            diameter: 600_000,
+            drill: 300_000,
+            layers: b.layers.all(),
+            gen: Generation(1),
+        };
+        // Interleaved nets: A has 3 items, B 2, C 4.
+        let copper = RoutedCopper {
+            tracks: vec![
+                t("A", 0),
+                t("B", 1),
+                t("A", 2),
+                t("C", 3),
+                t("C", 4),
+                t("C", 5),
+            ],
+            vias: vec![v("A", 6), v("B", 7), v("C", 8)],
+        };
+        let plan = RoutePlan::from_routed(&b, &copper).unwrap();
+        let chunks = plan.chunks_by_net(5);
+        let nets: Vec<Vec<&str>> = chunks
+            .iter()
+            .map(|c| {
+                let mut n: Vec<&str> = c
+                    .plan
+                    .tracks
+                    .iter()
+                    .map(|t| t.net.as_str())
+                    .chain(c.plan.vias.iter().map(|v| v.net.as_str()))
+                    .collect();
+                n.dedup();
+                n.sort();
+                n.dedup();
+                n
+            })
+            .collect();
+        assert_eq!(nets, vec![vec!["A", "B"], vec!["C"]]);
+        assert!(chunks.iter().all(|c| c.plan.item_count() <= 5));
+        assert_eq!(chunks.iter().map(|c| c.plan.item_count()).sum::<usize>(), 9);
+        // Every created item maps back to the plan item it came from.
+        for c in &chunks {
+            for k in 0..c.plan.item_count() {
+                let r = c.item(k).unwrap();
+                match r.kind {
+                    PlanItemKind::Track => {
+                        assert_eq!(c.plan.tracks[k], plan.tracks[r.index as usize])
+                    }
+                    PlanItemKind::Via => assert_eq!(
+                        c.plan.vias[k - c.plan.tracks.len()],
+                        plan.vias[r.index as usize]
+                    ),
+                }
+            }
+            assert!(c.item(c.plan.item_count()).is_none());
+        }
+        // A net bigger than a chunk is split on its own.
+        let big = plan.chunks_by_net(2);
+        assert!(big.iter().all(|c| c.plan.item_count() <= 2));
+        assert_eq!(big.iter().map(|c| c.plan.item_count()).sum::<usize>(), 9);
+    }
+
+    #[test]
+    fn a_plan_reads_back_to_the_same_copper() {
+        let b = board();
+        let c = copper(&b);
+        let plan = RoutePlan::from_routed(&b, &c).unwrap();
+        assert_eq!(plan.to_routed(&b, Generation(1)).unwrap(), c);
+        let mut bad = plan.clone();
+        bad.tracks[0].net = "NOPE".into();
+        assert_eq!(
+            bad.to_routed(&b, Generation(1)).unwrap_err().to_string(),
+            "tracks[0].net: names a net the board does not have"
+        );
     }
 }

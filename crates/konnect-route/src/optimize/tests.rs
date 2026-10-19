@@ -344,7 +344,10 @@ fn the_report_and_telemetry_are_recorded() {
     assert!(r.defects_before > 0, "staircases are jogs");
 }
 
-fn pads_board(pads: &[(&str, (f64, f64), (f64, f64))]) -> RouteBoard {
+/// (net, centre, size) per pad, mm.
+type PadSpec<'a> = (&'a str, (f64, f64), (f64, f64));
+
+fn pads_board(pads: &[PadSpec<'_>]) -> RouteBoard {
     let mut b = BoardBuilder::new(30.0, 30.0, &["F.Cu", "B.Cu"]);
     for (i, (net, at, size)) in pads.iter().enumerate() {
         let u = b.footprint(&format!("U{i}"), *at);
