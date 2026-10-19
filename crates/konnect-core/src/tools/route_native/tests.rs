@@ -452,6 +452,19 @@ fn allowance_arguments_reach_the_spec_and_typos_are_refused() {
     assert!(job_spec(&typo).unwrap().is_err());
     assert!(class_mode(&json!({ "net_classes": "maybe" })).is_err());
     assert_eq!(class_mode(&json!({})).unwrap(), ClassMode::Auto);
+    assert!(class_mode(&json!({ "net_classes": true })).is_err());
+    assert_eq!(
+        class_mode(&json!({ "net_classes": null })).unwrap(),
+        ClassMode::Auto
+    );
+    // Allowances steer native routing only: with copper taken from the
+    // board they would be silently ignored, so they are refused.
+    let taken = json!({ "board": f.board(), "output_plan": f.path("s.json"),
+                        "source": "board_unlocked", "exclude_classes": [] });
+    assert!(job_spec(&taken).unwrap().is_err());
+    let taken_plain = json!({ "board": f.board(), "output_plan": f.path("t.json"),
+                              "source": "board_unlocked" });
+    assert!(job_spec(&taken_plain).unwrap().is_ok());
 }
 
 #[tokio::test]

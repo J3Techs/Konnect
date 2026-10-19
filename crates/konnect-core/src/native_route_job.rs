@@ -755,6 +755,14 @@ pub fn run_pipeline(
         clear_findings: false,
         ..PipelineSettings::default()
     };
+    if spec.source != CopperSource::Native && !spec.allowances.is_default() {
+        report.stop(
+            StopKind::InputError,
+            "allowances apply only to native routing (source native); this job takes existing copper"
+                .to_string(),
+        );
+        return Ok(report);
+    }
     if spec.source == CopperSource::Native {
         match spec
             .allowances

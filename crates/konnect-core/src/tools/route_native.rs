@@ -78,9 +78,9 @@ fn job_props() -> Value {
                                 "layers": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Every layer of the second chance, the class's own included" },
                                 "nets": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Only these nets of the class (names or * ? patterns)" },
                                 "reference": { "type": "object", "required": ["plane"], "additionalProperties": false,
-                                               "description": "Tracks on the 'over' layers must lie over one filled piece of this plane, grown by margin_mm (checked again after the optimizer)",
+                                               "description": "Needs the class in class_layers. Tracks of the fallback's nets on the 'over' layers must lie over one filled piece of this plane, margin_mm inside it and clear of the holes other nets' vias and tracks will cut at the refill (checked again after the optimizer). Use a margin of at least the zone clearance",
                                                "properties": { "plane": { "type": "string" },
-                                                               "over": { "type": "array", "items": { "type": "string" }, "description": "Default: the fallback layers beyond the class's own" },
+                                                               "over": { "type": "array", "items": { "type": "string" }, "description": "Default: the fallback layers beyond the class's own; only those are allowed" },
                                                                "margin_mm": { "type": "number", "minimum": 0 } } } } } },
         "neck_down": { "type": "object", "additionalProperties": false,
                        "description": "Native routing: let a track leave a pad narrower than its class width, within reach_mm of the pad (never below the rules' minimum)",
@@ -388,6 +388,12 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
         }
         spec.allowances = serde_json::from_value(Value::Object(allowance_args))
             .map_err(|e| invalid("allowances", &format!("cannot be read: {e}")))?;
+        if spec.source != CopperSource::Native && !spec.allowances.is_default() {
+            return Err(invalid(
+                "allowances",
+                "class_layers, layer_fallback, neck_down, exclude_classes and                  fanout_share_within_mm apply only when source is native",
+            ));
+        }
         spec.fanout_plan = opt_path(args, "fanout_plan")?;
         spec.time_limit_seconds = match args.get("time_limit_seconds") {
             None | Some(Value::Null) => None,
@@ -435,7 +441,12 @@ enum ClassMode {
 }
 
 fn class_mode(args: &Value) -> Result<ClassMode, Refusal> {
-    match args.get("net_classes").and_then(Value::as_str) {
+    let mode = match args.get("net_classes") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) => Some(m.as_str()),
+        Some(_) => return Err(invalid("net_classes", "must be auto, kicad or project")),
+    };
+    match mode {
         None | Some("auto") => Ok(ClassMode::Auto),
         Some("kicad") => Ok(ClassMode::Kicad),
         Some("project") => Ok(ClassMode::Project),
