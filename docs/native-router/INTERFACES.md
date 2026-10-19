@@ -345,9 +345,11 @@ Tuning round 2 (merged together; all additive):
 - **`ClassFallback { layers, reference: Option<ReferencePlane> }`** and
   **`ReferencePlane { plane, over, margin }`**: after negotiation (step 6),
   the connections of such a class that are still failed are routed again
-  on `layers`, around every copper routed so far. Tracks on `over` must lie
-  over one filled piece of `plane` grown by `margin`; a net whose tracks
-  leave it is dropped again. KiCad's fills are fractured, so antipads, pad
+  on `layers`, around every copper routed so far. Tracks on the layers of
+  `over` beyond the class's own (`LayerPolicy::class_layers`) must lie over
+  one filled piece of `plane` grown by `margin`, clear of the holes other
+  nets' copper will cut in it at the refill; a net whose new tracks leave
+  it is dropped again. KiCad's fills are fractured, so antipads, pad
   clearances and voids count as off the reference. Counter:
   `pipeline_fallback_routed`; its time is charged to `Stage::Detail`.
 - **`optimize_guarded(work, rules, routed, opts, guard, tel)`** is step 7 on
@@ -622,22 +624,41 @@ and part of the plan.
   unless named, except the class policy: `exclude_classes: None` means
   `default_excluded_classes(classes)`, every class whose track width is
   at least `WIDE_CLASS_MIN_WIDTH_NM` (0.5 mm); `Some([])` routes every
-  class.
+  class. A `reference` needs the class in `class_layers`, and its `over`
+  (default: the fallback layers beyond the class's own) must be fallback
+  layers outside the class's own; anything else is refused. Each
+  `layer_fallback.nets` pattern must match a net of the class (one whose
+  nets an earlier pattern already named is accepted).
 - **`PipelineSettings::excluded_classes: BTreeSet<ClassId>`** (default
   empty): those classes' open connections go to
   **`PipelineResult::excluded`** (renumbered), never to the task list or
   the failures; `pipeline::split_excluded`; counter
-  `pipeline_excluded_by_policy`. A struct literal of `PipelineSettings`
-  needs the field.
+  `pipeline_excluded_by_policy`. The plane fanout (S2) places no sites for
+  those classes either (counter `pipeline_fanout_excluded_by_policy`). A
+  struct literal of `PipelineSettings` needs the field.
 - **`ClassFallback::nets: Option<BTreeSet<NetId>>`** (serde default
   `None`): only those nets of the class get the second chance. A struct
   literal of `ClassFallback` needs the field.
-- **`pipeline::enforce_reference(work, rules, fallback, before, routed) ->
-  ReferenceReport { tracks_checked, reverted_nets, dropped_nets }`** runs
-  after S6 (in `route_board` and in the job runner) whenever a fallback
-  names a reference: a net of such a class with a track off the reference
-  on the covered layers goes back to its negotiated copper, or loses its
-  copper. `PipelineResult::reference`; counters `pipeline_reference_*`.
+- **`pipeline::enforce_reference(work, rules, settings, before, routed) ->
+  ReferenceReport { tracks_checked, reverted_nets, dropped_nets,
+  dropped_tracks, dropped_vias, opened }`** runs after S6 (in
+  `route_board` and in the job runner) whenever a fallback names a
+  reference. It checks only tracks of the fallback's `nets` (all of the
+  class when unset) on the reference's layers beyond the class's own; a
+  class with no `class_layers` entry is never checked. Such a track must
+  lie over the plane's saved fill and clear of the clearance holes the
+  final refill will cut around other nets' vias (board, fanout and routed)
+  and tracks on the plane, grown by the rules' clearance to the plane's
+  zones. A zone's own clearance setting is not in the board model, so the
+  margin should be at least it. A net that breaks this goes back to its
+  negotiated copper when that keeps to the reference; otherwise only the
+  joined pieces of routed copper holding an offending track are taken out.
+  In `route_board` the connections that opens move to the failures as
+  `DetailFailure::OffReference` (`off_reference`, reason `NoCorridor`,
+  not retried); in the job runner they stay open like the clear stage's,
+  counted in `reference.opened`. `PipelineResult::reference`; counters
+  `pipeline_reference_*` (`_dropped_tracks`, `_opened`, `_failed` new).
+  Breaking: the third argument was the fallback map.
   Reference pieces are edge-indexed (`IndexedPolygon`); the second
   chance's setup fell from about 35 s to 0.1 s on a dense real board.
   Counters `pipeline_fallback_tasks`, `pipeline_fallback_us_setup`,
@@ -661,7 +682,10 @@ and part of the plan.
   in the job status. `start_native_route_job` and `route_native_region`
   take `class_layers`, `layer_fallback`, `neck_down`, `exclude_classes`,
   `fanout_share_within_mm`, `fanout_plan` and `net_classes` (`auto`,
-  `kicad`, `project`). Behaviour change: a native job now leaves
+  `kicad`, `project`; any other value, including a non-string, is
+  refused). The allowance arguments are refused when `source` is not
+  `native`, and a runner given such a spec stops with an input error
+  instead of ignoring them. Behaviour change: a native job now leaves
   wide-copper classes unrouted by default. `plan_plane_vias` takes
   `share_within_mm` and `retry_failed` and reports each failed pad's
   reasons and blockers. The recommended live sequence is in

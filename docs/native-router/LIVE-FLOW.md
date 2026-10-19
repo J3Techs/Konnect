@@ -49,10 +49,28 @@ Everything is off unless named, except the class policy:
 | Argument | Meaning |
 |---|---|
 | `class_layers` | `{ "Class": ["F.Cu"] }`: the layers a class routes on. Unlisted classes use every routable layer. |
-| `layer_fallback` | `[{ "class", "layers", "nets"?, "reference"?: { "plane", "over"?, "margin_mm" } }]`: connections of the class negotiation failed are routed again on `layers`. With `reference`, tracks on `over` (default: the fallback layers beyond the class's own) must lie over one filled piece of `plane`, at least `margin_mm` inside it; the check runs again after the optimizer, which may not move such a track off the reference. `nets` limits the fallback to some nets of the class. |
+| `layer_fallback` | `[{ "class", "layers", "nets"?, "reference"?: { "plane", "over"?, "margin_mm" } }]`: connections of the class negotiation failed are routed again on `layers`. `nets` limits the fallback to some nets of the class. With `reference` (which needs the class in `class_layers`), tracks of those nets on `over` (default and limit: the fallback layers beyond the class's own) must lie over one filled piece of `plane`, at least `margin_mm` inside it and clear of the holes the final refill will cut around other nets' vias and tracks; the check runs again after the optimizer, which may not move such a track off the reference. The class's own layers are never held to it. |
 | `neck_down` | `{ "width_mm": 0.1, "reach_mm": 1.0, "classes"?, "exclude_classes"? }`: a track may leave a pad narrower than its class width within the reach, never below the rules' minimum. |
 | `exclude_classes` | Classes left unrouted (zones or hand-drawn copper), reported as `excluded_by_policy`, never as failures. Default: every class whose track width is at least 0.5 mm. `[]` routes every class. |
 | `fanout_share_within_mm` | A plane pad that gets no via of its own may share a same-net via placed for a pad within this distance. Default: never. |
 
 The resolved allowances are reported back by name, so the report shows
-exactly what a run was allowed to do.
+exactly what a run was allowed to do. They apply to native routing only:
+with `source` `board_unlocked` or `plan` they are refused.
+
+## The reference plane and the refill
+
+This sequence refills only at the end, so the job checks a reference
+against the plane fill as saved before routing. That fill has no holes yet
+for the job's own fanout vias or for routed vias and tracks of other nets.
+The check subtracts them itself: each such via or track on the plane,
+grown by the rules' clearance to the plane's zones. Two things it cannot
+see:
+
+- **The zone's own clearance setting** is not in the board model. Give a
+  `margin_mm` of at least that clearance (KiCad clears by the larger of
+  the zone's setting and the rules).
+- **The refill itself** (thermal spokes, island removal, minimum width).
+  After the final `run_drc`, check the plane under the reference class's
+  tracks on the added layers (for example with a custom DRC rule for that
+  class) before accepting them.
