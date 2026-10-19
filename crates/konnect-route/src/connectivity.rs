@@ -13,7 +13,7 @@
 //! [`ConnectivityReport::unfilled_zones_skipped`].
 
 use crate::api::{Connection, ConnectionId, ItemRef, LayerId, NetId, PadId};
-use crate::board::RouteBoard;
+use crate::board::{PadKind, RouteBoard};
 use konnect_geom::{touches, ArcPolicy, IndexEntry, LayerIndex, Shape};
 use serde::{Deserialize, Serialize};
 
@@ -263,6 +263,208 @@ impl ConnectivityReport {
             .sum()
     }
 
+    /// Connections still needed on plane nets (see [`plane_nets`]) and on
+    /// the rest, in that order. They add up to [`Self::connection_count`].
+    pub fn connection_split(&self, board: &RouteBoard) -> (usize, usize) {
+        let planes = plane_net_mask(board);
+        let mut plane = 0;
+        let mut signal = 0;
+        for n in &self.nets {
+            if planes.get(n.net.index()).copied().unwrap_or(false) {
+                plane += n.connections_needed();
+            } else {
+                signal += n.connections_needed();
+            }
+        }
+        (plane, signal)
+    }
+
+    /// The state of a net with at least two pads; `None` for other nets.
+    pub fn net_status(&self, board: &RouteBoard, net: NetId) -> Option<NetStatus> {
+        let n = self.nets.get(net.index())?;
+        if n.pad_count < 2 {
+            return None;
+        }
+        Some(if n.pad_island_count() <= 1 {
+            NetStatus::Complete
+        } else if net_has_routing_copper(board)[net.index()] {
+            NetStatus::Partial
+        } else {
+            NetStatus::NoCopper
+        })
+    }
+
+    /// Complete, partial and copper-less nets among those with two or more
+    /// pads, plus the connection totals.
+    pub fn completeness(&self, board: &RouteBoard) -> Completeness {
+        let copper = net_has_routing_copper(board);
+        let mut out = Completeness::default();
+        for n in self.nets.iter().filter(|n| n.pad_count >= 2) {
+            out.multi_pad_nets += 1;
+            if n.pad_island_count() <= 1 {
+                out.complete += 1;
+            } else if copper[n.net.index()] {
+                out.partial += 1;
+            } else {
+                out.no_copper += 1;
+            }
+        }
+        out.connections = self.connection_count();
+        (out.plane_connections, out.signal_connections) = self.connection_split(board);
+        out
+    }
+
+    /// For each pad, the index of its island in its net's
+    /// [`NetConnectivity::islands`]; `None` for pads with no net.
+    pub fn island_of_pads(&self, board: &RouteBoard) -> Vec<Option<u32>> {
+        let mut out = vec![None; board.pads.len()];
+        for n in &self.nets {
+            for (i, island) in n.islands.iter().enumerate() {
+                for p in island.pads() {
+                    out[p.index()] = Some(i as u32);
+                }
+            }
+        }
+        out
+    }
+
+    /// Per plane net, which pads are joined to one of its filled plane
+    /// pieces through copper, in net order.
+    pub fn plane_joins(&self, board: &RouteBoard) -> Vec<PlaneJoin> {
+        let mut out = Vec::new();
+        for net in plane_nets(board) {
+            let Some(n) = self.nets.get(net.index()) else {
+                continue;
+            };
+            let mut join = PlaneJoin {
+                net,
+                pieces: board
+                    .zones
+                    .iter()
+                    .filter(|z| z.filled && z.net == Some(net))
+                    .map(|z| z.id)
+                    .collect(),
+                pads: n.pad_count,
+                ..Default::default()
+            };
+            for island in &n.islands {
+                let on_plane = island.items.iter().any(|i| matches!(i, ItemRef::Zone(_)));
+                if on_plane {
+                    join.plane_islands += 1;
+                    join.joined_pads += island.pads().count();
+                    continue;
+                }
+                if !island.has_pad() {
+                    continue;
+                }
+                join.unjoined_islands += 1;
+                let escaped = island
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, ItemRef::Track(_) | ItemRef::Arc(_) | ItemRef::Via(_)));
+                join.unjoined_islands_with_copper += usize::from(escaped);
+                for p in island.pads() {
+                    join.unjoined_pads.push(p);
+                    if board.pads[p.index()].kind == PadKind::Smd {
+                        join.unjoined_smd_pads += 1;
+                    }
+                }
+            }
+            join.unjoined_pads.sort();
+            out.push(join);
+        }
+        out
+    }
+}
+
+/// Nets that own at least one filled zone piece: the planes.
+pub fn plane_nets(board: &RouteBoard) -> Vec<NetId> {
+    let mask = plane_net_mask(board);
+    (0..board.nets.len())
+        .filter(|&i| mask[i])
+        .map(|i| NetId(i as u32))
+        .collect()
+}
+
+fn plane_net_mask(board: &RouteBoard) -> Vec<bool> {
+    let mut mask = vec![false; board.nets.len()];
+    for z in board.zones.iter().filter(|z| z.filled) {
+        if let Some(n) = z.net {
+            if let Some(m) = mask.get_mut(n.index()) {
+                *m = true;
+            }
+        }
+    }
+    mask
+}
+
+/// Nets with any track, arc or via: the copper a router makes. Zone fills
+/// do not count, matching the HANDOFF definition of "no copper".
+fn net_has_routing_copper(board: &RouteBoard) -> Vec<bool> {
+    let mut has = vec![false; board.nets.len()];
+    let nets = board
+        .tracks
+        .iter()
+        .map(|t| t.net)
+        .chain(board.arcs.iter().map(|a| a.net))
+        .chain(board.vias.iter().map(|v| v.net));
+    for n in nets.flatten() {
+        if let Some(h) = has.get_mut(n.index()) {
+            *h = true;
+        }
+    }
+    has
+}
+
+/// How far a net with two or more pads is from routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetStatus {
+    /// All pads in one island.
+    Complete,
+    /// Several pad islands, and the net has some track, arc or via.
+    Partial,
+    /// Several pad islands and no track, arc or via at all.
+    NoCopper,
+}
+
+/// Board-wide completeness, over nets with at least two pads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Completeness {
+    pub multi_pad_nets: usize,
+    pub complete: usize,
+    pub partial: usize,
+    pub no_copper: usize,
+    /// Connections still needed (pad islands minus one, summed).
+    pub connections: usize,
+    /// The part of `connections` on plane nets.
+    pub plane_connections: usize,
+    pub signal_connections: usize,
+}
+
+/// One plane net's pads against its plane pieces.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PlaneJoin {
+    pub net: NetId,
+    /// The net's filled zone pieces.
+    pub pieces: Vec<crate::api::ZoneId>,
+    pub pads: usize,
+    /// Islands holding a plane piece (more than one when the pieces are not
+    /// joined to each other).
+    pub plane_islands: usize,
+    pub joined_pads: usize,
+    /// Pads in islands that hold no plane piece, sorted.
+    pub unjoined_pads: Vec<PadId>,
+    pub unjoined_smd_pads: usize,
+    /// Pad islands that hold no plane piece; a router needs one connection
+    /// (a via, usually) for each.
+    pub unjoined_islands: usize,
+    /// Of those, islands that already carry a track, arc or via (escaped
+    /// pads whose copper misses the plane).
+    pub unjoined_islands_with_copper: usize,
+}
+
+impl ConnectivityReport {
     /// The routing task list: per net, a minimum spanning tree over its pad
     /// islands, each edge between the closest pad pair of two islands
     /// (Prim's algorithm; ties broken by island order). Deterministic.
