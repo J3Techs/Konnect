@@ -8,6 +8,9 @@ use konnect_geom::{BBox, Coord, Point};
 /// Base cells with no refined index.
 pub(crate) const NONE: u32 = u32::MAX;
 
+/// Most base cells along one side of the grid.
+const MAX_SIDE: i64 = 65_000;
+
 /// The board area to grid: the outline's box, else every pad's.
 fn board_bbox(board: &RouteBoard) -> BBox {
     if let Some(b) = board.outline.bbox {
@@ -29,8 +32,12 @@ fn board_bbox(board: &RouteBoard) -> BBox {
 
 /// Lay out the grid: the base cells over the board and the refined set.
 pub(crate) fn lay_out(board: &RouteBoard, settings: &GlobalSettings) -> GCellGrid {
-    let pitch = settings.gcell_pitch.max(1);
     let area = board_bbox(board);
+    // Cell coordinates are u16: a pitch too fine for the board is coarsened
+    // so neither side exceeds MAX_SIDE cells.
+    let extent = area.width().max(area.height()).max(1);
+    let min_pitch = (extent + MAX_SIDE - 1) / MAX_SIDE;
+    let pitch = i64::from(settings.gcell_pitch.max(1)).max(min_pitch) as Coord;
     let span = |w: i64| ((w.max(1) + i64::from(pitch) - 1) / i64::from(pitch)).max(1) as u32;
     let cols = span(area.width());
     let rows = span(area.height());
@@ -51,7 +58,12 @@ pub(crate) fn lay_out(board: &RouteBoard, settings: &GlobalSettings) -> GCellGri
         capacity: Vec::new(),
     };
     let fine = settings.fine_pitch;
-    if settings.refine_min_pads == 0 || fine <= 0 || fine >= pitch || pitch % fine != 0 {
+    if settings.refine_min_pads == 0
+        || pitch != settings.gcell_pitch
+        || fine <= 0
+        || fine >= pitch
+        || pitch % fine != 0
+    {
         return grid;
     }
     // Pad centres per base cell, counting pads with copper on a routable

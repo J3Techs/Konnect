@@ -450,3 +450,18 @@ fn settings_and_results_round_trip_through_json() {
         GlobalResult::default()
     );
 }
+
+#[test]
+fn a_pitch_too_fine_for_the_board_is_coarsened() {
+    let board = BoardBuilder::new(200.0, 10.0, &["F.Cu"]).build();
+    let settings = GlobalSettings {
+        gcell_pitch: 1_000,
+        fine_pitch: 500,
+        ..Default::default()
+    };
+    let grid = super::grid::lay_out(&board, &settings);
+    assert!(grid.cols <= 65_000 && grid.rows <= 65_000);
+    assert!(grid.pitch > 1_000);
+    assert!(grid.refined.is_empty());
+    assert!(i64::from(grid.cols) * i64::from(grid.pitch) >= 200_000_000);
+}
