@@ -1234,3 +1234,328 @@ fn the_relaxed_field_proves_sealed_targets_unreachable() {
     );
     assert!(stats.expansions <= 2, "{}", stats.expansions);
 }
+
+/// A small deterministic generator for the field comparisons.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    /// One to three headings.
+    fn mask(&mut self) -> u8 {
+        let v = self.next();
+        let mut m = 1u8 << ((v >> 33) % 8);
+        if v & 3 != 0 {
+            m |= 1 << ((v >> 40) % 8);
+        }
+        if v & 3 == 3 {
+            m |= 1 << ((v >> 47) % 8);
+        }
+        m
+    }
+}
+
+/// Walls, routed copper, history, HALO and via sites on every layer.
+fn rough_board(st: &mut TileStack, g: &mut Lcg, walls: u32) {
+    let (cols, rows) = (st.window.cols, st.window.rows);
+    for l in 0..st.layers.len() {
+        for _ in 0..walls {
+            let v = g.next();
+            let c = (v >> 33) as u32 % (cols - 4);
+            let r = (v >> 45) as u32 % (rows - 4);
+            let len = 2 + (v >> 20) as u32 % 8;
+            if v & 1 == 0 {
+                block(st, l, c..=(c + len).min(cols - 1), r..=r);
+            } else {
+                block(st, l, c..=c, r..=(r + len).min(rows - 1));
+            }
+        }
+    }
+    for (l, r) in st.layers.iter_mut().enumerate() {
+        for row in 0..rows {
+            for col in 0..cols {
+                let v = g.next();
+                if r.core.get(col, row) == 0 && v.is_multiple_of(5) {
+                    r.halo.set(col, row, 1);
+                }
+                if (l == 0 && row % 7 == 3) || (l == 1 && col % 9 == 4) || v.is_multiple_of(11) {
+                    r.present.set(col, row, 1 + (v >> 40) as u16 % 3);
+                }
+                if v.is_multiple_of(17) {
+                    r.history.set(col, row, 1 + (v >> 50) as u16 % 4);
+                }
+                r.via_site.set(
+                    col,
+                    row,
+                    match v % 7 {
+                        0 => VIA_NO,
+                        1 => VIA_CHECK,
+                        _ => VIA_FREE,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Run every job with and without the field from the first expansion and
+/// require the same cost (or the same failure). Returns the expansions
+/// without and with the field and the field runs.
+fn field_matches_plain(
+    ctx_plain: &SearchContext<'_>,
+    ctx_field: &SearchContext<'_>,
+    params: &CostParams,
+    jobs: &[(u8, JobNode, JobNode)],
+) -> (u64, u64, u64) {
+    let (mut exp_plain, mut exp_field, mut field_runs) = (0, 0, 0);
+    for &(flags, s, t) in jobs {
+        let mut pool = JobPool::default();
+        let i = pool.push(job(flags), &[s], &[t], &[]);
+        let mut outs = Vec::new();
+        for (ctx, exp) in [(ctx_plain, &mut exp_plain), (ctx_field, &mut exp_field)] {
+            let mut stats = SearchStats::default();
+            let o = search_with(ctx, &pool, &pool.jobs[0], i, params, &mut stats);
+            *exp += stats.expansions;
+            field_runs += stats.field_runs;
+            outs.push(o);
+        }
+        match (&outs[0], &outs[1]) {
+            (SearchOutcome::Found(a), SearchOutcome::Found(b)) => {
+                assert_eq!(a.cost, b.cost, "{flags:#x} {s:?} -> {t:?}");
+                assert_eq!(
+                    b.nodes.first().map(|n| (n.col, n.row)),
+                    Some((s.col, s.row))
+                );
+                assert_eq!(b.nodes.last().map(|n| (n.col, n.row)), Some((t.col, t.row)));
+            }
+            (SearchOutcome::Unreachable { .. }, SearchOutcome::Unreachable { .. }) => {}
+            (a, b) => panic!("{flags:#x} {s:?} -> {t:?}: {a:?} vs {b:?}"),
+        }
+    }
+    (exp_plain, exp_field, field_runs)
+}
+
+#[test]
+fn the_relaxed_field_keeps_path_costs_at_masked_targets_and_minimum_runs() {
+    // Targets entered only in one to three headings (pin access), sources
+    // left only in some, the derived heading mask on, and minimum-run jobs:
+    // the field's bound at a target must not undercut the cost of passing
+    // through it in a heading its mask refuses.
+    let (cols, rows) = (56u32, 44u32);
+    let mut st = stack(cols, rows, 3);
+    let mut g = Lcg(23);
+    rough_board(&mut st, &mut g, 26);
+    rederive(&mut st);
+    let params = CostParams {
+        present_factor: 4_000,
+        history_factor: 1_000,
+        ..CostParams::default()
+    };
+    for (use_heading_mask, flags) in [
+        (false, JOB_ALLOW_VIA),
+        (true, JOB_ALLOW_VIA),
+        (true, JOB_ALLOW_VIA | JOB_MIN_RUN),
+        (false, JOB_MIN_RUN),
+    ] {
+        let plain = SearchConfig {
+            use_heading_mask,
+            min_run_nm: 100_000,
+            via_congestion_reach_nm: Some(100_000),
+            ..SearchConfig::default()
+        };
+        let with_field = SearchConfig {
+            field_after: 1,
+            ..plain.clone()
+        };
+        let jobs: Vec<(u8, JobNode, JobNode)> = (0..80u32)
+            .map(|k| {
+                let v = g.next();
+                let mut s = node(
+                    (v >> 33) as u16 % cols as u16,
+                    (v >> 40) as u16 % rows as u16,
+                    (k % 3) as u8,
+                );
+                if k % 4 == 0 {
+                    s.heading_mask = g.mask();
+                }
+                let mut t = node(
+                    (v >> 17) as u16 % cols as u16,
+                    (v >> 24) as u16 % rows as u16,
+                    ((k / 3) % 3) as u8,
+                );
+                t.heading_mask = g.mask();
+                (flags, s, t)
+            })
+            .collect();
+        let ctx_plain = SearchContext::new(&st, &plain);
+        let ctx_field = SearchContext::new(&st, &with_field);
+        let (exp_plain, exp_field, runs) =
+            field_matches_plain(&ctx_plain, &ctx_field, &params, &jobs);
+        assert!(
+            runs > 40,
+            "{use_heading_mask} {flags:#x}: {runs} field runs"
+        );
+        assert!(
+            exp_field < exp_plain,
+            "{use_heading_mask} {flags:#x}: field {exp_field} vs plain {exp_plain}"
+        );
+    }
+}
+
+#[test]
+fn the_relaxed_field_keeps_path_costs_on_a_non_uniform_lattice() {
+    // Off-grid forced lines and a fine band make uneven gaps and diagonal
+    // edges: the field walks the lattice's own steps, not the uniform
+    // interior shortcut, and must still bound the real search exactly.
+    let mut spec = LatticeSpec::new(BBox::new(
+        Point::new(0, 0),
+        Point::new(2_600_000, 2_000_000),
+    ));
+    let mut g = Lcg(5);
+    for _ in 0..9 {
+        let v = g.next();
+        spec.force_point(Point::new(
+            ((v >> 20) % 2_500_000) as Coord + 37_000,
+            ((v >> 40) % 1_900_000) as Coord + 13_000,
+        ));
+    }
+    spec.fine_regions = vec![BBox::new(
+        Point::new(900_000, 0),
+        Point::new(1_500_000, 2_000_000),
+    )];
+    let lat = Lattice::build(&spec).unwrap();
+    let w = lat.window();
+    let mut st = TileStack {
+        tile: TileId(0),
+        profile: ProfileId(0),
+        window: w,
+        layers: (0..2)
+            .map(|l| TileRaster::new(TileId(0), LayerId(l), ProfileId(0), w))
+            .collect(),
+    };
+    rough_board(&mut st, &mut g, 14);
+    for r in &mut st.layers {
+        derive_masks_on_lattice(r, &lat, None);
+    }
+    let params = CostParams {
+        present_factor: 4_000,
+        history_factor: 1_000,
+        ..CostParams::default()
+    };
+    let (cols, rows) = (w.cols as u16, w.rows as u16);
+    for flags in [JOB_ALLOW_VIA, JOB_ALLOW_VIA | JOB_MIN_RUN] {
+        let plain = SearchConfig {
+            min_run_nm: 100_000,
+            ..SearchConfig::default()
+        };
+        let with_field = SearchConfig {
+            field_after: 1,
+            ..plain.clone()
+        };
+        let jobs: Vec<(u8, JobNode, JobNode)> = (0..60u32)
+            .map(|k| {
+                let v = g.next();
+                let s = node(
+                    (v >> 33) as u16 % cols,
+                    (v >> 40) as u16 % rows,
+                    (k % 2) as u8,
+                );
+                let mut t = node(
+                    (v >> 17) as u16 % cols,
+                    (v >> 24) as u16 % rows,
+                    ((k / 2) % 2) as u8,
+                );
+                if k % 2 == 0 {
+                    t.heading_mask = g.mask();
+                }
+                (flags, s, t)
+            })
+            .collect();
+        let ctx_plain = SearchContext {
+            lattice: Some(&lat),
+            ..SearchContext::new(&st, &plain)
+        };
+        let ctx_field = SearchContext {
+            lattice: Some(&lat),
+            ..SearchContext::new(&st, &with_field)
+        };
+        let (_, _, runs) = field_matches_plain(&ctx_plain, &ctx_field, &params, &jobs);
+        assert!(runs > 30, "{flags:#x}: {runs} field runs");
+    }
+}
+
+#[test]
+fn the_relaxed_field_bounds_passing_through_a_masked_target() {
+    // The target sits in a one-node hole in a thick wall and may only be
+    // entered from the pocket behind it, so every path passes through it
+    // first, loops in the pocket and comes back. Its predecessor in the
+    // hole is reached two ways: straight in, after a slightly dearer
+    // diagonal (a little history), or diagonally, cheaper there but a 45°
+    // bend into the target. If the field bounded the pass-through state at
+    // the target by 0 (its end state's value), that state would close on
+    // the first, dearer arrival before the straight one popped.
+    let mut st = stack(40, 24, 1);
+    for col in 19..=20 {
+        block(&mut st, 0, col..=col, 3..=9);
+        block(&mut st, 0, col..=col, 11..=17);
+    }
+    block(&mut st, 0, 19..=32, 3..=3);
+    block(&mut st, 0, 19..=32, 17..=17);
+    block(&mut st, 0, 32..=32, 3..=17);
+    rederive(&mut st);
+    st.layers[0].history.set(18, 10, 1);
+    let params = CostParams {
+        history_factor: 20,
+        ..CostParams::default()
+    };
+    let plain = SearchConfig {
+        use_heading_mask: false,
+        ..SearchConfig::default()
+    };
+    let with_field = SearchConfig {
+        field_after: 1,
+        ..plain.clone()
+    };
+    let mut t = node(20, 10, 0);
+    t.heading_mask = 1 << 4; // enter moving towards col - 1
+    let jobs = [(0u8, node(17, 11, 0), t)];
+    let (_, _, runs) = field_matches_plain(
+        &SearchContext::new(&st, &plain),
+        &SearchContext::new(&st, &with_field),
+        &params,
+        &jobs,
+    );
+    assert_eq!(runs, 1);
+    let mut pool = JobPool::default();
+    let i = pool.push(job(0), &[jobs[0].1], &[t], &[]);
+    let mut stats = SearchStats::default();
+    let o = search_with(
+        &SearchContext::new(&st, &with_field),
+        &pool,
+        &pool.jobs[0],
+        i,
+        &params,
+        &mut stats,
+    );
+    let p = found(&o);
+    // Into the hole straight, through the target, round the pocket and
+    // back in.
+    let head: Vec<(u16, u16)> = p.nodes[..2].iter().map(|n| (n.col, n.row)).collect();
+    assert_eq!(head, [(17, 11), (18, 10)]);
+    assert_eq!(runs_of_target(&p.nodes), 2);
+}
+
+/// How many times a path visits its last node.
+fn runs_of_target(nodes: &[JobNode]) -> usize {
+    let t = nodes.last().unwrap();
+    nodes
+        .iter()
+        .filter(|n| (n.col, n.row, n.layer) == (t.col, t.row, t.layer))
+        .count()
+}

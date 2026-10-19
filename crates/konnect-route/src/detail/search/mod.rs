@@ -278,7 +278,8 @@ pub struct SearchConfig {
     /// a relaxed cost-to-go field in the heuristic: one backward Dijkstra
     /// from the targets over the region that keeps the congestion-scaled
     /// step costs and the walls but drops bends, the turn rule and the
-    /// extras. The bound is consistent, so the path cost is the same as
+    /// extras, and bounds passing through a target apart from ending
+    /// there. The bound is consistent, so the path cost is the same as
     /// without it (ties may resolve differently); a search that floods its
     /// window around congestion then expands little beyond its path, and an
     /// enclosed target is proved unreachable without a flood. 0 (the

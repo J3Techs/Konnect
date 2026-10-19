@@ -166,6 +166,8 @@ pub(crate) struct Scratch {
     /// the heap that builds it.
     field: FieldMap,
     fheap: RadixHeap,
+    /// The field's pass-through bounds at the target node-layers.
+    fpass: Vec<PassBound>,
     /// Per region column, then row: the gap to the sources' box, nm.
     gaps: Vec<i64>,
     /// The last [`run`] stopped at its [`Problem::cap`].
@@ -801,6 +803,7 @@ pub(crate) fn run<G: Grid>(
         stop: 0,
         complete: false,
     };
+    s.fpass.clear();
     if use_field && sbox.0 != i64::MAX {
         let (settled, b) = relaxed_field(
             grid,
@@ -819,13 +822,25 @@ pub(crate) fn run<G: Grid>(
         fbound = b;
     }
     let fmap = fmap;
+    let fpass = std::mem::take(&mut s.fpass);
     // The field's bound at a node-layer: exact where the backward search
     // closed it; elsewhere `stop - octile to the sources` (every unclosed
-    // node had `d + octile >= stop`), or unreachable once it ran dry.
-    let fd_at = |c: u32, r: u32, l: u32| {
+    // node had `d + octile >= stop`), or unreachable once it ran dry. A
+    // state at a target that its mask does not end (arrived in heading `h`
+    // outside it) only passes through: it takes the pass-through bound,
+    // not the end state's 0, or a step into it would be inconsistent.
+    let fd_at = |c: u32, r: u32, l: u32, h: u32| {
         let i = lay.local(c, r) as usize * nl_layers + l as usize;
         if fmap.closed(i) {
-            fmap.get(i)
+            let v = fmap.get(i);
+            if v == 0 && h != none {
+                if let Ok(k) = fpass.binary_search_by_key(&i, |p| p.nl) {
+                    if fpass[k].mask & (1 << h) == 0 {
+                        return fpass[k].d;
+                    }
+                }
+            }
+            v
         } else if fbound.complete {
             u32::MAX
         } else {
@@ -856,7 +871,7 @@ pub(crate) fn run<G: Grid>(
         // With the field, a state that cannot reach a target is `u32::MAX`
         // (never pushed), and every other bound is raised to the field.
         let floor = if use_field {
-            let v = fd_at(c, r, l);
+            let v = fd_at(c, r, l, h);
             if v == u32::MAX {
                 return u32::MAX;
             }
@@ -1246,6 +1261,7 @@ pub(crate) fn run<G: Grid>(
     };
     s.tboxes = tboxes;
     s.field = fmap;
+    s.fpass = fpass;
     s.gaps = gaps;
     stats.expansions += expansions;
     outcome
@@ -1349,6 +1365,20 @@ fn via_congestion_cost(
     c.min(u64::from(u32::MAX - 1)) as u32
 }
 
+/// The field's bound for passing through a target node-layer: arriving in
+/// a heading outside its `mask` (the target's entry headings) ends nothing,
+/// and the cheapest way on is a step off it (or a via) and a path from
+/// there. Exact where the backward search closed that state, otherwise the
+/// [`FieldBound`] value, `u32::MAX` when nothing on is reachable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PassBound {
+    /// The target's node-layer index.
+    nl: usize,
+    d: u32,
+    closed: bool,
+    mask: u8,
+}
+
 /// Where [`relaxed_field`] stopped.
 #[derive(Clone, Copy)]
 struct FieldBound {
@@ -1366,11 +1396,14 @@ struct FieldBound {
 /// the `Near` surcharges, the walls and the real via prices). Every real
 /// move is a move of the relaxation and costs at least as much, so a closed
 /// node-layer's `fd` is a lower bound on the real cost to a target from any
-/// state there. It runs until a source closes and the open keys pass that
-/// source's cost by a slack; an unclosed node-layer then has
-/// `d >= stop - h`, `h` the octile to the sources plus a via off their
-/// layers ([`FieldBound`]). Both bounds are
-/// consistent, so the forward search's path cost is unchanged.
+/// state there. A target node-layer has two values: 0 for the states its
+/// entry mask ends, and the cost of passing through it for the others
+/// (left in `s.fpass`, [`PassBound`]). It runs until a source closes and
+/// the open keys pass that source's cost by a slack; an unclosed
+/// node-layer then has `d >= stop - h`, `h` the octile to the sources plus
+/// a via off their layers ([`FieldBound`]). Both bounds are consistent on
+/// every edge of the real search (into a target's pass-through states
+/// too), so its path cost is unchanged; ties may resolve differently.
 #[allow(clippy::too_many_arguments)]
 fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
     grid: &G,
@@ -1434,22 +1467,25 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
     // which any track step may do. The through costs live here, sorted by
     // node-layer, and their heap entries carry `THROUGH`.
     const THROUGH: u32 = 1 << 31;
-    let mut through: Vec<(usize, u32, bool)> = Vec::new();
+    let mut through = std::mem::take(&mut s.fpass);
+    through.clear();
     for t in targets {
         let (c, r, l) = (u32::from(t.col), u32::from(t.row), u32::from(t.layer));
         if l < lcount && in_region(c, r) {
-            through.push((
-                lay.local(c, r) as usize * nl_layers + l as usize,
-                u32::MAX,
-                false,
-            ));
+            let nl = lay.local(c, r) as usize * nl_layers + l as usize;
+            through.push(PassBound {
+                nl,
+                d: u32::MAX,
+                closed: false,
+                mask: s.nl_of(nl).dst_mask,
+            });
         }
     }
-    through.sort_unstable();
-    through.dedup_by_key(|t| t.0);
+    through.sort_unstable_by_key(|t| t.nl);
+    through.dedup_by_key(|t| t.nl);
     let push = |heap: &mut RadixHeap,
                 fd: &mut FieldMap,
-                through: &mut [(usize, u32, bool)],
+                through: &mut [PassBound],
                 pnl: usize,
                 nd: u32,
                 pc: u32,
@@ -1457,9 +1493,9 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
         let cur = fd.get(pnl);
         if cur == 0 {
             // A target's end state: the step passes through it instead.
-            if let Ok(i) = through.binary_search_by_key(&pnl, |t| t.0) {
-                if nd < through[i].1 {
-                    through[i].1 = nd;
+            if let Ok(i) = through.binary_search_by_key(&pnl, |t| t.nl) {
+                if nd < through[i].d {
+                    through[i].d = nd;
                     heap.push(
                         nd.saturating_add(to_sources(pc, pr, (pnl % nl_layers) as u32)),
                         pnl as u32 | THROUGH,
@@ -1481,13 +1517,13 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
         let layer = nl % nl_layers;
         let (c, r) = lay.col_row(node);
         let d = if is_through {
-            let Ok(i) = through.binary_search_by_key(&nl, |t| t.0) else {
+            let Ok(i) = through.binary_search_by_key(&nl, |t| t.nl) else {
                 continue;
             };
-            if through[i].2 {
+            if through[i].closed {
                 continue;
             }
-            through[i].1
+            through[i].d
         } else {
             if fd.closed(nl) {
                 continue;
@@ -1504,8 +1540,8 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
             break;
         }
         if is_through {
-            if let Ok(i) = through.binary_search_by_key(&nl, |t| t.0) {
-                through[i].2 = true;
+            if let Ok(i) = through.binary_search_by_key(&nl, |t| t.nl) {
+                through[i].closed = true;
             }
         } else {
             fd.close(nl);
@@ -1607,6 +1643,21 @@ fn relaxed_field<G: Grid, F: Fn(u32, u32, u32) -> u32>(
         }
     }
     s.fheap = heap;
+    // An unclosed pass-through state takes the bound of every unclosed
+    // node-layer.
+    for t in &mut through {
+        if !t.closed {
+            t.d = if bound.complete {
+                u32::MAX
+            } else {
+                let (c, r) = lay.col_row((t.nl / nl_layers) as u32);
+                bound
+                    .stop
+                    .saturating_sub(to_sources(c, r, (t.nl % nl_layers) as u32))
+            };
+        }
+    }
+    s.fpass = through;
     (settled, bound)
 }
 
