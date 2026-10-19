@@ -277,7 +277,10 @@ pub struct PlaneViaPlan {
 }
 
 impl PlaneViaPlan {
-    /// The planned copper, generation 0.
+    /// The planned copper, generation 0. Vias carry
+    /// [`LayerMask::EMPTY`](crate::api::LayerMask::EMPTY) here, because a
+    /// plan does not hold the board's layer stack; every planned via is a
+    /// through via, and [`Self::route_plan`] fills in all copper layers.
     pub fn routed(&self) -> RoutedCopper {
         let mut out = RoutedCopper::default();
         for s in &self.sites {
@@ -437,6 +440,7 @@ pub fn plan_plane_vias_excluding(
                 } else {
                     FanoutFailure::NoLegalSite
                 };
+                let (reasons, trials) = (r.reasons(), r.trial_list());
                 for &p in &u.pads {
                     plan.failed.push((p, failure.clone()));
                     plan.details.push(FailureDetail {
@@ -444,8 +448,8 @@ pub fn plan_plane_vias_excluding(
                         net: u.net,
                         candidates: r.total,
                         legal: cands[ui].len() as u32,
-                        rejections: r.by_reason.clone(),
-                        trials: r.trials.clone(),
+                        rejections: reasons.clone(),
+                        trials: trials.clone(),
                     });
                 }
             }
@@ -557,13 +561,34 @@ struct Rejections {
     board: u32,
     plane: u32,
     spokes: u32,
-    by_reason: BTreeMap<String, u32>,
-    trials: Vec<Trial>,
+    /// Rejections by reason. Reasons are static labels; they become owned
+    /// strings only in the report of a failed island.
+    by_reason: BTreeMap<&'static str, u32>,
+    /// Every rejected candidate: pad, via centre, reason.
+    trials: Vec<(PadId, Point, &'static str)>,
 }
 
 impl Rejections {
-    fn note(&mut self, why: &str) {
-        *self.by_reason.entry(why.to_string()).or_default() += 1;
+    fn note(&mut self, why: &'static str) {
+        *self.by_reason.entry(why).or_default() += 1;
+    }
+
+    fn reasons(&self) -> BTreeMap<String, u32> {
+        self.by_reason
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    fn trial_list(&self) -> Vec<Trial> {
+        self.trials
+            .iter()
+            .map(|&(pad, via, why)| Trial {
+                pad,
+                via,
+                reason: why.to_string(),
+            })
+            .collect()
     }
 }
 
@@ -675,8 +700,8 @@ struct PadPlan<'a> {
     layer: LayerId,
     c: Point,
     sizes: Vec<(Coord, Coord, bool)>,
+    /// Stub widths outside any courtyard (the probe for [`stub_widths`]).
     widths: Vec<(Coord, bool)>,
-    min_len: Coord,
 }
 
 fn pad_plan<'a>(ctx: &Ctx<'a>, net: NetId, pid: PadId) -> Option<PadPlan<'a>> {
@@ -694,18 +719,10 @@ fn pad_plan<'a>(ctx: &Ctx<'a>, net: NetId, pid: PadId) -> Option<PadPlan<'a>> {
         ViaSizePolicy::NetClassThenFloor if (floor.0, floor.1) == (class.0, class.1) => vec![class],
         ViaSizePolicy::NetClassThenFloor => vec![class, floor],
     };
+    // Outside any courtyard; [`stub_widths`] resolves them where each stub
+    // actually runs.
     let subject = RuleSubject::new(ItemKind::Track, Some(net));
-    let track_rule = rules.track_width(&subject, layer);
-    let widths = match s.stub_width {
-        StubWidthPolicy::Preferred => vec![(track_rule.preferred, false)],
-        StubWidthPolicy::Minimum => vec![(track_rule.min, true)],
-        StubWidthPolicy::PreferredThenMinimum if track_rule.min == track_rule.preferred => {
-            vec![(track_rule.preferred, false)]
-        }
-        StubWidthPolicy::PreferredThenMinimum => {
-            vec![(track_rule.preferred, false), (track_rule.min, true)]
-        }
-    };
+    let widths = width_options(s.stub_width, rules.track_width(&subject, layer));
     Some(PadPlan {
         pid,
         pad,
@@ -713,8 +730,39 @@ fn pad_plan<'a>(ctx: &Ctx<'a>, net: NetId, pid: PadId) -> Option<PadPlan<'a>> {
         c,
         sizes,
         widths,
-        min_len: rules.min_segment_length(&subject, layer).unwrap_or(0),
     })
+}
+
+/// Stub widths to try for a stub from `pp` to `via`, and the minimum
+/// segment length, resolved where the stub runs: a courtyard-scoped rule
+/// can set a different width or length there than outside.
+fn stub_widths(
+    ctx: &Ctx<'_>,
+    cache: &mut ClearanceCache,
+    net: NetId,
+    pp: &PadPlan<'_>,
+    via: Point,
+) -> (Vec<(Coord, bool)>, Coord) {
+    let probe = Shape::Segment(Segment::new(pp.c, via, pp.widths[0].0));
+    let key = ctx.space.subject_for(ItemKind::Track, Some(net), &probe);
+    let (rule, min_len) = ctx.space.track_rules(cache, ctx.rules, &key, pp.layer);
+    (
+        width_options(ctx.settings.stub_width, rule),
+        min_len.unwrap_or(0),
+    )
+}
+
+fn width_options(policy: StubWidthPolicy, rule: crate::rules::WidthRule) -> Vec<(Coord, bool)> {
+    match policy {
+        StubWidthPolicy::Preferred => vec![(rule.preferred, false)],
+        StubWidthPolicy::Minimum => vec![(rule.min, true)],
+        StubWidthPolicy::PreferredThenMinimum if rule.min == rule.preferred => {
+            vec![(rule.preferred, false)]
+        }
+        StubWidthPolicy::PreferredThenMinimum => {
+            vec![(rule.preferred, false), (rule.min, true)]
+        }
+    }
 }
 
 /// One exit geometry: the first legal (size, width) combination, or the
@@ -750,10 +798,11 @@ fn try_exit(
                 continue;
             }
         };
-        for &(w, min_stub) in &pp.widths {
+        let (widths, min_len) = stub_widths(ctx, cache, net, pp, via);
+        for (w, min_stub) in widths {
             let stub = Segment::new(pp.c, via, w);
             let l2 = (stub.b - stub.a).length2();
-            if l2 < i128::from(pp.min_len) * i128::from(pp.min_len) {
+            if l2 < i128::from(min_len) * i128::from(min_len) {
                 last = (via, "stub shorter than the segment minimum", 0);
                 continue;
             }
@@ -848,11 +897,7 @@ fn candidates(ctx: &Ctx<'_>, u: &Unit, cache: &mut ClearanceCache) -> (Vec<Cand>
                         Ok(c) => out.push(c),
                         Err((via, why, kind)) => {
                             rej.note(why);
-                            rej.trials.push(Trial {
-                                pad: pp.pid,
-                                via,
-                                reason: why.to_string(),
-                            });
+                            rej.trials.push((pp.pid, via, why));
                             match kind {
                                 1 => rej.plane += 1,
                                 2 => rej.spokes += 1,
@@ -953,7 +998,7 @@ fn check_via(
     let disc = Shape::Circle(Circle::from_diameter(via, diameter));
     let key = space.subject_for(ItemKind::Via, Some(net), &disc);
     // The via floor can depend on where the via is (courtyard-scoped rules).
-    let floor = space.with_subject(&key, |subject| ctx.rules.via(&subject));
+    let floor = space.via_rule(cache, ctx.rules, &key);
     if diameter < floor.min_diameter
         || drill < floor.min_drill
         || (diameter - drill) / 2 < floor.min_annular
@@ -1041,8 +1086,12 @@ fn share_vias(
             hosts.sort();
             for (_, hi) in hosts {
                 let (host_unit, host) = placed[hi];
-                for &(w, _) in &pp.widths {
+                let (widths, min_len) = stub_widths(ctx, &mut cache, u.net, &pp, host.via);
+                for (w, _) in widths {
                     let stub = Segment::new(pp.c, host.via, w);
+                    if (stub.b - stub.a).length2() < i128::from(min_len) * i128::from(min_len) {
+                        continue;
+                    }
                     let shape = Shape::Segment(stub);
                     let key = space.subject_for(ItemKind::Track, Some(u.net), &shape);
                     if space

@@ -17,7 +17,7 @@ pub(crate) mod poly;
 
 use crate::api::{FootprintId, ItemKind, ItemRef, KeepoutId, LayerId, LayerMask, NetId};
 use crate::board::{PadKind, RouteBoard};
-use crate::rules::{RuleSubject, RuleTable};
+use crate::rules::{RuleSubject, RuleTable, ViaRule, WidthRule};
 use konnect_geom::{
     gap_cmp, touches, ArcPolicy, BBox, Circle, Coord, IndexEntry, LayerIndex, Point, Segment, Shape,
 };
@@ -150,6 +150,8 @@ impl SubjectKey {
 #[derive(Default)]
 pub(crate) struct ClearanceCache {
     clearance: FxMap<(SubjectKey, SubjectKey, u8), Coord>,
+    via_rules: FxMap<SubjectKey, ViaRule>,
+    track_rules: FxMap<(SubjectKey, u8), (WidthRule, Option<Coord>)>,
     pub(crate) misses: u64,
 }
 
@@ -210,6 +212,9 @@ pub(crate) struct Space<'b> {
     hole_index: LayerIndex,
     edge_index: LayerIndex,
     keepout_index: LayerIndex,
+    /// Each keepout's region as a shape, by keepout index (built once so
+    /// queries need not clone polygons).
+    pub keepout_shapes: Vec<Shape>,
     courtyards: Vec<(FootprintId, Shape)>,
     court_index: LayerIndex,
     /// Names of keepouts that conditions can test with `enclosedByArea`.
@@ -285,6 +290,11 @@ impl<'b> Space<'b> {
             hole_index: LayerIndex::new(),
             edge_index,
             keepout_index,
+            keepout_shapes: board
+                .keepouts
+                .iter()
+                .map(|k| Shape::Polygon(k.region.clone()))
+                .collect(),
             courtyards,
             court_index,
             area_names,
@@ -457,6 +467,46 @@ impl<'b> Space<'b> {
         key
     }
 
+    /// The track width rule and minimum segment length for a subject on
+    /// `layer`, memoised per worker.
+    pub(crate) fn track_rules(
+        &self,
+        cache: &mut ClearanceCache,
+        rules: &dyn RuleTable,
+        key: &SubjectKey,
+        layer: LayerId,
+    ) -> (WidthRule, Option<Coord>) {
+        let k = (*key, layer.0);
+        if let Some(v) = cache.track_rules.get(&k) {
+            return *v;
+        }
+        cache.misses += 1;
+        let v = self.with_subject(key, |s| {
+            (
+                rules.track_width(&s, layer),
+                rules.min_segment_length(&s, layer),
+            )
+        });
+        cache.track_rules.insert(k, v);
+        v
+    }
+
+    /// The via rule for a subject, memoised per worker.
+    pub(crate) fn via_rule(
+        &self,
+        cache: &mut ClearanceCache,
+        rules: &dyn RuleTable,
+        key: &SubjectKey,
+    ) -> ViaRule {
+        if let Some(v) = cache.via_rules.get(key) {
+            return *v;
+        }
+        cache.misses += 1;
+        let v = self.with_subject(key, |s| rules.via(&s));
+        cache.via_rules.insert(*key, v);
+        v
+    }
+
     pub(crate) fn clearance(
         &self,
         cache: &mut ClearanceCache,
@@ -482,13 +532,14 @@ impl<'b> Space<'b> {
         key: &SubjectKey,
         f: impl FnOnce(RuleSubject<'_>) -> R,
     ) -> R {
-        let areas: Vec<&str> = key.areas[..key.n_areas as usize]
-            .iter()
-            .map(|&a| self.area_names[a as usize])
-            .collect();
+        let n = key.n_areas as usize;
+        let mut areas: [&str; MAX_AREAS] = [""; MAX_AREAS];
+        for (slot, &a) in areas.iter_mut().zip(&key.areas[..n]) {
+            *slot = self.area_names[a as usize];
+        }
         let mut s = RuleSubject::new(key.kind, key.net)
             .with_courtyards(key.courtyards())
-            .with_areas(&areas)
+            .with_areas(&areas[..n])
             .with_local_clearance(key.local);
         s.footprint = key.footprint;
         f(s)
@@ -615,7 +666,7 @@ impl<'b> Space<'b> {
             };
             if forbids
                 && k.layers.intersects(layers)
-                && touches(shape, &Shape::Polygon(k.region.clone()))
+                && touches(shape, &self.keepout_shapes[e.id as usize])
             {
                 return Some(Conflict::Keepout { id: k.id });
             }
@@ -719,7 +770,8 @@ fn index_planes(board: &RouteBoard) -> Vec<PlanePiece> {
             index: PolyIndex::with_target(
                 &z.region,
                 // Small islands need no big grid.
-                (z.region.outline().len() * 16).clamp(1_024, poly::DEFAULT_TARGET_CELLS),
+                (z.region.rings().map(<[Point]>::len).sum::<usize>() * 16)
+                    .clamp(1_024, poly::DEFAULT_TARGET_CELLS),
             ),
         })
         .collect()

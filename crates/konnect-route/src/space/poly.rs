@@ -280,23 +280,26 @@ impl PolyIndex {
             // Unreachable with the grid margin; fall back to a full test.
             return self.contains_linear(p);
         };
-        let mut cand: Vec<u32> = Vec::new();
-        for kk in c..k {
-            cand.extend_from_slice(self.cell_edges(row + kk));
-        }
-        cand.sort_unstable();
-        cand.dedup();
+        // Each edge once: within a row an edge is registered in a run of
+        // consecutive cells, so it is new at cell `kk` unless the cell to
+        // its left (inside the walk) holds it too. Cell lists are sorted.
         let mut parity = false;
-        for &e in &cand {
-            let (a, b) = self.edges[e as usize];
-            if orient(a, b, p) == 0 && within_box(a, b, p) {
-                return Containment::Boundary;
-            }
-            if (a.y > p.y) != (b.y > p.y)
-                && crossing_right_of(a, b, p)
-                && !crossing_right_of(a, b, q)
-            {
-                parity = !parity;
+        for kk in c..k {
+            let left = (kk > c).then(|| self.cell_edges(row + kk - 1));
+            for &e in self.cell_edges(row + kk) {
+                if left.is_some_and(|l| l.binary_search(&e).is_ok()) {
+                    continue;
+                }
+                let (a, b) = self.edges[e as usize];
+                if orient(a, b, p) == 0 && within_box(a, b, p) {
+                    return Containment::Boundary;
+                }
+                if (a.y > p.y) != (b.y > p.y)
+                    && crossing_right_of(a, b, p)
+                    && !crossing_right_of(a, b, q)
+                {
+                    parity = !parity;
+                }
             }
         }
         let inside = (q_state == IN) != parity;
