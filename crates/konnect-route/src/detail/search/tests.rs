@@ -761,6 +761,9 @@ fn corridors_steer_the_search() {
         cols: 4,
         rows: 4,
         layers: LayerMask(1),
+        fine_pitch: 1_000_000,
+        refined: Vec::new(),
+        capacity: Vec::new(),
     };
     // A corridor down column 0 then along row 3: an L, not the diagonal.
     let cells: Vec<u32> = vec![
