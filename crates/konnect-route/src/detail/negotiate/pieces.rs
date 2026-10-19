@@ -14,7 +14,7 @@ use super::conflicts::{HistoryMap, RoutedIndex};
 use super::tiles::Tiling;
 use super::{Ctx, DetailFailure, Task};
 use crate::api::{ItemKind, ItemRef, LayerId, NetId, LATTICE_PITCH_NM};
-use crate::detail::search::HEADINGS;
+use crate::detail::search::heading_delta;
 use crate::rules::RuleSubject;
 use konnect_geom::{BBox, Coord, Point, Segment, Shape};
 use std::collections::HashMap;
@@ -170,19 +170,21 @@ fn walk(tiling: &Tiling, line: &[Point], hints: &[Option<LayerId>]) -> Vec<Cross
     out
 }
 
-/// The heading bits whose move has `sign` along the axis (`x` or `y`).
+/// The heading bits whose move has `sign` along the board axis (`x` or
+/// `y`, Y-down). Heading bits are in the raster's Y-up sense
+/// ([`heading_delta`] gives a heading's board step), so a move towards
+/// larger board `y` is a heading with a negative Y-up component.
 fn crossing_headings(vertical_boundary: bool, sign: i32) -> u8 {
-    HEADINGS
-        .iter()
-        .enumerate()
-        .filter(|(_, (dx, dy))| {
+    (0..8u8)
+        .filter(|&h| {
+            let (dcol, drow) = heading_delta(h);
             if vertical_boundary {
-                *dx == sign
+                dcol == sign
             } else {
-                *dy == sign
+                drow == sign
             }
         })
-        .fold(0u8, |m, (h, _)| m | (1 << h))
+        .fold(0u8, |m, h| m | (1 << h))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -416,7 +418,16 @@ mod tests {
         // +x: (1,-1), (1,0), (1,1) are headings 7, 0, 1.
         assert_eq!(crossing_headings(true, 1), 0b1000_0011);
         assert_eq!(crossing_headings(true, -1), 0b0011_1000);
-        assert_eq!(crossing_headings(false, 1), 0b0000_1110);
-        assert_eq!(crossing_headings(false, -1), 0b1110_0000);
+        // Board +y (Y-down, row + 1) is Y-up south: headings 5, 6, 7.
+        assert_eq!(crossing_headings(false, 1), 0b1110_0000);
+        assert_eq!(crossing_headings(false, -1), 0b0000_1110);
+        for (vertical, sign) in [(true, 1), (true, -1), (false, 1), (false, -1)] {
+            let m = crossing_headings(vertical, sign);
+            for h in 0..8u8 {
+                let (dc, dr) = heading_delta(h);
+                let along = if vertical { dc } else { dr };
+                assert_eq!(m & (1 << h) != 0, along == sign, "{vertical} {sign} {h}");
+            }
+        }
     }
 }
