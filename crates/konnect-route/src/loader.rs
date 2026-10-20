@@ -99,6 +99,15 @@ pub fn load_board_str(
     options: &LoadOptions,
 ) -> Result<(RouteBoard, LoadReport), LoadError> {
     let tree = parse_sexp(text).map_err(|e| LoadError::Parse(e.to_string()))?;
+    load_board_tree(&tree, options)
+}
+
+/// Load a `.kicad_pcb` that has already been parsed, so a caller that also
+/// reads other parts of the tree (zone settings, say) parses the text once.
+pub fn load_board_tree(
+    tree: &SexpNode,
+    options: &LoadOptions,
+) -> Result<(RouteBoard, LoadReport), LoadError> {
     if tree.head() != Some("kicad_pcb") {
         return Err(LoadError::Parse(
             "the root node is not (kicad_pcb …)".to_string(),
@@ -107,7 +116,7 @@ pub fn load_board_str(
     let mut report = LoadReport::default();
     let policy = options.arc_policy;
 
-    let layers = layer_table(&tree);
+    let layers = layer_table(tree);
     if layers.is_empty() {
         return Err(LoadError::NoCopperLayers);
     }
@@ -132,7 +141,7 @@ pub fn load_board_str(
     };
 
     // Nets: every named net, sorted, so ids are stable.
-    let mut names: Vec<String> = collect_net_keys(&tree).into_iter().collect();
+    let mut names: Vec<String> = collect_net_keys(tree).into_iter().collect();
     names.sort();
     let partners = pair_partners(&names);
     let nets: Vec<Net> = names
@@ -146,19 +155,19 @@ pub fn load_board_str(
             pair,
         })
         .collect();
-    let resolver = NetResolver::new(&tree, &names);
+    let resolver = NetResolver::new(tree, &names);
 
     let mut board = RouteBoard {
-        outline: outline(&tree, &policy, &mut report),
+        outline: outline(tree, &policy, &mut report),
         layers,
         routable,
         nets,
         ..Default::default()
     };
 
-    load_footprints(&tree, &resolver, &policy, &mut board, &mut report);
-    load_tracks(&tree, &resolver, &mut board, &mut report);
-    load_zones(&tree, &resolver, &policy, &mut board, &mut report);
+    load_footprints(tree, &resolver, &policy, &mut board, &mut report);
+    load_tracks(tree, &resolver, &mut board, &mut report);
+    load_zones(tree, &resolver, &policy, &mut board, &mut report);
 
     debug_assert_eq!(board.validate(), Ok(()));
     Ok((board, report))
@@ -291,7 +300,7 @@ fn uuid(node: &SexpNode) -> Option<String> {
 
 /// A closed path of lossless outline elements as a ring; arcs approximated
 /// on `side`.
-fn elements_to_ring(
+pub fn elements_to_ring(
     elements: &[ZoneOutlineElement],
     policy: &ArcPolicy,
     side: ArcSide,

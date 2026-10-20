@@ -44,8 +44,9 @@ pub mod rules;
 mod space;
 pub mod synthetic;
 pub mod telemetry;
+pub mod trunk;
 
 pub use board::RouteBoard;
-pub use loader::{load_board_file, load_board_str, LoadOptions, LoadReport};
+pub use loader::{load_board_file, load_board_str, load_board_tree, LoadOptions, LoadReport};
 pub use plan::{RoutePlan, RoutedCopper};
 pub use rules::{ProjectRuleTable, RuleTable};

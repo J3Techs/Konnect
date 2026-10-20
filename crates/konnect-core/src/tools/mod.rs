@@ -3,6 +3,10 @@
 #[cfg(test)]
 mod board_extents_tests;
 mod board_graphics;
+pub(crate) mod board_inspect;
+#[cfg(test)]
+mod board_inspect_tests;
+mod board_render;
 mod board_session;
 mod board_source;
 #[cfg(test)]
@@ -45,6 +49,7 @@ mod routing_batch;
 // apply path (`route_native_apply`) behind its `apply_route_plan` tool.
 pub(crate) mod route_native;
 pub(crate) mod route_native_apply;
+mod route_plan_tools;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
@@ -60,6 +65,7 @@ mod schematic_placement_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
+mod zone_batch;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;

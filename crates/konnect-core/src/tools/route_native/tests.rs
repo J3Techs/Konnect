@@ -99,10 +99,10 @@ fn t(net: &str, layer: &str, a: (f64, f64), b: (f64, f64)) -> PlanTrack {
 fn every_draft_tool_has_a_valid_schema_and_a_unique_name() {
     let defs = tools();
     let mut names: Vec<&str> = defs.iter().map(|d| d.name).collect();
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 16);
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 16);
 }
 
 #[tokio::test]

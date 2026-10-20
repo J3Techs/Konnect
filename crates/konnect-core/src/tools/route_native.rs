@@ -24,7 +24,10 @@ use crate::native_route_job::{
     self, guarded, CopperSource, NativeJobSpec, Quiet, StageError, StopKind,
 };
 use crate::tool;
-use crate::tools::{get_path, route_native_apply, ToolContext, ToolDef};
+use crate::tools::{
+    board_inspect, board_render, get_path, route_native_apply, route_plan_tools, ToolContext,
+    ToolDef,
+};
 use konnect_route::api::Generation;
 use konnect_route::check::ViolationKind;
 use konnect_route::connectivity::ConnectivityReport;
@@ -97,15 +100,173 @@ fn job_props() -> Value {
     })
 }
 
+/// The box argument the inspection and planning tools share.
+pub(crate) fn box_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": {
+            "x1": { "type": "number" }, "y1": { "type": "number" },
+            "x2": { "type": "number" }, "y2": { "type": "number" }
+        },
+        "required": ["x1", "y1", "x2", "y2"]
+    })
+}
+
+fn saved_board_prop() -> Value {
+    json!({ "type": "string", "description": "Saved .kicad_pcb to read (the file on disk, not the live editor)" })
+}
+
+fn names_prop(description: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": description })
+}
+
+fn query_copper_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board": saved_board_prop(),
+            "area": box_schema("Only items meeting this box, mm (corners in any order)"),
+            "area_mode": { "type": "string", "enum": ["intersects", "inside"], "default": "intersects",
+                           "description": "intersects: any copper touching the box; inside: wholly inside it" },
+            "nets": names_prop("Only these nets (names or * ? patterns); each must match a net of the board"),
+            "layers": names_prop("Only items on these copper layers (a via or zone on any of them)"),
+            "kinds": { "type": "array", "minItems": 1,
+                       "items": { "type": "string", "enum": ["track", "arc", "via", "zone", "rule_area"] },
+                       "description": "Item kinds to list (default: all)" },
+            "locked": { "type": "boolean", "description": "Only locked (true) or only unlocked (false) items" },
+            "counts_only": { "type": "boolean", "default": false, "description": "Return counts by kind, layer and net instead of items" },
+            "max_items": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 500, "description": "Items listed; the counts cover every match" },
+            "include_fills": { "type": "boolean", "default": false, "description": "Also list each zone's filled polygons (large)" }
+        },
+        "required": ["board"]
+    })
+}
+
+fn render_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board": saved_board_prop(),
+            "area": box_schema("The window to draw, mm (default: the board outline)"),
+            "layers": names_prop("Copper layers to draw (default F.Cu). The first is drawn on top at full strength, the rest faded beneath it"),
+            "px_per_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 400, "default": 20, "description": "Scale; the image may be at most 8192 px a side and 40 Mpx" },
+            "grid_mm": { "type": "number", "minimum": 0, "description": "Grid step in mm with coordinate labels (0: none; default: a step at least 40 px apart)" },
+            "fill_zones": { "type": "boolean", "default": true, "description": "Draw zone fills (translucent) as well as their outlines" },
+            "labels": { "type": "array", "items": { "type": "string", "enum": ["references", "pad_numbers", "nets", "zones", "none"] },
+                        "description": "Labels to draw (default: references)" },
+            "overlay_routing_file": { "type": "string", "description": "A routing_file ({tracks, vias}) drawn over the board, marked as planned" },
+            "overlay_zones_file": { "type": "string", "description": "A JSON array of add_zones entries (or {\"zones\": [...]}) drawn over the board, marked as planned" },
+            "output": { "type": "string", "description": "PNG path to write (default: konnect-renders in the system temp directory)" },
+            "inline": { "type": "boolean", "default": false, "description": "Also return the PNG as an MCP image content item (base64)" }
+        },
+        "required": ["board"]
+    })
+}
+
+fn tap_vias_schema() -> Value {
+    with_props(
+        json!({
+            "pads": names_prop("The pads to tap, as REFERENCE.NUMBER (e.g. C12.1); any net"),
+            "target_layer": { "type": "string", "description": "Copper layer the tap must reach, e.g. In2.Cu: every via is a through via, and it must also clear other nets' zone fills on this layer" },
+            "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
+            "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits" }
+        }),
+        &["board", "pads", "target_layer", "output_plan"],
+    )
+}
+
+fn trunk_schema() -> Value {
+    with_props(
+        json!({
+            "net": { "type": "string", "description": "The trunk's net" },
+            "layer": { "type": "string", "description": "The copper layer the trunk runs on, e.g. In2.Cu" },
+            "waypoints": { "type": "array", "minItems": 2, "description": "Ordered points the trunk passes through (tap via positions), mm; each leg starts and ends exactly on them",
+                           "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] } },
+            "preferred_width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Width wherever it fits" },
+            "min_width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Narrowest the trunk may go (default: the rules' minimum for the net)" },
+            "neck_radius_mm": { "type": "number", "minimum": 0, "maximum": 50, "default": 2, "description": "Within this distance of a waypoint the trunk may run narrow without penalty" },
+            "leg_widths": { "type": "array", "description": "Preferred widths for single legs (leg 0 runs from waypoint 0 to 1)",
+                            "items": { "type": "object", "properties": { "leg": { "type": "integer", "minimum": 0 }, "width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 } }, "required": ["leg", "width_mm"] } },
+            "keepouts": { "type": "array", "description": "Boxes the trunk copper may not touch, mm",
+                          "items": box_schema("A keep-out box") },
+            "avoid_routing_files": names_prop("routing_files whose copper of other nets the trunk keeps clear of (other planned trunks)"),
+            "grid_mm": { "type": "number", "minimum": 0.02, "maximum": 1, "default": 0.1, "description": "Search grid pitch" },
+            "waypoint_vias": { "type": "boolean", "default": true, "description": "Put a via at each waypoint (none where the board already has one of the net). Turn off when the waypoint vias come from a plan_tap_vias file that will be applied too" },
+            "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
+        }),
+        &[
+            "board",
+            "net",
+            "layer",
+            "waypoints",
+            "preferred_width_mm",
+            "output_plan",
+        ],
+    )
+}
+
+fn query_pads_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board": saved_board_prop(),
+            "area": box_schema("Only pads whose copper meets this box, mm (corners in any order)"),
+            "area_mode": { "type": "string", "enum": ["intersects", "inside"], "default": "intersects" },
+            "nets": names_prop("Only pads on these nets (names or * ? patterns)"),
+            "references": names_prop("Only pads of these footprints"),
+            "pads": names_prop("Only these pads, as REFERENCE.NUMBER (e.g. C12.1); with references, the union of both"),
+            "layers": names_prop("Only pads with copper on these layers"),
+            "pad_kinds": { "type": "array", "minItems": 1,
+                           "items": { "type": "string", "enum": ["smd", "thru_hole", "np_thru_hole", "connect"] } },
+            "compact": { "type": "boolean", "default": false, "description": "Leave out the exact copper shapes (the bounding box stays)" },
+            "max_items": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 500 }
+        },
+        "required": ["board"]
+    })
+}
+
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "connectivity_report",
-            "Union-find connectivity of the saved board's copper: per net, the islands its pads fall into and the connections still needed to join them. Zone pieces with no fill are left out (their outline only bounds copper) and counted. Reads the saved file only.",
+            "Union-find connectivity of the saved board's copper: per net, the islands its pads fall into and the connections still needed to join them. With nets, each named net's islands are also listed with their member pads (REFERENCE.NUMBER), copper item counts and zone names. Zone pieces with no fill are left out (their outline only bounds copper) and counted. Reads the saved file only.",
             with_props(json!({
-                "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Nets listed, most connections needed first; the totals always cover every net" }
+                "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Nets listed, most connections needed first; the totals always cover every net" },
+                "nets": names_prop("List these nets' islands (names or * ? patterns), with their pads and copper"),
+                "max_pads_per_island": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 200, "description": "Pads named per island; pad_count always covers all" }
             }), &["board"]),
             |args, ctx| async move { handle_connectivity_report(args, ctx).await }
+        ),
+        tool!(
+            "query_copper",
+            "List the tracks, arcs, vias, zones and rule areas of the saved board, filtered by any of: a box (items touching it, or wholly inside), nets, copper layers, kinds and locked state. Each item carries its UUID, net, layer(s), exact geometry (track ends and width; via centre, diameter, drill and layer span; zone name, priority, layers, outline and holes, pad connection, clearance, minimum width and fill state) and lock. counts_only answers with counts by kind, layer and net. Reads the saved file only.",
+            query_copper_schema(),
+            |args, ctx| async move { board_inspect::handle_query_copper(args, ctx).await }
+        ),
+        tool!(
+            "query_pads",
+            "List pads of the saved board by box, nets, footprint references and/or REFERENCE.NUMBER names in one call: board-space anchor, rotation, pad type, copper layers, net, drill, a bounding box and the exact copper outline (custom-pad primitives transformed to board space). compact leaves the outlines out. Reads the saved file only.",
+            query_pads_schema(),
+            |args, ctx| async move { board_inspect::handle_query_pads(args, ctx).await }
+        ),
+        tool!(
+            "render_board_layers_png",
+            "Draw a window of the saved board to PNG for chosen copper layers: pads with their true outlines, tracks, arcs, vias with drills, zone outlines and (optionally) fills, rule areas and the board edge, coloured per net (stable colours; grounds slate, supplies warm), with optional reference, pad-number, net and zone labels and a mm grid. A routing_file and/or a zones file can be laid over it to review a plan before applying it. Returns the PNG path and its pixel size; inline adds the image itself. Reads the saved file only.",
+            render_schema(),
+            |args, ctx| async move { board_render::handle_render_board_layers_png(args, ctx).await }
+        ),
+        tool!(
+            "plan_tap_vias",
+            "Plan a tap for each named pad (any net): one exact-checked through via near the pad and a stub from the pad to it on the pad's layer, so copper on target_layer can join the pad. Never via-in-pad on an SMD pad; sites of different pads clear each other; the via also clears other nets' zone fills on target_layer. A through-hole pad is its own tap. Writes an add_routing routing_file and checks it with the exact kernel. Reads the saved file only.",
+            tap_vias_schema(),
+            |args, ctx| async move { route_plan_tools::handle_plan_tap_vias(args, ctx).await }
+        ),
+        tool!(
+            "plan_trunk",
+            "Plan one net's wide trunk on one copper layer through ordered waypoints, around every other-net obstacle on that layer (pads, vias, tracks, holes and NPTH, zones of other nets, rule areas, the board edge, keep-out boxes and the copper of avoid_routing_files) with the board's own clearance rules. Octilinear runs with few bends, no turn sharper than 90 degrees (also across a waypoint), each leg starting and ending exactly on its waypoints; every run takes the widest width from the preferred down to the minimum that the exact check accepts, narrower within neck_radius_mm of a waypoint. Writes an add_routing routing_file (tracks plus a via per waypoint) of the legs that pass the exact check, and reports per leg its length, width profile and DC resistance from the stackup copper, and any leg or run that failed. Reads the saved file only.",
+            trunk_schema(),
+            |args, ctx| async move { route_plan_tools::handle_plan_trunk(args, ctx).await }
         ),
         tool!(
             "audit_terminal_access",
@@ -231,13 +392,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
 
 // ─── Argument helpers ────────────────────────────────────────────────────
 
-type Refusal = CallToolResult;
+pub(crate) type Refusal = CallToolResult;
 
-fn invalid(field: &str, reason: &str) -> Refusal {
+pub(crate) fn invalid(field: &str, reason: &str) -> Refusal {
     crate::tools::invalid_arg(field, reason)
 }
 
-fn opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, Refusal> {
+pub(crate) fn opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, Refusal> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if !s.is_empty() => Ok(Some(PathBuf::from(s))),
@@ -245,7 +406,7 @@ fn opt_path(args: &Value, key: &str) -> Result<Option<PathBuf>, Refusal> {
     }
 }
 
-fn opt_bool(args: &Value, key: &str, default: bool) -> Result<bool, Refusal> {
+pub(crate) fn opt_bool(args: &Value, key: &str, default: bool) -> Result<bool, Refusal> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
@@ -253,7 +414,7 @@ fn opt_bool(args: &Value, key: &str, default: bool) -> Result<bool, Refusal> {
     }
 }
 
-fn opt_count(args: &Value, key: &str, default: u64, max: u64) -> Result<u64, Refusal> {
+pub(crate) fn opt_count(args: &Value, key: &str, default: u64, max: u64) -> Result<u64, Refusal> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(v) => match v.as_u64() {
@@ -263,7 +424,7 @@ fn opt_count(args: &Value, key: &str, default: u64, max: u64) -> Result<u64, Ref
     }
 }
 
-fn opt_strings(args: &Value, key: &str) -> Result<Option<Vec<String>>, Refusal> {
+pub(crate) fn opt_strings(args: &Value, key: &str) -> Result<Option<Vec<String>>, Refusal> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(a)) => {
@@ -300,7 +461,7 @@ fn region(args: &Value) -> Result<Option<RegionMm>, Refusal> {
     }
 }
 
-fn file_must_exist(path: &Path, field: &str) -> Result<(), Refusal> {
+pub(crate) fn file_must_exist(path: &Path, field: &str) -> Result<(), Refusal> {
     if path.is_file() {
         Ok(())
     } else {
@@ -314,7 +475,10 @@ fn file_must_exist(path: &Path, field: &str) -> Result<(), Refusal> {
 }
 
 /// A spec for the board arguments every tool shares.
-fn base_spec(args: &Value, output_plan: PathBuf) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
+pub(crate) fn base_spec(
+    args: &Value,
+    output_plan: PathBuf,
+) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
     let board = get_path(args, "board")?;
     let project = match opt_path(args, "project") {
         Ok(p) => p,
@@ -517,7 +681,7 @@ async fn kicad_classes(
     ))
 }
 
-fn loaded(
+pub(crate) fn loaded(
     spec: &NativeJobSpec,
 ) -> Result<(RouteBoard, konnect_route::ProjectRuleTable), CallToolResult> {
     spec.load_inputs()
@@ -540,7 +704,7 @@ fn unavailable(capability: &str, error: &anyhow::Error) -> CallToolResult {
 
 /// A stage that could not give a result: unavailable when it is the
 /// unbuilt stub, an error naming the panic when it is built and failed.
-fn stage_failure(capability: &str, error: StageError) -> CallToolResult {
+pub(crate) fn stage_failure(capability: &str, error: StageError) -> CallToolResult {
     match error {
         StageError::Unavailable { .. } => unavailable(capability, &anyhow::Error::new(error)),
         StageError::Panicked { .. } => CallToolResult::error(format!(
@@ -551,7 +715,7 @@ fn stage_failure(capability: &str, error: StageError) -> CallToolResult {
 
 // ─── Handlers ────────────────────────────────────────────────────────────
 
-async fn handle_connectivity_report(
+pub(crate) async fn handle_connectivity_report(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -581,7 +745,7 @@ async fn handle_plan_plane_vias(
     tokio::task::spawn_blocking(move || plan_plane_vias_blocking(&args)).await?
 }
 
-async fn handle_check_route_rules(
+pub(crate) async fn handle_check_route_rules(
     args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -600,9 +764,17 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
         Ok(n) => n as usize,
         Err(r) => return Ok(r),
     };
+    let pads_listed = match opt_count(args, "max_pads_per_island", 200, 100_000) {
+        Ok(n) => n as usize,
+        Err(r) => return Ok(r),
+    };
     let (board, _) =
         konnect_route::load_board_file(&spec.board, &konnect_route::LoadOptions::default())
             .map_err(|e| anyhow::anyhow!("could not read {}: {e}", spec.board.display()))?;
+    let named = match board_inspect::nets_arg(&board, args) {
+        Ok(n) => n,
+        Err(r) => return Ok(r),
+    };
     let t = std::time::Instant::now();
     let report = ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default());
     let mut nets: Vec<(usize, &str, usize)> = report
@@ -619,9 +791,15 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
         .collect();
     nets.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
     let incomplete = nets.len();
+    let net_islands: Option<Vec<Value>> = named.map(|set| {
+        set.iter()
+            .map(|&n| island_listing(&board, &report, n, pads_listed))
+            .collect()
+    });
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "board": spec.board,
+        "net_islands": net_islands,
         "multi_pad_nets": report.multi_pad_net_count(),
         "connections_needed": report.connection_count(),
         "incomplete_nets": incomplete,
@@ -632,6 +810,91 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
         })).collect::<Vec<_>>(),
         "listed": incomplete.min(listed),
     })))
+}
+
+/// One net's islands for `connectivity_report`'s `nets`: member pads, copper
+/// counts, zone names and extent of each.
+fn island_listing(
+    board: &RouteBoard,
+    report: &ConnectivityReport,
+    net: konnect_route::api::NetId,
+    pads_listed: usize,
+) -> Value {
+    use konnect_route::api::ItemRef;
+    let nc = &report.nets[net.index()];
+    let policy = konnect_geom::ArcPolicy::default();
+    let islands: Vec<Value> = nc
+        .islands
+        .iter()
+        .enumerate()
+        .map(|(index, island)| {
+            let mut counts = [0usize; 4];
+            let mut zone_names = std::collections::BTreeSet::new();
+            let mut bbox: Option<konnect_geom::BBox> = None;
+            let mut grow = |b: konnect_geom::BBox| {
+                bbox = Some(bbox.map_or(b, |a| a.union(b)));
+            };
+            let mut pads = Vec::new();
+            for item in &island.items {
+                match *item {
+                    ItemRef::Pad(p) => {
+                        let pad = &board.pads[p.index()];
+                        pads.push(board_inspect::pad_label(board, pad));
+                        if let Some(b) = pad.bbox() {
+                            grow(b);
+                        }
+                    }
+                    ItemRef::Track(t) => {
+                        counts[0] += 1;
+                        grow(board.tracks[t.index()].seg.bbox());
+                    }
+                    ItemRef::Arc(a) => {
+                        counts[1] += 1;
+                        for s in board.arcs[a.index()].segments(&policy) {
+                            grow(s.bbox());
+                        }
+                    }
+                    ItemRef::Via(v) => {
+                        counts[2] += 1;
+                        grow(board.vias[v.index()].shape().bbox());
+                    }
+                    ItemRef::Zone(z) => {
+                        counts[3] += 1;
+                        let piece = &board.zones[z.index()];
+                        grow(piece.region.bbox());
+                        zone_names.insert(
+                            piece
+                                .zone_name
+                                .clone()
+                                .unwrap_or_else(|| "(unnamed)".to_string()),
+                        );
+                    }
+                }
+            }
+            let pad_count = pads.len();
+            pads.truncate(pads_listed);
+            json!({
+                "index": index,
+                "pad_count": pad_count,
+                "pads": pads,
+                "tracks": counts[0],
+                "arcs": counts[1],
+                "vias": counts[2],
+                "zone_pieces": counts[3],
+                "items": island.items.len(),
+                "zones": zone_names,
+                "bbox": bbox.map(|b| board_inspect::bbox_json(&b)),
+            })
+        })
+        .collect();
+    json!({
+        "net": board.net(net).name,
+        "pad_count": nc.pad_count,
+        "island_count": nc.islands.len(),
+        "pad_islands": nc.pad_island_count(),
+        "connections_needed": nc.connections_needed(),
+        "islands": islands,
+    })
 }
 
 fn audit_terminal_access_blocking(args: &Value) -> anyhow::Result<CallToolResult> {

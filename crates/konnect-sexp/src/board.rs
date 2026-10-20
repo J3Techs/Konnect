@@ -1326,81 +1326,207 @@ pub fn zone_geometry(tree: &SexpNode) -> Scan<ZoneGeometry> {
     let mut items = Vec::new();
     let mut skipped = 0usize;
     for zone in tree.find_all("zone") {
-        let parsed = (|| {
-            let layers: Vec<String> = match zone.find("layers") {
-                Some(node) => node
-                    .children()?
-                    .iter()
-                    .skip(1)
-                    .filter_map(|c| c.as_str())
-                    .map(str::to_string)
-                    .collect(),
-                None => vec![zone.find_str("layer")?.to_string()],
-            };
-            if layers.is_empty() {
-                return None;
-            }
-
-            let mut rings = Vec::new();
-            for polygon in zone.find_all("polygon") {
-                rings.push(outline_path(polygon.find("pts")?)?);
-            }
-            let mut rings = rings.into_iter();
-            let outline = rings.next()?;
-            let holes: Vec<_> = rings.collect();
-
-            let mut fills = Vec::new();
-            for fill in zone.find_all("filled_polygon") {
-                let layer = fill.find_str("layer")?.to_string();
-                let mut points = Vec::new();
-                for node in fill.find("pts")?.children()?.iter().skip(1) {
-                    if node.head()? != "xy" {
-                        return None;
-                    }
-                    points.push(exact_coordinate_pair(node)?);
-                }
-                if points.len() < 3 {
-                    return None;
-                }
-                fills.push(FilledPolygon {
-                    layer,
-                    island: fill.find("island").is_some(),
-                    points,
-                });
-            }
-
-            let priority = match zone.find("priority") {
-                Some(node) => node.get(1)?.as_str()?.parse::<u32>().ok()?,
-                None => 0,
-            };
-            let keepout = zone.find("keepout").map(|k| {
-                let forbids = |tag: &str| k.find_str(tag) == Some("not_allowed");
-                KeepoutRules {
-                    tracks: forbids("tracks"),
-                    vias: forbids("vias"),
-                    pads: forbids("pads"),
-                    copperpour: forbids("copperpour"),
-                    footprints: forbids("footprints"),
-                }
-            });
-
-            Some(ZoneGeometry {
-                net: resolve_net(zone, &table),
-                name: zone.find_str("name").map(str::to_string),
-                layers,
-                priority,
-                keepout,
-                outline,
-                holes,
-                fills,
-            })
-        })();
-        match parsed {
+        match zone_geometry_of(zone, &table) {
             Some(z) => items.push(z),
             None => skipped += 1,
         }
     }
     Scan { items, skipped }
+}
+
+/// One `(zone …)` node's geometry, or `None` when any part of it is
+/// unreadable (see [`zone_geometry`]).
+fn zone_geometry_of(zone: &SexpNode, table: &HashMap<String, String>) -> Option<ZoneGeometry> {
+    let layers: Vec<String> = match zone.find("layers") {
+        Some(node) => node
+            .children()?
+            .iter()
+            .skip(1)
+            .filter_map(|c| c.as_str())
+            .map(str::to_string)
+            .collect(),
+        None => vec![zone.find_str("layer")?.to_string()],
+    };
+    if layers.is_empty() {
+        return None;
+    }
+
+    let mut rings = Vec::new();
+    for polygon in zone.find_all("polygon") {
+        rings.push(outline_path(polygon.find("pts")?)?);
+    }
+    let mut rings = rings.into_iter();
+    let outline = rings.next()?;
+    let holes: Vec<_> = rings.collect();
+
+    let mut fills = Vec::new();
+    for fill in zone.find_all("filled_polygon") {
+        let layer = fill.find_str("layer")?.to_string();
+        let mut points = Vec::new();
+        for node in fill.find("pts")?.children()?.iter().skip(1) {
+            if node.head()? != "xy" {
+                return None;
+            }
+            points.push(exact_coordinate_pair(node)?);
+        }
+        if points.len() < 3 {
+            return None;
+        }
+        fills.push(FilledPolygon {
+            layer,
+            island: fill.find("island").is_some(),
+            points,
+        });
+    }
+
+    let priority = match zone.find("priority") {
+        Some(node) => node.get(1)?.as_str()?.parse::<u32>().ok()?,
+        None => 0,
+    };
+    let keepout = zone.find("keepout").map(|k| {
+        let forbids = |tag: &str| k.find_str(tag) == Some("not_allowed");
+        KeepoutRules {
+            tracks: forbids("tracks"),
+            vias: forbids("vias"),
+            pads: forbids("pads"),
+            copperpour: forbids("copperpour"),
+            footprints: forbids("footprints"),
+        }
+    });
+
+    Some(ZoneGeometry {
+        net: resolve_net(zone, table),
+        name: zone.find_str("name").map(str::to_string),
+        layers,
+        priority,
+        keepout,
+        outline,
+        holes,
+        fills,
+    })
+}
+
+/// How a copper zone joins the pads of its own net: KiCad's
+/// `(connect_pads …)` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZonePadConnection {
+    /// `(connect_pads yes …)`: solid copper to the pad.
+    Solid,
+    /// `(connect_pads …)` with no token: thermal reliefs (KiCad's default).
+    Thermal,
+    /// `(connect_pads thru_hole_only …)`: reliefs on through-hole pads only.
+    ThruHoleOnly,
+    /// `(connect_pads no …)`: the pour never joins a pad.
+    None,
+}
+
+impl ZonePadConnection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ZonePadConnection::Solid => "solid",
+            ZonePadConnection::Thermal => "thermal",
+            ZonePadConnection::ThruHoleOnly => "thru_hole_only",
+            ZonePadConnection::None => "none",
+        }
+    }
+}
+
+/// A zone's geometry together with its identity and the pour settings an
+/// inspection reports. Settings KiCad did not write are `None`, never a
+/// substituted default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneRecord {
+    pub geometry: ZoneGeometry,
+    pub uuid: Option<String>,
+    /// `(locked yes)` or the legacy bare `locked` token.
+    pub locked: bool,
+    /// `None` for a rule area, or a zone with no `(connect_pads …)` node.
+    pub pad_connection: Option<ZonePadConnection>,
+    /// `(connect_pads … (clearance X))`, mm.
+    pub clearance: Option<f64>,
+    /// `(min_thickness X)`, mm.
+    pub min_thickness: Option<f64>,
+    /// `(fill yes …)`: KiCad's flag that the zone holds a fill.
+    pub fill_enabled: bool,
+    /// `(fill … (mode hatch))`.
+    pub hatched: bool,
+    pub thermal_gap: Option<f64>,
+    pub thermal_bridge_width: Option<f64>,
+    pub island_removal_mode: Option<u32>,
+}
+
+/// Every zone's geometry, identity and pour settings, in file order. Fails
+/// closed per zone exactly like [`zone_geometry`].
+pub fn zone_records(tree: &SexpNode) -> Scan<ZoneRecord> {
+    let table = top_level_net_table(tree);
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for zone in tree.find_all("zone") {
+        let Some(geometry) = zone_geometry_of(zone, &table) else {
+            skipped += 1;
+            continue;
+        };
+        let connect = zone.find("connect_pads");
+        let pad_connection = connect.map(|c| {
+            match c
+                .children()
+                .unwrap_or(&[])
+                .get(1)
+                .and_then(SexpNode::as_str)
+            {
+                Some("yes") => ZonePadConnection::Solid,
+                Some("no") => ZonePadConnection::None,
+                Some("thru_hole_only") => ZonePadConnection::ThruHoleOnly,
+                _ => ZonePadConnection::Thermal,
+            }
+        });
+        let finite = |v: Option<f64>| v.filter(|x| x.is_finite());
+        let fill = zone.find("fill");
+        let fill_enabled = fill
+            .and_then(|f| f.children())
+            .and_then(|c| c.get(1))
+            .and_then(SexpNode::as_str)
+            == Some("yes");
+        let hatched = fill.and_then(|f| f.find_str("mode")) == Some("hatch");
+        items.push(ZoneRecord {
+            uuid: zone.find_str("uuid").map(str::to_string),
+            locked: node_is_locked(zone),
+            pad_connection: if geometry.keepout.is_some() {
+                None
+            } else {
+                pad_connection
+            },
+            clearance: finite(connect.and_then(|c| c.find_f64("clearance"))),
+            min_thickness: finite(zone.find_f64("min_thickness")),
+            fill_enabled,
+            hatched,
+            thermal_gap: finite(fill.and_then(|f| f.find_f64("thermal_gap"))),
+            thermal_bridge_width: finite(fill.and_then(|f| f.find_f64("thermal_bridge_width"))),
+            island_removal_mode: fill
+                .and_then(|f| f.find("island_removal_mode"))
+                .and_then(|n| n.get(1))
+                .and_then(SexpNode::as_str)
+                .and_then(|s| s.parse::<u32>().ok()),
+            geometry,
+        });
+    }
+    Scan { items, skipped }
+}
+
+/// KiCad's lock flag on an item: `(locked yes)`, or the legacy bare token.
+fn node_is_locked(node: &SexpNode) -> bool {
+    for child in node.children().unwrap_or(&[]) {
+        if let SexpNode::Atom(a) = child {
+            if a == "locked" {
+                return true;
+            }
+        }
+        if child.head() == Some("locked") {
+            return matches!(child.get(1).and_then(SexpNode::as_str), Some("yes"));
+        }
+    }
+    false
 }
 
 /// One `(pts …)` path of exact `xy` and `arc` elements, with at least three
@@ -2696,6 +2822,69 @@ mod tests {
             })
         );
         assert!(area.fills.is_empty());
+    }
+
+    /// Settings as KiCad 10 writes them: a solid pour with a clearance, a
+    /// locked thermal pour that holds no fill, and a rule area.
+    const ZONE_SETTINGS_BOARD: &str = "(kicad_pcb
+            (version 20260206)
+            (zone (net \"VM\") (layer \"F.Cu\") (uuid \"aa\") (name \"U1 VM\") (priority 3)
+                (hatch edge 0.508) (connect_pads yes (clearance 0.15)) (min_thickness 0.25)
+                (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5) (island_removal_mode 0))
+                (polygon (pts (xy 0 0) (xy 4 0) (xy 4 3) (xy 0 3)))
+                (filled_polygon (layer \"F.Cu\") (pts (xy 0.1 0.1) (xy 3.9 0.1) (xy 3.9 2.9))))
+            (zone (net \"GND\") (layers \"In1.Cu\" \"In3.Cu\") (uuid \"bb\") (locked yes)
+                (connect_pads (clearance 0.3)) (min_thickness 0.2) (fill (thermal_gap 0.4))
+                (polygon (pts (xy 0 0) (xy 9 0) (xy 9 9))))
+            (zone (net \"GND\") (layer \"B.Cu\") (uuid \"cc\") (connect_pads thru_hole_only (clearance 0.2))
+                (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))
+            (zone (layers \"F.Cu\") (uuid \"dd\") (name \"keep\") (connect_pads (clearance 0))
+                (keepout (tracks not_allowed) (vias allowed) (pads allowed) (copperpour allowed) (footprints allowed))
+                (polygon (pts (xy 0 0) (xy 2 0) (xy 2 2))))
+        )";
+
+    #[test]
+    fn zone_records_read_identity_and_pour_settings_without_defaults() {
+        let tree = parse_sexp(ZONE_SETTINGS_BOARD).unwrap();
+        let scan = zone_records(&tree);
+        assert_eq!(scan.skipped, 0);
+        assert_eq!(scan.items.len(), 4);
+
+        let vm = &scan.items[0];
+        assert_eq!(vm.uuid.as_deref(), Some("aa"));
+        assert_eq!(vm.geometry.name.as_deref(), Some("U1 VM"));
+        assert_eq!(vm.geometry.priority, 3);
+        assert!(!vm.locked);
+        assert_eq!(vm.pad_connection, Some(ZonePadConnection::Solid));
+        assert_eq!(vm.clearance, Some(0.15));
+        assert_eq!(vm.min_thickness, Some(0.25));
+        assert!(vm.fill_enabled);
+        assert_eq!(vm.thermal_gap, Some(0.5));
+        assert_eq!(vm.island_removal_mode, Some(0));
+        assert_eq!(vm.geometry.fills.len(), 1);
+
+        let gnd = &scan.items[1];
+        assert!(gnd.locked);
+        assert_eq!(gnd.pad_connection, Some(ZonePadConnection::Thermal));
+        assert_eq!(gnd.clearance, Some(0.3));
+        assert!(!gnd.fill_enabled, "(fill (…)) without yes holds no fill");
+        assert_eq!(
+            gnd.geometry.layers,
+            vec!["In1.Cu".to_string(), "In3.Cu".to_string()]
+        );
+
+        let tht = &scan.items[2];
+        assert_eq!(tht.pad_connection, Some(ZonePadConnection::ThruHoleOnly));
+        assert_eq!(tht.min_thickness, None, "absent settings are not defaulted");
+
+        let keep = &scan.items[3];
+        assert!(keep.geometry.keepout.is_some());
+        assert_eq!(keep.pad_connection, None, "a rule area pours nothing");
+
+        // The geometry is exactly what zone_geometry reads.
+        let geometry = zone_geometry(&tree);
+        let from_records: Vec<_> = scan.items.iter().map(|r| r.geometry.clone()).collect();
+        assert_eq!(geometry.items, from_records);
     }
 
     /// A footprint rotated 90° whose courtyard is four `fp_line`s written out

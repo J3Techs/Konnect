@@ -64,6 +64,8 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+pub mod tap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanoutSettings {
     /// Shrink applied to plane pieces before the via-inside-plane test, nm.
@@ -133,6 +135,14 @@ pub struct FanoutSettings {
     /// Evenly spaced exit directions of the retry round's far exits.
     #[serde(default = "default_far_directions")]
     pub far_directions: u8,
+    /// Require the via inside its own net's plane pieces (S2 plane fanout).
+    /// Off for tap vias ([`tap`]), which only have to reach a layer.
+    #[serde(default = "yes")]
+    pub require_own_plane: bool,
+    /// Keep the via's annulus clear of other nets' zone fills on this layer,
+    /// by the via-to-zone clearance, so copper on that layer can leave it.
+    #[serde(default)]
+    pub clear_of_zones_on: Option<LayerId>,
 }
 
 fn default_array_min_pads() -> u32 {
@@ -193,6 +203,8 @@ impl Default for FanoutSettings {
             retry_failed: true,
             far_gaps: default_far_gaps(),
             far_directions: default_far_directions(),
+            require_own_plane: true,
+            clear_of_zones_on: None,
         }
     }
 }
@@ -978,12 +990,12 @@ fn candidates_with(
     let mut rej = Rejections::default();
     let net = u.net;
 
-    // Plane layers carrying the net.
+    // Plane layers carrying the net (none when the via need not join one).
     let own_layers: Vec<LayerId> = {
         let mut v: Vec<LayerId> = space
             .planes
             .iter()
-            .filter(|p| p.net == Some(net))
+            .filter(|p| s.require_own_plane && p.net == Some(net))
             .map(|p| p.layer)
             .collect();
         v.sort();
@@ -1179,6 +1191,21 @@ fn check_via(
         let bb = p.index.bbox().inflate(grown);
         if bb.contains(via) && !p.index.disc_outside(via, grown) {
             return Err(("via: inside another net's island", 1));
+        }
+    }
+    if let Some(target) = s.clear_of_zones_on {
+        let via_subject = RuleSubject::new(ItemKind::Via, Some(net));
+        for p in space
+            .planes
+            .iter()
+            .filter(|p| p.layer == target && p.net != Some(net))
+        {
+            let zone_subject = RuleSubject::new(ItemKind::Zone, p.net);
+            let reach = r + ctx.rules.clearance(&via_subject, &zone_subject, target);
+            let bb = p.index.bbox().inflate(reach);
+            if bb.contains(via) && !p.index.disc_outside(via, reach) {
+                return Err(("via: in another net's zone on the target layer", 1));
+            }
         }
     }
     let disc = Shape::Circle(Circle::from_diameter(via, diameter));

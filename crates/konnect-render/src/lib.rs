@@ -11,6 +11,11 @@
 use anyhow::{bail, Context, Result};
 use resvg::{tiny_skia, usvg};
 
+pub mod canvas;
+mod font;
+
+pub use canvas::{Anchor, Canvas, Rgba};
+
 /// Identity of the rendering stack, stored in every visual baseline and
 /// compared before a baseline diff is trusted. The version half MUST move
 /// with the exact pins in the workspace manifest — a resvg bump that changes
@@ -77,6 +82,15 @@ pub fn svg_to_png(svg: &[u8], width_px: u32) -> Result<Rendered> {
         width_px,
         height_px,
     })
+}
+
+/// Decode a PNG to its size and RGBA bytes (row-major), for callers that
+/// probe a render's pixels.
+pub fn png_rgba(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    let img = image::load_from_memory(png)
+        .context("PNG did not decode")?
+        .to_rgba8();
+    Ok((img.width(), img.height(), img.into_raw()))
 }
 
 /// The result of comparing two renders.

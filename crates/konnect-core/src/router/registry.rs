@@ -76,9 +76,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, batch silkscreen/fab lines, rectangles and texts, SVG logo import",
+        description: "Board outline, layers, zones (one or a batch), mounting holes, board text, batch silkscreen/fab lines, rectangles and texts, SVG logo import",
         category: "pcb",
-        tool_count: 15,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -94,9 +94,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "native_routing",
-        description: "Native autorouter on the saved board: connectivity, terminal-access audit, plane-via fanout, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan; then the plan applied to the open board with a KIID ledger, KiCad's DRC read back onto it, and the refilled reference plane checked under a class's tracks",
+        description: "Native autorouter on the saved board: copper and pad queries with exact geometry, layer renders with plan overlays, connectivity with island membership, terminal-access audit, plane-via fanout, tap vias for named pads, power-trunk planning, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan; then the plan applied to the open board with a KIID ledger, KiCad's DRC read back onto it, and the refilled reference plane checked under a class's tracks",
         category: "pcb",
-        tool_count: 11,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "placement",

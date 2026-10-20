@@ -800,6 +800,47 @@ and part of the plan.
   and the listed off tracks. It reads the saved file only. It is step 7 of
   [`LIVE-FLOW.md`](LIVE-FLOW.md).
 
+### Inspection, tap vias and power trunks
+
+All additive; nothing frozen changed meaning.
+
+- **`loader::load_board_tree(tree, options)`** loads a board already
+  parsed (`load_board_str` now calls it), so a caller that also reads other
+  parts of the tree parses the text once. `loader::elements_to_ring` is
+  public.
+- **`konnect-sexp` `board::zone_records`** returns each zone's
+  `ZoneGeometry` with its UUID, lock, `ZonePadConnection` (`solid`,
+  `thermal`, `thru_hole_only`, `none`; `None` for a rule area), clearance,
+  minimum thickness, fill flag, hatch mode, thermal gap and bridge width
+  and island removal mode. Settings the file does not write are `None`.
+  `zone_geometry` reads through the same per-zone parser.
+- **`FanoutSettings`** gained `require_own_plane` (default on: the S2
+  inside-own-plane test) and `clear_of_zones_on: Option<LayerId>` (default
+  none: when set, a via's annulus must clear other nets' zone fills on that
+  layer by the via-to-zone clearance). Defaults keep S2 unchanged.
+- **`fanout::tap::plan_tap_vias(board, rules, pads, target, settings) ->
+  TapPlan`** plans one through via and stub per named pad (any net) with
+  the fanout's candidates, exact checks and selection, the plane test off
+  and the target layer's foreign zone fills kept clear. A through-hole pad
+  on the target layer is its own tap (no via). `TapPlan::routed(board)`
+  is the copper (vias span every layer).
+- **`trunk::plan_trunk(board, rules, &TrunkSpec, &TrunkTuning) ->
+  TrunkPlan`** plans one net's trunk on one layer through ordered
+  waypoints: A* over (cell, direction) on a grid anchored on each leg's
+  start, octilinear moves, no turn over 90° (also across a waypoint),
+  a clearance field from every other-net obstacle on the layer (copper,
+  holes, edge, rule areas, other nets' zone pieces, `avoid` copper and
+  keep-out boxes), exact endpoint fits by run-length adjustment, and a
+  per-piece widest-legal width from the preferred down to the minimum.
+  Every candidate geometry is checked with the space's exact predicates;
+  `TrunkPlan::copper` holds only legs the check passed.
+- **Tools** (`native_routing`, now 16 tools): `query_copper`,
+  `query_pads`, `render_board_layers_png`, `plan_tap_vias` and
+  `plan_trunk`; `connectivity_report` gained `nets` and
+  `max_pads_per_island` (an island listing, absent without `nets`).
+  `pcb_board` gained `add_zones`. All read the saved file except
+  `add_zones`, which writes like `add_zone`.
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

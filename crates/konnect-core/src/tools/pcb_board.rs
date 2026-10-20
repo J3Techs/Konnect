@@ -468,7 +468,7 @@ pub(crate) enum PadConnection {
 
 impl PadConnection {
     /// `thermal` is KiCad's default for a new zone, so it is ours.
-    fn parse(value: Option<&str>) -> Result<Self, String> {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.unwrap_or("thermal") {
             "solid" => Ok(Self::Solid),
             "thermal" => Ok(Self::Thermal),
@@ -479,7 +479,7 @@ impl PadConnection {
         }
     }
 
-    fn as_ipc(self) -> konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle {
+    pub(crate) fn as_ipc(self) -> konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle {
         use konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle;
         match self {
             Self::Solid => ZoneConnectionStyle::ZcsFull,
@@ -491,7 +491,7 @@ impl PadConnection {
     /// The token between `connect_pads` and its `(clearance …)`. Thermal is
     /// spelled by writing nothing at all — that is how the file format says
     /// "the default".
-    fn sexp_token(self) -> &'static str {
+    pub(crate) fn sexp_token(self) -> &'static str {
         match self {
             Self::Solid => " yes",
             Self::Thermal => "",
@@ -499,7 +499,7 @@ impl PadConnection {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Solid => "solid",
             Self::Thermal => "thermal",
@@ -970,10 +970,49 @@ fn format_zone_polygon(
     priority: u32,
     connection: PadConnection,
 ) -> String {
-    let uuid = new_uuid();
+    format_zone_block(
+        net,
+        layer,
+        clearance,
+        min_width,
+        points,
+        &[],
+        name,
+        priority,
+        connection,
+        &new_uuid(),
+    )
+}
+
+/// A `(zone …)` block with an explicit UUID and optional holes. KiCad writes
+/// a zone's outline as its first `(polygon …)` and every later one is a hole
+/// in it (`ZONE::AddPolygon`), so each hole is one more polygon.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn format_zone_block(
+    net: &konnect_sexp::net::NetRef,
+    layer: &str,
+    clearance: f64,
+    min_width: f64,
+    points: &[(f64, f64)],
+    holes: &[Vec<(f64, f64)>],
+    name: &str,
+    priority: u32,
+    connection: PadConnection,
+    uuid: &str,
+) -> String {
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
+        .collect();
+    let hole_polygons: String = holes
+        .iter()
+        .map(|hole| {
+            let hp: String = hole
+                .iter()
+                .map(|(x, y)| format!("\n      (xy {x} {y})"))
+                .collect();
+            format!("\n    (polygon (pts{hp}\n    ))")
+        })
         .collect();
     // KiCad omits both of these at their defaults, and so do we: an explicit
     // `(priority 0)` is legal but is not what pcbnew writes.
@@ -996,7 +1035,7 @@ fn format_zone_polygon(
          (hatch edge {hatch_pitch})\n    (connect_pads{connect} (clearance {clearance}))\n    \
          (min_thickness {min_width})\n    \
          (fill yes (thermal_gap {thermal}) (thermal_bridge_width {thermal}))\n    \
-         (polygon (pts{pts}\n    ))\n  )",
+         (polygon (pts{pts}\n    )){hole_polygons}\n  )",
         net_nodes = net.zone_net_nodes(),
         layer_node = net.zone_layer_node(layer),
     )
@@ -1272,6 +1311,7 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_graphics::tool(),
+        super::zone_batch::tool(),
         tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
@@ -2571,34 +2611,11 @@ pub(crate) async fn add_zone_impl(
     if points.len() < 3 {
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
-    let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
-    if let Some(items) = args.get("holes").filter(|v| !v.is_null()) {
-        let Some(items) = items.as_array() else {
-            return Ok(crate::tools::invalid_arg(
-                "holes",
-                "must be an array of vertex arrays",
-            ));
-        };
-        for (index, hole) in items.iter().enumerate() {
-            let vertices: Option<Vec<(f64, f64)>> = hole.as_array().map(|pts| {
-                pts.iter()
-                    .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-                    .filter(|(x, y)| x.is_finite() && y.is_finite())
-                    .collect()
-            });
-            match vertices {
-                Some(v) if v.len() >= 3 && v.len() == hole.as_array().map_or(0, Vec::len) => {
-                    holes.push(v)
-                }
-                _ => {
-                    return Ok(crate::tools::invalid_arg(
-                        &format!("holes[{index}]"),
-                        "must hold at least 3 {x, y} vertices with finite numbers",
-                    ))
-                }
-            }
-        }
-    }
+    // The same hole rules `add_zones` applies to each of its zones.
+    let holes = match super::zone_batch::parse_zone_holes(args.get("holes"), "holes") {
+        Ok(h) => h,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let describe = || {
         json!({

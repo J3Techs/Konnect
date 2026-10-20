@@ -3004,6 +3004,48 @@ impl KiCadIpcClient {
             .filter(|id| !id.is_empty()))
     }
 
+    /// Create several copper zones in one undo step and refill once.
+    ///
+    /// Every net name is resolved against one `GetNets` answer before
+    /// anything is created, so an unknown net refuses the whole batch. The
+    /// zones go in as one `CreateItems` inside one commit, then a single
+    /// `RefillZones` pours them all. Returns the KIID KiCad gave each zone,
+    /// in request order where KiCad reports one.
+    pub fn add_zones(
+        &self,
+        specs: &[crate::builders::ZoneSpec<'_>],
+    ) -> Result<Vec<Option<String>>> {
+        let nets: std::collections::HashMap<String, i32> = self
+            .get_nets()?
+            .into_iter()
+            .map(|n| (n.name, n.netcode))
+            .collect();
+        let mut items = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let code = *nets
+                .get(spec.net_name)
+                .ok_or_else(|| anyhow::anyhow!("Net '{}' not found on board", spec.net_name))?;
+            let zone = crate::builders::build_zone(spec, code);
+            items.push(crate::builders::pack_any(&zone, "kiapi.board.types.Zone"));
+        }
+        let created =
+            self.run_commit("Add zones", |client| client.create_items_returning(items))?;
+        self.refill_zones()?;
+        let mut ids: Vec<Option<String>> = created
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Zone"))
+            .map(|item| {
+                kiapi::board::types::Zone::decode(item.value.as_slice())
+                    .ok()
+                    .and_then(|zone| zone.id)
+                    .map(|id| id.value)
+                    .filter(|id| !id.is_empty())
+            })
+            .collect();
+        ids.resize(specs.len(), None);
+        Ok(ids)
+    }
+
     /// One BGA-fanout element: a via and the stub track reaching it.
     pub fn apply_fanout(
         &self,
