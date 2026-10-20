@@ -99,10 +99,10 @@ fn t(net: &str, layer: &str, a: (f64, f64), b: (f64, f64)) -> PlanTrack {
 fn every_draft_tool_has_a_valid_schema_and_a_unique_name() {
     let defs = tools();
     let mut names: Vec<&str> = defs.iter().map(|d| d.name).collect();
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 11);
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 11);
 }
 
 #[tokio::test]
@@ -125,6 +125,47 @@ async fn connectivity_report_counts_the_saved_copper() {
         .await
         .unwrap();
     assert!(r.is_error && text(&r).contains("max_listed"));
+}
+
+#[tokio::test]
+async fn check_reference_plane_reads_the_saved_fill_and_refuses_bad_names() {
+    let f = files();
+    let call = |extra: Value| {
+        let mut a = json!({ "board": f.board(), "plane": "F.Cu", "layers": ["B.Cu"] });
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        a
+    };
+    // F.Cu has no fill: every checked B.Cu track is off and bare.
+    let r = handle_check_reference_plane(&call(json!({ "class": "Default" })), &ctx())
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["source"], "saved_file");
+    assert_eq!(b["plane_pieces"], 0);
+    assert_eq!(b["tracks_off"], b["tracks_checked"]);
+    assert_eq!(b["tracks_off_bare"], b["tracks_checked"]);
+    assert_eq!(b["all_over_plane"], b["tracks_checked"] == 0);
+
+    for (extra, field) in [
+        (json!({}), "class"),
+        (json!({ "class": "Nope" }), "class"),
+        (json!({ "class": "Default", "plane": "In9.Cu" }), "plane"),
+        (json!({ "class": "Default", "layers": ["X.Cu"] }), "layers"),
+        (json!({ "nets": ["NO_SUCH_*"] }), "nets"),
+        (json!({ "class": "Default", "margin_mm": -1 }), "margin_mm"),
+    ] {
+        let r = handle_check_reference_plane(&call(extra.clone()), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            r.is_error && text(&r).contains(field),
+            "{extra}: {}",
+            text(&r)
+        );
+    }
 }
 
 #[tokio::test]

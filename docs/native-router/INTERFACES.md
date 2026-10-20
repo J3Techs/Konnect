@@ -770,6 +770,36 @@ and part of the plan.
   against KiCad's effective classes in a Specctra export) and
   `fanout_real_fixture` (each failed pad's reason).
 
+### Reference coverage after the refill (live round 3)
+
+- **`pipeline::coverage`.** `reference_coverage(board, rules, plane,
+  layers, nets, margin) -> ReferenceCoverage` checks the tracks of `nets`
+  on `layers` against the plane's fill as saved (run it on a refilled,
+  saved board): each track's copper edge grown by `margin` must lie over
+  one filled piece. The stretch of a track within its own net's via
+  antipad on the plane (via radius plus the rules' via-to-zone clearance)
+  is exempt. `ReferenceCoverage { pieces, island_pieces, tracks_checked,
+  nets_checked, over_island, off: Vec<OffReference> }`; `OffReference {
+  net, layer, seg, off_nm, bare }` (`bare`: some of it has no plane copper
+  under its centre line). `select_nets(board, class, patterns)` picks a
+  class's nets by name or `*`/`?` pattern.
+- **Fractured fills.** KiCad saves fills fractured: each void is joined to
+  the outline by a zero-width slit. A whole-shape containment test treats
+  a shape straddling a slit as outside. `coverage::covers(poly, shape)`
+  falls back to testing a 50 µm grid of the shape's points, where a point
+  on a slit counts as on the boundary. Behaviour change: the job's own
+  reference check (`inside_reference`: the fallback keepouts, the drop
+  after the fallback and the check after S6) uses it too. Before this, a
+  fallback track or keepout cell over a slit counted as off the plane. On
+  the real-board fixture the plan is byte-identical either way.
+- **`ReferencePiece`** carries KiCad's `island` flag.
+- **Tool.** `check_reference_plane` (`native_routing`, now 11 tools):
+  `board`, `plane`, `layers`, `class` and/or `nets`, `margin_mm`,
+  `max_listed`. It reports `tracks_checked`, `tracks_off`,
+  `tracks_off_bare`, `off_by_net`, `tracks_over_island`, `all_over_plane`
+  and the listed off tracks. It reads the saved file only. It is step 7 of
+  [`LIVE-FLOW.md`](LIVE-FLOW.md).
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

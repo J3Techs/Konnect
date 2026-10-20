@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **249 registered tools** + **7 always-visible meta-tools** = **256 total**
+- **250 registered tools** + **7 always-visible meta-tools** = **257 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -306,7 +306,7 @@ and Windows servers do not.
 | `delete_zones` | Delete zones from the open board by name, net and layer; locked zones kept unless `include_locked`. Dry run by default listing name, net, layers, priority and outline size; apply needs `expected_count`, deletes in one undo step and proves the zones gone. Replacing a zone is `delete_zones` then `add_zone`. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `native_routing` · 10 tools
+### `native_routing` · 11 tools
 **Purpose:** Konnect's native autorouter on the saved board file: connectivity, terminal-access audit, plane-via fanout, an exact rule check of a routing file, and the whole route pipeline (connectivity, fanout, pin access, global and detailed routing, optimizer, exact check) in-process for one region or as a resumable background job, then the plan applied to the open board with a KIID ledger and KiCad's DRC read back onto it. Every tool but `apply_route_plan` reads the saved board and writes at most a new file; `apply_route_plan` creates copper in the board KiCad holds open and never saves it.
 **Source:** [`crates/konnect-core/src/tools/route_native.rs`](crates/konnect-core/src/tools/route_native.rs)
 
@@ -321,6 +321,7 @@ and Windows servers do not.
 | `get_native_route_job` | Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST), the current stage, the report when finished, and whether the plan and a checkpoint exist. Reads the job directory only. |
 | `stop_native_route_job` | Ask a job started by start_native_route_job to stop at its next stage boundary; its checkpoint is kept for resume. Waits up to wait_seconds and reports the job. |
 | `apply_route_plan` | Create a routing_file's tracks and vias in the open board, however many there are: members, net names and (strict) the geometry lint are checked before anything is written, then net-whole `CreateItems` chunks of at most 20,000 items. Writes a ledger of the KIID KiCad gave each plan item; a failure part-way reports the chunks already created. Does not save, refill or run DRC. |
+| `check_reference_plane` | After the final refill: check that every track of a class (or of named nets) on the given layers lies over one filled piece of a reference plane, its copper edge at least margin_mm inside the fill as saved. The stretch of a track inside its own via's antipad is not held to the plane. Lists each track that leaves the plane, and whether some of it has no plane copper under its centre line. Reads the saved file only. |
 | `map_route_plan_drc` | Read a KiCad DRC report (run_drc's output file) back onto a plan applied with apply_route_plan, through the ledger: which findings touch the plan, by rule, and the plan nets an error involves. Reads files only. |
 
 ### `placement` · 6 tools

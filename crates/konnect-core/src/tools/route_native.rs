@@ -136,6 +136,19 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_check_route_rules(args, ctx).await }
         ),
         tool!(
+            "check_reference_plane",
+            "After the final refill: check that every track of a class (or of named nets) on the given layers lies over one filled piece of a reference plane, its copper edge at least margin_mm inside the fill as saved. The stretch of a track inside its own via's antipad is not held to the plane. Lists each track that leaves the plane, and whether some of it has no plane copper under its centre line at all. Reads the saved file only.",
+            with_props(json!({
+                "plane": { "type": "string", "description": "The reference plane layer, e.g. In1.Cu" },
+                "layers": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Routing layers whose tracks are checked, e.g. [\"B.Cu\"]" },
+                "class": { "type": "string", "description": "Check this net class's tracks" },
+                "nets": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Check these nets (names or * ? patterns); with class, only the class's nets that match" },
+                "margin_mm": { "type": "number", "minimum": 0, "default": 0, "description": "How far inside the fill a track's copper edge must stay" },
+                "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Off-plane tracks listed; the counts cover all" }
+            }), &["board", "plane", "layers"]),
+            |args, ctx| async move { handle_check_reference_plane(args, ctx).await }
+        ),
+        tool!(
             "route_native_region",
             "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. Use start_native_route_job for a whole board.",
             {
@@ -817,6 +830,140 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "plan_written": written,
         "output_plan": if written { json!(output) } else { Value::Null },
         "next": "Apply with add_routing (routing_file, locked: true), then refill zones and run DRC.",
+    })))
+}
+
+async fn handle_check_reference_plane(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || check_reference_plane_blocking(&args)).await?
+}
+
+fn check_reference_plane_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
+    use konnect_route::pipeline::coverage::reference_coverage;
+    let spec = match base_spec(args, PathBuf::new())? {
+        Ok(s) => s,
+        Err(r) => return Ok(r),
+    };
+    let Some(plane_name) = args.get("plane").and_then(Value::as_str) else {
+        return Ok(invalid("plane", "is required (a copper layer name)"));
+    };
+    let layer_names = match opt_strings(args, "layers") {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(invalid("layers", "is required")),
+        Err(r) => return Ok(r),
+    };
+    let class = match args.get("class") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) if !c.is_empty() => Some(c.clone()),
+        Some(_) => return Ok(invalid("class", "must be a net class name")),
+    };
+    let patterns = match opt_strings(args, "nets") {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    if class.is_none() && patterns.is_none() {
+        return Ok(invalid("class", "give class, nets or both"));
+    }
+    let margin_mm = match args.get("margin_mm") {
+        None | Some(Value::Null) => 0.0,
+        Some(v) => match v.as_f64().filter(|m| m.is_finite() && *m >= 0.0) {
+            Some(m) => m,
+            None => return Ok(invalid("margin_mm", "must be a non-negative number")),
+        },
+    };
+    let Some(margin) = konnect_geom::mm_to_nm(margin_mm) else {
+        return Ok(invalid("margin_mm", "is out of range"));
+    };
+    let listed = match opt_count(args, "max_listed", LISTED_DEFAULT, 10_000) {
+        Ok(n) => n as usize,
+        Err(r) => return Ok(r),
+    };
+    let (board, rules) = match loaded(&spec) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    let Some(plane) = board.layers.by_name(plane_name.trim()) else {
+        return Ok(invalid(
+            "plane",
+            &format!("'{plane_name}' is not a copper layer of the board"),
+        ));
+    };
+    let mut layers = konnect_route::api::LayerMask::EMPTY;
+    for n in &layer_names {
+        let m = board.layers.expand(n.trim());
+        if m.is_empty() {
+            return Ok(invalid(
+                "layers",
+                &format!("'{n}' is not a copper layer of the board"),
+            ));
+        }
+        layers = layers.union(m);
+    }
+    let class_id = match &class {
+        None => None,
+        Some(c) => match rules.classes().iter().position(|k| &k.name == c) {
+            Some(i) => Some(konnect_route::api::ClassId(i as u16)),
+            None => {
+                return Ok(invalid(
+                    "class",
+                    &format!("'{c}' is not a net class of the project"),
+                ))
+            }
+        },
+    };
+    let nets = konnect_route::pipeline::coverage::select_nets(
+        &board,
+        class_id,
+        patterns.as_deref().unwrap_or(&[]),
+    );
+    if nets.is_empty() {
+        return Ok(invalid(
+            "nets",
+            "no net of the board matches class and nets",
+        ));
+    }
+    let t = std::time::Instant::now();
+    let cov = reference_coverage(&board, &rules, plane, layers, &nets, margin);
+    let mm = |v: i64| konnect_geom::nm_to_mm(v);
+    let pt = |p: konnect_geom::Point| {
+        let (x, y) = p.to_mm();
+        json!([x, y])
+    };
+    let mut off_nets: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in &cov.off {
+        *off_nets.entry(board.net(o.net).name.as_str()).or_default() += 1;
+    }
+    Ok(CallToolResult::json(&json!({
+        "source": "saved_file",
+        "board": spec.board,
+        "plane": board.layers.name(plane),
+        "layers": layers.iter().map(|l| board.layers.name(l)).collect::<Vec<_>>(),
+        "margin_mm": margin_mm,
+        "nets_selected": nets.len(),
+        "plane_pieces": cov.pieces,
+        "plane_island_pieces": cov.island_pieces,
+        "tracks_checked": cov.tracks_checked,
+        "nets_with_tracks": cov.nets_checked.iter().map(|n| board.net(*n).name.as_str()).collect::<Vec<_>>(),
+        "tracks_over_island": cov.over_island,
+        "tracks_off": cov.off.len(),
+        "tracks_off_bare": cov.off.iter().filter(|o| o.bare).count(),
+        "off_by_net": off_nets,
+        "all_over_plane": cov.off.is_empty(),
+        "elapsed_ms": t.elapsed().as_millis() as u64,
+        "off": cov.off.iter().take(listed).map(|o| json!({
+            "net": board.net(o.net).name,
+            "layer": board.layers.name(o.layer),
+            "a_mm": pt(o.seg.a),
+            "b_mm": pt(o.seg.b),
+            "width_mm": mm(i64::from(o.seg.width)),
+            "off_mm": mm(o.off_nm),
+            "bare": o.bare,
+        })).collect::<Vec<_>>(),
+        "listed": cov.off.len().min(listed),
+        "note": "Judged against the fill as saved: run it after the final refill and save (run_drc with sync_live_board and refill_zones).",
     })))
 }
 

@@ -42,6 +42,7 @@
 
 pub mod allowances;
 pub mod backend;
+pub mod coverage;
 
 pub use allowances::{
     default_excluded_classes, AllowanceError, AllowanceReport, LayerFallbackSpec, NeckDownSpec,
@@ -1587,6 +1588,8 @@ fn fail_unjoined(
 struct ReferencePiece {
     net: NetId,
     poly: IndexedPolygon,
+    /// KiCad's `(island)` marker on the fill piece.
+    island: bool,
 }
 
 /// The filled copper pieces of `plane` as saved. KiCad's fills are
@@ -1606,6 +1609,7 @@ fn reference_pieces(board: &RouteBoard, plane: LayerId) -> Vec<ReferencePiece> {
             Some(ReferencePiece {
                 net,
                 poly: IndexedPolygon::new(poly),
+                island: z.island,
             })
         })
         .collect()
@@ -1726,7 +1730,7 @@ fn inside_reference(
     let b = shape.bbox();
     pieces.iter().any(|p| {
         p.poly.bbox().contains_bbox(&b)
-            && p.poly.contains(shape)
+            && coverage::covers(&p.poly, shape)
             && !holes.cuts(shape, |n| n != p.net && !ignore(n))
     })
 }

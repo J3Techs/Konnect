@@ -28,6 +28,10 @@ any project; nothing here is specific to one board.
    and an `output` file. It refills once over IPC, saves, and runs the CLI
    DRC on the saved file without refilling a second time.
 6. **`map_route_plan_drc`** on each applied plan and its ledger.
+7. **`check_reference_plane`** when a fallback names a reference: the
+   class, the fallback's added layers, the plane and the same
+   `margin_mm`, on the board the DRC step just refilled and saved. It
+   lists every track that the refill left off the plane.
 
 ## What this removes
 
@@ -71,6 +75,5 @@ see:
   `margin_mm` of at least that clearance (KiCad clears by the larger of
   the zone's setting and the rules).
 - **The refill itself** (thermal spokes, island removal, minimum width).
-  After the final `run_drc`, check the plane under the reference class's
-  tracks on the added layers (for example with a custom DRC rule for that
-  class) before accepting them.
+  After the final `run_drc`, run `check_reference_plane` (step 7) before
+  accepting the class's tracks on the added layers.
