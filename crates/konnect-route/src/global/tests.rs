@@ -646,3 +646,16 @@ fn no_routable_layer_reports_no_access_and_no_convergence() {
     }
     assert!(!r.stats.converged);
 }
+
+#[test]
+fn capacity_scale_rounds_and_keeps_nonzero_capacity() {
+    let mut caps = [0u16, 1, 2, 3, 4, 10, u16::MAX];
+    super::scale_capacity(&mut caps, 700);
+    assert_eq!(caps, [0, 1, 1, 2, 3, 7, 45_875]);
+    let mut caps = [0u16, 1, 5];
+    super::scale_capacity(&mut caps, 1);
+    assert_eq!(caps, [0, 1, 1]);
+    let mut caps = [0u16, 1, 5];
+    super::scale_capacity(&mut caps, 1500);
+    assert_eq!(caps, [0, 1, 5]);
+}

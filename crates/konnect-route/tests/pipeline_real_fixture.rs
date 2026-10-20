@@ -30,7 +30,8 @@
 //! - `KONNECT_PIPELINE_CLEAR=0|1`: take out routed copper S7 still finds a
 //!   defect in (default on);
 //! - `KONNECT_PIPELINE_REPAIR=0|1`: route again what the clear stage
-//!   opened, with the connections still failed (default on);
+//!   opened, around the copper left; connections already failed are not
+//!   retried (default on);
 //! - `KONNECT_PIPELINE_RESCUE`, `KONNECT_PIPELINE_RESCUE_ITERATIONS`,
 //!   `KONNECT_PIPELINE_RESCUE_NEIGHBOURS`: the rescue rounds after
 //!   negotiation, their negotiation iterations, and how many winners a

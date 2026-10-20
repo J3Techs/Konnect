@@ -224,7 +224,9 @@ pub struct GlobalSettings {
     /// of it), on every planar and via resource. Detailed routing reaches
     /// less than the packed-track capacity (tile pins, octilinear jogs,
     /// vias between tracks), so a lower share spreads corridors before
-    /// detail finds the congestion.
+    /// detail finds the congestion. Each capacity is rounded to the nearest
+    /// track and a non-zero one never drops below 1; 1000 or more leaves
+    /// the capacity as computed.
     pub capacity_scale: u32,
 }
 
@@ -534,12 +536,7 @@ pub fn build_grid_with(
     let grid = with_threads(settings.threads, || {
         let mut grid = grid::lay_out(board, settings);
         grid.capacity = capacity::compute(board, rules, &grid, settings);
-        if settings.capacity_scale < 1000 {
-            let scale = settings.capacity_scale;
-            for c in &mut grid.capacity {
-                *c = (u32::from(*c) * scale / 1000) as u16;
-            }
-        }
+        scale_capacity(&mut grid.capacity, settings.capacity_scale);
         grid
     });
     let us = start.elapsed().as_micros() as u64;
@@ -547,6 +544,21 @@ pub fn build_grid_with(
     telemetry.count("global_grid_us", us);
     telemetry.count("global_refined_cells", grid.refined.len() as u64);
     grid
+}
+
+/// Scale every capacity to `scale`/1000 of itself, rounding to the
+/// nearest track and never below one: capacity 0 is a wall to global
+/// search (and uncongested pin access at a terminal), so a share must not
+/// turn a single-track channel or a single-via cell into one. A scale of
+/// 1000 or more leaves the capacity as computed.
+fn scale_capacity(capacity: &mut [u16], scale: u32) {
+    if scale >= 1000 {
+        return;
+    }
+    for c in capacity.iter_mut().filter(|c| **c > 0) {
+        let scaled = (u32::from(*c) * scale + 500) / 1000;
+        *c = scaled.clamp(1, u32::from(u16::MAX)) as u16;
+    }
 }
 
 /// Route every connection globally.
