@@ -21,6 +21,10 @@
 //!   one per line (keep the file outside the repository);
 //! - `KONNECT_PIPELINE_NO_FANOUT=1`, `KONNECT_PIPELINE_NO_ACCESS=1`,
 //!   `KONNECT_PIPELINE_NO_OPTIMIZE=1`;
+//! - `KONNECT_PIPELINE_FANOUT_RETRY=0|1`: the fanout's retry round for
+//!   pads the first selection left without a site (default on);
+//! - `KONNECT_PIPELINE_FANOUT_FAR_GAPS=mm,mm,mm`: that round's far exit
+//!   gaps (default 2.0, 2.5, 3.0; `0`: no far exits);
 //! - `KONNECT_PIPELINE_REFERENCE=1`: negotiation's reference search instead
 //!   of the kernel, for comparison;
 //! - `KONNECT_PIPELINE_CLEAR=0|1`: take out routed copper S7 still finds a
@@ -200,6 +204,27 @@ fn pipeline_real_board_fixture() {
     }
     if env_on("KONNECT_PIPELINE_NO_FANOUT") {
         settings.fanout = None;
+    }
+    if let (Some(f), Ok(v)) = (
+        settings.fanout.as_mut(),
+        std::env::var("KONNECT_PIPELINE_FANOUT_RETRY"),
+    ) {
+        f.retry_failed = v.trim() != "0";
+    }
+    if let (Some(f), Ok(v)) = (
+        settings.fanout.as_mut(),
+        std::env::var("KONNECT_PIPELINE_FANOUT_FAR_GAPS"),
+    ) {
+        // Up to three gaps in mm, comma separated; 0 or empty: none.
+        let mut gaps = [0; 3];
+        for (g, mm) in gaps
+            .iter_mut()
+            .zip(v.split(',').filter(|x| !x.trim().is_empty()))
+        {
+            let mm: f64 = mm.trim().parse().expect("mm");
+            *g = (mm * 1e6).round() as i32;
+        }
+        f.far_gaps = gaps;
     }
     if env_on("KONNECT_PIPELINE_NO_ACCESS") {
         settings.access = None;

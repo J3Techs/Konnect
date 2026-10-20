@@ -421,6 +421,28 @@ literal of `PipelineSettings` or `GlobalSettings` needs the new fields.
   `KernelBackend::negotiation_config()` sets as `SearchConfig::max_expansions`;
   a capped search fails as `BudgetExhausted`, which negotiation retries.
 
+**Wave 4 integration (INT).** With the allowances and the completion work
+merged, `route_board` runs, after negotiation: the rescue rounds, then
+`class_fallback`'s second chance (only for what the rescue left failed),
+then S6, then `enforce_reference`, then the clear stage and the repair.
+Consequences:
+
+- Rescue rounds and the repair route with the class's own layers
+  (`class_layers`); only the second chance uses a fallback's layers, so
+  nothing after it adds copper on a reference-held layer for a fallback
+  net. Copper the repair adds for other nets is not checked against a
+  reference again: a new via of another net near a fallback track can cut
+  the plane under it after `enforce_reference` ran (open issue; the job
+  runner does not run the repair, see below).
+- A connection the second chance or the reference check leaves failed
+  keeps the reason they give (`off_reference`, or the fallback search's
+  own, which can be `no_access` where the reference keepouts close a pad).
+- Excluded classes (`excluded_classes`) never reach the rescue, the
+  second chance or the repair.
+- The `konnect-core` job runner calls `route_board` with S6 and the clear
+  stage off and runs them itself, so live jobs get the rescue rounds, the
+  capacity share and the search cap, but not the repair.
+
 Every stage records its time in the result's `Telemetry` (`Stage::Audit` for
 connectivity, `Fanout`, `Access`, `Global`, `Detail`, `Optimize`, `Check`
 for the guard and the check, `Plan`) plus `pipeline_*` counters. The
@@ -781,7 +803,9 @@ and part of the plan.
 - `tests/pipeline_real_fixture.rs` reads its knobs from
   `KONNECT_PIPELINE_*` variables (listed in its module docs, including
   `KONNECT_PIPELINE_GRID_CORE_MM`, `KONNECT_PIPELINE_CLEAR=0|1`, the rescue,
-  repair and capacity-scale knobs, and `KONNECT_PIPELINE_NETS_FILE`, a file
+  repair and capacity-scale knobs, the fanout retry knobs
+  `KONNECT_PIPELINE_FANOUT_RETRY=0|1` and
+  `KONNECT_PIPELINE_FANOUT_FAR_GAPS=mm,…`, and `KONNECT_PIPELINE_NETS_FILE`, a file
   of net names kept outside the repository).
   `tests/pipeline_tail_fixture.rs` re-runs
   S6–S8 on copper a previous run saved. `tests/search_replay.rs` is a gated
