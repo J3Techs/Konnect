@@ -108,7 +108,8 @@ pub struct PipelineSettings {
     /// leaves, then negotiated among themselves around that copper (made
     /// fixed). 0 turns it off.
     pub rescue_rounds: u32,
-    /// Negotiation iterations of each rescue round (its fill passes follow).
+    /// Negotiation iterations of each rescue round (its fill passes
+    /// follow), and of the repair's try ([`Self::clear_repair`]).
     pub rescue_iterations: u32,
     /// A rescue round also rips up the routed connections a loser lost to,
     /// when it lost to at most this many (0: never rip up).
@@ -145,7 +146,8 @@ pub struct PipelineSettings {
     pub clear_findings: bool,
     /// After the clear stage, route once more ([`repair`]) the connections
     /// it opened, around all the copper left; the new copper is optimized
-    /// and cleared against the rest. Needs [`Self::clear_findings`].
+    /// and cleared against the rest. Needs [`Self::clear_findings`]; its
+    /// negotiation runs [`Self::rescue_iterations`] iterations.
     /// Measured on a dense real board: this joined about half of what the
     /// clear stage opened, in a few seconds.
     pub clear_repair: bool,
@@ -822,10 +824,12 @@ fn route_around(
 /// A round may also rip up the routed connections a loser lost to, when it
 /// lost to at most [`PipelineSettings::rescue_neighbours`] of them: they
 /// are routed again together with the losers, and the round is kept only
-/// if more of those connections end up joined than before; otherwise its
-/// copper is dropped and later rounds leave every routed connection in
-/// place. Credit goes by connectivity: a connection counts as routed when
-/// its two terminals are joined, whichever connection's copper joins them.
+/// if more of the connections it judges (the failed, the ripped and those
+/// credited by an earlier round) end up joined than were joined before it;
+/// otherwise its copper is dropped and later rounds leave every routed
+/// connection in place. Credit goes by connectivity: a connection counts
+/// as routed when its two terminals are joined, whichever connection's
+/// copper joins them, and is judged again by every later round.
 /// Returns how many fewer connections are failed afterwards.
 #[allow(clippy::too_many_arguments)]
 fn rescue(
@@ -849,6 +853,10 @@ fn rescue(
     // around nearly the same copper, rarely do better and spend most of
     // their time on them.
     let mut hopeless: BTreeSet<ConnectionId> = BTreeSet::new();
+    // Connections a round moved from failed to routed by connectivity:
+    // some are joined only through other connections' copper, which a
+    // later round may rip up, so every later round judges them again.
+    let mut credited: BTreeSet<ConnectionId> = BTreeSet::new();
     for _ in 0..settings.rescue_rounds {
         let losers: BTreeSet<ConnectionId> = detail
             .failure_details
@@ -909,12 +917,10 @@ fn rescue(
         let mut judged: BTreeSet<ConnectionId> =
             detail.failure_details.iter().map(|(id, _)| *id).collect();
         judged.extend(ripped.iter().copied());
+        judged.extend(credited.iter().copied());
         let now = joined(work, &copper, connections, &judged);
-        let before = ripped.len();
-        let after = now
-            .iter()
-            .filter(|id| losers.contains(id) || ripped.contains(id))
-            .count();
+        let before = joined(work, routed, connections, &judged).len();
+        let after = now.len();
         if !ripped.is_empty() && after <= before {
             // Ripping up did not pay: keep the old copper, and leave every
             // routed connection in place from now on.
@@ -963,6 +969,7 @@ fn rescue(
                 (*id, f)
             })
             .collect();
+        credited.extend(now.iter().copied());
         let still: BTreeSet<ConnectionId> = failure_details.iter().map(|(id, _)| *id).collect();
         detail.routed = routed_now
             .union(&now)
@@ -983,7 +990,8 @@ fn rescue(
 
 /// Route once more, after S6 and the clear stage, the connections
 /// [`clear_findings`] cut open (routed before it, open after it), around
-/// all the copper left (made fixed; [`route_around`]). Connections that
+/// all the copper left (made fixed; [`route_around`], for
+/// [`PipelineSettings::rescue_iterations`] iterations). Connections that
 /// failed before are not tried again: on a dense real board the rescue
 /// rounds had already taken nearly all they could, and retrying them here
 /// cost more time than it won. The new copper is optimized (when S6 runs)
@@ -991,7 +999,9 @@ fn rescue(
 /// `routed`. `detail` is then brought to what is joined: a connection is
 /// routed when its two terminals are joined, and one the clear stage left
 /// open fails as [`DetailFailure::ExactCheckRejected`] (its copper failed
-/// the exact check). Returns how many more connections are joined.
+/// the exact check), whatever this try's own search found (counted as
+/// `pipeline_repair_failed_<reason>`); a connection that failed before
+/// keeps its reason. Returns how many more connections are joined.
 #[allow(clippy::too_many_arguments)]
 fn repair(
     work: &RouteBoard,
@@ -1016,7 +1026,6 @@ fn repair(
         .filter(|id| !before.contains(id) && !failed.contains_key(id))
         .collect();
     tel.count("pipeline_repair_queued", ids.len() as u64);
-    let mut reasons: BTreeMap<ConnectionId, DetailFailure> = BTreeMap::new();
     if !ids.is_empty() {
         let second = route_around(
             work,
@@ -1057,39 +1066,23 @@ fn repair(
         tel.count("pipeline_repair_cleared_cut", u64::from(cleared.cut_tracks));
         routed.tracks.extend(fresh.tracks);
         routed.vias.extend(fresh.vias);
-        let map = |c: &ConnectionId| ids[c.index()];
-        reasons = second
-            .failure_details
-            .iter()
-            .map(|(c, f)| {
-                let f = match f {
-                    DetailFailure::Congestion {
-                        iterations,
-                        against,
-                    } => DetailFailure::Congestion {
-                        iterations: *iterations,
-                        against: against.iter().map(map).collect(),
-                    },
-                    other => other.clone(),
-                };
-                (map(c), f)
-            })
-            .collect();
+        // The try's own reasons, for the record: the connection still
+        // reports why it opened.
+        for (_, f) in &second.failure_details {
+            tel.count(&format!("pipeline_repair_failed_{}", f.name()), 1);
+        }
     }
     let now = joined(work, routed, connections, &every);
     detail.failure_details = every
         .iter()
         .filter(|id| !now.contains(id))
         .map(|id| {
-            // A lost negotiation stays the reason when this try merely
-            // found no way around fixed copper.
-            let f = match (reasons.remove(id), failed.get(id)) {
-                (_, Some(f @ DetailFailure::Congestion { .. })) => f.clone(),
-                (_, Some(f)) if !f.retryable() => f.clone(),
-                (Some(f), _) => f,
-                (None, Some(f)) => f.clone(),
-                (None, None) => DetailFailure::ExactCheckRejected,
-            };
+            // A connection failed before keeps its reason; one the clear
+            // stage cut open (repaired or not) failed the exact check.
+            let f = failed
+                .get(id)
+                .cloned()
+                .unwrap_or(DetailFailure::ExactCheckRejected);
             (*id, f)
         })
         .collect();

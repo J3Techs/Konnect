@@ -847,19 +847,19 @@ fn lock_state(m: &std::sync::Mutex<DagState>) -> std::sync::MutexGuard<'_, DagSt
 ///
 /// `order` is the canonical schedule (passes in order, tiles in id order).
 /// Tile `t` depends on every earlier tile whose window meets `t`'s, and its
-/// store holds this iteration's copper of those tiles only. Copper of an
-/// earlier tile `j` that `t` does not depend on may be within `t`'s reach,
-/// but it could not change `t`'s rasters:
-/// `j` commits centre lines a context margin inside its own window
-/// ([`Ctx::margin`], from the largest clearance and the widest copper any
-/// net draws), so that copper stays further from `t`'s disjoint window than
-/// any clearance plus half-width plus half-diagonal a node of `t` paints
-/// with; but the net's own vias in it close via sites within hole-to-hole
-/// around them, further out than that margin, so whether a tile saw it
-/// depended on timing. Any execution that respects these edges therefore
-/// computes the same result on any number of threads; there are just no
-/// pass barriers, so a slow tile holds up only its neighbours. Results
-/// come back in `order`.
+/// store holds this iteration's copper of those tiles only, never that of
+/// an earlier tile `j` it does not depend on. Most of `j`'s copper could
+/// not change `t`'s rasters anyway: `j` commits centre lines a context
+/// margin inside its own window ([`Ctx::margin`], from the largest
+/// clearance and the widest copper any net draws), further from `t`'s
+/// disjoint window than any clearance plus half-width plus half-diagonal a
+/// node of `t` paints with. A net's own vias are the exception: they close
+/// that net's via sites within hole-to-hole around them, which can reach
+/// past the margin, so reading `j`'s copper would make `t` depend on
+/// whether `j` happened to finish first. Reading only dependencies' copper,
+/// any execution that respects these edges computes the same result on any
+/// number of threads; there are just no pass barriers, so a slow tile holds
+/// up only its neighbours. Results come back in `order`.
 ///
 /// A panic in any tile stops every worker and is re-raised here.
 #[allow(clippy::too_many_arguments)]
