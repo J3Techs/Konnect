@@ -19,7 +19,7 @@ use konnect_geom::{nm_to_mm, BBox, Coord, Point};
 use konnect_route::api::{Generation, LayerId, NetId};
 use konnect_route::check::{CheckReport, CheckedItem, ViolationKind};
 use konnect_route::plan::{RoutePlan, RoutedCopper};
-use konnect_route::trunk::{TrunkSpec, TrunkTuning, ViaStatus};
+use konnect_route::trunk::{Regularization, TrunkSpec, TrunkTuning, ViaStatus};
 use konnect_route::RouteBoard;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -30,7 +30,7 @@ const COPPER_RESISTIVITY_OHM_M: f64 = 1.724e-8;
 /// Copper assumed when the stackup does not give the layer's thickness.
 const DEFAULT_COPPER_MM: f64 = 0.035;
 
-fn absolute(p: PathBuf) -> anyhow::Result<PathBuf> {
+pub(crate) fn absolute(p: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(if p.is_absolute() {
         p
     } else {
@@ -38,7 +38,7 @@ fn absolute(p: PathBuf) -> anyhow::Result<PathBuf> {
     })
 }
 
-fn refuse_existing(output: &Path) -> Option<CallToolResult> {
+pub(crate) fn refuse_existing(output: &Path) -> Option<CallToolResult> {
     output.exists().then(|| {
         CallToolResult::error_kind(
             ToolErrorKind::Conflict {
@@ -52,7 +52,7 @@ fn refuse_existing(output: &Path) -> Option<CallToolResult> {
     })
 }
 
-fn write_plan(output: &Path, plan: &RoutePlan) -> Result<(), CallToolResult> {
+pub(crate) fn write_plan(output: &Path, plan: &RoutePlan) -> Result<(), CallToolResult> {
     native_route_job::write_new_atomic(output, plan.to_routing_file_json().as_bytes()).map_err(
         |e| {
             if output.exists() {
@@ -126,15 +126,59 @@ fn routing_of(board: &RouteBoard, copper: &RoutedCopper) -> Result<RoutePlan, Ca
         .map_err(|e| CallToolResult::error(format!("plan not built: {e}")))
 }
 
-fn kind_name(k: ViolationKind) -> String {
+pub(crate) fn kind_name(k: ViolationKind) -> String {
     serde_json::to_value(k)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default()
 }
 
+/// A board item of a violation, as the operator knows it: a pad by
+/// `REF.PAD`, copper by kind, net, UUID and place.
+pub(crate) fn board_item_label(board: &RouteBoard, item: konnect_route::api::ItemRef) -> String {
+    use konnect_route::api::ItemRef;
+    let net = |n: Option<NetId>| n.map_or("no net".to_string(), |n| board.net(n).name.clone());
+    let uuid = |u: &Option<String>| u.clone().unwrap_or_else(|| "planned".to_string());
+    match item {
+        ItemRef::Pad(p) => format!(
+            "pad {}",
+            board_inspect::pad_label(board, &board.pads[p.index()])
+        ),
+        ItemRef::Track(t) => {
+            let t = &board.tracks[t.index()];
+            let (a, b) = (t.seg.a.to_mm(), t.seg.b.to_mm());
+            format!(
+                "track of {} {} ({}, {}) to ({}, {})",
+                net(t.net),
+                uuid(&t.uuid),
+                a.0,
+                a.1,
+                b.0,
+                b.1
+            )
+        }
+        ItemRef::Arc(a) => {
+            let a = &board.arcs[a.index()];
+            format!("arc of {} {}", net(a.net), uuid(&a.uuid))
+        }
+        ItemRef::Via(v) => {
+            let v = &board.vias[v.index()];
+            let (x, y) = v.center.to_mm();
+            format!("via of {} {} at ({x}, {y})", net(v.net), uuid(&v.uuid))
+        }
+        ItemRef::Zone(z) => {
+            let z = &board.zones[z.index()];
+            format!(
+                "zone {} of {}",
+                z.zone_name.as_deref().unwrap_or("(unnamed)"),
+                net(z.net)
+            )
+        }
+    }
+}
+
 /// Counts by kind and the first `listed` violations, located.
-fn check_json(
+pub(crate) fn check_json(
     board: &RouteBoard,
     report: &CheckReport,
     against: &str,
@@ -295,7 +339,7 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         }
     }
     let check = check_json(&board, &report, "saved board", 50, |item| match item {
-        CheckedItem::Board { item } => json!(format!("{item:?}")),
+        CheckedItem::Board { item } => json!(board_item_label(&board, *item)),
         CheckedItem::RoutedTrack { index } => json!(format!("stub {index}")),
         CheckedItem::RoutedVia { index } => json!(format!("via {index}")),
         CheckedItem::Edge => json!("board edge"),
@@ -329,7 +373,12 @@ pub(crate) async fn handle_plan_trunk(
     tokio::task::spawn_blocking(move || plan_trunk_blocking(&args)).await?
 }
 
-fn length_arg(args: &Value, key: &str, min: f64, max: f64) -> Result<Option<Coord>, Refusal> {
+pub(crate) fn length_arg(
+    args: &Value,
+    key: &str,
+    min: f64,
+    max: f64,
+) -> Result<Option<Coord>, Refusal> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v
@@ -346,7 +395,7 @@ fn length_arg(args: &Value, key: &str, min: f64, max: f64) -> Result<Option<Coor
     }
 }
 
-fn point_arg(v: &Value, field: &str) -> Result<Point, Refusal> {
+pub(crate) fn point_arg(v: &Value, field: &str) -> Result<Point, Refusal> {
     let get = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
     match (get("x"), get("y")) {
         (Some(x), Some(y)) => Point::from_mm(x, y)
@@ -368,7 +417,7 @@ fn copper_thickness(board_path: &Path, layer: &str) -> Option<f64> {
         .filter(|t| t.is_finite() && *t > 0.0)
 }
 
-fn read_avoid(board: &RouteBoard, paths: &[String]) -> Result<RoutedCopper, Refusal> {
+pub(crate) fn read_avoid(board: &RouteBoard, paths: &[String]) -> Result<RoutedCopper, Refusal> {
     let mut all = RoutedCopper::default();
     for (i, p) in paths.iter().enumerate() {
         let field = format!("avoid_routing_files[{i}]");
@@ -496,6 +545,12 @@ fn trunk_args(
     let avoid_files = opt_strings(args, "avoid_routing_files")?.unwrap_or_default();
     let avoid = read_avoid(board, &avoid_files)?;
     let waypoint_vias = opt_bool(args, "waypoint_vias", true)?;
+    let tuning = TrunkTuning {
+        regularize: opt_bool(args, "regularize", true)?,
+        min_segment: length_arg(args, "min_segment_mm", 0.01, 20.0)?
+            .unwrap_or(TrunkTuning::default().min_segment),
+        ..TrunkTuning::default()
+    };
     Ok(TrunkArgs {
         spec: TrunkSpec {
             net,
@@ -511,9 +566,18 @@ fn trunk_args(
             waypoint_vias,
             carve_zones,
         },
-        tuning: TrunkTuning::default(),
+        tuning,
         avoid_files,
     })
+}
+
+fn regularization_name(r: Regularization) -> &'static str {
+    match r {
+        Regularization::Off => "off",
+        Regularization::NotNeeded => "not_needed",
+        Regularization::Regularized => "regularized",
+        Regularization::Forced => "forced",
+    }
 }
 
 fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
@@ -627,6 +691,8 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                 total_len += len;
                 total_r += r;
             }
+            let runs = l.runs();
+            let min_seg = f64::from(a.tuning.min_segment);
             json!({
                 "leg": l.index,
                 "from": pt(l.from), "to": pt(l.to),
@@ -635,6 +701,14 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                 "violations": l.violations.iter().map(|(p, why)| json!({ "piece": p, "kind": why })).collect::<Vec<_>>(),
                 "length_mm": round3(len),
                 "bends": l.bends,
+                "regularization": regularization_name(l.regularization),
+                "shortest_segment_mm": l.shortest_run().map(|s| (s / 1e3).round() / 1e3),
+                "segments_under_minimum": runs.iter().filter(|r| (r.b - r.a).length_f64() < min_seg - 0.5).count(),
+                "forced_jog": l.forced_jog,
+                "segments": runs.iter().map(|r| json!({
+                    "from": pt(r.a), "to": pt(r.b),
+                    "length_mm": round3((r.b - r.a).length_f64() / 1e6),
+                })).collect::<Vec<_>>(),
                 "preferred_width_mm": mm(l.preferred_width),
                 "min_width_used_mm": l.pieces.iter().map(|p| mm(p.width)).fold(None, |m: Option<f64>, w| Some(m.map_or(w, |m| m.min(w)))),
                 "max_width_used_mm": l.pieces.iter().map(|p| mm(p.width)).fold(None, |m: Option<f64>, w| Some(m.map_or(w, |m| m.max(w)))),
@@ -715,11 +789,23 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                 None => json!(format!("track {index}")),
             },
             CheckedItem::RoutedVia { index } => json!(format!("waypoint via {}", index)),
-            CheckedItem::Board { item } => json!(format!("{item:?}")),
+            CheckedItem::Board { item } => json!(board_item_label(&checked_board, *item)),
             CheckedItem::Edge => json!("board edge"),
         },
     );
     let complete = routed == plan.legs.len() && report.violations.is_empty();
+    let lint = if written {
+        crate::tools::board_lint::lint_planned(
+            &checked_board,
+            &copper,
+            &crate::tools::route_geometry::Limits::default(),
+            crate::tools::board_lint::DOGLEG_DEFAULT_NM,
+            50,
+        )
+    } else {
+        Value::Null
+    };
+    let count = |r: Regularization| plan.legs.iter().filter(|l| l.regularization == r).count();
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "board": spec.board,
@@ -728,6 +814,14 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "complete": complete,
         "legs_routed": routed,
         "legs_failed": plan.legs.len() - routed,
+        "regularize": {
+            "on": a.tuning.regularize,
+            "min_segment_mm": mm(a.tuning.min_segment),
+            "legs_regularized": count(Regularization::Regularized),
+            "legs_not_needed": count(Regularization::NotNeeded),
+            "legs_forced": count(Regularization::Forced),
+        },
+        "lint": lint,
         "legs": legs,
         "vias": vias,
         "carve_zones": carved,

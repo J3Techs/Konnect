@@ -217,17 +217,14 @@ fn read_zone_overlay(
         .collect()
 }
 
-fn read_plan_overlay(path: &std::path::Path) -> Result<RoutePlan, Refusal> {
-    super::route_native::file_must_exist(path, "overlay_routing_file")?;
-    std::fs::read_to_string(path)
-        .map_err(|e| e.to_string())
-        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
-        .map_err(|e| {
-            invalid(
-                "overlay_routing_file",
-                &format!("is not a routing_file: {e}"),
-            )
-        })
+/// `overlay_routing_file`, or `overlay_routing_files` merged in order.
+fn read_plan_overlay(args: &Value) -> Result<Option<RoutePlan>, Refusal> {
+    let files = super::route_native::read_plan_files(
+        args,
+        "overlay_routing_file",
+        "overlay_routing_files",
+    )?;
+    Ok((!files.is_empty()).then(|| super::route_native::merged_plan(&files)))
 }
 
 // ─── Drawing ─────────────────────────────────────────────────────────────────
@@ -282,6 +279,7 @@ struct Drawn {
     plan_vias: usize,
     plan_zones: usize,
     labels: usize,
+    markers: usize,
 }
 
 struct Scene<'a> {
@@ -718,101 +716,257 @@ fn default_output(saved: &SavedBoard, layers: &[String], w: &BBox) -> PathBuf {
     ))
 }
 
-fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
-    let saved = match load_saved_board(args)? {
-        Ok(s) => s,
-        Err(r) => return Ok(r),
+// ─── Markers ─────────────────────────────────────────────────────────────────
+
+/// Radius of a marker ring, px: the same at every scale.
+pub(crate) const MARKER_RING_PX: f64 = 12.0;
+const MARKER_STROKE_PX: f32 = 3.0;
+/// Most markers one render takes.
+const MARKERS_MAX: usize = 100_000;
+
+/// A point to ring on a render, with an optional short label; its colour
+/// comes from its kind.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Marker {
+    pub x: f64,
+    pub y: f64,
+    pub label: Option<String>,
+    pub kind: Option<String>,
+}
+
+/// The ring colour of a marker kind: the lint's kinds have fixed bright
+/// colours, any other kind a stable hue, no kind white.
+pub(crate) fn marker_color(kind: Option<&str>) -> Rgba {
+    match kind {
+        None => Rgba(255, 255, 255, 255),
+        Some("via_dogleg") => Rgba(0, 255, 255, 255),
+        Some("pad_dogleg") => Rgba(90, 150, 255, 255),
+        Some("acute_bend") => Rgba(255, 255, 0, 255),
+        Some("short_jog") => Rgba(255, 140, 0, 255),
+        Some("hairpin") => Rgba(255, 60, 170, 255),
+        Some("unsplit_t_junction") => Rgba(140, 255, 60, 255),
+        Some("collinear_vertex") => Rgba(205, 205, 205, 255),
+        Some(other) => hsl((fnv1a(other) % 360) as f32, 1.0, 0.6),
+    }
+}
+
+fn parse_marker(v: &Value, field: &str) -> Result<Marker, Refusal> {
+    let Some(o) = v.as_object() else {
+        return Err(invalid(field, "must be an object {x, y, label?, kind?}"));
     };
-    let b = &saved.board;
-    let parsed = (|| -> Result<_, Refusal> {
-        let window = match args.get("area") {
-            None | Some(Value::Null) => match b.outline.bbox {
-                Some(bb) => bb.inflate(500_000),
-                None => {
-                    return Err(invalid(
-                        "area",
-                        "is required: the board has no Edge.Cuts outline to frame",
-                    ))
-                }
-            },
-            Some(v) => box_arg(v, "area")?,
-        };
-        let mask = layers_arg(b, args, "layers")?.unwrap_or_else(|| {
-            b.layers
-                .front()
-                .map(LayerMask::single)
-                .unwrap_or(LayerMask::EMPTY)
-        });
-        // Keep the caller's order: the first listed layer is drawn on top.
-        let mut layers: Vec<LayerId> = Vec::new();
-        for n in opt_strings(args, "layers")?.unwrap_or_else(|| vec!["F.Cu".to_string()]) {
-            for l in b.layers.expand(n.trim()).iter() {
-                if !layers.contains(&l) {
-                    layers.push(l);
-                }
+    if let Some(k) = o
+        .keys()
+        .find(|k| !["x", "y", "label", "kind"].contains(&k.as_str()))
+    {
+        return Err(invalid(
+            &format!("{field}.{k}"),
+            "is not a marker key (x, y, label, kind)",
+        ));
+    }
+    let num = |k: &str| o.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
+    let text = |k: &str| -> Result<Option<String>, Refusal> {
+        match o.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(invalid(&format!("{field}.{k}"), "must be a string")),
+        }
+    };
+    match (num("x"), num("y")) {
+        (Some(x), Some(y)) => Ok(Marker {
+            x,
+            y,
+            label: text("label")?,
+            kind: text("kind")?,
+        }),
+        _ => Err(invalid(field, "needs finite x and y (mm)")),
+    }
+}
+
+/// `markers` inline and/or `markers_file` (a JSON array of markers, or an
+/// object with a `markers` array), in that order.
+fn markers_arg(args: &Value) -> Result<Vec<Marker>, Refusal> {
+    let mut out = Vec::new();
+    match args.get("markers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (i, m) in items.iter().enumerate() {
+                out.push(parse_marker(m, &format!("markers[{i}]"))?);
             }
         }
-        if layers.is_empty() {
-            layers.extend(mask.iter());
+        Some(_) => return Err(invalid("markers", "must be an array of markers")),
+    }
+    if let Some(path) = opt_path(args, "markers_file")? {
+        super::route_native::file_must_exist(&path, "markers_file")?;
+        let v: Value = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+            .map_err(|e| invalid("markers_file", &format!("cannot be read as JSON: {e}")))?;
+        let items = match &v {
+            Value::Array(a) => a,
+            Value::Object(o) => match o.get("markers").and_then(Value::as_array) {
+                Some(a) => a,
+                None => return Err(invalid("markers_file", "has no markers array")),
+            },
+            _ => return Err(invalid("markers_file", "must hold an array of markers")),
+        };
+        for (i, m) in items.iter().enumerate() {
+            out.push(parse_marker(m, &format!("markers_file[{i}]"))?);
         }
-        if layers.is_empty() {
-            return Err(invalid(
-                "layers",
-                "is required: the board has no F.Cu to draw by default",
-            ));
+    }
+    if out.len() > MARKERS_MAX {
+        return Err(invalid(
+            "markers",
+            &format!(
+                "{} markers exceed the {MARKERS_MAX} one render takes",
+                out.len()
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn in_window(window: &BBox, x: f64, y: f64) -> bool {
+    Point::from_mm(x, y).is_some_and(|p| window.contains(p))
+}
+
+/// Ring each marker in the window, label it, and count them.
+fn draw_markers(c: &mut Canvas, window: &BBox, markers: &[Marker]) -> usize {
+    let r_mm = MARKER_RING_PX / c.px_per_mm();
+    let mut n = 0;
+    for m in markers.iter().filter(|m| in_window(window, m.x, m.y)) {
+        let color = marker_color(m.kind.as_deref());
+        c.stroke_circle(m.x, m.y, r_mm, MARKER_STROKE_PX + 3.0, HALO);
+        c.stroke_circle(m.x, m.y, r_mm, MARKER_STROKE_PX, color);
+        if let Some(label) = m.label.as_deref().filter(|l| !l.is_empty()) {
+            let (px, py) = c.to_px(m.x, m.y);
+            let r = MARKER_RING_PX as f32;
+            c.text_px(
+                (px + r + 3.0, py - r - 2.0),
+                Anchor::TopLeft,
+                11.0,
+                label,
+                color,
+                Some(HALO),
+            );
         }
-        let px_per_mm = positive_arg(args, "px_per_mm", DEFAULT_PX_PER_MM, 400.0)?;
-        let grid = grid_arg(args, px_per_mm)?;
-        let fill_zones = opt_bool(args, "fill_zones", true)?;
-        let labels = labels_arg(args)?;
-        let plan = match opt_path(args, "overlay_routing_file")? {
-            Some(p) => Some(read_plan_overlay(&p)?),
-            None => None,
-        };
-        let zones = match opt_path(args, "overlay_zones_file")? {
-            Some(p) => Some(read_zone_overlay(&p)?),
-            None => None,
-        };
-        let output = opt_path(args, "output")?;
-        let inline = opt_bool(args, "inline", false)?;
-        Ok((
-            window, layers, px_per_mm, grid, fill_zones, labels, plan, zones, output, inline,
-        ))
-    })();
-    let (window, layers, px_per_mm, grid, fill_zones, labels, plan, zones, output, inline) =
-        match parsed {
-            Ok(v) => v,
-            Err(r) => return Ok(r),
-        };
-    let (x0, y0) = window.min.to_mm();
-    let (x1, y1) = window.max.to_mm();
-    let mut canvas = match Canvas::new(x0, y0, x1, y1, px_per_mm, BACKGROUND) {
-        Ok(c) => c,
-        Err(e) => return Ok(invalid("px_per_mm", &format!("{e:#}"))),
+        n += 1;
+    }
+    n
+}
+
+// ─── One window, drawn ───────────────────────────────────────────────────────
+
+/// What a render draws besides its window, parsed once: shared by
+/// `render_board_layers_png` and every tile of `render_board_tiles`.
+struct RenderSpec {
+    layers: Vec<LayerId>,
+    px_per_mm: f64,
+    grid: f64,
+    fill_zones: bool,
+    labels: Labels,
+    plan: Option<RoutePlan>,
+    zones: Option<Vec<super::zone_batch::ZoneRequest>>,
+    markers: Vec<Marker>,
+}
+
+impl RenderSpec {
+    fn layer_names(&self, b: &konnect_route::RouteBoard) -> Vec<String> {
+        self.layers
+            .iter()
+            .map(|l| b.layers.name(*l).to_string())
+            .collect()
+    }
+}
+
+/// `area`, or the board outline grown by 0.5 mm.
+fn window_arg(b: &konnect_route::RouteBoard, args: &Value) -> Result<BBox, Refusal> {
+    match args.get("area") {
+        None | Some(Value::Null) => match b.outline.bbox {
+            Some(bb) => Ok(bb.inflate(500_000)),
+            None => Err(invalid(
+                "area",
+                "is required: the board has no Edge.Cuts outline to frame",
+            )),
+        },
+        Some(v) => box_arg(v, "area"),
+    }
+}
+
+fn render_spec(b: &konnect_route::RouteBoard, args: &Value) -> Result<RenderSpec, Refusal> {
+    let mask = layers_arg(b, args, "layers")?.unwrap_or_else(|| {
+        b.layers
+            .front()
+            .map(LayerMask::single)
+            .unwrap_or(LayerMask::EMPTY)
+    });
+    // Keep the caller's order: the first listed layer is drawn on top.
+    let mut layers: Vec<LayerId> = Vec::new();
+    for n in opt_strings(args, "layers")?.unwrap_or_else(|| vec!["F.Cu".to_string()]) {
+        for l in b.layers.expand(n.trim()).iter() {
+            if !layers.contains(&l) {
+                layers.push(l);
+            }
+        }
+    }
+    if layers.is_empty() {
+        layers.extend(mask.iter());
+    }
+    if layers.is_empty() {
+        return Err(invalid(
+            "layers",
+            "is required: the board has no F.Cu to draw by default",
+        ));
+    }
+    let px_per_mm = positive_arg(args, "px_per_mm", DEFAULT_PX_PER_MM, 400.0)?;
+    let grid = grid_arg(args, px_per_mm)?;
+    let fill_zones = opt_bool(args, "fill_zones", true)?;
+    let labels = labels_arg(args)?;
+    let plan = read_plan_overlay(args)?;
+    let zones = match opt_path(args, "overlay_zones_file")? {
+        Some(p) => Some(read_zone_overlay(&p)?),
+        None => None,
     };
-    let t = std::time::Instant::now();
-    let scene = Scene {
-        saved: &saved,
-        window,
-        layers: layers.clone(),
+    let markers = markers_arg(args)?;
+    Ok(RenderSpec {
+        layers,
+        px_per_mm,
+        grid,
         fill_zones,
         labels,
+        plan,
+        zones,
+        markers,
+    })
+}
+
+/// Draw `window` of the board as `spec` says, caption included.
+fn draw_window(
+    saved: &SavedBoard,
+    spec: &RenderSpec,
+    window: BBox,
+) -> Result<(Canvas, Drawn), Refusal> {
+    let (x0, y0) = window.min.to_mm();
+    let (x1, y1) = window.max.to_mm();
+    let mut canvas = Canvas::new(x0, y0, x1, y1, spec.px_per_mm, BACKGROUND)
+        .map_err(|e| invalid("px_per_mm", &format!("{e:#}")))?;
+    let scene = Scene {
+        saved,
+        window,
+        layers: spec.layers.clone(),
+        fill_zones: spec.fill_zones,
+        labels: spec.labels,
     };
     let mut drawn = Drawn::default();
-    draw_grid(&mut canvas, &window, grid);
+    draw_grid(&mut canvas, &window, spec.grid);
     scene.draw_board(&mut canvas, &mut drawn);
-    if let Some(z) = &zones {
+    if let Some(z) = &spec.zones {
         scene.draw_zone_overlay(&mut canvas, z, &mut drawn);
     }
-    if let Some(p) = &plan {
+    if let Some(p) = &spec.plan {
         scene.draw_plan(&mut canvas, p, &mut drawn);
     }
     scene.draw_labels(&mut canvas, &mut drawn);
-    let layer_list = layer_names(b, layers.iter().fold(LayerMask::EMPTY, |m, l| m.with(*l)));
-    let ordered: Vec<String> = layers
-        .iter()
-        .map(|l| b.layers.name(*l).to_string())
-        .collect();
+    drawn.markers = draw_markers(&mut canvas, &window, &spec.markers);
     let caption = format!(
         "{}  {}  {:.3},{:.3} - {:.3},{:.3} mm  {} px/mm",
         saved
@@ -820,12 +974,12 @@ fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        ordered.join(" over "),
+        spec.layer_names(&saved.board).join(" over "),
         x0,
         y0,
         x1,
         y1,
-        px_per_mm
+        spec.px_per_mm
     );
     let h = canvas.height_px() as f32;
     canvas.text_px(
@@ -836,12 +990,10 @@ fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         TEXT,
         Some(HALO),
     );
-    let png = canvas.encode_png()?;
-    let path = output.unwrap_or_else(|| default_output(&saved, &ordered, &window));
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, &png)?;
+    Ok((canvas, drawn))
+}
+
+fn legend() -> BTreeMap<&'static str, Value> {
     let mut legend: BTreeMap<&str, Value> = BTreeMap::new();
     legend.insert("ground_nets", json!("slate grey"));
     legend.insert("power_nets", json!("warm hues (red to orange)"));
@@ -856,6 +1008,57 @@ fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "overlay",
         json!("planned copper carries a white dashed centre line; planned vias a magenta ring"),
     );
+    legend.insert(
+        "markers",
+        json!("a ring of fixed pixel size with its label: via_dogleg cyan, pad_dogleg blue, acute_bend yellow, short_jog orange, hairpin pink, unsplit_t_junction lime, collinear_vertex grey, other kinds a stable hue, no kind white"),
+    );
+    legend
+}
+
+fn drawn_json(d: &Drawn) -> Value {
+    json!({
+        "pads": d.pads, "tracks": d.tracks, "arcs": d.arcs, "vias": d.vias,
+        "zones": d.zones, "fill_pieces": d.fill_pieces, "rule_areas": d.rule_areas,
+        "overlay_tracks": d.plan_tracks, "overlay_vias": d.plan_vias,
+        "overlay_zones": d.plan_zones, "labels": d.labels, "markers": d.markers,
+    })
+}
+
+fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
+    let saved = match load_saved_board(args)? {
+        Ok(s) => s,
+        Err(r) => return Ok(r),
+    };
+    let b = &saved.board;
+    let parsed = (|| -> Result<_, Refusal> {
+        let window = window_arg(b, args)?;
+        let spec = render_spec(b, args)?;
+        let output = opt_path(args, "output")?;
+        let inline = opt_bool(args, "inline", false)?;
+        Ok((window, spec, output, inline))
+    })();
+    let (window, spec, output, inline) = match parsed {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    let t = std::time::Instant::now();
+    let (canvas, drawn) = match draw_window(&saved, &spec, window) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    let (x0, y0) = window.min.to_mm();
+    let (x1, y1) = window.max.to_mm();
+    let layer_list = layer_names(
+        b,
+        spec.layers.iter().fold(LayerMask::EMPTY, |m, l| m.with(*l)),
+    );
+    let ordered = spec.layer_names(b);
+    let png = canvas.encode_png()?;
+    let path = output.unwrap_or_else(|| default_output(&saved, &ordered, &window));
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &png)?;
     let body = json!({
         "source": "saved_file",
         "board": saved.path,
@@ -865,17 +1068,13 @@ fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "height_px": canvas.height_px(),
         "png_bytes": png.len(),
         "window": { "x1": x0, "y1": y0, "x2": x1, "y2": y1 },
-        "px_per_mm": px_per_mm,
-        "grid_mm": grid,
+        "px_per_mm": spec.px_per_mm,
+        "grid_mm": spec.grid,
         "layers": ordered,
         "layers_drawn": layer_list,
-        "drawn": {
-            "pads": drawn.pads, "tracks": drawn.tracks, "arcs": drawn.arcs, "vias": drawn.vias,
-            "zones": drawn.zones, "fill_pieces": drawn.fill_pieces, "rule_areas": drawn.rule_areas,
-            "overlay_tracks": drawn.plan_tracks, "overlay_vias": drawn.plan_vias,
-            "overlay_zones": drawn.plan_zones, "labels": drawn.labels,
-        },
-        "legend": legend,
+        "drawn": drawn_json(&drawn),
+        "markers_given": spec.markers.len(),
+        "legend": legend(),
         "elapsed_ms": t.elapsed().as_millis() as u64,
         "inline": inline,
     });
@@ -888,6 +1087,267 @@ fn render_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         });
     }
     Ok(result)
+}
+
+// ─── render_board_tiles ──────────────────────────────────────────────────────
+
+const TILE_DEFAULT_MM: f64 = 40.0;
+const TILE_OVERLAP_DEFAULT_MM: f64 = 2.0;
+const TILES_DEFAULT: u64 = 100;
+const TILES_MAX: u64 = 2_000;
+
+/// One tile of a grid: its place and its window, mm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Tile {
+    pub row: usize,
+    pub col: usize,
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
+/// The starts and ends of tiles `size` long, overlapping by `overlap`,
+/// covering `lo..hi`. The last tile is clipped to `hi`.
+fn spans(lo: f64, hi: f64, size: f64, overlap: f64) -> Vec<(f64, f64)> {
+    let step = size - overlap;
+    let width = hi - lo;
+    let n = if width <= size {
+        1
+    } else {
+        (((width - size) / step) - 1e-9).ceil() as usize + 1
+    };
+    (0..n)
+        .map(|i| {
+            let a = lo + i as f64 * step;
+            (a, (a + size).min(hi))
+        })
+        .collect()
+}
+
+/// Square tiles of `size` mm overlapping by `overlap` mm over the window,
+/// row by row from the top left.
+pub(crate) fn tile_grid(window: (f64, f64, f64, f64), size: f64, overlap: f64) -> Vec<Tile> {
+    let (x0, y0, x1, y1) = window;
+    let cols = spans(x0, x1, size, overlap);
+    let rows = spans(y0, y1, size, overlap);
+    let mut out = Vec::with_capacity(cols.len() * rows.len());
+    for (row, &(ya, yb)) in rows.iter().enumerate() {
+        for (col, &(xa, xb)) in cols.iter().enumerate() {
+            out.push(Tile {
+                row,
+                col,
+                x1: xa,
+                y1: ya,
+                x2: xb,
+                y2: yb,
+            });
+        }
+    }
+    out
+}
+
+pub(crate) fn tiles_schema() -> Value {
+    let mut s = super::route_native::render_schema();
+    let p = s["properties"]
+        .as_object_mut()
+        .expect("render schema has properties");
+    p.remove("output");
+    p.remove("inline");
+    p.insert(
+        "area".into(),
+        super::route_native::box_schema(
+            "The window to split into tiles, mm (default: the board outline)",
+        ),
+    );
+    p.insert("tile_mm".into(), json!({ "type": "number", "minimum": 1, "maximum": 1000, "default": TILE_DEFAULT_MM, "description": "Side of a square tile, mm" }));
+    p.insert("overlap_mm".into(), json!({ "type": "number", "minimum": 0, "default": TILE_OVERLAP_DEFAULT_MM, "description": "How far neighbouring tiles overlap, mm (less than tile_mm)" }));
+    p.insert("only_tiles_with_markers".into(), json!({ "type": "boolean", "default": false, "description": "Write only the tiles that hold at least one marker" }));
+    p.insert("max_tiles".into(), json!({ "type": "integer", "minimum": 1, "maximum": TILES_MAX, "default": TILES_DEFAULT, "description": "Most tiles written, row by row; the reply says when more were left out" }));
+    p.insert("output_dir".into(), json!({ "type": "string", "description": "Directory for the tiles and index.json; it must be new or empty (default: a new directory under konnect-renders in the system temp directory)" }));
+    s
+}
+
+pub(crate) async fn handle_render_board_tiles(
+    args: &Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || render_tiles_blocking(&args)).await?
+}
+
+fn render_tiles_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
+    let saved = match load_saved_board(args)? {
+        Ok(s) => s,
+        Err(r) => return Ok(r),
+    };
+    let b = &saved.board;
+    let parsed = (|| -> Result<_, Refusal> {
+        let window = window_arg(b, args)?;
+        let spec = render_spec(b, args)?;
+        let tile = positive_arg(args, "tile_mm", TILE_DEFAULT_MM, 1000.0)?;
+        if tile < 1.0 {
+            return Err(invalid("tile_mm", "must be at least 1 mm"));
+        }
+        let overlap = match args.get("overlap_mm") {
+            None | Some(Value::Null) => TILE_OVERLAP_DEFAULT_MM.min(tile / 2.0),
+            Some(v) => match v
+                .as_f64()
+                .filter(|x| x.is_finite() && *x >= 0.0 && *x < tile)
+            {
+                Some(x) => x,
+                None => {
+                    return Err(invalid(
+                        "overlap_mm",
+                        "must be at least 0 and less than tile_mm",
+                    ))
+                }
+            },
+        };
+        Canvas::size_for(0.0, 0.0, tile, tile, spec.px_per_mm)
+            .map_err(|e| invalid("px_per_mm", &format!("a {tile} mm tile: {e:#}")))?;
+        let only = opt_bool(args, "only_tiles_with_markers", false)?;
+        let max_tiles = match args.get("max_tiles") {
+            None | Some(Value::Null) => TILES_DEFAULT,
+            Some(v) => match v.as_u64().filter(|n| (1..=TILES_MAX).contains(n)) {
+                Some(n) => n,
+                None => {
+                    return Err(invalid(
+                        "max_tiles",
+                        &format!("must be an integer from 1 to {TILES_MAX}"),
+                    ))
+                }
+            },
+        } as usize;
+        let dir = opt_path(args, "output_dir")?;
+        Ok((window, spec, tile, overlap, only, max_tiles, dir))
+    })();
+    let (window, spec, tile, overlap, only, max_tiles, dir) = match parsed {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    let ordered = spec.layer_names(b);
+    let dir = match dir {
+        Some(d) => d,
+        None => {
+            let stem = saved
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "board".to_string());
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            std::env::temp_dir().join("konnect-renders").join(format!(
+                "{stem}-tiles-{}-{stamp}",
+                ordered.join("+").replace('.', "")
+            ))
+        }
+    };
+    if dir.exists() {
+        let empty = std::fs::read_dir(&dir).map(|mut d| d.next().is_none());
+        match empty {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::Conflict {
+                        paths: vec![dir.display().to_string()],
+                    },
+                    format!(
+                        "{} is not empty; tiles are written only to a new or empty directory. Nothing was written.",
+                        dir.display()
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Ok(invalid(
+                    "output_dir",
+                    &format!("is not a readable directory: {e}"),
+                ))
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let (x0, y0) = window.min.to_mm();
+    let (x1, y1) = window.max.to_mm();
+    let grid = tile_grid((x0, y0, x1, y1), tile, overlap);
+    let rows = grid.iter().map(|g| g.row + 1).max().unwrap_or(0);
+    let cols = grid.iter().map(|g| g.col + 1).max().unwrap_or(0);
+    let count_in = |g: &Tile| {
+        spec.markers
+            .iter()
+            .filter(|m| m.x >= g.x1 && m.x <= g.x2 && m.y >= g.y1 && m.y <= g.y2)
+            .count()
+    };
+    let chosen: Vec<(Tile, usize)> = grid
+        .iter()
+        .map(|g| (*g, count_in(g)))
+        .filter(|(_, n)| !only || *n > 0)
+        .collect();
+    let skipped_without_markers = grid.len() - chosen.len();
+    let truncated = chosen.len() > max_tiles;
+    std::fs::create_dir_all(&dir)?;
+    let mut entries = Vec::new();
+    for (g, n) in chosen.iter().take(max_tiles) {
+        let (Some(a), Some(z)) = (Point::from_mm(g.x1, g.y1), Point::from_mm(g.x2, g.y2)) else {
+            continue;
+        };
+        let (canvas, drawn) = match draw_window(&saved, &spec, BBox::new(a, z)) {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        };
+        let file = format!("tile_r{:02}_c{:02}.png", g.row, g.col);
+        let png = canvas.encode_png()?;
+        std::fs::write(dir.join(&file), &png)?;
+        entries.push(json!({
+            "file": file,
+            "path": dir.join(&file).display().to_string(),
+            "row": g.row, "col": g.col,
+            "window": { "x1": g.x1, "y1": g.y1, "x2": g.x2, "y2": g.y2 },
+            "layers": ordered,
+            "markers": n,
+            "markers_drawn": drawn.markers,
+            "width_px": canvas.width_px(), "height_px": canvas.height_px(),
+        }));
+    }
+    let index = json!({
+        "board": saved.path,
+        "source": "saved_file",
+        "window": { "x1": x0, "y1": y0, "x2": x1, "y2": y1 },
+        "tile_mm": tile,
+        "overlap_mm": overlap,
+        "px_per_mm": spec.px_per_mm,
+        "layers": ordered,
+        "rows": rows,
+        "cols": cols,
+        "markers": spec.markers.len(),
+        "only_tiles_with_markers": only,
+        "tiles": entries,
+    });
+    let index_path = dir.join("index.json");
+    std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)?;
+    Ok(CallToolResult::json(&json!({
+        "source": "saved_file",
+        "board": saved.path,
+        "note": SAVED_FILE_NOTE,
+        "output_dir": dir.display().to_string(),
+        "index": index_path.display().to_string(),
+        "rows": rows,
+        "cols": cols,
+        "tiles_in_grid": grid.len(),
+        "tiles_written": entries.len(),
+        "skipped_without_markers": skipped_without_markers,
+        "truncated": truncated,
+        "tile_mm": tile,
+        "overlap_mm": overlap,
+        "px_per_mm": spec.px_per_mm,
+        "layers": ordered,
+        "markers": spec.markers.len(),
+        "tiles": entries,
+        "legend": legend(),
+        "elapsed_ms": t.elapsed().as_millis() as u64,
+    })))
 }
 
 #[cfg(test)]

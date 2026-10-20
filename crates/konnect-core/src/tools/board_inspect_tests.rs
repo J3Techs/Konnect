@@ -542,6 +542,171 @@ async fn render_overlays_a_plan_and_refuses_bad_windows_and_files() {
     );
 }
 
+#[tokio::test]
+async fn render_rings_a_marker_at_a_fixed_pixel_size_in_its_kind_colour() {
+    let f = files();
+    let out = f.path("markers.png");
+    let r = render(
+        &f,
+        json!({
+            "area": { "x1": 0, "y1": 0, "x2": 25, "y2": 30 }, "px_per_mm": 10, "grid_mm": 0,
+            "labels": ["none"], "fill_zones": false, "output": out,
+            "markers": [
+                { "x": 10, "y": 20, "kind": "via_dogleg", "label": "via_dogleg SIG" },
+                { "x": 40, "y": 20, "kind": "acute_bend" }
+            ]
+        }),
+    )
+    .await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(
+        b["drawn"]["markers"], 1,
+        "the second marker is outside the window"
+    );
+    assert_eq!(b["markers_given"], 2);
+    let (w, _, rgba) = konnect_render::png_rgba(&std::fs::read(&out).unwrap()).unwrap();
+    // (10, 20) mm is pixel (100, 200); the ring's centre line is 12 px out.
+    let px = |x: usize, y: usize| {
+        let at = (y * w as usize + x) * 4;
+        [rgba[at], rgba[at + 1], rgba[at + 2]]
+    };
+    let ring = (100 + board_render::MARKER_RING_PX as usize, 200);
+    assert_eq!(
+        px(ring.0, ring.1),
+        [0, 255, 255],
+        "via_dogleg rings are cyan"
+    );
+    assert_eq!(
+        board_render::marker_color(Some("via_dogleg")),
+        konnect_render::Rgba(0, 255, 255, 255)
+    );
+
+    // The same marker from a file, as lint_board_geometry writes it.
+    let file = f.path("m.json");
+    std::fs::write(
+        &file,
+        r#"{"markers":[{"x":10,"y":20,"label":"via_dogleg SIG","kind":"via_dogleg"}]}"#,
+    )
+    .unwrap();
+    let r = render(
+        &f,
+        json!({ "area": { "x1": 0, "y1": 0, "x2": 25, "y2": 30 }, "markers_file": file, "output": f.path("m.png") }),
+    )
+    .await;
+    assert_eq!(body(&r)["drawn"]["markers"], 1, "{}", text(&r));
+    for (extra, field) in [
+        (json!({ "markers": [{ "x": 1 }] }), "markers[0]"),
+        (
+            json!({ "markers": [{ "x": 1, "y": 2, "colour": "red" }] }),
+            "markers[0].colour",
+        ),
+        (json!({ "markers_file": f.path("missing.json") }), ""),
+    ] {
+        let r = render(
+            &f,
+            with(json!({ "output": f.path("bad.png") }), extra.clone()),
+        )
+        .await;
+        assert!(r.is_error, "{extra} accepted");
+        if !field.is_empty() {
+            assert_eq!(field_of(&r), field, "{}", text(&r));
+        }
+    }
+}
+
+#[test]
+fn tile_grids_overlap_and_clip_the_last_tile() {
+    let grid = board_render::tile_grid((0.0, 0.0, 100.0, 50.0), 40.0, 2.0);
+    let cols: Vec<(f64, f64)> = grid
+        .iter()
+        .filter(|t| t.row == 0)
+        .map(|t| (t.x1, t.x2))
+        .collect();
+    assert_eq!(cols, [(0.0, 40.0), (38.0, 78.0), (76.0, 100.0)]);
+    let rows: Vec<(f64, f64)> = grid
+        .iter()
+        .filter(|t| t.col == 0)
+        .map(|t| (t.y1, t.y2))
+        .collect();
+    assert_eq!(rows, [(0.0, 40.0), (38.0, 50.0)]);
+    assert_eq!(grid.len(), 6);
+    // A window an exact number of steps wide gets no sliver tile.
+    assert_eq!(
+        board_render::tile_grid((0.0, 0.0, 78.0, 10.0), 40.0, 2.0).len(),
+        2
+    );
+    // A window smaller than a tile is one tile.
+    let one = board_render::tile_grid((5.0, 5.0, 20.0, 9.0), 40.0, 2.0);
+    assert_eq!((one.len(), one[0].x2, one[0].y2), (1, 20.0, 9.0));
+}
+
+#[tokio::test]
+async fn render_board_tiles_writes_only_tiles_with_markers_and_an_index() {
+    let f = files();
+    let dir = f.path("tiles");
+    let args = json!({
+        "board": f.board(), "layers": ["F.Cu", "B.Cu"], "tile_mm": 20, "overlap_mm": 1,
+        "px_per_mm": 4, "only_tiles_with_markers": true, "output_dir": dir,
+        "markers": [ { "x": 5, "y": 5, "kind": "via_dogleg" }, { "x": 45, "y": 35, "kind": "acute_bend" } ]
+    });
+    let r = board_render::handle_render_board_tiles(&args, &ctx())
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    assert_eq!(r.content.len(), 1, "never an inline image");
+    let b = body(&r);
+    // The outline (50 x 40 mm) grown by 0.5 mm: 3 x 3 tiles of 20 mm, step 19.
+    assert_eq!((b["rows"].as_u64(), b["cols"].as_u64()), (Some(3), Some(3)));
+    assert_eq!(b["tiles_in_grid"], 9);
+    assert_eq!(b["tiles_written"], 2, "{b}");
+    assert_eq!(b["skipped_without_markers"], 7);
+    let files: Vec<&str> = b["tiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["tile_r00_c00.png", "tile_r01_c02.png"]);
+    for name in &files {
+        assert!(Path::new(&dir).join(name).is_file());
+    }
+    let index: Value =
+        serde_json::from_str(&std::fs::read_to_string(Path::new(&dir).join("index.json")).unwrap())
+            .unwrap();
+    assert_eq!(index["tiles"][1]["markers"], 1);
+    assert_eq!(index["tiles"][0]["layers"], json!(["F.Cu", "B.Cu"]));
+    assert_eq!(index["tiles"][0]["width_px"], 80);
+
+    // A directory with files in it is never written into.
+    let again = board_render::handle_render_board_tiles(&args, &ctx())
+        .await
+        .unwrap();
+    assert!(again.is_error && text(&again).contains("not empty"));
+
+    // Without the filter every tile is a candidate; max_tiles caps the run.
+    let capped = with(
+        args.clone(),
+        json!({ "only_tiles_with_markers": false, "max_tiles": 4, "output_dir": f.path("all") }),
+    );
+    let r = board_render::handle_render_board_tiles(&capped, &ctx())
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(
+        (b["tiles_written"].as_u64(), b["truncated"].as_bool()),
+        (Some(4), Some(true))
+    );
+    let bad = with(
+        args,
+        json!({ "overlap_mm": 20, "output_dir": f.path("bad") }),
+    );
+    let r = board_render::handle_render_board_tiles(&bad, &ctx())
+        .await
+        .unwrap();
+    assert_eq!(field_of(&r), "overlap_mm");
+}
+
 // ─── plan_tap_vias ───────────────────────────────────────────────────────────
 
 #[tokio::test]

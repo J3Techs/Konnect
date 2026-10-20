@@ -200,7 +200,12 @@ pub fn tools() -> Vec<ToolDef> {
              footprint's complete text — pad fabrication properties, padstacks, custom pads, \
              groups, models — into the saved file in one atomic, revision-checked write, and \
              refuses a board that already has circuit footprints, netted pads or routing. \
-             Reopen the board and run native DRC afterwards.",
+             Reopen the board and run native DRC afterwards. A pad whose net changes while \
+             its old or new net has routed copper is a routed_pad_net_change conflict that \
+             names the pad and every track, arc or via touching it by UUID, or says that only \
+             copper elsewhere on the net and zone fills are involved; naming such a pad in \
+             accept_pad_net_changes plans the change when no track, arc or via touches it \
+             (refill zones afterwards).",
             json!({
                 "type": "object",
                 "properties": {
@@ -213,6 +218,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["live", "closed_initial"],
                         "default": "live",
                         "description": "live: KiCad IPC on the open board. closed_initial: one-time verbatim library import into the saved, closed board"
+                    },
+                    "accept_pad_net_changes": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 3 },
+                        "description": "backend live: pads (REFERENCE.PAD, e.g. J1.1) whose net change is planned although their old or new net has routed copper, provided no track, arc or via touches the pad (zone fills may; refill afterwards). A touched pad stays a conflict naming that copper. The plan revision covers this list: apply with the same list"
                     },
                     "response_detail": {
                         "type": "string",

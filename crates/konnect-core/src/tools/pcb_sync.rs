@@ -19,6 +19,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 mod closed_initial;
+mod pad_contacts;
+#[cfg(test)]
+mod pad_net_change_tests;
 mod parking;
 
 #[cfg(test)]
@@ -332,6 +335,19 @@ struct SyncDiagnostic {
     references: Vec<String>,
     /// The library footprint the diagnostic is about, when it is about one.
     footprint_id: Option<String>,
+    /// For a pad-level diagnostic: the pad and the copper touching it,
+    /// serialized as `pad` and `touching_copper` beside the other fields.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pad_detail: Option<Box<PadDetail>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PadDetail {
+    /// `REF.PAD`.
+    pad: String,
+    /// The tracks, arcs and vias touching the pad, each named by UUID.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    touching_copper: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -354,6 +370,149 @@ struct SyncPlan {
     /// except through the positions in `changes`.
     #[serde(skip)]
     parking: Option<serde_json::Value>,
+    /// Pad net changes planned because the caller accepted them in
+    /// `accept_pad_net_changes`: no track, arc or via touches these pads.
+    #[serde(skip)]
+    accepted_pad_net_changes: Vec<AcceptedPadNetChange>,
+    /// Entries of `accept_pad_net_changes` that named no pad whose net the
+    /// plan changes.
+    #[serde(skip)]
+    unused_pad_net_acceptances: Vec<String>,
+}
+
+/// A pad whose net change was planned on the caller's acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AcceptedPadNetChange {
+    pad: String,
+    from: String,
+    to: String,
+}
+
+/// What a caller allows beyond the default plan.
+#[derive(Debug, Default)]
+struct SyncOptions<'a> {
+    /// `REF.PAD` names whose net may change although their old or new net
+    /// has routed copper, provided no track, arc or via touches the pad.
+    accept_pad_net_changes: BTreeSet<String>,
+    /// The live board's copper geometry, to tell which pads copper touches;
+    /// `None` when it was not read.
+    copper: Option<&'a pad_contacts::CopperGeometry>,
+}
+
+/// Parse `accept_pad_net_changes`: `REF.PAD` names.
+fn accept_pad_net_changes_arg(
+    args: &serde_json::Value,
+) -> std::result::Result<BTreeSet<String>, CallToolResult> {
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "accept_pad_net_changes".to_string(),
+                reason: reason.clone(),
+            },
+            format!("Argument 'accept_pad_net_changes' is invalid: {reason}"),
+        )
+    };
+    match args.get("accept_pad_net_changes") {
+        None | Some(serde_json::Value::Null) => Ok(BTreeSet::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| match item.as_str().map(str::trim) {
+                Some(name)
+                    if name
+                        .split_once('.')
+                        .is_some_and(|(r, n)| !r.is_empty() && !n.is_empty()) =>
+                {
+                    Ok(name.to_string())
+                }
+                _ => Err(refuse(format!(
+                    "{item} is not a REFERENCE.PAD name such as J1.1"
+                ))),
+            })
+            .collect(),
+        Some(_) => Err(refuse(
+            "must be an array of REFERENCE.PAD names".to_string(),
+        )),
+    }
+}
+
+/// What the pad's net change touches, in words, for the diagnostic.
+/// One pad whose net the plan would change.
+struct PadNetChange<'a> {
+    reference: &'a str,
+    number: &'a str,
+    old_net: &'a str,
+    new_net: &'a str,
+}
+
+fn pad_change_conflict(
+    change: &PadNetChange,
+    copper: Option<&pad_contacts::CopperGeometry>,
+    contacts: &std::result::Result<Vec<pad_contacts::Contact>, String>,
+    accepted: bool,
+) -> SyncDiagnostic {
+    let PadNetChange {
+        reference,
+        number,
+        old_net,
+        new_net,
+    } = *change;
+    let pad = format!("{reference}.{number}");
+    let head = format!("{reference} pad {number} would change from '{old_net}' to '{new_net}'");
+    let mut touching = Vec::new();
+    let message = match (copper, contacts) {
+        (None, _) => format!("{head} while routed copper uses that net"),
+        (Some(_), Err(why)) => format!(
+            "{head} while routed copper uses that net, and the pad's copper could not be read ({why}), \
+             so whether a track, arc or via touches it is unknown"
+        ),
+        (Some(_), Ok(list)) if !list.is_empty() => {
+            touching = list.iter().map(pad_contacts::Contact::describe).collect();
+            format!(
+                "{head} while {} touch{} the pad: {}{}",
+                if list.len() == 1 { "this item" } else { "these items" },
+                if list.len() == 1 { "es" } else { "" },
+                touching.join(", "),
+                if accepted {
+                    ". accept_pad_net_changes cannot plan it while copper touches the pad: \
+                     delete or reroute that copper first"
+                } else {
+                    ""
+                }
+            )
+        }
+        (Some(g), Ok(_)) => {
+            let elsewhere: Vec<String> = [old_net, new_net]
+                .iter()
+                .filter(|n| !n.is_empty())
+                .filter_map(|n| {
+                    g.by_net
+                        .get(*n)
+                        .map(|c| format!("{c} track(s), arc(s) or via(s) on '{n}'"))
+                })
+                .collect();
+            let zones = if g.zones > 0 {
+                format!(
+                    "{}the board's {} zone(s), whose fills may reach the pad; a refill re-forms them",
+                    if elsewhere.is_empty() { "" } else { " and " },
+                    g.zones
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{head}; no track, arc or via touches the pad, only copper elsewhere on the net: {}{zones}. \
+                 Name {pad} in accept_pad_net_changes to plan this change (refill zones afterwards)",
+                elsewhere.join(", ")
+            )
+        }
+    };
+    SyncDiagnostic {
+        pad_detail: Some(Box::new(PadDetail {
+            pad,
+            touching_copper: touching,
+        })),
+        ..conflict("routed_pad_net_change", message, Some(reference))
+    }
 }
 
 /// What added footprints were staged beside (#688).
@@ -413,6 +572,8 @@ struct LiveSnapshot {
     items: BTreeMap<String, prost_types::Any>,
     net_codes: BTreeMap<String, i32>,
     document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    /// Pads and routed copper with their geometry.
+    copper: pad_contacts::CopperGeometry,
 }
 
 #[derive(Debug)]
@@ -544,6 +705,19 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
             "Apply requires the plan revision returned by a current dry run.",
         ));
     }
+    let accept_pad_net_changes = match accept_pad_net_changes_arg(args) {
+        Ok(list) => list,
+        Err(refusal) => return Ok(refusal),
+    };
+    if closed && !accept_pad_net_changes.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "accept_pad_net_changes".to_string(),
+                reason: "applies to backend live only".to_string(),
+            },
+            "accept_pad_net_changes applies to backend 'live' only: closed_initial never reassigns a routed pad.",
+        ));
+    }
     if !schematic.exists() || !board.exists() {
         let missing = if !schematic.exists() {
             &schematic
@@ -583,7 +757,11 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let options = SyncOptions {
+                accept_pad_net_changes: accept_pad_net_changes.clone(),
+                copper: Some(&snapshot.copper),
+            };
+            let mut plan = plan_sync_with(&netlist_source, &design, &snapshot.state, &options);
             plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
@@ -610,7 +788,7 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
             if let Err(diagnostic) =
                 restage_additions(&mut plan, &prepared, snapshot.state.bounds)
             {
-                refuse_plan(&mut plan, vec![diagnostic]);
+                refuse_plan(&mut plan, vec![*diagnostic]);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
             }
             refresh_revision_with_staging(&mut plan);
@@ -738,6 +916,17 @@ fn sync_response(
         "parking": plan.parking,
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
+    let mut value = value;
+    if !plan.accepted_pad_net_changes.is_empty() || !plan.unused_pad_net_acceptances.is_empty() {
+        value["accepted_pad_net_changes"] = serde_json::json!(plan.accepted_pad_net_changes);
+        value["unused_pad_net_acceptances"] = serde_json::json!(plan.unused_pad_net_acceptances);
+        value["refill_needed"] = serde_json::json!(!plan.accepted_pad_net_changes.is_empty());
+        if !plan.accepted_pad_net_changes.is_empty() {
+            value["refill_note"] = serde_json::json!(
+                "No track, arc or via touches the accepted pads, but zone fills of their old net may: refill every zone after the update (run_drc with refill_zones, or KiCad's Fill All Zones) so the fills re-form around the new nets."
+            );
+        }
+    }
     CallToolResult::json(&value)
 }
 
@@ -868,6 +1057,19 @@ fn conflict_result(message: String) -> CallToolResult {
 }
 
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    plan_sync_with(netlist_source, design, board, &SyncOptions::default())
+}
+
+fn plan_sync_with(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    options: &SyncOptions,
+) -> SyncPlan {
+    let mut accepted_changes: Vec<AcceptedPadNetChange> = Vec::new();
+    let mut acceptances_used: BTreeSet<String> = BTreeSet::new();
+    // The touching copper of every accepted pad, for the revision.
+    let mut accepted_evidence: Vec<(String, Vec<String>)> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
@@ -1159,14 +1361,49 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 continue;
             }
             if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
-                diagnostics.push(conflict(
-                    "routed_pad_net_change",
-                    format!(
-                        "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
-                        component.reference, number, old_net, new_net
-                    ),
-                    Some(&component.reference),
-                ));
+                let names = [
+                    format!("{}.{number}", component.reference),
+                    format!("{}.{number}", footprint.reference),
+                ];
+                let accepted_name = names
+                    .iter()
+                    .find(|n| options.accept_pad_net_changes.contains(*n))
+                    .cloned();
+                let contacts = match options.copper {
+                    Some(g) => g.contacts(&footprint.kiid, number),
+                    None => Err("the board's copper geometry was not read".to_string()),
+                };
+                if let Some(name) = &accepted_name {
+                    acceptances_used.insert(name.clone());
+                    accepted_evidence.push((
+                        name.clone(),
+                        match &contacts {
+                            Ok(list) => list.iter().map(|c| c.uuid.clone()).collect(),
+                            Err(why) => vec![format!("unknown: {why}")],
+                        },
+                    ));
+                }
+                match (&accepted_name, &contacts) {
+                    (Some(name), Ok(list)) if list.is_empty() && options.copper.is_some() => {
+                        changed_pads += 1;
+                        accepted_changes.push(AcceptedPadNetChange {
+                            pad: name.clone(),
+                            from: old_net.to_string(),
+                            to: new_net.to_string(),
+                        });
+                    }
+                    _ => diagnostics.push(pad_change_conflict(
+                        &PadNetChange {
+                            reference: &component.reference,
+                            number,
+                            old_net,
+                            new_net,
+                        },
+                        options.copper,
+                        &contacts,
+                        accepted_name.is_some(),
+                    )),
+                }
             } else {
                 changed_pads += 1;
             }
@@ -1212,7 +1449,34 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     } else {
         PlanStatus::Ready
     };
-    let plan_revision = plan_revision(netlist_source, board);
+    let mut plan_revision = plan_revision(netlist_source, board);
+    // A plan made under acceptances is a different plan: the revision covers
+    // the list and the copper each accepted pad was found touching.
+    if !options.accept_pad_net_changes.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(plan_revision.as_bytes());
+        for name in &options.accept_pad_net_changes {
+            hasher.update(b"accept\0");
+            hasher.update(name.as_bytes());
+        }
+        for (name, touching) in &accepted_evidence {
+            hasher.update(b"evidence\0");
+            hasher.update(name.as_bytes());
+            for uuid in touching {
+                hasher.update(uuid.as_bytes());
+            }
+        }
+        plan_revision = format!("{:x}", hasher.finalize());
+    }
+    if !diagnostics.is_empty() {
+        accepted_changes.clear();
+    }
+    let unused_pad_net_acceptances = options
+        .accept_pad_net_changes
+        .iter()
+        .filter(|name| !acceptances_used.contains(*name))
+        .cloned()
+        .collect();
     SyncPlan {
         status,
         plan_revision,
@@ -1223,6 +1487,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
         parking: None,
+        accepted_pad_net_changes: accepted_changes,
+        unused_pad_net_acceptances,
     }
 }
 
@@ -1233,6 +1499,7 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
         reference: reference.map(str::to_string),
         references: reference.map(str::to_string).into_iter().collect(),
         footprint_id: None,
+        pad_detail: None,
     }
 }
 
@@ -1254,6 +1521,7 @@ fn footprint_conflict(
         },
         references,
         footprint_id: Some(footprint_id.to_string()),
+        pad_detail: None,
     }
 }
 
@@ -2460,6 +2728,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     let footprint_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
     let mut footprints = Vec::new();
     let mut items = BTreeMap::new();
+    let mut instances = Vec::new();
     for item in footprint_items {
         let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
             .context("KiCad returned an invalid footprint item")?;
@@ -2467,6 +2736,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         let kiid = footprint.kiid.clone();
         footprints.push(footprint);
         items.insert(kiid, item);
+        instances.push(instance);
     }
 
     let nets = client.get_nets_in(document.clone())?;
@@ -2475,25 +2745,29 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
+    let tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
+    for item in &tracks {
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
         }
     }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
+    let arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
+    for item in &arcs {
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
         }
     }
-    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
+    let vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
+    for item in &vias {
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
+    let zones = client
         .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
+        .len();
+    let copper = pad_contacts::CopperGeometry::read(&instances, &tracks, &arcs, &vias, zones);
+    if zones > 0 {
         // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
         // reassignment on a zoned board therefore fails closed.
         for net in net_codes.keys() {
@@ -2525,6 +2799,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         items,
         net_codes,
         document,
+        copper,
     })
 }
 
@@ -2945,7 +3220,7 @@ fn restage_additions(
     plan: &mut SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     bounds: Bounds,
-) -> std::result::Result<(), SyncDiagnostic> {
+) -> std::result::Result<(), Box<SyncDiagnostic>> {
     let mut boxes = Vec::new();
     let mut sources = BTreeMap::<&str, usize>::new();
     for change in &plan.changes {
@@ -2963,7 +3238,7 @@ fn restage_additions(
         }
     }
     let (positions, summary) = parking::park(&boxes, bounds)
-        .map_err(|reason| conflict("parking_extent_out_of_range", reason, None))?;
+        .map_err(|reason| Box::new(conflict("parking_extent_out_of_range", reason, None)))?;
     let mut positions = positions.into_iter();
     for change in &mut plan.changes {
         if let PlannedChange::Add { position, .. } = change {
@@ -5334,6 +5609,8 @@ mod tests {
             unassigned: Vec::new(),
             staging: None,
             parking: None,
+            accepted_pad_net_changes: Vec::new(),
+            unused_pad_net_acceptances: Vec::new(),
         }
     }
 

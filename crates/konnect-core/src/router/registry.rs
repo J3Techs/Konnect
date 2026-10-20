@@ -94,9 +94,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "native_routing",
-        description: "Native autorouter on the saved board: copper and pad queries with exact geometry, layer renders with plan overlays, connectivity with island membership, terminal-access audit, plane-via fanout, tap vias for named pads, power-trunk planning, exact rule check of a routing file, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan; then the plan applied to the open board with a KIID ledger, KiCad's DRC read back onto it, and the refilled reference plane checked under a class's tracks",
+        description: "Native autorouter on the saved board: copper and pad queries with exact geometry, layer renders and tiled renders with plan overlays and markers, a shape lint of the board's copper (acute bends, jogs, hairpins, T-junctions, via and pad doglegs) and exact-checked via-dogleg fix plans, connectivity with island membership, terminal-access audit, plane-via fanout, tap vias for named pads, power-trunk planning with run-length regularization, hand-specified routes (vertices or a parallel offset, anchored on pads and vias), exact rule check of one or several routing files, and the whole route pipeline in-process or as a resumable background job that writes an add_routing plan; then the plan applied to the open board with a KIID ledger, KiCad's DRC read back onto it, and the refilled reference plane checked under a class's tracks",
         category: "pcb",
-        tool_count: 16,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "placement",

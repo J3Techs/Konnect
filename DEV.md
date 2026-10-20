@@ -104,10 +104,12 @@ Konnect/
 │   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
 │   │           ├── pcb_routing.rs    # 15 tools (traces, vias, nets, netclasses, SES import)
-│   │           ├── route_native.rs   # 16 tools (native autorouter: connectivity, terminal audit, plane vias, rule check, route jobs, inspection and planning)
+│   │           ├── route_native.rs   # 20 tools (native autorouter: connectivity, terminal audit, plane vias, rule check, route jobs, inspection, linting, planning and hand-specified routes)
 │   │           ├── board_inspect.rs  # query_copper / query_pads: saved-board copper and pads with exact geometry
-│   │           ├── board_render.rs   # render_board_layers_png: per-net coloured layer render with plan overlays
-│   │           ├── route_plan_tools.rs # plan_tap_vias / plan_trunk: tap vias for named pads, power-trunk planning
+│   │           ├── board_render.rs   # render_board_layers_png / render_board_tiles: per-net coloured layer renders with plan overlays and markers
+│   │           ├── board_lint.rs     # lint_board_geometry / plan_dogleg_fixes: shape lint of saved copper, via-dogleg fix plans
+│   │           ├── route_plan_tools.rs # plan_tap_vias / plan_trunk: tap vias for named pads, power-trunk planning with run-length regularization
+│   │           ├── route_build.rs    # build_route: a hand-specified route (vertices or parallel_to, anchors, extend_to) checked and written as a plan
 │   │           ├── zone_batch.rs     # add_zones: many zones in one commit and refill, or one atomic file write
 │   │           ├── pcb_export.rs     # 14 tools (Gerber, PDF, 3D, Specctra DSN, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
@@ -371,7 +373,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 256 tools (263 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 260 tools (267 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -456,12 +458,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **22 toolsets, 256 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **22 toolsets, 260 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 263 tools (256 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 267 tools (260 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

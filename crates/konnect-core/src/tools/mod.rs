@@ -6,6 +6,7 @@ mod board_graphics;
 pub(crate) mod board_inspect;
 #[cfg(test)]
 mod board_inspect_tests;
+mod board_lint;
 mod board_render;
 mod board_session;
 mod board_source;
@@ -47,6 +48,7 @@ mod route_geometry;
 mod routing_batch;
 // Native router: the `native_routing` toolset (`route_native`) and the plan
 // apply path (`route_native_apply`) behind its `apply_route_plan` tool.
+mod route_build;
 pub(crate) mod route_native;
 pub(crate) mod route_native_apply;
 mod route_plan_tools;

@@ -377,6 +377,8 @@ fn plan(
             unassigned: Vec::new(),
             staging: None,
             parking: None,
+            accepted_pad_net_changes: Vec::new(),
+            unused_pad_net_acceptances: Vec::new(),
         },
         hierarchy_files: saved.hierarchy.len(),
         inputs: inputs.clone(),
@@ -613,6 +615,7 @@ fn initial_only_refusals(inventory: &Inventory, saved: &SavedDesign) -> Vec<Sync
             },
             references,
             footprint_id: None,
+            pad_detail: None,
         });
     }
     refusals

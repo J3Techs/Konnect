@@ -90,6 +90,23 @@ pub struct TrunkTuning {
     pub min_run: Coord,
     /// Shortest piece the width profile splits a run into, nm.
     pub min_piece: Coord,
+    /// When the endpoint fit leaves a run shorter than `min_segment`, solve
+    /// the leg's run lengths again on whole nanometres (see
+    /// [`Regularization`]).
+    #[serde(default = "regularize_default")]
+    pub regularize: bool,
+    /// Shortest run between two bends (or a bend and a waypoint) the
+    /// regularization allows, nm.
+    #[serde(default = "min_segment_default")]
+    pub min_segment: Coord,
+}
+
+fn regularize_default() -> bool {
+    true
+}
+
+fn min_segment_default() -> Coord {
+    1_000_000
 }
 
 impl Default for TrunkTuning {
@@ -102,8 +119,39 @@ impl Default for TrunkTuning {
             max_cells: 4_000_000,
             min_run: 200_000,
             min_piece: 1_000_000,
+            regularize: regularize_default(),
+            min_segment: min_segment_default(),
         }
     }
+}
+
+/// What regularization did to a leg.
+///
+/// The search's grid is anchored on the leg's start waypoint, so an end
+/// waypoint off that grid is reached by adjusting run lengths, which can
+/// leave a run of a fraction of a millimetre (a jog, or a short bent run
+/// into the waypoint). Regularization solves the run lengths again on whole
+/// nanometres: each run shorter than the minimum is dropped or lengthened
+/// to it (and, when that is not enough, one run of the minimum length is
+/// added), and the remainder is absorbed by one run, or by two runs of
+/// independent direction, so the leg still starts and ends exactly on its
+/// waypoints with every run octilinear and at least the minimum long.
+/// Candidates nearest the searched path are tried first; each is checked
+/// with the exact kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Regularization {
+    /// Turned off, or the leg has no copper.
+    #[default]
+    Off,
+    /// The fitted geometry had no run shorter than the minimum.
+    NotNeeded,
+    /// The run lengths were solved again; every run is at least the
+    /// minimum.
+    Regularized,
+    /// No regular candidate passed; the fitted geometry was kept, and
+    /// [`TrunkLeg::forced_jog`] says why.
+    Forced,
 }
 
 /// One planned leg.
@@ -124,6 +172,14 @@ pub struct TrunkLeg {
     pub violations: Vec<(usize, String)>,
     pub grid: Coord,
     pub expansions: usize,
+    /// What regularization did.
+    #[serde(default)]
+    pub regularization: Regularization,
+    /// When a run shorter than the minimum remains: what forced it (the
+    /// obstacle that refused the regular candidates, or the waypoints'
+    /// geometry).
+    #[serde(default)]
+    pub forced_jog: Option<String>,
 }
 
 impl TrunkLeg {
@@ -134,6 +190,40 @@ impl TrunkLeg {
     pub fn routed(&self) -> bool {
         self.failure.is_none() && self.violations.is_empty() && !self.pieces.is_empty()
     }
+
+    /// The leg's straight runs, from bend to bend: consecutive collinear
+    /// pieces (a width change) are one run. Width is the first piece's.
+    pub fn runs(&self) -> Vec<Segment> {
+        straight_runs(&self.pieces)
+    }
+
+    /// Length of the shortest straight run, nm.
+    pub fn shortest_run(&self) -> Option<f64> {
+        self.runs()
+            .iter()
+            .map(|s| (s.b - s.a).length_f64())
+            .reduce(f64::min)
+    }
+}
+
+/// Consecutive joined collinear segments of one direction merged into one
+/// (whatever their widths).
+pub fn straight_runs(pieces: &[Segment]) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for s in pieces {
+        if s.a == s.b {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            let (u, v) = (last.b - last.a, s.b - s.a);
+            if last.b == s.a && u.cross(v) == 0 && u.dot(v) > 0 {
+                last.b = s.b;
+                continue;
+            }
+        }
+        out.push(*s);
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,6 +1117,370 @@ fn endpoint_fits(runs: &[(u8, f64)], residual: (f64, f64), min_run: f64) -> Vec<
     out
 }
 
+// ─── Regularization ──────────────────────────────────────────────────────────
+
+/// A straight run: an octilinear direction (an index into [`DIRS`]) and how
+/// far it moves along each axis it moves on, nm. A diagonal run of `k`
+/// moves `k` in x and `k` in y, so it is `k * sqrt 2` long; whole
+/// nanometres keep every diagonal exactly 45 degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Run {
+    dir: u8,
+    k: i64,
+}
+
+impl Run {
+    fn length(self) -> f64 {
+        if self.dir % 2 == 1 {
+            self.k as f64 * std::f64::consts::SQRT_2
+        } else {
+            self.k as f64
+        }
+    }
+}
+
+/// The smallest `k` whose run in direction `dir` is at least `min` long.
+fn min_k(dir: u8, min: Coord) -> i64 {
+    if dir % 2 == 1 {
+        (f64::from(min) / std::f64::consts::SQRT_2).ceil() as i64
+    } else {
+        i64::from(min)
+    }
+}
+
+/// `runs` without empty runs, neighbours of one direction joined.
+fn joined(runs: impl IntoIterator<Item = Run>) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for r in runs {
+        if r.k == 0 {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.dir == r.dir => last.k += r.k,
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Where `runs` from `a` end, nm.
+fn end_of(a: Point, runs: &[Run]) -> (i64, i64) {
+    runs.iter()
+        .fold((i64::from(a.x), i64::from(a.y)), |(x, y), r| {
+            let (dx, dy) = DIRS[r.dir as usize];
+            (x + dx * r.k, y + dy * r.k)
+        })
+}
+
+/// The vertices of `runs` from `a`; `None` outside the coordinate range.
+fn points_of(a: Point, runs: &[Run]) -> Option<Vec<Point>> {
+    let mut out = vec![a];
+    let (mut x, mut y) = (i64::from(a.x), i64::from(a.y));
+    for r in runs {
+        let (dx, dy) = DIRS[r.dir as usize];
+        x += dx * r.k;
+        y += dy * r.k;
+        out.push(Point::new(
+            Coord::try_from(x).ok()?,
+            Coord::try_from(y).ok()?,
+        ));
+    }
+    Some(out)
+}
+
+/// Distance from `p` to the polyline through `line`, nm.
+fn polyline_distance(p: Point, line: &[Point]) -> f64 {
+    let (px, py) = (f64::from(p.x), f64::from(p.y));
+    match line {
+        [] => f64::MAX,
+        [only] => (*only - p).length_f64(),
+        _ => line
+            .windows(2)
+            .map(|w| seg_dist(px, py, w[0], w[1]))
+            .fold(f64::MAX, f64::min),
+    }
+}
+
+fn orient(p: Point, q: Point, r: Point) -> i128 {
+    (q - p).cross(r - p).signum()
+}
+
+fn within(p: Point, q: Point, r: Point) -> bool {
+    r.x >= p.x.min(q.x) && r.x <= p.x.max(q.x) && r.y >= p.y.min(q.y) && r.y <= p.y.max(q.y)
+}
+
+/// Whether segments `p1 p2` and `q1 q2` meet (cross, touch or overlap).
+fn segments_meet(p1: Point, p2: Point, q1: Point, q2: Point) -> bool {
+    let (d1, d2) = (orient(q1, q2, p1), orient(q1, q2, p2));
+    let (d3, d4) = (orient(p1, p2, q1), orient(p1, p2, q2));
+    if d1 * d2 < 0 && d3 * d4 < 0 {
+        return true;
+    }
+    (d1 == 0 && within(q1, q2, p1))
+        || (d2 == 0 && within(q1, q2, p2))
+        || (d3 == 0 && within(p1, p2, q1))
+        || (d4 == 0 && within(p1, p2, q2))
+}
+
+/// Whether two segments of the polyline that share no vertex meet.
+fn self_crossing(v: &[Point]) -> bool {
+    let n = v.len().saturating_sub(1);
+    (0..n).any(|i| (i + 2..n).any(|j| segments_meet(v[i], v[i + 1], v[j], v[j + 1])))
+}
+
+/// Short runs whose drop-or-lengthen choice is enumerated; further short
+/// runs are lengthened.
+const MAX_SHORT_CHOICES: usize = 6;
+/// Candidates the exact check is run on, per phase.
+const MAX_CHECKED: usize = 48;
+/// What 45 degrees of bend weighs in a candidate's score, in minimum runs
+/// of straying from the searched path: a jog of two bends is worth
+/// removing when the path moves less than about this many runs for it.
+const BEND_WEIGHT: f64 = 3.0;
+/// Candidates scored per phase; enumeration stops there.
+const MAX_CANDIDATES: usize = 20_000;
+
+/// One leg's regularization: see [`Regularization`].
+struct Regularizer<'o, 'a> {
+    obstacles: &'o Obstacles<'a>,
+    spec: &'o TrunkSpec,
+    min_segment: Coord,
+    a: Point,
+    b: Point,
+    /// The direction the previous leg arrived in (the turn limit).
+    arrival: Option<u8>,
+    /// The direction toward the next waypoint (a soft preference).
+    next_dir: Option<u8>,
+}
+
+impl Regularizer<'_, '_> {
+    fn long_enough(&self, r: Run) -> bool {
+        r.k > 0 && r.length() >= f64::from(self.min_segment) - 0.5
+    }
+
+    /// The leg's vertices, from `a` exactly to `b`, every run octilinear
+    /// and at least the minimum long; or why there is none.
+    fn solve(&self, cache: &mut ClearanceCache, lattice: &[Run]) -> Result<Vec<Point>, String> {
+        let base = joined(lattice.iter().copied());
+        let reference = points_of(self.a, &base).unwrap_or_else(|| vec![self.a]);
+        let variants = self.variants(&base);
+        let mut blocked: Option<String> = None;
+        // Plain re-solving first; one added run only when that fails.
+        for insert in [false, true] {
+            let candidates = self.candidates(&variants, insert, &reference);
+            for runs in candidates.iter().take(MAX_CHECKED) {
+                let Some(verts) = points_of(self.a, runs) else {
+                    continue;
+                };
+                if verts.last() != Some(&self.b) || self_crossing(&verts) {
+                    continue;
+                }
+                match self.conflict(cache, &verts) {
+                    None => return Ok(verts),
+                    Some(why) => {
+                        blocked.get_or_insert(why);
+                    }
+                }
+            }
+        }
+        let min_mm = f64::from(self.min_segment) / 1e6;
+        Err(match blocked {
+            Some(why) => format!(
+                "forced by {why}: every octilinear candidate near the searched path with all runs at least {min_mm} mm is blocked there"
+            ),
+            None => format!(
+                "forced by the waypoints' geometry: no octilinear path near the searched path has every run at least {min_mm} mm (the end waypoint is too little off the runs' axes)"
+            ),
+        })
+    }
+
+    /// The exact check of every run at the minimum width: the first
+    /// conflict and where it is.
+    fn conflict(&self, cache: &mut ClearanceCache, verts: &[Point]) -> Option<String> {
+        for w in verts.windows(2) {
+            let seg = Segment::new(w[0], w[1], self.spec.min_width);
+            if let Some(why) = self.obstacles.piece_conflict(cache, seg) {
+                let (x, y) = (
+                    (f64::from(w[0].x) + f64::from(w[1].x)) / 2e6,
+                    (f64::from(w[0].y) + f64::from(w[1].y)) / 2e6,
+                );
+                return Some(format!("{why} (run through ({x:.3}, {y:.3}) mm)"));
+            }
+        }
+        None
+    }
+
+    /// Every way of dropping or lengthening the short runs, in a fixed
+    /// order, without repeats.
+    fn variants(&self, base: &[Run]) -> Vec<Vec<Run>> {
+        let short: Vec<usize> = (0..base.len())
+            .filter(|&i| !self.long_enough(base[i]))
+            .collect();
+        let choose = &short[..short.len().min(MAX_SHORT_CHOICES)];
+        let mut out: Vec<Vec<Run>> = Vec::new();
+        for mask in 0u32..(1u32 << choose.len()) {
+            let runs = joined(base.iter().enumerate().map(|(i, r)| {
+                if self.long_enough(*r) {
+                    return *r;
+                }
+                let drop = choose
+                    .iter()
+                    .position(|&c| c == i)
+                    .is_some_and(|bit| mask & (1 << bit) != 0);
+                Run {
+                    dir: r.dir,
+                    k: if drop {
+                        0
+                    } else {
+                        min_k(r.dir, self.min_segment)
+                    },
+                }
+            }));
+            if !runs.is_empty() && !out.contains(&runs) {
+                out.push(runs);
+            }
+        }
+        out
+    }
+
+    /// Candidates from `variants` (each with one added run of the minimum
+    /// length when `insert`), with the remainder to `b` absorbed by one
+    /// run along it or two runs of independent direction, legal and
+    /// sorted nearest `reference` first.
+    fn candidates(
+        &self,
+        variants: &[Vec<Run>],
+        insert: bool,
+        reference: &[Point],
+    ) -> Vec<Vec<Run>> {
+        let mut scored: Vec<(f64, Vec<Run>)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<Vec<Run>> = std::collections::BTreeSet::new();
+        'outer: for v in variants {
+            let bases: Vec<Vec<Run>> = if insert {
+                let mut out = Vec::new();
+                for pos in 0..=v.len() {
+                    let prev = pos.checked_sub(1).map(|p| v[p].dir);
+                    let next = v.get(pos).map(|r| r.dir);
+                    for dir in 0..8u8 {
+                        if prev.is_some_and(|p| p == dir || turn(p, dir) > 2)
+                            || next.is_some_and(|n| n == dir || turn(dir, n) > 2)
+                        {
+                            continue;
+                        }
+                        let mut w = v.clone();
+                        w.insert(
+                            pos,
+                            Run {
+                                dir,
+                                k: min_k(dir, self.min_segment),
+                            },
+                        );
+                        out.push(w);
+                    }
+                }
+                out
+            } else {
+                vec![v.clone()]
+            };
+            for w in bases {
+                for c in self.absorbed(&w) {
+                    if seen.contains(&c) || !self.legal(&c) {
+                        continue;
+                    }
+                    if let Some(score) = self.score(&c, reference) {
+                        seen.insert(c.clone());
+                        scored.push((score, c));
+                        if scored.len() >= MAX_CANDIDATES {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        scored.sort_by(|x, y| {
+            x.0.partial_cmp(&y.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| x.1.cmp(&y.1))
+        });
+        scored.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// `w` with the remainder to `b` taken up exactly (whole nanometres):
+    /// by nothing, one run along it, or a pair of runs.
+    fn absorbed(&self, w: &[Run]) -> Vec<Vec<Run>> {
+        let (ex, ey) = end_of(self.a, w);
+        let (rx, ry) = (i64::from(self.b.x) - ex, i64::from(self.b.y) - ey);
+        if rx == 0 && ry == 0 {
+            return vec![w.to_vec()];
+        }
+        let mut out = Vec::new();
+        for q in 0..w.len() {
+            let (dx, dy) = DIRS[w[q].dir as usize];
+            if dx * ry - dy * rx != 0 {
+                continue;
+            }
+            let t = if dx != 0 { rx * dx } else { ry * dy };
+            if dx * t == rx && dy * t == ry {
+                let mut c = w.to_vec();
+                c[q].k += t;
+                out.push(c);
+            }
+        }
+        for q in 0..w.len() {
+            for p in 0..q {
+                let (px, py) = DIRS[w[p].dir as usize];
+                let (qx, qy) = DIRS[w[q].dir as usize];
+                let det = px * qy - py * qx;
+                if det == 0 {
+                    continue;
+                }
+                let (an, bn) = (rx * qy - ry * qx, px * ry - py * rx);
+                if an % det != 0 || bn % det != 0 {
+                    continue;
+                }
+                let mut c = w.to_vec();
+                c[p].k += an / det;
+                c[q].k += bn / det;
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Every run long enough, no turn over 90 degrees (also from the
+    /// arriving leg).
+    fn legal(&self, c: &[Run]) -> bool {
+        c.iter().all(|r| self.long_enough(*r))
+            && c.windows(2)
+                .all(|w| w[0].dir != w[1].dir && turn(w[0].dir, w[1].dir) <= 2)
+            && match (self.arrival, c.first()) {
+                (Some(sd), Some(f)) => turn(sd, f.dir) <= 2,
+                _ => true,
+            }
+    }
+
+    /// How far the candidate strays from the searched path (both ways),
+    /// plus BEND_WEIGHT minimum runs per 45 degrees of bend; lower is better.
+    fn score(&self, c: &[Run], reference: &[Point]) -> Option<f64> {
+        let verts = points_of(self.a, c)?;
+        let dev: f64 = verts
+            .iter()
+            .map(|v| polyline_distance(*v, reference))
+            .chain(reference.iter().map(|u| polyline_distance(*u, &verts)))
+            .sum();
+        let per_bend = BEND_WEIGHT * f64::from(self.min_segment);
+        let turning: f64 = c
+            .windows(2)
+            .map(|w| f64::from(turn(w[0].dir, w[1].dir)))
+            .sum();
+        let away = match (self.next_dir, c.last()) {
+            (Some(nd), Some(l)) if turn(l.dir, nd) > 2 => 10.0 * per_bend,
+            _ => 0.0,
+        };
+        Some(dev + turning * per_bend + away)
+    }
+}
+
 // ─── Planning ────────────────────────────────────────────────────────────────
 
 /// Plan the trunk. Legs that cannot be routed are reported, not guessed.
@@ -1096,6 +1550,8 @@ fn plan_leg(
         violations: Vec::new(),
         grid: spec.grid,
         expansions: 0,
+        regularization: Regularization::Off,
+        forced_jog: None,
     };
     if a == b {
         leg.failure = Some("the leg's waypoints are the same point".to_string());
@@ -1185,10 +1641,50 @@ fn plan_leg(
                     break;
                 }
             }
-            let Some(verts) = fitted else {
-                last_err = "the path found could not be made to end exactly on the waypoint and still clear".to_string();
-                continue;
+            let min_seg = f64::from(tuning.min_segment);
+            let shortest = |v: &[Point]| {
+                v.windows(2)
+                    .map(|w| (w[1] - w[0]).length_f64())
+                    .fold(f64::MAX, f64::min)
             };
+            let (verts, regularization, forced) = match fitted {
+                Some(v) if !tuning.regularize => (v, Regularization::Off, None),
+                None if !tuning.regularize => {
+                    last_err = "the path found could not be made to end exactly on the waypoint and still clear".to_string();
+                    continue;
+                }
+                Some(v) if shortest(&v) >= min_seg - 0.5 => (v, Regularization::NotNeeded, None),
+                fitted => {
+                    let lattice: Vec<Run> = runs
+                        .iter()
+                        .map(|&(dir, n)| Run {
+                            dir,
+                            k: (n * f64::from(step)).round() as i64,
+                        })
+                        .collect();
+                    let reg = Regularizer {
+                        obstacles,
+                        spec,
+                        min_segment: tuning.min_segment,
+                        a,
+                        b,
+                        arrival,
+                        next_dir,
+                    };
+                    match reg.solve(cache, &lattice) {
+                        Ok(v) => (v, Regularization::Regularized, None),
+                        Err(why) => match fitted {
+                            Some(v) => (v, Regularization::Forced, Some(why)),
+                            None => {
+                                last_err = format!("the path found could not be made to end exactly on the waypoint and still clear ({why})");
+                                continue;
+                            }
+                        },
+                    }
+                }
+            };
+            leg.regularization = regularization;
+            leg.forced_jog = forced;
             leg.bends = verts.len().saturating_sub(2);
             leg.pieces = widen(obstacles, cache, &field, &verts, spec, pref, tuning, a, b);
             leg.failure = None;
@@ -1650,6 +2146,165 @@ mod tests {
         let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
         assert!(plan.legs[0].routed());
         assert!(plan.legs[0].length() < around - 5_000_000.0);
+    }
+
+    /// Exactly 0, 45 or 90 degrees in whole nanometres.
+    fn octilinear(s: &Segment) -> bool {
+        let (dx, dy) = ((s.b.x - s.a.x).abs(), (s.b.y - s.a.y).abs());
+        dx == 0 || dy == 0 || dx == dy
+    }
+
+    /// A clean board with a through-hole pad of the trunk's net at the end
+    /// waypoint, off the 0.1 mm grid anchored on the start.
+    fn pad_board(end: (f64, f64)) -> RouteBoard {
+        let mut b = BoardBuilder::new(60.0, 40.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        b.net("P5V");
+        b.net("GND");
+        let j = b.footprint("J1", end);
+        b.th_pad(j, "1", "P5V", end, 1.8, 1.0);
+        b.build()
+    }
+
+    #[test]
+    fn regularization_lands_exactly_on_an_off_lattice_pad_with_no_short_run() {
+        // Nearly diagonal: the shortest octilinear path is a 6.0007 mm
+        // diagonal plus a 0.2486 mm straight run.
+        let end = (16.2493, 16.0007);
+        let board = pad_board(end);
+        let rules = UniformRules::default();
+        let mut s = spec(&board, &[(10.0, 10.0), end]);
+        s.min_width = 300_000;
+        s.preferred_width = 1_500_000;
+
+        let off = TrunkTuning {
+            regularize: false,
+            ..TrunkTuning::default()
+        };
+        let plan = plan_trunk(&board, &rules, &s, &off);
+        let leg = &plan.legs[0];
+        assert!(leg.routed(), "{:?}", leg.failure);
+        assert_eq!(leg.regularization, Regularization::Off);
+        assert!(
+            leg.shortest_run().unwrap() < 1_000_000.0,
+            "without regularization the fit leaves a short run: {:?}",
+            leg.runs()
+        );
+
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        let leg = &plan.legs[0];
+        assert!(leg.routed(), "{:?} {:?}", leg.failure, leg.violations);
+        assert_eq!(leg.regularization, Regularization::Regularized);
+        assert_eq!(leg.forced_jog, None);
+        assert_eq!(leg.pieces.first().unwrap().a, mm(10.0, 10.0));
+        assert_eq!(leg.pieces.last().unwrap().b, mm(end.0, end.1));
+        for w in leg.pieces.windows(2) {
+            assert_eq!(w[0].b, w[1].a, "pieces are joined");
+        }
+        let runs = leg.runs();
+        for r in &runs {
+            assert!(octilinear(r), "{r:?}");
+            assert!((r.b - r.a).length_f64() >= 1_000_000.0 - 0.5, "{runs:?}");
+        }
+        for w in runs.windows(2) {
+            let (u, v) = (w[0].b - w[0].a, w[1].b - w[1].a);
+            assert!(u.dot(v) >= 0, "a turn over 90 degrees: {w:?}");
+        }
+        let copper = plan.copper(&board, s.net, s.layer);
+        let report = check_routed(&board, &rules, &copper);
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    #[test]
+    fn a_short_first_run_off_a_via_is_dropped_or_lengthened() {
+        // From a waypoint 0.8 mm above the line of a long 45 degree run.
+        let end = (40.0313, 30.0);
+        let board = pad_board(end);
+        let rules = UniformRules::default();
+        let s = spec(&board, &[(20.0, 9.2), (25.0, 10.0), end]);
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        for leg in &plan.legs {
+            assert!(leg.routed(), "{:?}", leg.failure);
+            assert_ne!(leg.regularization, Regularization::Forced, "{leg:?}");
+            assert!(
+                leg.shortest_run().unwrap() >= 1_000_000.0 - 0.5,
+                "{:?}",
+                leg.runs()
+            );
+            assert_eq!(leg.pieces.first().unwrap().a, leg.from);
+            assert_eq!(leg.pieces.last().unwrap().b, leg.to);
+        }
+        let copper = plan.copper(&board, s.net, s.layer);
+        assert!(check_routed(&board, &rules, &copper).violations.is_empty());
+    }
+
+    #[test]
+    fn a_jog_an_obstacle_forces_is_kept_and_named() {
+        // A 0.3 mm sideways offset over 20 mm inside a 1.15 mm corridor of
+        // keep-out boxes: every run of at least 1 mm that makes the offset
+        // swings out of the corridor.
+        let board = pad_board((30.0, 10.3));
+        let rules = UniformRules::default();
+        let mut s = spec(&board, &[(10.0, 10.0), (30.0, 10.3)]);
+        s.preferred_width = 300_000;
+        s.min_width = 300_000;
+        s.keepouts.push(BBox::new(mm(5.0, 5.0), mm(35.0, 9.55)));
+        s.keepouts.push(BBox::new(mm(5.0, 10.75), mm(28.9, 15.0)));
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        let leg = &plan.legs[0];
+        assert!(leg.routed(), "{:?}", leg.failure);
+        assert_eq!(
+            leg.regularization,
+            Regularization::Forced,
+            "{:?}",
+            leg.runs()
+        );
+        let why = leg.forced_jog.as_deref().unwrap();
+        assert!(why.contains("keep-out box"), "{why}");
+        assert!(leg.shortest_run().unwrap() < 1_000_000.0);
+        assert_eq!(leg.pieces.last().unwrap().b, mm(30.0, 10.3));
+
+        // Without the corridor the offset is made with runs of 1 mm or more.
+        s.keepouts.clear();
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        let leg = &plan.legs[0];
+        assert!(leg.routed(), "{:?}", leg.failure);
+        assert_eq!(leg.regularization, Regularization::Regularized);
+        assert!(leg.shortest_run().unwrap() >= 1_000_000.0 - 0.5);
+    }
+
+    #[test]
+    fn regularizer_absorbs_the_remainder_in_whole_nanometres() {
+        let b = mm(16.2493, 16.0007);
+        let r = |dir: u8, k: i64| Run { dir, k };
+        // SE 6.0, E 1.0 ends at (17.0, 16.0): the pair (SE, E) takes the
+        // rest exactly; a parity-odd pair of diagonals is never used.
+        let w = vec![r(1, 6_000_000), r(0, 1_000_000)];
+        let space_board = pad_board((16.2493, 16.0007));
+        let rules = UniformRules::default();
+        let s = spec(&space_board, &[(10.0, 10.0), (16.2493, 16.0007)]);
+        let obstacles = Obstacles::new(&space_board, &rules, &s);
+        let reg = Regularizer {
+            obstacles: &obstacles,
+            spec: &s,
+            min_segment: 1_000_000,
+            a: mm(10.0, 10.0),
+            b,
+            arrival: None,
+            next_dir: None,
+        };
+        let out = reg.absorbed(&w);
+        assert!(!out.is_empty());
+        for c in &out {
+            assert_eq!(end_of(reg.a, c), (i64::from(b.x), i64::from(b.y)));
+        }
+        let diag = vec![r(7, 1_000_000), r(1, 1_000_000)];
+        let reg_odd = Regularizer {
+            b: Point::new(reg.a.x + 2_000_001, reg.a.y),
+            ..reg
+        };
+        assert!(reg_odd.absorbed(&diag).is_empty(), "no half nanometres");
+        assert_eq!(min_k(1, 1_000_000), 707_107);
+        assert!(Run { dir: 1, k: 707_107 }.length() >= 1_000_000.0);
     }
 
     #[test]

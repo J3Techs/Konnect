@@ -317,8 +317,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_routing",
             "Add many copper tracks and through vias to the board KiCad holds open, in one \
-             CreateItems (one undo step). Items come inline (tracks/vias) or from \
-             'routing_file', a JSON object with the same keys. Every member is validated and \
+             CreateItems (one undo step). Items come inline (tracks/vias), from \
+             'routing_file', a JSON object with the same keys, or from 'routing_files', \
+             several such files merged in order into one batch (a bad member is refused \
+             naming its file and index). Every member is validated and \
              every net name resolved in one GetNets before anything is sent; one bad member or \
              unknown net refuses the whole batch. 'locked' creates every item locked, so later \
              bulk edits and the autorouter leave it alone. Vias are through vias (F.Cu to \
@@ -330,8 +332,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "delete_routing",
             "Delete tracks, arcs and vias from the board KiCad holds open, selected by an area \
-             (items lying wholly inside it), a list of nets, or both, optionally limited to some \
-             kinds. Locked items are kept and counted unless include_locked is set. Defaults to a \
+             (items lying wholly inside it), a list of nets and/or exact UUIDs (uuids, or \
+             uuids_file such as plan_dogleg_fixes' output_fixes), every given filter matching, \
+             optionally limited to some kinds. A UUID that is not a track, arc or via of the \
+             board refuses the whole call, naming it. Locked items are kept and counted unless \
+             include_locked is set. Defaults to a \
              dry run that lists what would go; apply needs expected_count equal to that dry run's \
              count, re-reads the board and refuses if the selection changed, and deletes in one \
              DeleteItems (one undo step). Footprints, pads and zones are never touched.",
@@ -602,22 +607,7 @@ async fn handle_add_routing(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     use super::routing_batch;
-    let file = match args.get("routing_file").and_then(serde_json::Value::as_str) {
-        None => None,
-        Some(path) => match std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()))
-        {
-            Ok(v) => Some(v),
-            Err(reason) => {
-                return Ok(crate::tools::invalid_arg(
-                    "routing_file",
-                    &format!("cannot be read as JSON: {reason}"),
-                ))
-            }
-        },
-    };
-    let batch = match routing_batch::parse(args, file.as_ref()) {
+    let (batch, files) = match routing_batch::parse_request(args) {
         Ok(b) => b,
         Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
     };
@@ -645,6 +635,12 @@ async fn handle_add_routing(
     let mut summary = batch.summary();
     if let Some(report) = &geometry {
         summary["geometry"] = report.to_json(&limits);
+    }
+    if !files.is_empty() {
+        summary["routing_files"] = json!(files
+            .iter()
+            .map(|f| json!({ "path": f.path, "tracks": f.tracks, "vias": f.vias }))
+            .collect::<Vec<_>>());
     }
     let created = ipc!(ctx, args, |c, document| {
         let codes: BTreeMap<String, i32> = c
@@ -709,6 +705,10 @@ async fn handle_delete_routing(
             "apply requires the count a dry run of this selection returned",
         ));
     }
+    let uuids_named = selection
+        .uuids
+        .as_ref()
+        .map(std::collections::BTreeSet::len);
     let outcome = ipc!(ctx, args, |c, document| {
         use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as K;
         let items = c.get_items_of_types_in(
@@ -716,6 +716,29 @@ async fn handle_delete_routing(
             &[K::KotPcbTrace, K::KotPcbArc, K::KotPcbVia],
         )?;
         let copper = routing_batch::decode_copper(&items)?;
+        let unknown = selection.unknown_uuids(&copper);
+        if !unknown.is_empty() {
+            let shown: Vec<&str> = unknown.iter().take(50).map(String::as_str).collect();
+            let more = unknown.len() - shown.len();
+            let list = if more > 0 {
+                format!("{} and {more} more", shown.join(", "))
+            } else {
+                shown.join(", ")
+            };
+            return Ok(Err(CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: "uuids".to_string(),
+                    reason: format!(
+                        "{} UUID(s) are not tracks, arcs or vias of the open board: {list}",
+                        unknown.len()
+                    ),
+                },
+                format!(
+                    "Nothing was deleted: {} of the named UUID(s) are not tracks, arcs or vias of the board open in KiCad: {list}",
+                    unknown.len()
+                ),
+            )));
+        }
         let (picked, kept_locked) = selection.pick(&copper);
         let summary = routing_batch::summarize(&picked);
         let ids: Vec<String> = picked.iter().map(|i| i.id.clone()).collect();
@@ -723,11 +746,11 @@ async fn handle_delete_routing(
             return Ok(Ok((summary, kept_locked, false)));
         }
         if Some(ids.len() as u64) != expected {
-            return Ok(Err(format!(
+            return Ok(Err(CallToolResult::error(format!(
                 "The selection now matches {} item(s), not the expected {}; nothing was deleted. Run a fresh dry run.",
                 ids.len(),
                 expected.unwrap_or(0)
-            )));
+            ))));
         }
         c.delete_items_in(document.clone(), ids.clone())?;
         // KiCad 10 leaves DeleteItems' per-item results empty: prove absence by readback
@@ -740,20 +763,23 @@ async fn handle_delete_routing(
             .filter(|i| gone.contains(i.id.as_str()))
             .count();
         if survivors > 0 {
-            return Ok(Err(format!(
+            return Ok(Err(CallToolResult::error(format!(
                 "KiCad accepted the delete but {survivors} of {} selected item(s) are still on the board.",
                 ids.len()
-            )));
+            ))));
         }
         Ok(Ok((summary, kept_locked, true)))
     });
     match outcome {
-        Err(message) => Ok(CallToolResult::error(message)),
+        Err(refusal) => Ok(refusal),
         Ok((summary, kept_locked, deleted)) => {
             let mut body = summary;
             body["dry_run"] = json!(dry_run);
             body["deleted"] = json!(deleted);
             body["locked_kept"] = json!(kept_locked);
+            if let Some(n) = uuids_named {
+                body["uuids_named"] = json!(n);
+            }
             body["source"] = json!("ipc");
             if dry_run {
                 body["next"] =
@@ -1737,6 +1763,178 @@ mod delete_trace_tests {
             2,
             "only the unlocked track inside the area went"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_routing_by_uuids_dry_runs_applies_and_refuses_unknown_uuids() {
+        use prost::Message;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let track = |id: &str, net: &str, locked: bool| {
+            let mut t = konnect_ipc::builders::build_track(net, 1, "F.Cu", 0.2, 1.0, 1.0, 2.0, 1.0);
+            t.id = Some(kiapi::common::types::Kiid { value: id.into() });
+            if locked {
+                t.locked = kiapi::common::types::LockedState::LsLocked as i32;
+            }
+            konnect_ipc::builders::pack_any(&t, "kiapi.board.types.Track")
+        };
+        let mut via = konnect_ipc::builders::build_via("GND", 1, 1.5, 1.5, 0.2, 0.45);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "v-1".into(),
+        });
+        via.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        let alive = Arc::new(Mutex::new(vec![
+            track("t-1", "GND", false),
+            track("t-2", "GND", true),
+            track("t-3", "VCC", false),
+            konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"),
+        ]));
+        let deletes = Arc::new(Mutex::new(0usize));
+        let (in_mock, deletes_in_mock) = (alive.clone(), deletes.clone());
+        let id_of = |any: &prost_types::Any| -> String {
+            if konnect_ipc::builders::any_is(any, "kiapi.board.types.Via") {
+                kiapi::board::types::Via::decode(any.value.as_slice())
+                    .ok()
+                    .and_then(|v| v.id)
+            } else {
+                kiapi::board::types::Track::decode(any.value.as_slice())
+                    .ok()
+                    .and_then(|t| t.id)
+            }
+            .map(|k| k.value)
+            .unwrap_or_default()
+        };
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: in_mock.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *deletes_in_mock.lock().unwrap() += 1;
+                let req =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                let ids: Vec<String> = req.item_ids.into_iter().map(|k| k.value).collect();
+                in_mock
+                    .lock()
+                    .unwrap()
+                    .retain(|any| !ids.contains(&id_of(any)));
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+        let ctx = ctx_talking_to(server.address().to_string());
+        let body = |r: &CallToolResult| -> serde_json::Value {
+            match r.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                    serde_json::from_str(text).unwrap()
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        let call = |extra: serde_json::Value| {
+            let mut args = json!({ "board": board });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+
+        // A dry run of UUIDs alone keeps the locked via and counts it.
+        let dry = body(
+            &handle_delete_routing(&call(json!({ "uuids": ["t-1", "v-1"] })), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            (
+                dry["count"].clone(),
+                dry["locked_kept"].clone(),
+                dry["uuids_named"].clone(),
+                dry["deleted"].clone()
+            ),
+            (json!(1), json!(1), json!(2), json!(false))
+        );
+        // UUIDs and nets intersect.
+        let both = body(
+            &handle_delete_routing(
+                &call(json!({ "uuids": ["t-1", "t-3"], "nets": ["VCC"] })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(both["count"], json!(1));
+
+        // A UUID that is not a track, arc or via refuses the whole call, by name.
+        let unknown = handle_delete_routing(
+            &call(json!({ "uuids": ["t-1", "zone-9", "nothing"], "dry_run": false, "expected_count": 1 })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(unknown.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&unknown).as_deref(),
+            Some("stale_target")
+        );
+        let message = match unknown.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            message.contains("zone-9") && message.contains("nothing"),
+            "{message}"
+        );
+        // Apply needs the count, and a wrong count deletes nothing.
+        let no_count = handle_delete_routing(
+            &call(json!({ "uuids": ["t-1", "v-1"], "include_locked": true, "dry_run": false })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(no_count.is_error);
+        let wrong = handle_delete_routing(
+            &call(json!({ "uuids": ["t-1", "v-1"], "include_locked": true, "dry_run": false, "expected_count": 1 })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(wrong.is_error);
+        assert_eq!(
+            *deletes.lock().unwrap(),
+            0,
+            "no refusal reached DeleteItems"
+        );
+        assert_eq!(alive.lock().unwrap().len(), 4);
+
+        // From a plan_dogleg_fixes output_fixes file, locked included.
+        let fixes = dir.path().join("fix.fixes.json");
+        std::fs::write(&fixes, r#"{ "delete_uuids": ["t-1", "v-1"], "fixes": [] }"#).unwrap();
+        let applied = handle_delete_routing(
+            &call(json!({ "uuids_file": fixes, "include_locked": true, "dry_run": false, "expected_count": 2 })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{:?}", applied.content);
+        assert_eq!(body(&applied)["deleted"], json!(true));
+        assert_eq!(*deletes.lock().unwrap(), 1);
+        let left: Vec<String> = alive.lock().unwrap().iter().map(id_of).collect();
+        assert_eq!(left, ["t-2", "t-3"]);
     }
 
     #[tokio::test]

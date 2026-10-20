@@ -15,6 +15,8 @@
 //! | `start/get/stop_native_route_job` | the pipeline in a runner process |
 //! | `apply_route_plan` | S8 apply: a plan of any size into the open board, with a KIID ledger |
 //! | `map_route_plan_drc` | KiCad's DRC report read back onto an applied plan |
+//! | `lint_board_geometry` / `plan_dogleg_fixes` | shape lint of the saved copper, via-dogleg fix plans ([`board_lint`]) |
+//! | `render_board_layers_png` / `render_board_tiles` | renders with overlays and markers ([`board_render`]) |
 //!
 //! `apply_route_plan` is the one tool here that writes: it creates the
 //! plan's copper in the board KiCad holds open, never the saved file.
@@ -25,8 +27,8 @@ use crate::native_route_job::{
 };
 use crate::tool;
 use crate::tools::{
-    board_inspect, board_render, get_path, route_native_apply, route_plan_tools, ToolContext,
-    ToolDef,
+    board_inspect, board_lint, board_render, get_path, route_native_apply, route_plan_tools,
+    ToolContext, ToolDef,
 };
 use konnect_route::api::Generation;
 use konnect_route::check::ViolationKind;
@@ -51,7 +53,7 @@ fn board_props() -> Value {
     })
 }
 
-fn with_props(extra: Value, required: &[&str]) -> Value {
+pub(crate) fn with_props(extra: Value, required: &[&str]) -> Value {
     let mut props = board_props();
     if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
         p.extend(e.clone());
@@ -143,7 +145,7 @@ fn query_copper_schema() -> Value {
     })
 }
 
-fn render_schema() -> Value {
+pub(crate) fn render_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -156,7 +158,12 @@ fn render_schema() -> Value {
             "labels": { "type": "array", "items": { "type": "string", "enum": ["references", "pad_numbers", "nets", "zones", "none"] },
                         "description": "Labels to draw (default: references)" },
             "overlay_routing_file": { "type": "string", "description": "A routing_file ({tracks, vias}) drawn over the board, marked as planned" },
+            "overlay_routing_files": plan_files_prop("Instead of overlay_routing_file: several routing files, merged in order and drawn as one plan; a file that cannot be read is refused naming its index and path"),
             "overlay_zones_file": { "type": "string", "description": "A JSON array of add_zones entries (or {\"zones\": [...]}) drawn over the board, marked as planned" },
+            "markers": { "type": "array", "maxItems": 100000, "description": "Points to ring, mm: a bright ring of fixed pixel size with an optional short label, coloured by kind (the lint's finding kinds have fixed colours)",
+                         "items": { "type": "object", "additionalProperties": false, "required": ["x", "y"],
+                                    "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "label": { "type": "string" }, "kind": { "type": "string" } } } },
+            "markers_file": { "type": "string", "description": "A JSON array of markers ({x, y, label?, kind?}) or {\"markers\": [...]}, e.g. lint_board_geometry's markers_output; drawn after any inline markers" },
             "output": { "type": "string", "description": "PNG path to write (default: konnect-renders in the system temp directory)" },
             "inline": { "type": "boolean", "default": false, "description": "Also return the PNG as an MCP image content item (base64)" }
         },
@@ -195,6 +202,8 @@ fn trunk_schema() -> Value {
             "carve_zones": names_prop("Zones (exact names) the trunk may cut through because a refill carves them around it: neither their fill nor their outline is an obstacle, while their net's pads, vias and tracks still are. Each must be a copper zone of the board with copper on the trunk's layer. The reply gives the trunk length over each"),
             "grid_mm": { "type": "number", "minimum": 0.02, "maximum": 1, "default": 0.1, "description": "Search grid pitch" },
             "waypoint_vias": { "type": "boolean", "default": true, "description": "Put a via at each waypoint (none where the board already has one of the net). Turn off when the waypoint vias come from a plan_tap_vias file that will be applied too" },
+            "regularize": { "type": "boolean", "default": true, "description": "When the search's fit leaves a run shorter than min_segment_mm (a jog, or a short bent run into a waypoint off the search grid), solve the leg's run lengths again on whole nanometres: still exactly on its waypoints, every run 0, 45 or 90 degrees and at least min_segment_mm, checked exactly. If no such geometry clears, the fit is kept and the leg reports the forced jog and the obstacle that forced it" },
+            "min_segment_mm": { "type": "number", "minimum": 0.01, "maximum": 20, "default": 1.0, "description": "Shortest straight run (bend to bend, or bend to waypoint) regularization allows" },
             "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
         }),
         &[
@@ -254,9 +263,27 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "render_board_layers_png",
-            "Draw a window of the saved board to PNG for chosen copper layers: pads with their true outlines, tracks, arcs, vias with drills, zone outlines and (optionally) fills, rule areas and the board edge, coloured per net (stable colours; grounds slate, supplies warm), with optional reference, pad-number, net and zone labels and a mm grid. A routing_file and/or a zones file can be laid over it to review a plan before applying it. Returns the PNG path and its pixel size; inline adds the image itself. Reads the saved file only.",
+            "Draw a window of the saved board to PNG for chosen copper layers: pads with their true outlines, tracks, arcs, vias with drills, zone outlines and (optionally) fills, rule areas and the board edge, coloured per net (stable colours; grounds slate, supplies warm), with optional reference, pad-number, net and zone labels and a mm grid. A routing_file (or several, overlay_routing_files, merged in order) and/or a zones file can be laid over it to review a plan before applying it, and markers (inline or markers_file, e.g. lint_board_geometry's markers_output) ring points with a label. Returns the PNG path and its pixel size; inline adds the image itself. Reads the saved file only.",
             render_schema(),
             |args, ctx| async move { board_render::handle_render_board_layers_png(args, ctx).await }
+        ),
+        tool!(
+            "render_board_tiles",
+            "Render a window of the saved board (default: the outline) as a grid of overlapping square tiles, each drawn like render_board_layers_png for the chosen layers and scale, with optional markers (inline or a markers_file such as lint_board_geometry's markers_output). Writes tile_rRR_cCC.png files and an index.json (each tile's window, layers and marker count) to output_dir; only_tiles_with_markers skips tiles without one. Returns the paths and the index only, never the images. Reads the saved file only.",
+            board_render::tiles_schema(),
+            |args, ctx| async move { board_render::handle_render_board_tiles(args, ctx).await }
+        ),
+        tool!(
+            "lint_board_geometry",
+            "Lint the copper already on the saved board for shape defects KiCad's DRC does not judge: acute bends (also where several tracks meet, on vias and pads), short jogs, hairpins, unsplit T-junctions and collinear vertices (as add_routing's lint defines them; none counted on a via or pad, where the vertex is the connection), plus via doglegs (a chain's last segment into a via shorter than dogleg_length_mm and bent off the longer segment before it, with the via's offset from that segment's axis) and pad doglegs (the same into a pad). Filters: nets, layers, area, locked, kinds. Answers with counts by kind, layer and net, hotspots, and each finding with its UUIDs, segment lengths and interior angles; markers_output writes every finding as render markers. Reads the saved file only.",
+            board_lint::lint_schema(),
+            |args, ctx| async move { board_lint::handle_lint_board_geometry(args, ctx).await }
+        ),
+        tool!(
+            "plan_dogleg_fixes",
+            "Plan the removal of the saved board's via doglegs: each via moves to where the axis of the dogleg's longer segment meets the axes of every other track on the via (they keep their directions, extended or shortened); the short segment goes and the longer one runs straight to the new point. A via whose tracks do not meet at one point, whose point would bend an octilinear track, that sits in a pad, carries an arc or a track touching it off centre, or whose replacement adds a violation in the exact check (check_route_rules' kernel, against the board without the deleted items, as one consistent set) is reported as not fixable with the reason; pad doglegs are reported, never fixed. Writes output_plan, an add_routing routing_file of the new copper, and output_fixes with delete_uuids and a record per fix. Reads the saved file only.",
+            board_lint::plan_schema(),
+            |args, ctx| async move { board_lint::handle_plan_dogleg_fixes(args, ctx).await }
         ),
         tool!(
             "plan_tap_vias",
@@ -266,9 +293,15 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "plan_trunk",
-            "Plan one net's wide trunk on one copper layer through ordered waypoints, around every other-net obstacle on that layer (pads, vias, tracks, holes and NPTH, zones of other nets except those named in carve_zones, rule areas, the board edge, keep-out boxes and the copper of avoid_routing_files) with the board's own clearance rules. Octilinear runs with few bends, no turn sharper than 90 degrees (also across a waypoint), each leg starting and ending exactly on its waypoints; every run takes the widest width from the preferred down to the minimum that the exact check accepts, narrower within neck_radius_mm of a waypoint. Writes an add_routing routing_file (tracks plus a via per waypoint) of the legs that pass the exact check, and reports per leg its length, width profile and DC resistance from the stackup copper, and any leg or run that failed. Reads the saved file only.",
+            "Plan one net's wide trunk on one copper layer through ordered waypoints, around every other-net obstacle on that layer (pads, vias, tracks, holes and NPTH, zones of other nets except those named in carve_zones, rule areas, the board edge, keep-out boxes and the copper of avoid_routing_files) with the board's own clearance rules. Octilinear runs with few bends, no turn sharper than 90 degrees (also across a waypoint), each leg starting and ending exactly on its waypoints; with regularize (default on) no straight run is shorter than min_segment_mm (default 1) unless an obstacle forces it, which the leg then reports with the obstacle. Every run takes the widest width from the preferred down to the minimum that the exact check accepts, narrower within neck_radius_mm of a waypoint. Writes an add_routing routing_file (tracks plus a via per waypoint) of the legs that pass the exact check, lints it as lint_board_geometry would on the board (jogs, doglegs, acute bends), and reports per leg its runs, shortest segment, length, width profile and DC resistance from the stackup copper, and any leg or run that failed. Reads the saved file only.",
             trunk_schema(),
             |args, ctx| async move { route_plan_tools::handle_plan_trunk(args, ctx).await }
+        ),
+        tool!(
+            "build_route",
+            "Build one net's route on one copper layer from a polyline you specify, check it and write it as an add_routing routing_file: the hand-specification path beside plan_trunk (nothing is searched or snapped). The polyline is vertices (mm), or parallel_to: another route's chain of tracks in a routing_file offset sideways by pitch_mm to one side (for a second wide route beside the first). Widths: width_mm, or segment_widths per segment. Each end may be anchored on a pad (REF.PAD), a via by UUID or a via by position (start/end); the end vertex must lie within 1 micron of it and the anchor must be of the net with copper on the layer, else the call is refused naming the mismatch. extend_to computes the 0, 45 or 90 degree run that lands exactly on an end anchor (e.g. end with a 45 degree run into J1.4). Refused, naming the segment or vertex: a segment not 0, 45 or 90 degrees within 1 nm (unless allow_any_angle), shorter than min_segment_mm (default 0.25), a bend under min_bend_angle_deg (default 90), or segments that cross. Then the exact check (check_route_rules' kernel) against the saved board plus avoid_routing_files and a lint as lint_board_geometry would see it on the board (board tracks the route repeats exactly are set aside for both, so a hand route already on the board can be rebuilt); the file is written only when the check finds nothing. Reads the saved file only.",
+            crate::tools::route_build::schema(),
+            |args, ctx| async move { crate::tools::route_build::handle_build_route(args, ctx).await }
         ),
         tool!(
             "audit_terminal_access",
@@ -290,13 +323,14 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_route_rules",
-            "Check the copper in a routing_file against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Zone fills are left to KiCad's refill (only the interim checker treats them as copper, never those named in carve_zones). Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in. KiCad's DRC stays the final authority.",
+            "Check the copper in a routing_file (or several, merged in order and checked as one batch, so they are also checked against each other) against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Zone fills are left to KiCad's refill (only the interim checker treats them as copper, never those named in carve_zones). Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in; with routing_files each violation's routed side names its file and member. KiCad's DRC stays the final authority.",
             with_props(json!({
                 "routing_file": { "type": "string", "description": "add_routing routing_file to check" },
+                "routing_files": plan_files_prop("Instead of routing_file: several routing files merged in order and checked as one batch; a bad file or member is refused naming its index and path"),
                 "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Interim checker only: treat other nets' zone fills as copper. The S7 checker leaves every fill to KiCad's refill" },
                 "carve_zones": names_prop("Zones (exact names) a refill will carve around the copper: never treated as copper, whatever zones_are_obstacles says. Each must be a copper zone of the board"),
                 "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT }
-            }), &["board", "routing_file"]),
+            }), &["board"]),
             |args, ctx| async move { handle_check_route_rules(args, ctx).await }
         ),
         tool!(
@@ -475,6 +509,149 @@ pub(crate) fn file_must_exist(path: &Path, field: &str) -> Result<(), Refusal> {
             format!("{field} is not a file: {}", path.display()),
         ))
     }
+}
+
+/// Most files one routing-file list may name.
+pub(crate) const MAX_PLAN_FILES: usize = 256;
+
+/// One routing file of a `routing_file` / `routing_files` pair of
+/// arguments, read.
+pub(crate) struct PlanFile {
+    /// The argument it came from: the single field, or `list[i]`.
+    pub field: String,
+    pub path: PathBuf,
+    pub plan: RoutePlan,
+    /// True for a member of the list form.
+    pub listed: bool,
+}
+
+impl PlanFile {
+    /// A refusal of something in this file: under its field, naming the
+    /// path when it is a list member.
+    pub(crate) fn refusal(&self, reason: &str) -> Refusal {
+        if self.listed {
+            invalid(&self.field, &format!("{}: {reason}", self.path.display()))
+        } else {
+            invalid(&self.field, reason)
+        }
+    }
+}
+
+fn parse_plan(path: &Path) -> Result<RoutePlan, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+}
+
+/// The routing files named by `single` or by `list` (one or the other, not
+/// both), read in order; empty when neither is given. A missing file is
+/// `file_not_found` naming its field (`list[i]`) and path; a file that is
+/// not a routing_file is refused under its field.
+pub(crate) fn read_plan_files(
+    args: &Value,
+    single: &str,
+    list: &str,
+) -> Result<Vec<PlanFile>, Refusal> {
+    let one = opt_path(args, single)?;
+    let many = opt_strings(args, list)?;
+    match (one, many) {
+        (Some(_), Some(_)) => Err(invalid(list, &format!("give {single} or {list}, not both"))),
+        (Some(path), None) => {
+            file_must_exist(&path, single)?;
+            let plan = parse_plan(&path)
+                .map_err(|e| invalid(single, &format!("is not a routing_file: {e}")))?;
+            Ok(vec![PlanFile {
+                field: single.to_string(),
+                path,
+                plan,
+                listed: false,
+            }])
+        }
+        (None, Some(paths)) => {
+            if paths.len() > MAX_PLAN_FILES {
+                return Err(invalid(
+                    list,
+                    &format!("names more than {MAX_PLAN_FILES} files"),
+                ));
+            }
+            paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let field = format!("{list}[{i}]");
+                    let path = PathBuf::from(p);
+                    file_must_exist(&path, &field)?;
+                    let plan = parse_plan(&path).map_err(|e| {
+                        invalid(
+                            &field,
+                            &format!("{} is not a routing_file: {e}", path.display()),
+                        )
+                    })?;
+                    Ok(PlanFile {
+                        field,
+                        path,
+                        plan,
+                        listed: true,
+                    })
+                })
+                .collect()
+        }
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// The files' plans as one, in order: tracks file by file, then vias.
+pub(crate) fn merged_plan(files: &[PlanFile]) -> RoutePlan {
+    let mut out = RoutePlan::default();
+    for f in files {
+        out.tracks.extend(f.plan.tracks.iter().cloned());
+        out.vias.extend(f.plan.vias.iter().cloned());
+    }
+    out
+}
+
+/// The files' copper in board terms, as one batch in file order. Each file
+/// is validated on its own, so a refusal names the file (and, for a list,
+/// its index and path) and the bad member.
+pub(crate) fn routed_files(
+    board: &RouteBoard,
+    files: &[PlanFile],
+) -> Result<konnect_route::RoutedCopper, Refusal> {
+    let mut all = konnect_route::RoutedCopper::default();
+    for f in files {
+        let c = f
+            .plan
+            .to_routed(board, Generation(0))
+            .map_err(|e| f.refusal(&e.to_string()))?;
+        all.tracks.extend(c.tracks);
+        all.vias.extend(c.vias);
+    }
+    Ok(all)
+}
+
+/// Which file of `files` (merged in order by [`merged_plan`] or
+/// [`routed_files`]) holds routed track or via `index`, and its member name
+/// there.
+pub(crate) fn plan_member(files: &[PlanFile], via: bool, index: usize) -> Option<(usize, String)> {
+    let mut start = 0;
+    for (i, f) in files.iter().enumerate() {
+        let n = if via {
+            f.plan.vias.len()
+        } else {
+            f.plan.tracks.len()
+        };
+        if index < start + n {
+            let kind = if via { "vias" } else { "tracks" };
+            return Some((i, format!("{kind}[{}]", index - start)));
+        }
+        start += n;
+    }
+    None
+}
+
+/// The schema of a routing-file list argument.
+pub(crate) fn plan_files_prop(description: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": MAX_PLAN_FILES, "description": description })
 }
 
 /// A spec for the board arguments every tool shares.
@@ -1238,10 +1415,15 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(s) => s,
         Err(r) => return Ok(r),
     };
-    let file = get_path(args, "routing_file")?;
-    if let Err(r) = file_must_exist(&file, "routing_file") {
-        return Ok(r);
-    }
+    let files =
+        match read_plan_files(args, "routing_file", "routing_files") {
+            Ok(f) if f.is_empty() => return Ok(invalid(
+                "routing_file",
+                "is required: give routing_file, or routing_files to check several as one batch",
+            )),
+            Ok(f) => f,
+            Err(r) => return Ok(r),
+        };
     let zones = match opt_bool(args, "zones_are_obstacles", true) {
         Ok(b) => b,
         Err(r) => return Ok(r),
@@ -1249,18 +1431,6 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let listed = match opt_count(args, "max_listed", LISTED_DEFAULT, 10_000) {
         Ok(n) => n as usize,
         Err(r) => return Ok(r),
-    };
-    let plan: RoutePlan = match std::fs::read_to_string(&file)
-        .map_err(|e| e.to_string())
-        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(invalid(
-                "routing_file",
-                &format!("is not a routing_file: {e}"),
-            ))
-        }
     };
     let (board, rules) = match loaded(&spec) {
         Ok(v) => v,
@@ -1270,9 +1440,28 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
-    let copper = match plan.to_routed(&board, Generation(0)) {
+    let copper = match routed_files(&board, &files) {
         Ok(c) => c,
-        Err(e) => return Ok(invalid("routing_file", &e.to_string())),
+        Err(r) => return Ok(r),
+    };
+    let listed_files = files.iter().any(|f| f.listed);
+    let side = |item: &konnect_route::check::CheckedItem| -> Value {
+        use konnect_route::check::CheckedItem;
+        let mut v = serde_json::to_value(item).unwrap_or(Value::Null);
+        let found = match item {
+            CheckedItem::RoutedTrack { index } if listed_files => {
+                plan_member(&files, false, *index as usize)
+            }
+            CheckedItem::RoutedVia { index } if listed_files => {
+                plan_member(&files, true, *index as usize)
+            }
+            _ => None,
+        };
+        if let Some((file, member)) = found {
+            v["file"] = json!(file);
+            v["member"] = json!(member);
+        }
+        v
     };
     let t = std::time::Instant::now();
     let (report, checker, authoritative) = match guarded("check", || {
@@ -1321,14 +1510,27 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                 "kind": kind_name(v.kind), "x": x, "y": y,
                 "layer": v.layer.map(|l| board.layers.name(l).to_string()),
                 "required_mm": konnect_geom::nm_to_mm(i64::from(v.required)),
-                "a": v.a, "b": v.b,
+                "a": side(&v.a), "b": v.b.as_ref().map(&side),
             })
         })
         .collect();
+    let routing_files: Value = if listed_files {
+        json!(files
+            .iter()
+            .map(|f| json!({
+                "path": f.path,
+                "tracks": f.plan.tracks.len(),
+                "vias": f.plan.vias.len(),
+            }))
+            .collect::<Vec<_>>())
+    } else {
+        Value::Null
+    };
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "checker": checker,
         "authoritative": authoritative,
+        "routing_files": routing_files,
         "note": if authoritative { Value::Null } else {
             json!("The S7 checker is not built yet; the optimizer's exact checker ran instead. It covers clearance, holes, edges, keepouts, width and via size, but not track angle or segment length. KiCad DRC remains the final authority.")
         },

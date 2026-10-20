@@ -873,6 +873,111 @@ via, track and hole as an obstacle.
   answer with their full report (each failed leg or pad and why,
   `plan_written: false`) instead of the error "plan not built".
 
+### Board lint, dogleg fixes, markers and tiles
+
+All additive in `konnect-core`; no frozen type changed.
+
+- **`route_geometry::lint`** (the `add_routing` lint) hashes its joints and
+  buckets segments for the T-junction search, so a whole board lints in
+  linear time; its findings now carry the segments involved and their
+  interior angles. Verdicts and `add_routing`'s report are unchanged.
+- **`board_lint`**: `CopperIndex` (hashed track and arc ends, vias, pads and
+  tracks of one saved board), `find_doglegs` and `lint_board`. A via
+  dogleg is a track whose one end is on a via centre, shorter than
+  `dogleg_length_mm`, whose other end is a bare joint (exactly one other
+  track end, no via, no pad) with a longer track it is not collinear with
+  (turn of 1 degree or more). A pad dogleg is the same into a pad.
+- **Fix geometry.** The new via point is where the longer segment's axis
+  meets the axes of every other track ending on the via (a dogleg's longer
+  segment stands in for its short one); with no other track it is the
+  projection of the via onto that axis. Axes must meet within 2 nm; every
+  octilinear track must stay exactly octilinear at the rounded nanometre
+  point, and none may reverse or vanish. Fixes that share a track are one
+  group, accepted or refused whole.
+- **The check.** `BoardChecker` with `CheckOptions::for_routed` (what
+  `check_route_rules` runs) on the board without the deleted items: the new
+  copper of every accepted group, and the old copper as a baseline. A group
+  is refused for a violation its old copper did not have (same kind, same
+  other side); refused groups go back on the board and the rest is checked
+  again until a round finds nothing new.
+- **Tools** (`native_routing`, now 19): `lint_board_geometry`,
+  `plan_dogleg_fixes` (writes `output_plan`, a routing_file, and
+  `output_fixes` with `delete_uuids`; the routing_file stays a pure
+  `{tracks, vias}` body so `add_routing`, `check_route_rules` and the
+  render overlay read it unchanged), and `render_board_tiles`.
+  `render_board_layers_png` takes `markers` / `markers_file`.
+  `delete_routing` (`pcb_routing`) takes `uuids` / `uuids_file`; an unknown
+  UUID refuses the call with `stale_target`.
+
+### Trunk regularization, hand-built routes and routing-file lists
+
+Additive; no frozen type changed meaning.
+
+- **`TrunkTuning`** gained `regularize: bool` (serde default `true`) and
+  `min_segment: Coord` (serde default 1 mm). **`TrunkLeg`** gained
+  `regularization: Regularization` (`off`, `not_needed`, `regularized`,
+  `forced`; serde default `off`) and `forced_jog: Option<String>`, plus
+  `runs()` / `shortest_run()`; `trunk::straight_runs(pieces)` joins
+  collinear pieces whatever their widths.
+- **Regularization** runs when a leg's endpoint fit leaves a run shorter
+  than `min_segment` (or no fit at all). The search's runs are re-solved on
+  whole nanometres, a diagonal run moving `k` nm on both axes so it stays
+  exactly 45 degrees: each short run is dropped or lengthened to the
+  minimum (every combination of the first six), the remainder to the end
+  waypoint is absorbed by one run along it or by two runs of independent
+  direction (an integer 2 x 2 solve; a half-nanometre solution is skipped),
+  and only when no such candidate passes, one run of the minimum length is
+  added at any position (turns at most 90 degrees). Candidates are legal
+  only with every run at least the minimum, every turn (also from the
+  arriving leg) at most 90 degrees and no self-crossing; they are ordered by
+  their distance from the searched path both ways plus three minimum runs
+  per 45 degrees of bend (so a side step is dropped whenever moving the
+  path for it costs less), and the first 48 per phase are checked at
+  the minimum width with the exact kernel. When none passes, the fit is
+  kept, the leg is `forced`, and `forced_jog` names the first blocking
+  obstacle and where, or the waypoints' geometry when no candidate exists.
+  A lateral offset under about 0.7 mm between collinear waypoints can only
+  be made with runs of 1 mm by a 45 degree lane change that swings to one
+  side; that is what regularization produces there.
+- **`plan_trunk`** takes `regularize` and `min_segment_mm`, reports per leg
+  `regularization`, `segments` (bend to bend), `shortest_segment_mm`,
+  `segments_under_minimum` and `forced_jog`, and lints the written plan
+  (`lint`) with `board_lint::lint_planned`: the plan frozen into a copy of
+  the saved board (plus the avoided files), its nets and layers linted as
+  `lint_board_geometry` does, only findings touching planned copper kept,
+  with the default limits (jog 0.25 mm, dogleg 1 mm, 90 degrees). A board
+  track the plan repeats exactly (net, layer, ends, width) is set aside and
+  counted (`board_tracks_repeated_by_the_plan`), so re-planning copper that
+  is already on the board is not linted as zero-degree bends.
+- **`build_route`** (`route_build.rs`, `native_routing`, now 20 tools):
+  vertices or `parallel_to` (a routing file's one unbranched chain of one
+  net's tracks on the layer, run along its first listed track, collinear
+  tracks joined, offset by `pitch_mm` to `left` or `right` as drawn; each
+  octilinear offset line keeps an integer form, so corners land on whole
+  nanometres, rounding a half away; a run that would fold over is refused);
+  `extend_to` start/end turns of 0, 45 or 90 degrees solved in whole
+  nanometres for octilinear runs (a 0 degree landing needs the anchor on
+  the run's line within 1 nm, or 1 micron with `allow_any_angle`); anchors
+  (`pad`, `via_uuid`, `via_at`) within 1 micron, of the net, with copper on
+  the layer. Geometry refusals (`invalid_argument` on `vertices`,
+  `parallel_to`, `start`, `end` or `extend_to.*`) come before the exact
+  check (`check_routed` against the board with the avoided copper frozen
+  in, and with board tracks the route repeats exactly set aside and counted
+  in `check.board_tracks_repeated_set_aside`, so a hand route can be
+  rebuilt); violations are reported and nothing is written.
+- **Violation labels.** `plan_tap_vias`, `plan_trunk` and `build_route`
+  name a board item of a violation by kind, net, UUID and place (a pad as
+  `pad REF.PAD`) instead of its internal id.
+- **Routing-file lists.** `add_routing` takes `routing_files`,
+  `check_route_rules` `routing_files`, `render_board_layers_png` and
+  `render_board_tiles` `overlay_routing_files` (at most 256 each; not
+  together with the single-file field). Files are read and validated in
+  order, each on its own, so a refusal names `field[i]` and the path; the
+  merged batch is tracks file by file, then vias file by file, and is held
+  to the per-call item cap. `check_route_rules`' required arguments are now
+  `board` and one of the two forms; with a list each violation's routed
+  side carries `file` and `member`.
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

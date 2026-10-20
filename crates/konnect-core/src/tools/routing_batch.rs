@@ -11,7 +11,7 @@
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi::board::types::BoardLayer;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_ITEMS: usize = 20_000;
 const MAX_WIDTH_MM: f64 = 20.0;
@@ -201,6 +201,110 @@ pub(crate) fn parse(
     })
 }
 
+/// Most files one `routing_files` list may name.
+pub(crate) const MAX_FILES: usize = 256;
+
+/// One member of `routing_files`, as parsed: its path and its counts.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FileCounts {
+    pub path: String,
+    pub tracks: usize,
+    pub vias: usize,
+}
+
+fn read_json(path: &str) -> Result<serde_json::Value, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()))
+}
+
+/// Parse a whole `add_routing` request: inline items, one `routing_file`,
+/// or `routing_files` (at most one of the three). The files of a list are
+/// read and validated in order, each on its own so a refusal names the file
+/// and its index (`routing_files[1]`, with the path and the bad member in
+/// the reason), then merged into one batch: tracks in file order, then vias
+/// in file order. The merged batch is held to the per-call item cap.
+pub(crate) fn parse_request(args: &serde_json::Value) -> Result<(Batch, Vec<FileCounts>), Refusal> {
+    let present = |k: &str| args.get(k).is_some_and(|v| !v.is_null());
+    let inline = present("tracks") || present("vias");
+    match (present("routing_file"), present("routing_files")) {
+        (true, true) => {
+            return Err(refuse(
+                "routing_files",
+                "give routing_file or routing_files, not both",
+            ))
+        }
+        (false, true) if inline => {
+            return Err(refuse(
+                "routing_files",
+                "give the items inline or in routing_files, not both",
+            ))
+        }
+        (false, true) => {}
+        (true, false) => {
+            let Some(path) = args.get("routing_file").and_then(serde_json::Value::as_str) else {
+                return Err(refuse("routing_file", "must be a path"));
+            };
+            let file = read_json(path)
+                .map_err(|e| refuse("routing_file", format!("cannot be read as JSON: {e}")))?;
+            return parse(args, Some(&file)).map(|b| (b, Vec::new()));
+        }
+        (false, false) => return parse(args, None).map(|b| (b, Vec::new())),
+    }
+    let Some(list) = args
+        .get("routing_files")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err(refuse("routing_files", "must be an array of paths"));
+    };
+    if list.is_empty() || list.len() > MAX_FILES {
+        return Err(refuse(
+            "routing_files",
+            format!("must name from 1 to {MAX_FILES} files"),
+        ));
+    }
+    let mut merged = Batch {
+        tracks: Vec::new(),
+        vias: Vec::new(),
+        locked: args
+            .get("locked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    };
+    let mut counts = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        let field = format!("routing_files[{i}]");
+        let Some(path) = item.as_str().filter(|p| !p.is_empty()) else {
+            return Err(refuse(field, "must be a non-empty path"));
+        };
+        let file = read_json(path)
+            .map_err(|e| refuse(&field, format!("{path} cannot be read as JSON: {e}")))?;
+        let batch = parse(&serde_json::json!({}), Some(&file)).map_err(|(member, reason)| {
+            let member = if member == "routing_file" {
+                String::new()
+            } else {
+                format!("{member} ")
+            };
+            refuse(&field, format!("{path}: {member}{reason}"))
+        })?;
+        counts.push(FileCounts {
+            path: path.to_string(),
+            tracks: batch.tracks.len(),
+            vias: batch.vias.len(),
+        });
+        merged.tracks.extend(batch.tracks);
+        merged.vias.extend(batch.vias);
+    }
+    let total = merged.tracks.len() + merged.vias.len();
+    if total > MAX_ITEMS {
+        return Err(refuse(
+            "routing_files",
+            format!("{total} items in all exceed the {MAX_ITEMS} one call may carry"),
+        ));
+    }
+    Ok((merged, counts))
+}
+
 impl Batch {
     pub(crate) fn nets(&self) -> Vec<String> {
         let mut nets: Vec<String> = self
@@ -321,6 +425,8 @@ pub(crate) fn schema() -> serde_json::Value {
                 }
             },
             "routing_file": { "type": "string", "description": "Path to a JSON object {tracks, vias} used instead of the inline items" },
+            "routing_files": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": MAX_FILES,
+                               "description": "Instead of routing_file: several routing files, merged in order (tracks, then vias, file by file) and validated and linted as one batch; a bad member is refused naming its file and index" },
             "locked": { "type": "boolean", "default": false, "description": "Create every item locked, so later bulk edits and autorouters leave it alone" }
         },
         "required": ["board"]
@@ -352,8 +458,79 @@ pub(crate) struct CopperItem {
 pub(crate) struct Selection {
     pub area: Option<(f64, f64, f64, f64)>,
     pub nets: Option<Vec<String>>,
+    /// Exact KIIDs, from `uuids` or `uuids_file`. Each must name a track,
+    /// arc or via of the board, or nothing is deleted.
+    pub uuids: Option<BTreeSet<String>>,
     pub kinds: Vec<String>,
     pub include_locked: bool,
+}
+
+/// Most UUIDs one call may name.
+pub(crate) const MAX_UUIDS: usize = MAX_ITEMS;
+
+fn uuid_list(v: &serde_json::Value, field: &str) -> Result<BTreeSet<String>, Refusal> {
+    let Some(items) = v.as_array() else {
+        return Err(refuse(field, "must be an array of UUID strings"));
+    };
+    if items.is_empty() || items.len() > MAX_UUIDS {
+        return Err(refuse(
+            field,
+            format!("must hold from 1 to {MAX_UUIDS} UUIDs"),
+        ));
+    }
+    let mut out = BTreeSet::new();
+    for (i, item) in items.iter().enumerate() {
+        match item.as_str().map(str::trim) {
+            Some(u) if !u.is_empty() => {
+                out.insert(u.to_string());
+            }
+            _ => {
+                return Err(refuse(
+                    format!("{field}[{i}]"),
+                    "must be a non-empty UUID string",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `uuids` inline, or `uuids_file`: a JSON array of UUIDs, or an object
+/// whose `delete_uuids` (as `plan_dogleg_fixes` writes it) or `uuids` holds
+/// one.
+fn uuids_arg(args: &serde_json::Value) -> Result<Option<BTreeSet<String>>, Refusal> {
+    let inline = args.get("uuids").filter(|v| !v.is_null());
+    let file = args.get("uuids_file").filter(|v| !v.is_null());
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(refuse("uuids_file", "give uuids or uuids_file, not both")),
+        (Some(v), None) => uuid_list(v, "uuids").map(Some),
+        (None, Some(f)) => {
+            let Some(path) = f.as_str().filter(|p| !p.is_empty()) else {
+                return Err(refuse("uuids_file", "must be a path"));
+            };
+            let v: serde_json::Value = std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+                .map_err(|e| refuse("uuids_file", format!("cannot be read as JSON: {e}")))?;
+            let list = match &v {
+                serde_json::Value::Array(_) => &v,
+                serde_json::Value::Object(o) => {
+                    match o.get("delete_uuids").or_else(|| o.get("uuids")) {
+                        Some(list) => list,
+                        None => {
+                            return Err(refuse(
+                                "uuids_file",
+                                "holds neither an array nor a delete_uuids or uuids list",
+                            ))
+                        }
+                    }
+                }
+                _ => return Err(refuse("uuids_file", "must hold an array of UUIDs")),
+            };
+            uuid_list(list, "uuids_file").map(Some)
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 pub(crate) fn parse_selection(args: &serde_json::Value) -> Result<Selection, Refusal> {
@@ -387,10 +564,11 @@ pub(crate) fn parse_selection(args: &serde_json::Value) -> Result<Selection, Ref
             }
         }
     };
-    if area.is_none() && nets.is_none() {
+    let uuids = uuids_arg(args)?;
+    if area.is_none() && nets.is_none() && uuids.is_none() {
         return Err(refuse(
             "area",
-            "give an area, nets, or both: deleting all routing is not offered",
+            "give an area, nets or uuids (any combination): deleting all routing is not offered",
         ));
     }
     let kinds = match args.get("kinds").filter(|v| !v.is_null()) {
@@ -421,12 +599,26 @@ pub(crate) fn parse_selection(args: &serde_json::Value) -> Result<Selection, Ref
     Ok(Selection {
         area,
         nets,
+        uuids,
         kinds,
         include_locked,
     })
 }
 
 impl Selection {
+    /// The named UUIDs that are not a track, arc or via of `items`, sorted.
+    pub(crate) fn unknown_uuids(&self, items: &[CopperItem]) -> Vec<String> {
+        let Some(uuids) = &self.uuids else {
+            return Vec::new();
+        };
+        let present: BTreeSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        uuids
+            .iter()
+            .filter(|u| !present.contains(u.as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// (selected, locked items the filters matched but that were kept)
     pub(crate) fn pick<'a>(&self, items: &'a [CopperItem]) -> (Vec<&'a CopperItem>, usize) {
         let mut picked = Vec::new();
@@ -434,6 +626,11 @@ impl Selection {
         for item in items {
             if !self.kinds.iter().any(|k| k == item.kind) {
                 continue;
+            }
+            if let Some(uuids) = &self.uuids {
+                if !uuids.contains(&item.id) {
+                    continue;
+                }
             }
             if let Some(nets) = &self.nets {
                 if !nets.contains(&item.net) {
@@ -542,6 +739,8 @@ pub(crate) fn delete_schema() -> serde_json::Value {
                 "required": ["x1", "y1", "x2", "y2"]
             },
             "nets": { "type": "array", "items": { "type": "string" }, "description": "Only items on these nets" },
+            "uuids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": MAX_UUIDS, "description": "Only the tracks, arcs and vias with these UUIDs; every one must be a track, arc or via of the board or nothing is deleted. Alone or with the other filters (every filter must match)" },
+            "uuids_file": { "type": "string", "description": "Instead of uuids: a JSON file holding an array of UUIDs, or an object with a delete_uuids array (the output_fixes of plan_dogleg_fixes) or a uuids array" },
             "kinds": { "type": "array", "items": { "type": "string", "enum": ["track", "arc", "via"] }, "description": "Default: all three" },
             "include_locked": { "type": "boolean", "default": false, "description": "Also delete locked items; otherwise they are kept and counted" },
             "dry_run": { "type": "boolean", "default": true },
@@ -600,6 +799,65 @@ mod tests {
             ["b"]
         );
         assert_eq!(summarize(&s.pick(&items).0)["by_kind"], json!({ "via": 1 }));
+    }
+
+    #[test]
+    fn uuids_select_alone_or_with_other_filters_and_name_the_unknown() {
+        let items = vec![
+            item("a", "track", "GND", vec![(1.0, 1.0), (2.0, 1.0)], false),
+            item("b", "via", "GND", vec![(1.5, 1.5)], true),
+            item("c", "track", "VCC", vec![(1.0, 1.0), (2.0, 1.0)], false),
+        ];
+        let s = parse_selection(&json!({ "uuids": ["a", "c", "b"] })).unwrap();
+        let (picked, kept) = s.pick(&items);
+        assert_eq!(
+            picked.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(kept, 1, "the locked via is kept without include_locked");
+        let s = parse_selection(&json!({ "uuids": ["a", "c"], "nets": ["VCC"] })).unwrap();
+        assert_eq!(
+            s.pick(&items)
+                .0
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c"],
+            "uuids and nets intersect"
+        );
+        let s = parse_selection(&json!({ "uuids": ["a", "zone-1", "missing"] })).unwrap();
+        assert_eq!(s.unknown_uuids(&items), ["missing", "zone-1"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fixes.json");
+        std::fs::write(&file, r#"{ "delete_uuids": ["b", "a"], "fixes": [] }"#).unwrap();
+        let s = parse_selection(&json!({ "uuids_file": file, "include_locked": true })).unwrap();
+        assert_eq!(s.pick(&items).0.len(), 2);
+        let list = dir.path().join("list.json");
+        std::fs::write(&list, r#"["c"]"#).unwrap();
+        assert_eq!(
+            parse_selection(&json!({ "uuids_file": list }))
+                .unwrap()
+                .uuids
+                .unwrap()
+                .len(),
+            1
+        );
+        for (args, field) in [
+            (json!({ "uuids": [] }), "uuids"),
+            (json!({ "uuids": ["a", ""] }), "uuids[1]"),
+            (json!({ "uuids": "a" }), "uuids"),
+            (
+                json!({ "uuids": ["a"], "uuids_file": "x.json" }),
+                "uuids_file",
+            ),
+            (
+                json!({ "uuids_file": dir.path().join("none.json") }),
+                "uuids_file",
+            ),
+        ] {
+            assert_eq!(parse_selection(&args).unwrap_err().0, field, "{args}");
+        }
     }
 
     #[test]
@@ -755,6 +1013,104 @@ mod tests {
             "vias[0].type"
         );
         assert_eq!(field(json!({})), "tracks");
+    }
+
+    #[test]
+    fn routing_files_merge_in_order_and_a_bad_member_names_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: serde_json::Value| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body.to_string()).unwrap();
+            p.display().to_string()
+        };
+        let a = file(
+            "a.json",
+            json!({ "tracks": [{ "net": "A", "layer": "F.Cu", "width": 0.2, "x1": 0, "y1": 0, "x2": 1, "y2": 0 }],
+                    "vias": [{ "net": "A", "x": 1, "y": 0, "drill": 0.2, "diameter": 0.45 }] }),
+        );
+        let b = file(
+            "b.json",
+            json!({ "tracks": [{ "net": "B", "layer": "In2.Cu", "width": 1.5, "x1": 0, "y1": 5, "x2": 9, "y2": 5 },
+                               { "net": "B", "layer": "In2.Cu", "width": 1.5, "x1": 9, "y1": 5, "x2": 12, "y2": 8 }] }),
+        );
+        let c = file(
+            "c.json",
+            json!({ "vias": [{ "net": "C", "x": 20, "y": 20, "drill": 0.3, "diameter": 0.6 }] }),
+        );
+        let (batch, counts) =
+            parse_request(&json!({ "routing_files": [a, b, c], "locked": true })).unwrap();
+        assert_eq!(
+            batch
+                .tracks
+                .iter()
+                .map(|t| t.net.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B", "B"]
+        );
+        assert_eq!(
+            batch
+                .vias
+                .iter()
+                .map(|v| v.net.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "C"]
+        );
+        assert!(batch.locked);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|c| (c.tracks, c.vias))
+                .collect::<Vec<_>>(),
+            [(1, 1), (2, 0), (0, 1)]
+        );
+        // The merged batch is linted as one: B's two tracks meet at (9, 5).
+        assert_eq!(batch.segments().len(), 3);
+
+        let bad = file(
+            "bad.json",
+            json!({ "tracks": [{ "net": "B", "layer": "In2.Cu", "width": 0, "x1": 0, "y1": 0, "x2": 1, "y2": 0 }] }),
+        );
+        let (field, reason) = parse_request(&json!({ "routing_files": [a, bad] })).unwrap_err();
+        assert_eq!(field, "routing_files[1]");
+        assert!(
+            reason.contains("bad.json") && reason.contains("tracks[0].width"),
+            "{reason}"
+        );
+        let other = file("other.json", json!({ "zones": [] }));
+        let (field, reason) = parse_request(&json!({ "routing_files": [other] })).unwrap_err();
+        assert_eq!(field, "routing_files[0]");
+        assert!(reason.contains("other.json: key 'zones'"), "{reason}");
+        let missing = dir.path().join("missing.json").display().to_string();
+        let (field, reason) =
+            parse_request(&json!({ "routing_files": [a, b, missing] })).unwrap_err();
+        assert_eq!(field, "routing_files[2]");
+        assert!(reason.contains("missing.json cannot be read"), "{reason}");
+        for args in [
+            json!({ "routing_files": [a], "routing_file": b }),
+            json!({ "routing_files": [a], "tracks": [] }),
+            json!({ "routing_files": [] }),
+            json!({ "routing_files": "a.json" }),
+        ] {
+            assert_eq!(
+                parse_request(&args).unwrap_err().0,
+                "routing_files",
+                "{args}"
+            );
+        }
+        // The single file and the inline items still work.
+        assert_eq!(
+            parse_request(&json!({ "routing_file": b }))
+                .unwrap()
+                .0
+                .tracks
+                .len(),
+            2
+        );
+        assert!(parse_request(&json!({ "routing_file": b }))
+            .unwrap()
+            .1
+            .is_empty());
+        assert_eq!(parse_request(&sample()).unwrap().0.vias.len(), 1);
     }
 
     #[test]
