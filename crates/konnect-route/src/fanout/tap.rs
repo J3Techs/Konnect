@@ -6,7 +6,9 @@
 //! differences: the pads are named by the caller instead of found by net;
 //! any net qualifies, and the via need not sit inside a plane of its net;
 //! and the via must stay clear of other nets' zone fills on the target
-//! layer, so copper there can leave it. Everything else is the fanout's:
+//! layer, so copper there can leave it, except in zones the caller names to
+//! carve (a refill cuts those around the via). Everything else is the
+//! fanout's:
 //! every candidate is checked exactly against every layer (annulus and stub
 //! clearance with the resolved rules, hole to hole, hole clearance, board
 //! edge, keepouts, the via floor), a via never lands on an SMD pad of its
@@ -77,12 +79,15 @@ impl TapPlan {
 
 /// Plan a tap for each of `pads` (a pad listed twice is planned once).
 /// `target` is the layer the taps must reach: every via is a through via,
-/// and it must also clear other nets' zone fills on `target`.
+/// and it must also clear other nets' zone fills on `target`, except the
+/// fills of the zones named in `carve_zones`, which a refill will carve
+/// around the via. On the other layers nothing changes.
 pub fn plan_tap_vias(
     board: &RouteBoard,
     rules: &dyn RuleTable,
     pads: &[PadId],
     target: LayerId,
+    carve_zones: &[String],
     settings: &FanoutSettings,
 ) -> TapPlan {
     let t0 = std::time::Instant::now();
@@ -91,7 +96,16 @@ pub fn plan_tap_vias(
     s.partial_plane_fallback = false;
     s.clear_of_zones_on = Some(target);
     let policy = ArcPolicy::default();
-    let space = Space::new(board, rules, &policy, true);
+    let mut space = Space::new(board, rules, &policy, true);
+    if !carve_zones.is_empty() {
+        space.planes.retain(|p| {
+            p.layer != target
+                || !board.zones[p.zone.index()]
+                    .zone_name
+                    .as_ref()
+                    .is_some_and(|n| carve_zones.contains(n))
+        });
+    }
     let mut plan = TapPlan::default();
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
@@ -246,7 +260,14 @@ mod tests {
             .map(|p| p.id)
             .collect();
         let target = board.layers.by_name("In2.Cu").unwrap();
-        let plan = plan_tap_vias(&board, &rules, &pads, target, &FanoutSettings::default());
+        let plan = plan_tap_vias(
+            &board,
+            &rules,
+            &pads,
+            target,
+            &[],
+            &FanoutSettings::default(),
+        );
         assert!(plan.failed.is_empty(), "{:?}", plan.details);
         assert_eq!(plan.sites.len(), 2);
         for s in &plan.sites {
@@ -279,10 +300,56 @@ mod tests {
             &rules,
             &[PadId(0)],
             target,
+            &[],
             &FanoutSettings::default(),
         );
         assert_eq!(plan.sites.len(), 1);
         assert_eq!(plan.sites[0].via, None);
         assert_eq!(plan.sites[0].at, board.pads[0].center);
+    }
+
+    /// A P5V pad over a GND plane that covers all of In2.Cu, with a P3V3
+    /// zone on In2.Cu over the pad's east side and a GND via south-west.
+    fn plane_board() -> RouteBoard {
+        let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        for n in ["GND", "P5V", "P3V3"] {
+            b.net(n);
+        }
+        let c1 = b.footprint("C1", (10.0, 10.0));
+        b.smd_pad(c1, "1", "P5V", (9.5, 10.0), (0.6, 0.6), "F.Cu");
+        b.smd_pad(c1, "2", "GND", (10.5, 10.0), (0.6, 0.6), "F.Cu");
+        b.via("GND", (8.3, 11.0), 0.6, 0.3, false);
+        b.zone("GND", "In2.Cu", (0.5, 0.5, 29.5, 19.5));
+        b.zone("P3V3", "In2.Cu", (9.0, 7.0, 14.0, 13.0));
+        let mut board = b.build();
+        board.zones[0].zone_name = Some("GND plane".to_string());
+        board.zones[1].zone_name = Some("P3V3 island".to_string());
+        board
+    }
+
+    #[test]
+    fn a_carved_zone_admits_the_via_while_other_zones_and_its_own_copper_still_count() {
+        let board = plane_board();
+        let rules = UniformRules::default();
+        let target = board.layers.by_name("In2.Cu").unwrap();
+        let pad = board.pads.iter().find(|p| p.number == "1").unwrap().id;
+        let s = FanoutSettings::default();
+        // The plane covers every site on In2.Cu: nothing is legal.
+        let plan = plan_tap_vias(&board, &rules, &[pad], target, &[], &s);
+        assert!(plan.sites.is_empty());
+        assert_eq!(plan.failed.len(), 1);
+        let carve = ["GND plane".to_string()];
+        let plan = plan_tap_vias(&board, &rules, &[pad], target, &carve, &s);
+        assert!(plan.failed.is_empty(), "{:?}", plan.details);
+        let site = &plan.sites[0];
+        // Inside the carved plane, but still clear of the P3V3 zone (not
+        // carved) by radius plus clearance.
+        assert!(site.at.x <= 9_000_000 - 300_000 - 200_000, "{:?}", site.at);
+        // The plane's own net keeps its copper: the GND via stays clear.
+        let gnd_via = Shape::Circle(Circle::from_diameter(board.vias[0].center, 600_000));
+        let disc = Shape::Circle(Circle::from_diameter(site.at, 600_000));
+        assert_ne!(gap_cmp(&disc, &gnd_via, 200_000), Ordering::Less);
+        let report = check_routed(&board, &rules, &plan.routed(&board));
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
     }
 }

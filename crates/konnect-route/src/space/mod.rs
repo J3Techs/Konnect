@@ -15,7 +15,7 @@
 
 pub(crate) mod poly;
 
-use crate::api::{FootprintId, ItemKind, ItemRef, KeepoutId, LayerId, LayerMask, NetId};
+use crate::api::{FootprintId, ItemKind, ItemRef, KeepoutId, LayerId, LayerMask, NetId, ZoneId};
 use crate::board::{PadKind, RouteBoard};
 use crate::rules::{RuleSubject, RuleTable, ViaRule, WidthRule};
 use konnect_geom::{
@@ -180,6 +180,8 @@ pub(crate) struct HoleItem {
 /// One filled plane piece, indexed for containment.
 #[derive(Debug, Clone)]
 pub(crate) struct PlanePiece {
+    /// The board's zone piece this indexes.
+    pub zone: ZoneId,
     pub net: Option<NetId>,
     pub layer: LayerId,
     /// Not the layer's base pour: a higher-priority zone, or a piece KiCad
@@ -764,6 +766,7 @@ fn index_planes(board: &RouteBoard) -> Vec<PlanePiece> {
     pieces
         .par_iter()
         .map(|z| PlanePiece {
+            zone: z.id,
             net: z.net,
             layer: z.layer,
             island: z.island || Some(z.priority) != base_priority.get(z.layer),

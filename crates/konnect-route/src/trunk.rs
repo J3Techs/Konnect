@@ -8,11 +8,12 @@
 //! the largest half width a track centred there could have and still clear
 //! every obstacle on the layer by its rule ([`Field`]): other nets' pads,
 //! tracks, arcs and vias, every hole (hole clearance), the board edge, rule
-//! areas that forbid tracks, other nets' zone fills, other planned copper
-//! (`avoid`) and caller keep-out boxes. A cell is passable when the minimum
-//! width fits with a margin that covers the straight run between adjacent
-//! cell centres; outside the neck-down radius of the leg's waypoints, a
-//! cell where the preferred width does not fit costs more.
+//! areas that forbid tracks, other nets' zone fills (except zones named in
+//! `carve_zones`, which a refill cuts around the trunk), other planned
+//! copper (`avoid`) and caller keep-out boxes. A cell is passable when the
+//! minimum width fits with a margin that covers the straight run between
+//! adjacent cell centres; outside the neck-down radius of the leg's
+//! waypoints, a cell where the preferred width does not fit costs more.
 //!
 //! The search is A* over (cell, direction) with octilinear moves. A turn is
 //! at most 90°: two straight tracks meeting at more than 90° of turn make an
@@ -29,12 +30,13 @@
 //! the preferred down to the minimum that the exact check accepts.
 
 use crate::api::{Generation, ItemKind, LayerId, NetId};
-use crate::board::RouteBoard;
+use crate::board::{RouteBoard, ZonePiece};
 use crate::plan::{RoutedCopper, RoutedTrack, RoutedVia};
 use crate::rules::{RuleSubject, RuleTable};
 use crate::space::{ClearanceCache, Conflict, Space};
 use konnect_geom::{
-    gap_cmp, touches, ArcPolicy, BBox, Circle, ConvexPoly, Coord, Point, Polygon, Segment, Shape,
+    gap_cmp, point_in_polygon, touches, ArcPolicy, BBox, Circle, Containment, ConvexPoly, Coord,
+    Point, Polygon, Segment, Shape,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
@@ -63,6 +65,11 @@ pub struct TrunkSpec {
     /// Plan a via at each waypoint (skipped where the board already has a
     /// via of the net there).
     pub waypoint_vias: bool,
+    /// Zones (by name) the trunk may cut through: a refill carves them
+    /// around it, so neither their fill nor their outline is an obstacle.
+    /// Their net's pads, vias and tracks still are.
+    #[serde(default)]
+    pub carve_zones: Vec<String>,
 }
 
 /// Search tuning.
@@ -260,7 +267,7 @@ impl<'a> Obstacles<'a> {
         }
         let mut extra = Vec::new();
         for z in &board.zones {
-            if z.layer != layer || z.net == Some(net) {
+            if z.layer != layer || z.net == Some(net) || carved(z, &spec.carve_zones) {
                 continue;
             }
             let c = rules.clearance(&track, &RuleSubject::new(ItemKind::Zone, z.net), layer);
@@ -350,6 +357,68 @@ impl<'a> Obstacles<'a> {
         }
         None
     }
+}
+
+fn carved(z: &ZonePiece, carve_zones: &[String]) -> bool {
+    z.zone_name
+        .as_ref()
+        .is_some_and(|n| carve_zones.contains(n))
+}
+
+/// Length (nm) of the centre lines of `pieces` that runs over the copper
+/// of the zone named `zone` on `layer`, as saved (its fill, or its outline
+/// when it has no fill): how much of the zone a trunk cuts through.
+pub fn length_over_zone(board: &RouteBoard, layer: LayerId, zone: &str, pieces: &[Segment]) -> f64 {
+    let polys: Vec<&Polygon> = board
+        .zones
+        .iter()
+        .filter(|z| z.layer == layer && z.zone_name.as_deref() == Some(zone))
+        .map(|z| &z.region)
+        .collect();
+    let mut total = 0.0;
+    for s in pieces {
+        let (ax, ay) = (f64::from(s.a.x), f64::from(s.a.y));
+        let (dx, dy) = (f64::from(s.b.x) - ax, f64::from(s.b.y) - ay);
+        let len = dx.hypot(dy);
+        if len == 0.0 {
+            continue;
+        }
+        let bb = s.bbox();
+        for p in polys.iter().filter(|p| p.bbox().intersects(&bb)) {
+            // Where the centre line crosses the polygon's edges; each span
+            // between crossings is wholly inside or outside.
+            let mut ts = vec![0.0, 1.0];
+            for ring in p.rings() {
+                let n = ring.len();
+                for k in 0..n {
+                    let (c, d) = (ring[k], ring[(k + 1) % n]);
+                    let (cx, cy) = (f64::from(c.x), f64::from(c.y));
+                    let (ex, ey) = (f64::from(d.x) - cx, f64::from(d.y) - cy);
+                    let den = dx * ey - dy * ex;
+                    if den == 0.0 {
+                        continue;
+                    }
+                    let t = ((cx - ax) * ey - (cy - ay) * ex) / den;
+                    let u = ((cx - ax) * dy - (cy - ay) * dx) / den;
+                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+                        ts.push(t);
+                    }
+                }
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+            for w in ts.windows(2) {
+                let m = (w[0] + w[1]) / 2.0;
+                let mid = Point::new(
+                    (ax + m * dx).round() as Coord,
+                    (ay + m * dy).round() as Coord,
+                );
+                if w[1] > w[0] && point_in_polygon(mid, p) != Containment::Outside {
+                    total += (w[1] - w[0]) * len;
+                }
+            }
+        }
+    }
+    total
 }
 
 fn conflict_text(space: &Space<'_>, c: &Conflict) -> String {
@@ -1403,6 +1472,7 @@ mod tests {
             avoid: RoutedCopper::default(),
             grid: 100_000,
             waypoint_vias: true,
+            carve_zones: Vec::new(),
         }
     }
 
@@ -1517,5 +1587,79 @@ mod tests {
         assert!(!plan.legs[0].routed());
         assert!(plan.legs[0].failure.is_some());
         assert!(plan.copper(&board, s.net, s.layer).tracks.is_empty());
+    }
+
+    /// In2.Cu under a GND plane over the whole board, a P3V3 zone standing
+    /// across the straight line from y 0.5 to 20, a GND via on the line, and
+    /// a P5V zone around the far waypoint.
+    fn plane_board() -> RouteBoard {
+        let mut b = BoardBuilder::new(60.0, 40.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        for n in ["P5V", "GND", "P3V3"] {
+            b.net(n);
+        }
+        b.zone("GND", "In2.Cu", (0.5, 0.5, 59.5, 39.5));
+        b.zone("P3V3", "In2.Cu", (28.0, 0.5, 32.0, 20.0));
+        b.zone("P5V", "In2.Cu", (48.0, 6.0, 56.0, 14.0));
+        b.via("GND", (15.0, 10.0), 0.6, 0.3, false);
+        let mut board = b.build();
+        for (z, name) in board
+            .zones
+            .iter_mut()
+            .zip(["GND plane", "P3V3 island", "P5V island"])
+        {
+            z.zone_name = Some(name.to_string());
+        }
+        board
+    }
+
+    #[test]
+    fn a_carved_zone_is_no_obstacle_but_other_zones_and_its_nets_copper_are() {
+        let board = plane_board();
+        let rules = UniformRules::default();
+        // The far waypoint lies inside the trunk net's own zone.
+        let mut s = spec(&board, &[(5.0, 10.0), (52.0, 10.0)]);
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        assert!(!plan.legs[0].routed(), "the GND plane blocks every path");
+
+        s.carve_zones = vec!["GND plane".to_string()];
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        let leg = &plan.legs[0];
+        assert!(leg.routed(), "{:?} {:?}", leg.failure, leg.violations);
+        assert_eq!(leg.pieces.last().unwrap().b, mm(52.0, 10.0));
+        let island = Shape::Polygon(board.zones[1].region.clone());
+        let via = board.vias[0].shape();
+        for p in &leg.pieces {
+            let seg = Shape::Segment(*p);
+            assert_ne!(gap_cmp(&seg, &island, 200_000), Ordering::Less, "{p:?}");
+            assert_ne!(gap_cmp(&seg, &via, 200_000), Ordering::Less, "{p:?}");
+        }
+        let copper = plan.copper(&board, s.net, s.layer);
+        let report = check_routed(&board, &rules, &copper);
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        // All of it runs over the carved plane.
+        let over = length_over_zone(&board, s.layer, "GND plane", &leg.pieces);
+        assert!(
+            (over - leg.length()).abs() < 1_000.0,
+            "{over} {}",
+            leg.length()
+        );
+
+        // Carving the P3V3 zone as well opens the straight way.
+        let around = leg.length();
+        s.carve_zones.push("P3V3 island".to_string());
+        let plan = plan_trunk(&board, &rules, &s, &TrunkTuning::default());
+        assert!(plan.legs[0].routed());
+        assert!(plan.legs[0].length() < around - 5_000_000.0);
+    }
+
+    #[test]
+    fn length_over_zone_counts_only_the_stretch_inside() {
+        let board = plane_board();
+        let layer = board.layers.by_name("In2.Cu").unwrap();
+        // From x 20 to 40 at y 10: 4 mm inside the P3V3 zone (x 28 to 32).
+        let seg = Segment::new(mm(20.0, 10.0), mm(40.0, 10.0), 1_000_000);
+        let over = length_over_zone(&board, layer, "P3V3 island", &[seg]);
+        assert!((over - 4_000_000.0).abs() < 1.0, "{over}");
+        assert_eq!(length_over_zone(&board, layer, "nope", &[seg]), 0.0);
     }
 }

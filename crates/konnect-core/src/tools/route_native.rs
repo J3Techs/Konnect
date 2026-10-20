@@ -169,6 +169,7 @@ fn tap_vias_schema() -> Value {
         json!({
             "pads": names_prop("The pads to tap, as REFERENCE.NUMBER (e.g. C12.1); any net"),
             "target_layer": { "type": "string", "description": "Copper layer the tap must reach, e.g. In2.Cu: every via is a through via, and it must also clear other nets' zone fills on this layer" },
+            "carve_zones": names_prop("Zones (exact names) on target_layer that a refill will carve around the vias: a tap via may sit inside their fill. Each must be a copper zone of the board with copper on target_layer"),
             "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
             "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits" }
         }),
@@ -191,6 +192,7 @@ fn trunk_schema() -> Value {
             "keepouts": { "type": "array", "description": "Boxes the trunk copper may not touch, mm",
                           "items": box_schema("A keep-out box") },
             "avoid_routing_files": names_prop("routing_files whose copper of other nets the trunk keeps clear of (other planned trunks)"),
+            "carve_zones": names_prop("Zones (exact names) the trunk may cut through because a refill carves them around it: neither their fill nor their outline is an obstacle, while their net's pads, vias and tracks still are. Each must be a copper zone of the board with copper on the trunk's layer. The reply gives the trunk length over each"),
             "grid_mm": { "type": "number", "minimum": 0.02, "maximum": 1, "default": 0.1, "description": "Search grid pitch" },
             "waypoint_vias": { "type": "boolean", "default": true, "description": "Put a via at each waypoint (none where the board already has one of the net). Turn off when the waypoint vias come from a plan_tap_vias file that will be applied too" },
             "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
@@ -258,13 +260,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "plan_tap_vias",
-            "Plan a tap for each named pad (any net): one exact-checked through via near the pad and a stub from the pad to it on the pad's layer, so copper on target_layer can join the pad. Never via-in-pad on an SMD pad; sites of different pads clear each other; the via also clears other nets' zone fills on target_layer. A through-hole pad is its own tap. Writes an add_routing routing_file and checks it with the exact kernel. Reads the saved file only.",
+            "Plan a tap for each named pad (any net): one exact-checked through via near the pad and a stub from the pad to it on the pad's layer, so copper on target_layer can join the pad. Never via-in-pad on an SMD pad; sites of different pads clear each other; the via also clears other nets' zone fills on target_layer, except zones named in carve_zones. A through-hole pad is its own tap. Writes an add_routing routing_file and checks it with the exact kernel. Reads the saved file only.",
             tap_vias_schema(),
             |args, ctx| async move { route_plan_tools::handle_plan_tap_vias(args, ctx).await }
         ),
         tool!(
             "plan_trunk",
-            "Plan one net's wide trunk on one copper layer through ordered waypoints, around every other-net obstacle on that layer (pads, vias, tracks, holes and NPTH, zones of other nets, rule areas, the board edge, keep-out boxes and the copper of avoid_routing_files) with the board's own clearance rules. Octilinear runs with few bends, no turn sharper than 90 degrees (also across a waypoint), each leg starting and ending exactly on its waypoints; every run takes the widest width from the preferred down to the minimum that the exact check accepts, narrower within neck_radius_mm of a waypoint. Writes an add_routing routing_file (tracks plus a via per waypoint) of the legs that pass the exact check, and reports per leg its length, width profile and DC resistance from the stackup copper, and any leg or run that failed. Reads the saved file only.",
+            "Plan one net's wide trunk on one copper layer through ordered waypoints, around every other-net obstacle on that layer (pads, vias, tracks, holes and NPTH, zones of other nets except those named in carve_zones, rule areas, the board edge, keep-out boxes and the copper of avoid_routing_files) with the board's own clearance rules. Octilinear runs with few bends, no turn sharper than 90 degrees (also across a waypoint), each leg starting and ending exactly on its waypoints; every run takes the widest width from the preferred down to the minimum that the exact check accepts, narrower within neck_radius_mm of a waypoint. Writes an add_routing routing_file (tracks plus a via per waypoint) of the legs that pass the exact check, and reports per leg its length, width profile and DC resistance from the stackup copper, and any leg or run that failed. Reads the saved file only.",
             trunk_schema(),
             |args, ctx| async move { route_plan_tools::handle_plan_trunk(args, ctx).await }
         ),
@@ -288,10 +290,11 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_route_rules",
-            "Check the copper in a routing_file against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in. KiCad's DRC stays the final authority.",
+            "Check the copper in a routing_file against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Zone fills are left to KiCad's refill (only the interim checker treats them as copper, never those named in carve_zones). Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in. KiCad's DRC stays the final authority.",
             with_props(json!({
                 "routing_file": { "type": "string", "description": "add_routing routing_file to check" },
-                "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Treat other nets' zone fills as copper (a refill would carve them)" },
+                "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Interim checker only: treat other nets' zone fills as copper. The S7 checker leaves every fill to KiCad's refill" },
+                "carve_zones": names_prop("Zones (exact names) a refill will carve around the copper: never treated as copper, whatever zones_are_obstacles says. Each must be a copper zone of the board"),
                 "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT }
             }), &["board", "routing_file"]),
             |args, ctx| async move { handle_check_route_rules(args, ctx).await }
@@ -1263,6 +1266,10 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
+    let carve = match route_plan_tools::carve_zones_arg(&board, args, None) {
+        Ok(c) => c,
+        Err(r) => return Ok(r),
+    };
     let copper = match plan.to_routed(&board, Generation(0)) {
         Ok(c) => c,
         Err(e) => return Ok(invalid("routing_file", &e.to_string())),
@@ -1274,8 +1281,17 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(r) => (r, "check_routed", true),
         Err(e @ StageError::Panicked { .. }) => return Ok(stage_failure("check_routed", e)),
         Err(StageError::Unavailable { .. }) => {
+            // The interim checker treats zone pieces as copper: the carved
+            // ones are left out (ids renumbered).
+            let mut uncarved = board.clone();
+            uncarved
+                .zones
+                .retain(|z| !z.zone_name.as_ref().is_some_and(|n| carve.contains(n)));
+            for (i, z) in uncarved.zones.iter_mut().enumerate() {
+                z.id = konnect_route::api::ZoneId(i as u32);
+            }
             let ck = ExactChecker::new(
-                &board,
+                &uncarved,
                 &rules,
                 CheckerOptions {
                     zones_are_obstacles: zones,
@@ -1318,6 +1334,8 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         },
         "tracks": copper.tracks.len(),
         "vias": copper.vias.len(),
+        "zone_fills_checked": !authoritative && zones,
+        "carve_zones": carve,
         "violations": report.violations.len(),
         "by_kind": by_kind,
         "listed": first,

@@ -764,3 +764,176 @@ async fn plan_trunk_refuses_bad_arguments_before_writing() {
         assert!(!Path::new(&f.path("t.json")).exists());
     }
 }
+
+// ─── carve_zones ─────────────────────────────────────────────────────────────
+
+/// The minimal board's In1.Cu is the "GND plane" fill from 1.5 to 48.5 mm in
+/// x and 1.5 to 38.5 mm in y; J1.1 (GND, through-hole) sits on y = 20.
+#[tokio::test]
+async fn plan_trunk_cuts_through_a_carved_zone_and_keeps_clear_of_its_nets_copper() {
+    let f = files();
+    let base = json!({
+        "board": f.board(), "net": "SIG", "layer": "In1.Cu",
+        "waypoints": [{ "x": 5.0, "y": 20.0 }, { "x": 45.0, "y": 20.0 }],
+        "preferred_width_mm": 1.0, "min_width_mm": 0.2, "waypoint_vias": false
+    });
+    let plan = |out: &str, extra: Value| {
+        let a = with(
+            base.clone(),
+            with(json!({ "output_plan": f.path(out) }), extra),
+        );
+        async move {
+            route_plan_tools::handle_plan_trunk(&a, &ctx())
+                .await
+                .unwrap()
+        }
+    };
+    // The plane of another net blocks every path.
+    let r = plan("blocked.json", json!({})).await;
+    let b = body(&r);
+    assert_eq!(b["legs_routed"], 0, "{b}");
+    assert_eq!(b["carve_zones"], json!([]));
+    assert!(!Path::new(&f.path("blocked.json")).exists());
+
+    let r = plan("carved.json", json!({ "carve_zones": ["GND plane"] })).await;
+    let b = body(&r);
+    assert_eq!(b["complete"], true, "{b}");
+    assert_eq!(b["check"]["violations"], 0);
+    // It leaves y = 20 to pass J1.1, the plane net's own pad.
+    let profile = b["legs"][0]["width_profile"].as_array().unwrap();
+    assert!(
+        profile.iter().any(|p| p["from"][1] != json!(20.0)),
+        "{profile:?}"
+    );
+    // All of it runs over the carved fill.
+    let carved = &b["carve_zones"][0];
+    assert_eq!(carved["zone"], "GND plane");
+    let over = carved["length_mm"].as_f64().unwrap();
+    let total = b["totals"]["length_mm"].as_f64().unwrap();
+    assert!((over - total).abs() < 0.01, "{over} of {total}");
+    assert_eq!(carved["by_leg_mm"].as_array().unwrap().len(), 1);
+
+    // check_route_rules agrees, with the zone carved or not (the S7 check
+    // leaves fills to the refill).
+    for extra in [json!({}), json!({ "carve_zones": ["GND plane"] })] {
+        let r = route_native::handle_check_route_rules(
+            &with(
+                json!({ "board": f.board(), "routing_file": f.path("carved.json") }),
+                extra.clone(),
+            ),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let c = body(&r);
+        assert_eq!(c["violations"], 0, "{c}");
+        assert_eq!(c["zone_fills_checked"], false);
+        assert_eq!(
+            c["carve_zones"],
+            extra.get("carve_zones").cloned().unwrap_or(json!([]))
+        );
+    }
+}
+
+#[tokio::test]
+async fn plan_trunk_runs_freely_through_its_own_nets_zone() {
+    let f = files();
+    let args = json!({
+        "board": f.board(), "net": "GND", "layer": "In1.Cu", "output_plan": f.path("gnd.json"),
+        "waypoints": [{ "x": 5.0, "y": 5.0 }, { "x": 25.0, "y": 5.0 }],
+        "preferred_width_mm": 1.0, "waypoint_vias": false
+    });
+    let r = route_plan_tools::handle_plan_trunk(&args, &ctx())
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["complete"], true, "{b}");
+    assert_eq!(b["legs"][0]["bends"], 0, "straight through the GND plane");
+}
+
+#[tokio::test]
+async fn plan_tap_vias_may_place_a_via_inside_a_carved_zone() {
+    let f = files();
+    let args = json!({ "board": f.board(), "pads": ["R1.1"], "target_layer": "In1.Cu" });
+    let r = route_plan_tools::handle_plan_tap_vias(
+        &with(args.clone(), json!({ "output_plan": f.path("none.json") })),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    let b = body(&r);
+    assert_eq!(b["sites"], json!([]), "the GND fill covers In1.Cu: {b}");
+    assert_eq!(b["plan_written"], false);
+
+    let r = route_plan_tools::handle_plan_tap_vias(
+        &with(
+            args.clone(),
+            json!({ "output_plan": f.path("taps.json"), "carve_zones": ["GND plane"] }),
+        ),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    let b = body(&r);
+    assert_eq!(b["failed"], json!([]), "{b}");
+    assert_eq!(b["sites"][0]["tap"], "via");
+    assert_eq!(b["check"]["violations"], 0);
+    assert_eq!(b["carve_zones"], json!(["GND plane"]));
+}
+
+#[tokio::test]
+async fn carve_zones_must_name_a_zone_on_the_layer_used() {
+    let f = files();
+    let trunk = json!({
+        "board": f.board(), "net": "SIG", "layer": "In1.Cu", "output_plan": f.path("t.json"),
+        "waypoints": [{ "x": 5, "y": 5 }, { "x": 40, "y": 5 }],
+        "preferred_width_mm": 1.0
+    });
+    let taps = json!({
+        "board": f.board(), "pads": ["R1.1"], "target_layer": "In1.Cu",
+        "output_plan": f.path("t.json")
+    });
+    // An unknown name, a rule area's name, and a zone with no copper on
+    // the layer the tool works on.
+    for (names, layer) in [
+        (json!(["GND"]), "In1.Cu"),
+        (json!(["GND plane", "no_vias"]), "In1.Cu"),
+        (json!(["GND plane"]), "In2.Cu"),
+    ] {
+        let extra = json!({ "carve_zones": names, "layer": layer });
+        let r = route_plan_tools::handle_plan_trunk(&with(trunk.clone(), extra.clone()), &ctx())
+            .await
+            .unwrap();
+        assert!(r.is_error, "plan_trunk accepted {extra}");
+        assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
+        let extra = json!({ "carve_zones": names, "target_layer": layer });
+        let r = route_plan_tools::handle_plan_tap_vias(&with(taps.clone(), extra.clone()), &ctx())
+            .await
+            .unwrap();
+        assert!(r.is_error, "plan_tap_vias accepted {extra}");
+        assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
+        assert!(!Path::new(&f.path("t.json")).exists());
+    }
+    // check_route_rules refuses an unknown name but takes a zone on any
+    // layer.
+    std::fs::write(
+        f.path("one.json"),
+        r#"{"tracks":[{"net":"SIG","layer":"In2.Cu","width":0.2,"x1":5,"y1":35,"x2":10,"y2":35}],"vias":[]}"#,
+    )
+    .unwrap();
+    let check = |names: Value| {
+        let a =
+            json!({ "board": f.board(), "routing_file": f.path("one.json"), "carve_zones": names });
+        async move {
+            route_native::handle_check_route_rules(&a, &ctx())
+                .await
+                .unwrap()
+        }
+    };
+    let r = check(json!(["GND plane", "Nope"])).await;
+    assert!(r.is_error);
+    assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
+    assert!(text(&r).contains("'Nope'"), "{}", text(&r));
+    let r = check(json!(["GND plane"])).await;
+    assert!(!r.is_error, "{}", text(&r));
+}

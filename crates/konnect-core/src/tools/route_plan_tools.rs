@@ -16,7 +16,7 @@ use crate::tools::route_native::{
 };
 use crate::tools::{get_path, ToolContext};
 use konnect_geom::{nm_to_mm, BBox, Coord, Point};
-use konnect_route::api::{Generation, NetId};
+use konnect_route::api::{Generation, LayerId, NetId};
 use konnect_route::check::{CheckReport, CheckedItem, ViolationKind};
 use konnect_route::plan::{RoutePlan, RoutedCopper};
 use konnect_route::trunk::{TrunkSpec, TrunkTuning, ViaStatus};
@@ -67,6 +67,63 @@ fn write_plan(output: &Path, plan: &RoutePlan) -> Result<(), CallToolResult> {
             }
         },
     )
+}
+
+/// The `carve_zones` argument: exact names of zones a refill will carve
+/// around the planned copper. Each must name a copper zone of the board;
+/// with `layer`, each must also have copper there (carving it elsewhere
+/// would do nothing, so it is taken for a mistake).
+pub(crate) fn carve_zones_arg(
+    board: &RouteBoard,
+    args: &Value,
+    layer: Option<LayerId>,
+) -> Result<Vec<String>, Refusal> {
+    let Some(names) = opt_strings(args, "carve_zones")? else {
+        return Ok(Vec::new());
+    };
+    let quoted = |list: Vec<&String>| {
+        list.iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let on = |n: &String, l: Option<LayerId>| {
+        board
+            .zones
+            .iter()
+            .any(|z| z.zone_name.as_ref() == Some(n) && l.is_none_or(|l| z.layer == l))
+    };
+    let missing: Vec<&String> = names.iter().filter(|n| !on(n, None)).collect();
+    if !missing.is_empty() {
+        return Err(invalid(
+            "carve_zones",
+            &format!("no copper zone of the board is named {}", quoted(missing)),
+        ));
+    }
+    if let Some(l) = layer {
+        let off: Vec<&String> = names.iter().filter(|n| !on(n, Some(l))).collect();
+        if !off.is_empty() {
+            return Err(invalid(
+                "carve_zones",
+                &format!(
+                    "{} has no copper on {}, so there is nothing to carve there",
+                    quoted(off),
+                    board.layers.name(l)
+                ),
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// The routing_file of `copper`; empty when nothing was planned (the reply
+/// then says why, and no file is written).
+fn routing_of(board: &RouteBoard, copper: &RoutedCopper) -> Result<RoutePlan, CallToolResult> {
+    if copper.tracks.is_empty() && copper.vias.is_empty() {
+        return Ok(RoutePlan::default());
+    }
+    RoutePlan::from_routed(board, copper)
+        .map_err(|e| CallToolResult::error(format!("plan not built: {e}")))
 }
 
 fn kind_name(k: ViolationKind) -> String {
@@ -146,6 +203,10 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             &format!("'{target_name}' is not a copper layer of the board"),
         ));
     };
+    let carve = match carve_zones_arg(&board, args, Some(target)) {
+        Ok(c) => c,
+        Err(r) => return Ok(r),
+    };
     let indices = match board_inspect::named_pads(&board, &names, "pads") {
         Ok(v) => v,
         Err(r) => return Ok(r),
@@ -169,15 +230,15 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     };
     let t = std::time::Instant::now();
     let plan = match guarded("tap vias", || {
-        konnect_route::fanout::tap::plan_tap_vias(&board, &rules, &pads, target, &settings)
+        konnect_route::fanout::tap::plan_tap_vias(&board, &rules, &pads, target, &carve, &settings)
     }) {
         Ok(p) => p,
         Err(e) => return Ok(stage_failure("plan_tap_vias", e)),
     };
     let copper = plan.routed(&board);
-    let routing = match RoutePlan::from_routed(&board, &copper) {
+    let routing = match routing_of(&board, &copper) {
         Ok(r) => r,
-        Err(e) => return Ok(CallToolResult::error(format!("plan not built: {e}"))),
+        Err(r) => return Ok(r),
     };
     let report = konnect_route::check::check_routed(&board, &rules, &copper);
     let label =
@@ -243,6 +304,7 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "source": "saved_file",
         "board": spec.board,
         "target_layer": board.layers.name(target),
+        "carve_zones": carve,
         "requested": names.len(),
         "sites": sites,
         "failed": failed,
@@ -351,6 +413,7 @@ fn trunk_args(
             &format!("'{layer_name}' is not a copper layer of the board"),
         )
     })?;
+    let carve_zones = carve_zones_arg(board, args, Some(layer))?;
     let Some(points) = args.get("waypoints").and_then(Value::as_array) else {
         return Err(invalid(
             "waypoints",
@@ -446,6 +509,7 @@ fn trunk_args(
             avoid,
             grid,
             waypoint_vias,
+            carve_zones,
         },
         tuning: TrunkTuning::default(),
         avoid_files,
@@ -520,9 +584,9 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     }
     let copper = plan.copper(&board, net, layer);
     let report = konnect_route::check::check_routed(&checked_board, &rules, &copper);
-    let routing = match RoutePlan::from_routed(&board, &copper) {
+    let routing = match routing_of(&board, &copper) {
         Ok(r) => r,
-        Err(e) => return Ok(CallToolResult::error(format!("plan not built: {e}"))),
+        Err(r) => return Ok(r),
     };
 
     let layer_name = board.layers.name(layer).to_string();
@@ -603,6 +667,30 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             o
         })
         .collect();
+    // How much of each carved zone the routed legs cut through.
+    let carved: Vec<Value> = a
+        .spec
+        .carve_zones
+        .iter()
+        .map(|z| {
+            let by_leg: Vec<f64> = plan
+                .legs
+                .iter()
+                .map(|l| {
+                    if l.routed() {
+                        konnect_route::trunk::length_over_zone(&board, layer, z, &l.pieces) / 1e6
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            json!({
+                "zone": z,
+                "length_mm": round3(by_leg.iter().sum()),
+                "by_leg_mm": by_leg.into_iter().map(round3).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let routed = plan.legs.iter().filter(|l| l.routed()).count();
     let written = routing.item_count() > 0;
     if written {
@@ -642,6 +730,7 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "legs_failed": plan.legs.len() - routed,
         "legs": legs,
         "vias": vias,
+        "carve_zones": carved,
         "totals": {
             "length_mm": round3(total_len),
             "resistance_mohm": round3(total_r),

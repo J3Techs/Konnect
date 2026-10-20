@@ -841,6 +841,38 @@ All additive; nothing frozen changed meaning.
   `pcb_board` gained `add_zones`. All read the saved file except
   `add_zones`, which writes like `add_zone`.
 
+### Carved zones
+
+A zone named to carve is one a refill will cut around the new copper (a
+power trunk through a plane on the same layer, say), so planning ignores
+it. Matching is by exact zone name; the carved zone's net keeps every pad,
+via, track and hole as an obstacle.
+
+- **`TrunkSpec.carve_zones: Vec<String>`** (serde default empty): on the
+  trunk's layer, neither the fill nor the outline of a named zone is an
+  obstacle. Same-net zones were never obstacles and still are not.
+- **`trunk::length_over_zone(board, layer, zone, pieces) -> f64`**: nm of
+  the pieces' centre lines over the named zone's copper on `layer` as saved
+  (its fill, or its outline when unfilled).
+- **`fanout::tap::plan_tap_vias`** takes `carve_zones: &[String]` after
+  `target`: the named zones' plane pieces on the target layer are dropped
+  from the index, so a tap via may sit inside them. Other layers are
+  unchanged. Behaviour change for callers: one more argument (`&[]` keeps
+  the old result).
+- **Tools.** `plan_trunk`, `plan_tap_vias` and `check_route_rules` take
+  `carve_zones`. A name that matches no copper zone of the board is refused
+  (`invalid_argument`, field `carve_zones`); so is a zone with no copper on
+  the trunk's layer or on `target_layer`, since carving it would do nothing.
+  `check_route_rules` accepts a zone on any layer: its S7 check
+  (`check_routed`) leaves every fill to KiCad's refill, so only the interim
+  checker, which treats fills as copper under `zones_are_obstacles`, is
+  affected. It now reports `zone_fills_checked` and echoes `carve_zones`.
+  `plan_trunk` reports, per carved zone, `length_mm` and `by_leg_mm` over
+  the routed legs.
+- When nothing at all is planned, `plan_trunk` and `plan_tap_vias` now
+  answer with their full report (each failed leg or pad and why,
+  `plan_written: false`) instead of the error "plan not built".
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).
