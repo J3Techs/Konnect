@@ -253,6 +253,30 @@ async fn the_audit_and_plane_vias_run_on_the_saved_board() {
             .unwrap();
         assert!(r.is_error && text(&r).contains("never replaced"));
     }
+    // carve_zones: any copper zone of the board (plane vias are through
+    // vias); an unknown name or a rule area is refused before planning.
+    let carved = f.path("carved.json");
+    let r = handle_plan_plane_vias(
+        &json!({ "board": f.board(), "output_plan": carved, "carve_zones": ["GND plane"] }),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["carve_zones"], json!(["GND plane"]));
+    assert!(b["carving_sites"].is_array(), "{b}");
+    for names in [json!(["Nope"]), json!(["no_vias"])] {
+        let r = handle_plan_plane_vias(
+            &json!({ "board": f.board(), "output_plan": f.path("x.json"), "carve_zones": names }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "{names} accepted");
+        assert!(text(&r).contains("carve_zones"), "{}", text(&r));
+        assert!(!Path::new(&f.path("x.json")).exists());
+    }
 }
 
 #[tokio::test]
