@@ -395,6 +395,382 @@ async fn reproducing_a_route_already_on_the_board_checks_and_lints_clean() {
     assert_eq!(b["lint"]["defects"], 0, "{b}");
 }
 
+// ─── build_route: new vias ───────────────────────────────────────────────────
+
+fn plan_json(path: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_new_via_at_the_end_is_written_and_the_next_route_lands_on_it() {
+    let f = files();
+    // Via A east 10 mm on In2.Cu, ending on a new via.
+    let up = json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)],
+                     "start": { "via_uuid": "via-a" }, "end": { "new_via": {} } });
+    let r = build(&f, "up.json", up).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["plan_written"], true, "{b}");
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(b["anchors"]["end"]["kind"], "new_via");
+    let v = &b["new_vias"][0];
+    assert_eq!(v["end"], "end");
+    assert_eq!(v["at"], json!([20.1234, 9.8765]));
+    assert_eq!(
+        (v["diameter_mm"].as_f64(), v["drill_mm"].as_f64()),
+        (Some(0.8), Some(0.4)),
+        "the net class via"
+    );
+    assert_eq!(v["sized_from"], "net_class");
+    assert_eq!(v["carves"], json!([]));
+    let plan = plan_json(&f.path("up.json"));
+    assert_eq!(plan["tracks"].as_array().unwrap().len(), 1);
+    let vias = plan["vias"].as_array().unwrap();
+    assert_eq!(vias.len(), 1);
+    assert_eq!(
+        (
+            vias[0]["net"].as_str(),
+            vias[0]["x"].as_f64(),
+            vias[0]["y"].as_f64(),
+            vias[0]["diameter"].as_f64()
+        ),
+        (Some("PWR_A"), Some(20.1234), Some(9.8765), Some(0.8))
+    );
+
+    // The next route, on In1.Cu, starts on that via through via_at with the
+    // first plan avoided.
+    let down = json!({ "layer": "In1.Cu", "width_mm": 0.5,
+                       "vertices": [xy(20.1234, 9.8765), xy(20.1234, 20.0)],
+                       "start": { "via_at": xy(20.1234, 9.8765) },
+                       "avoid_routing_files": [f.path("up.json")] });
+    let r = build(&f, "down.json", down.clone()).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["plan_written"], true, "{b}");
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(b["anchors"]["start"]["kind"], "via");
+    assert!(
+        b["anchors"]["start"]["name"]
+            .as_str()
+            .unwrap()
+            .contains("avoid_routing_files"),
+        "{b}"
+    );
+    assert_eq!(plan_json(&f.path("down.json"))["vias"], json!([]));
+
+    // A second new via where one already is: land on it instead.
+    let mut again = down.clone();
+    again["start"] = json!({ "new_via": {} });
+    let r = build(&f, "again.json", again).await;
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(field_of(&r), "start.new_via");
+    assert!(
+        text(&r).contains("avoid_routing_files") && text(&r).contains("via_at"),
+        "{}",
+        text(&r)
+    );
+    let r = build(
+        &f,
+        "dup.json",
+        json!({ "vertices": [xy(5.0, 9.8765), xy(10.1234, 9.8765)], "end": { "new_via": {} } }),
+    )
+    .await;
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+    assert!(text(&r).contains("saved board"), "{}", text(&r));
+    assert!(!Path::new(&f.path("dup.json")).exists());
+
+    // A given size is used; a drill as wide as the via is refused.
+    let r = build(
+        &f,
+        "sized.json",
+        json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)],
+                "end": { "new_via": { "diameter_mm": 0.6, "drill_mm": 0.3 } } }),
+    )
+    .await;
+    let b = body(&r);
+    assert_eq!(b["new_vias"][0]["sized_from"], "arguments", "{b}");
+    assert_eq!(b["new_vias"][0]["diameter_mm"], 0.6);
+    let r = build(
+        &f,
+        "bad.json",
+        json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)],
+                "end": { "new_via": { "drill_mm": 0.8 } } }),
+    )
+    .await;
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_new_via_is_refused_where_it_breaks_a_site_rule_or_with_extend_to() {
+    let f = files();
+    // 1.0 mm from via B (PWR_B): copper 0.2 mm apart, under the 0.3 mm
+    // clearance; hole clearance and hole to hole are met.
+    let r = build(
+        &f,
+        "near.json",
+        json!({ "width_mm": 0.2, "vertices": [xy(5.0, 8.3765), xy(10.1234, 8.3765)], "end": { "new_via": {} } }),
+    )
+    .await;
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+    assert!(
+        text(&r).contains("via: copper clearance") && text(&r).contains("via-b"),
+        "{}",
+        text(&r)
+    );
+    assert!(!Path::new(&f.path("near.json")).exists());
+
+    // new_via and extend_to on the same end.
+    let r = build(
+        &f,
+        "turn.json",
+        json!({ "vertices": route_a(), "end": { "new_via": {} }, "extend_to": { "end": 45 } }),
+    )
+    .await;
+    assert!(r.is_error);
+    assert_eq!(field_of(&r), "extend_to.end", "{}", text(&r));
+    assert!(text(&r).contains("new_via"), "{}", text(&r));
+    // Exactly one kind of anchor per end.
+    let r = build(
+        &f,
+        "two.json",
+        json!({ "vertices": route_a(), "end": { "new_via": {}, "pad": "J1.1" } }),
+    )
+    .await;
+    assert_eq!(field_of(&r), "end", "{}", text(&r));
+}
+
+/// On In1.Cu, a SIG base pour and a PWR_B zone of priority 1 (an island)
+/// from x 15 to 25 and y 5 to 15.
+const IN1_ZONES: &str = "\t(zone (net \"SIG\") (layer \"In1.Cu\") (uuid \"z-sig\") (name \"SIG plane\")
+\t\t(polygon (pts (xy 1 1) (xy 59 1) (xy 59 44) (xy 1 44)))
+\t\t(filled_polygon (layer \"In1.Cu\") (pts (xy 1.5 1.5) (xy 58.5 1.5) (xy 58.5 43.5) (xy 1.5 43.5))))
+\t(zone (net \"PWR_B\") (layer \"In1.Cu\") (uuid \"z-b\") (name \"B island\") (priority 1)
+\t\t(polygon (pts (xy 15 5) (xy 25 5) (xy 25 15) (xy 15 15)))
+\t\t(filled_polygon (layer \"In1.Cu\") (pts (xy 15.5 5.5) (xy 24.5 5.5) (xy 24.5 14.5) (xy 15.5 14.5))))
+";
+
+#[tokio::test]
+async fn a_new_via_in_another_nets_island_needs_the_island_carved() {
+    let f = files();
+    std::fs::write(
+        f.path("demo.kicad_pcb"),
+        BOARD.replace("\t(gr_rect", &format!("{IN1_ZONES}\t(gr_rect")),
+    )
+    .unwrap();
+    let route = json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)],
+                        "start": { "via_uuid": "via-a" }, "end": { "new_via": {} } });
+    let r = build(&f, "in.json", route.clone()).await;
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+    assert!(
+        text(&r).contains("inside another net's island")
+            && text(&r).contains("B island")
+            && text(&r).contains("carve_zones"),
+        "{}",
+        text(&r)
+    );
+    let r = build(
+        &f,
+        "in.json",
+        with(route.clone(), json!({ "carve_zones": ["B island"] })),
+    )
+    .await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["plan_written"], true, "{b}");
+    assert_eq!(
+        b["new_vias"][0]["carves"],
+        json!(["B island@In1.Cu"]),
+        "{b}"
+    );
+    // B island has no copper on In2.Cu: the route itself does not cross it.
+    assert_eq!(b["carve_zones"][0]["zone"], "B island");
+    assert_eq!(b["carve_zones"][0]["route_length_mm"], 0.0);
+
+    // Without a new via, a zone with no copper on the route's layer is
+    // taken for a mistake; a rule area or unknown name always is.
+    let r = build(
+        &f,
+        "plain.json",
+        json!({ "vertices": route_a(), "carve_zones": ["B island"] }),
+    )
+    .await;
+    assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
+    assert!(text(&r).contains("new_via"), "{}", text(&r));
+    let r = build(
+        &f,
+        "plain.json",
+        with(route, json!({ "carve_zones": ["Nope"] })),
+    )
+    .await;
+    assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
+}
+
+// ─── build_route: replaces ───────────────────────────────────────────────────
+
+/// An old PWR_A track on In2.Cu from via A 5 mm east.
+const OLD_TRACK: &str = "\t(segment (start 10.1234 9.8765) (end 15.1234 9.8765) (width 1.5) (layer \"In2.Cu\") (net \"PWR_A\") (uuid \"old-a\"))\n";
+
+#[tokio::test]
+async fn replaced_copper_is_checked_and_linted_as_deleted_and_written_beside_the_plan() {
+    let f = files();
+    std::fs::write(
+        f.path("demo.kicad_pcb"),
+        BOARD.replace("\t(gr_rect", &format!("{OLD_TRACK}\t(gr_rect")),
+    )
+    .unwrap();
+    // Rebuilt 10 mm long over the old 5 mm track: overlapping it.
+    let route = json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)],
+                        "start": { "via_uuid": "via-a" } });
+    let r = build(&f, "over.json", route.clone()).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert!(
+        b["lint"]["defects"].as_u64().unwrap() > 0,
+        "the old track is reported against the new one: {b}"
+    );
+    assert!(b["replaces"].is_null());
+
+    let r = build(
+        &f,
+        "fixed.json",
+        with(route.clone(), json!({ "replaces": ["old-a"] })),
+    )
+    .await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(b["lint"]["defects"], 0, "{b}");
+    assert_eq!(b["plan_written"], true);
+    assert_eq!(b["replaces"]["uuids"], json!(["old-a"]));
+    assert_eq!(b["replaces"]["tracks"], 1);
+    assert_eq!(
+        b["check"]["against"],
+        "saved board without the replaced copper"
+    );
+    let side = f.path("fixed.replaces.json");
+    assert_eq!(b["replaces_output"], json!(side));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&side).unwrap()).unwrap();
+    assert_eq!(written["delete_uuids"], json!(["old-a"]));
+
+    // The same from a file (delete_routing's uuids_file shapes).
+    let list = f.path("list.json");
+    std::fs::write(&list, r#"{ "uuids": ["old-a"] }"#).unwrap();
+    let r = build(
+        &f,
+        "from_file.json",
+        with(route.clone(), json!({ "replaces_file": list })),
+    )
+    .await;
+    assert_eq!(body(&r)["lint"]["defects"], 0, "{}", text(&r));
+
+    // The side file is never replaced either.
+    std::fs::write(f.path("taken.replaces.json"), "{}").unwrap();
+    let r = build(
+        &f,
+        "taken.json",
+        with(route.clone(), json!({ "replaces": ["old-a"] })),
+    )
+    .await;
+    assert!(
+        r.is_error && text(&r).contains("never replaced"),
+        "{}",
+        text(&r)
+    );
+    assert!(!Path::new(&f.path("taken.json")).exists());
+}
+
+#[tokio::test]
+async fn replaces_refuses_unknown_uuids_and_anchors_on_a_replaced_via() {
+    let f = files();
+    std::fs::write(
+        f.path("demo.kicad_pcb"),
+        BOARD.replace("\t(gr_rect", &format!("{OLD_TRACK}\t(gr_rect")),
+    )
+    .unwrap();
+    let route = json!({ "vertices": [xy(10.1234, 9.8765), xy(20.1234, 9.8765)] });
+    let bad = f.path("bad_list.json");
+    std::fs::write(&bad, r#"{ "delete_uuids": ["old-a", "gone-2"] }"#).unwrap();
+    for (extra, field, words) in [
+        (json!({ "replaces": ["nope"] }), "replaces", "'nope'"),
+        (json!({ "replaces_file": bad }), "replaces_file", "'gone-2'"),
+        (
+            json!({ "replaces": ["pad-j1-1"] }),
+            "replaces",
+            "not a track, arc or via",
+        ),
+        (
+            json!({ "replaces": ["via-a"], "start": { "via_uuid": "via-a" } }),
+            "start.via_uuid",
+            "listed in replaces",
+        ),
+        (
+            json!({ "replaces": ["via-a"], "start": { "via_at": xy(10.1234, 9.8765) } }),
+            "start.via_at",
+            "listed in replaces",
+        ),
+    ] {
+        let r = build(&f, "r.json", with(route.clone(), extra.clone())).await;
+        assert!(r.is_error, "{extra} accepted");
+        assert_eq!(field_of(&r), field, "{extra}: {}", text(&r));
+        assert!(text(&r).contains(words), "{extra}: {}", text(&r));
+        assert!(!Path::new(&f.path("r.json")).exists());
+    }
+    // A new via may take a replaced via's place.
+    let r = build(
+        &f,
+        "swap.json",
+        with(
+            route,
+            json!({ "replaces": ["via-a", "old-a"], "start": { "new_via": {} } }),
+        ),
+    )
+    .await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["plan_written"], true, "{b}");
+    assert_eq!(b["replaces"]["vias"], 1);
+    assert_eq!(b["new_vias"][0]["at"], json!([10.1234, 9.8765]));
+}
+
+#[tokio::test]
+async fn check_route_rules_checks_against_the_board_without_replaced_copper() {
+    let f = files();
+    // A PWR_A track straight through via B.
+    let plan = write(
+        &f,
+        "through_b.json",
+        json!({ "tracks": [{ "net": "PWR_A", "layer": "In2.Cu", "width": 0.5, "x1": 5.0, "y1": 7.3765, "x2": 15.0, "y2": 7.3765 }] }),
+    );
+    let check = |extra: Value| {
+        let a = with(json!({ "board": f.board(), "routing_file": plan }), extra);
+        async move {
+            route_native::handle_check_route_rules(&a, &ctx())
+                .await
+                .unwrap()
+        }
+    };
+    let r = check(json!({})).await;
+    let b = body(&r);
+    assert!(b["violations"].as_u64().unwrap() >= 1, "{b}");
+    let v = &b["listed"][0];
+    let labels: Vec<&str> = [&v["a"], &v["b"]]
+        .iter()
+        .filter_map(|s| s["label"].as_str())
+        .collect();
+    assert!(labels.iter().any(|l| l.contains("via-b")), "{v}");
+    assert!(b["replaces"].is_null());
+
+    let r = check(json!({ "replaces": ["via-b"] })).await;
+    let b = body(&r);
+    assert_eq!(b["violations"], 0, "{b}");
+    assert_eq!(b["replaces"]["vias"], 1);
+    let r = check(json!({ "replaces": ["nope"] })).await;
+    assert!(r.is_error);
+    assert_eq!(field_of(&r), "replaces", "{}", text(&r));
+}
+
 // ─── plan_trunk regularization ───────────────────────────────────────────────
 
 #[tokio::test]

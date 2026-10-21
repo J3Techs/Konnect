@@ -123,6 +123,18 @@ fn names_prop(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": description })
 }
 
+/// The `replaces` argument of the tools that check a plan against the
+/// board minus the copper it replaces.
+pub(crate) fn replaces_prop() -> Value {
+    json!({ "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1,
+            "description": "UUIDs of saved-board tracks, arcs and vias the plan replaces: checked (and linted) as deleted. Each must be a track, arc or via of the saved board, else the call is refused naming it" })
+}
+
+/// The `replaces_file` argument (with or instead of `replaces`).
+pub(crate) fn replaces_file_prop() -> Value {
+    json!({ "type": "string", "description": "A JSON file of UUIDs the plan replaces, with or instead of replaces: an array, or an object whose delete_uuids or uuids holds one (the shapes delete_routing's uuids_file reads)" })
+}
+
 fn query_copper_schema() -> Value {
     json!({
         "type": "object",
@@ -176,7 +188,9 @@ fn tap_vias_schema() -> Value {
         json!({
             "pads": names_prop("The pads to tap, as REFERENCE.NUMBER (e.g. C12.1); any net"),
             "target_layer": { "type": "string", "description": "Copper layer the tap must reach, e.g. In2.Cu: every via is a through via, and it must also clear other nets' zone fills on this layer" },
-            "carve_zones": names_prop("Zones (exact names) on target_layer that a refill will carve around the vias: a tap via may sit inside their fill. Each must be a copper zone of the board with copper on target_layer"),
+            "carve_zones": names_prop("Zones (exact names) a refill will cut an antipad into around the vias, on any copper layer (a tap via is a through via and passes them all): a tap via may sit inside their islands on any layer and, on target_layer, inside their fill. Other nets' islands not named here still refuse a site. Each must be a copper zone of the board (a rule area or unknown name is refused). Each site reports in carves the named pours it actually sits in, as NAME@LAYER"),
+            "keepouts": { "type": "array", "description": "Boxes no tap via or stub may touch, mm",
+                          "items": box_schema("A keep-out box") },
             "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
             "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits" }
         }),
@@ -199,7 +213,7 @@ fn trunk_schema() -> Value {
             "keepouts": { "type": "array", "description": "Boxes the trunk copper may not touch, mm",
                           "items": box_schema("A keep-out box") },
             "avoid_routing_files": names_prop("routing_files whose copper of other nets the trunk keeps clear of (other planned trunks)"),
-            "carve_zones": names_prop("Zones (exact names) the trunk may cut through because a refill carves them around it: neither their fill nor their outline is an obstacle, while their net's pads, vias and tracks still are. Each must be a copper zone of the board with copper on the trunk's layer. The reply gives the trunk length over each"),
+            "carve_zones": names_prop("Zones (exact names) the trunk may cut through because a refill carves them around it: neither their fill nor their outline is an obstacle, while their net's pads, vias and tracks still are. Each must be a copper zone of the board with copper on the trunk's layer. The reply gives the trunk length over each, and each planned waypoint via lists the named pours it sits in (carves). Waypoint vias are not held out of other nets' islands on other layers, so nothing there needs carving"),
             "grid_mm": { "type": "number", "minimum": 0.02, "maximum": 1, "default": 0.1, "description": "Search grid pitch" },
             "waypoint_vias": { "type": "boolean", "default": true, "description": "Put a via at each waypoint (none where the board already has one of the net). Turn off when the waypoint vias come from a plan_tap_vias file that will be applied too" },
             "regularize": { "type": "boolean", "default": true, "description": "When the search's fit leaves a run shorter than min_segment_mm (a jog, or a short bent run into a waypoint off the search grid), solve the leg's run lengths again on whole nanometres: still exactly on its waypoints, every run 0, 45 or 90 degrees and at least min_segment_mm, checked exactly. If no such geometry clears, the fit is kept and the leg reports the forced jog and the obstacle that forced it" },
@@ -287,7 +301,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "plan_tap_vias",
-            "Plan a tap for each named pad (any net): one exact-checked through via near the pad and a stub from the pad to it on the pad's layer, so copper on target_layer can join the pad. Never via-in-pad on an SMD pad; sites of different pads clear each other; the via also clears other nets' zone fills on target_layer, except zones named in carve_zones. A through-hole pad is its own tap. Writes an add_routing routing_file and checks it with the exact kernel. Reads the saved file only.",
+            "Plan a tap for each named pad (any net): one exact-checked through via near the pad and a stub from the pad to it on the pad's layer, so copper on target_layer can join the pad. Never via-in-pad on an SMD pad; sites of different pads clear each other; the via stays out of other nets' islands on every layer it passes and clears other nets' zone fills on target_layer, except in zones named in carve_zones (any copper layer: a refill cuts an antipad around the via there; each site lists the pours it carves). No via or stub touches a keepouts box. A through-hole pad is its own tap. Writes an add_routing routing_file and checks it with the exact kernel. Reads the saved file only.",
             tap_vias_schema(),
             |args, ctx| async move { route_plan_tools::handle_plan_tap_vias(args, ctx).await }
         ),
@@ -299,7 +313,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "build_route",
-            "Build one net's route on one copper layer from a polyline you specify, check it and write it as an add_routing routing_file: the hand-specification path beside plan_trunk (nothing is searched or snapped). The polyline is vertices (mm), or parallel_to: another route's chain of tracks in a routing_file offset sideways by pitch_mm to one side (for a second wide route beside the first). Widths: width_mm, or segment_widths per segment. Each end may be anchored on a pad (REF.PAD), a via by UUID or a via by position (start/end); the end vertex must lie within 1 micron of it and the anchor must be of the net with copper on the layer, else the call is refused naming the mismatch. extend_to computes the 0, 45 or 90 degree run that lands exactly on an end anchor (e.g. end with a 45 degree run into J1.4). Refused, naming the segment or vertex: a segment not 0, 45 or 90 degrees within 1 nm (unless allow_any_angle), shorter than min_segment_mm (default 0.25), a bend under min_bend_angle_deg (default 90), or segments that cross. Then the exact check (check_route_rules' kernel) against the saved board plus avoid_routing_files and a lint as lint_board_geometry would see it on the board (board tracks the route repeats exactly are set aside for both, so a hand route already on the board can be rebuilt); the file is written only when the check finds nothing. Reads the saved file only.",
+            "Build one net's route on one copper layer from a polyline you specify, check it and write it as an add_routing routing_file: the hand-specification path beside plan_trunk (nothing is searched or snapped). The polyline is vertices (mm), or parallel_to: another route's chain of tracks in a routing_file offset sideways by pitch_mm to one side (for a second wide route beside the first). Widths: width_mm, or segment_widths per segment. Each end may be anchored on a pad (REF.PAD), a via by UUID or a via by position (start/end); the end vertex must lie within 1 micron of it and the anchor must be of the net with copper on the layer, else the call is refused naming the mismatch. An end may instead place new_via: a new through via of the net exactly on that vertex (net class size unless given), written with the tracks so the next build_route on another layer lands on it with via_at and this plan in avoid_routing_files; it must meet the tap-via site rules (via floor, clearances, no SMD pad of its net, outside other nets' islands on every layer unless named in carve_zones, where it lists the pours it carves), and is refused where a via of the net already is or with extend_to on the same end. extend_to computes the 0, 45 or 90 degree run that lands exactly on an end anchor (e.g. end with a 45 degree run into J1.4). Refused, naming the segment or vertex: a segment not 0, 45 or 90 degrees within 1 nm (unless allow_any_angle), shorter than min_segment_mm (default 0.25), a bend under min_bend_angle_deg (default 90), or segments that cross. Then the exact check (check_route_rules' kernel) against the saved board plus avoid_routing_files and a lint as lint_board_geometry would see it on the board (board tracks the route repeats exactly are set aside for both, so a hand route already on the board can be rebuilt; board tracks, arcs and vias named in replaces / replaces_file are treated as deleted for both, and their UUIDs are written beside the plan for delete_routing); the file is written only when the check finds nothing. Reads the saved file only.",
             crate::tools::route_build::schema(),
             |args, ctx| async move { crate::tools::route_build::handle_build_route(args, ctx).await }
         ),
@@ -313,22 +327,25 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "plan_plane_vias",
-            "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only.",
+            "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. A via must lie inside its own net's plane and outside other nets' islands on every layer, except the islands of zones named in carve_zones (a refill cuts an antipad around the via there; the reply lists the sites that carve each). Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only.",
             with_props(json!({
                 "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
                 "share_within_mm": { "type": "number", "minimum": 0, "description": "A pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" },
-                "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits, placed against the sites already chosen" }
+                "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits, placed against the sites already chosen" },
+                "carve_zones": names_prop("Zones (exact names) whose islands, on any copper layer (plane vias are through vias), may take a via: a refill cuts an antipad around it. Each must be a copper zone of the board. carving_sites lists each via that sits in a named pour, as NAME@LAYER")
             }), &["board", "output_plan"]),
             |args, ctx| async move { handle_plan_plane_vias(args, ctx).await }
         ),
         tool!(
             "check_route_rules",
-            "Check the copper in a routing_file (or several, merged in order and checked as one batch, so they are also checked against each other) against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Zone fills are left to KiCad's refill (only the interim checker treats them as copper, never those named in carve_zones). Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in; with routing_files each violation's routed side names its file and member. KiCad's DRC stays the final authority.",
+            "Check the copper in a routing_file (or several, merged in order and checked as one batch, so they are also checked against each other) against the saved board and itself with the router's exact kernel: clearance, hole clearance, hole-to-hole, edge clearance, keepouts, track width and via size, using the project's rules. Zone fills are left to KiCad's refill (only the interim checker treats them as copper, never those named in carve_zones). Board tracks, arcs and vias named in replaces / replaces_file are checked as deleted (the board as it will be once delete_routing removes them). Reports whether the authoritative S7 checker ran or the optimizer's interim exact checker stood in; with routing_files each violation's routed side names its file and member, and a board side carries a label. KiCad's DRC stays the final authority.",
             with_props(json!({
                 "routing_file": { "type": "string", "description": "add_routing routing_file to check" },
                 "routing_files": plan_files_prop("Instead of routing_file: several routing files merged in order and checked as one batch; a bad file or member is refused naming its index and path"),
                 "zones_are_obstacles": { "type": "boolean", "default": true, "description": "Interim checker only: treat other nets' zone fills as copper. The S7 checker leaves every fill to KiCad's refill" },
                 "carve_zones": names_prop("Zones (exact names) a refill will carve around the copper: never treated as copper, whatever zones_are_obstacles says. Each must be a copper zone of the board"),
+                "replaces": replaces_prop(),
+                "replaces_file": replaces_file_prop(),
                 "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT }
             }), &["board"]),
             |args, ctx| async move { handle_check_route_rules(args, ctx).await }
@@ -1186,13 +1203,55 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(b) => b,
         Err(r) => return Ok(r),
     };
+    // Plane vias are through vias: a zone on any copper layer may be carved.
+    let carve = match route_plan_tools::carve_zones_arg(&board, args, None) {
+        Ok(c) => c,
+        Err(r) => return Ok(r),
+    };
     let conn = ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default());
     let plan = match guarded("fanout", || {
-        konnect_route::fanout::plan_plane_vias(&board, &rules, &conn, &settings)
+        konnect_route::fanout::plan_plane_vias_carving(
+            &board,
+            &rules,
+            &conn,
+            &settings,
+            &[],
+            &carve,
+        )
     }) {
         Ok(p) => p,
         Err(e) => return Ok(stage_failure("plan_plane_vias", e)),
     };
+    // The sites whose via sits in a carved pour (a shared via is its
+    // host's): those pours get an antipad at the refill.
+    let own: Vec<&konnect_route::fanout::PlaneViaSite> =
+        plan.sites.iter().filter(|s| !s.shared).collect();
+    let carves = konnect_route::fanout::via_carves(
+        &board,
+        &rules,
+        &own.iter()
+            .map(|s| (s.net, s.via, s.via_diameter))
+            .collect::<Vec<_>>(),
+        &carve,
+    );
+    let mut carves_by_zone: BTreeMap<String, usize> = BTreeMap::new();
+    let mut carving_sites: Vec<Value> = Vec::new();
+    for (s, zones) in own.iter().zip(&carves) {
+        if zones.is_empty() {
+            continue;
+        }
+        let labels = route_plan_tools::carve_labels(&board, zones);
+        for l in &labels {
+            *carves_by_zone.entry(l.clone()).or_default() += 1;
+        }
+        let (x, y) = s.via.to_mm();
+        carving_sites.push(json!({
+            "pad": board_inspect::pad_label(&board, &board.pads[s.pad.index()]),
+            "net": board.net(s.net).name,
+            "x": x, "y": y,
+            "carves": labels,
+        }));
+    }
     let mm = |v: i32| konnect_geom::nm_to_mm(i64::from(v));
     let mut routing = RoutePlan::default();
     for s in &plan.sites {
@@ -1270,6 +1329,9 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "retried_sites": plan.stats.retried_sites,
         "failed": failed.len(),
         "failures": failed,
+        "carve_zones": carve,
+        "carves_by_zone": carves_by_zone,
+        "carving_sites": carving_sites,
         "plan_written": written,
         "output_plan": if written { json!(output) } else { Value::Null },
         "next": "Apply with add_routing (routing_file, locked: true), then refill zones and run DRC.",
@@ -1440,6 +1502,13 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
+    // Copper the plans replace is checked as deleted: the board as it will
+    // be once delete_routing has removed it.
+    let replaced = match route_plan_tools::replaces_arg(&board, args) {
+        Ok(r) => r,
+        Err(r) => return Ok(r),
+    };
+    let board = replaced.apply(&board);
     let copper = match routed_files(&board, &files) {
         Ok(c) => c,
         Err(r) => return Ok(r),
@@ -1448,6 +1517,9 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let side = |item: &konnect_route::check::CheckedItem| -> Value {
         use konnect_route::check::CheckedItem;
         let mut v = serde_json::to_value(item).unwrap_or(Value::Null);
+        if let CheckedItem::Board { item } = item {
+            v["label"] = json!(route_plan_tools::board_item_label(&board, *item));
+        }
         let found = match item {
             CheckedItem::RoutedTrack { index } if listed_files => {
                 plan_member(&files, false, *index as usize)
@@ -1538,6 +1610,7 @@ fn check_route_rules_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "vias": copper.vias.len(),
         "zone_fills_checked": !authoritative && zones,
         "carve_zones": carve,
+        "replaces": replaced.json(),
         "violations": report.violations.len(),
         "by_kind": by_kind,
         "listed": first,
