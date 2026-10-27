@@ -21,6 +21,7 @@ mod custom_rules;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;
+mod footprint_drills;
 pub(crate) mod footprint_fabrication;
 mod footprint_graphics;
 mod footprint_metadata;
