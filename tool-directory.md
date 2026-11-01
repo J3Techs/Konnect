@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 10 categories
-- **260 registered tools** + **7 always-visible meta-tools** = **267 total**
+- **262 registered tools** + **7 always-visible meta-tools** = **269 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -171,7 +171,7 @@ and Windows servers do not.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 12 tools
+### `sch_batch` · 14 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -184,6 +184,8 @@ and Windows servers do not.
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
+| `list_schematic_texts` | List a sheet's free text annotations (top-level `(text …)` items): text, position, rotation and UUID; `contains` filters by substring. Labels, fields and text boxes are not included. Read-only. |
+| `delete_schematic_text` | Delete one free text annotation by UUID, or by exact text with its x/y position; refuses, changing nothing, unless exactly one matches. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
@@ -205,7 +207,7 @@ and Windows servers do not.
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
-| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. A pad whose net changes while its old or new net has routed copper is a `routed_pad_net_change` conflict carrying `pad` and, by UUID, every track, arc or via touching it (`touching_copper`), or saying that only copper elsewhere on the net and zone fills are involved. `accept_pad_net_changes` (live backend; `REFERENCE.PAD` names) plans such a change when no track, arc or via touches the pad and reports `refill_needed`; the plan revision covers the list, so apply passes the same list. |
+| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. A pad whose net changes while its old or new net has routed copper is a `routed_pad_net_change` conflict carrying `pad` and, by UUID, every track, arc or via touching it (`touching_copper`), or saying that only copper elsewhere on the net and zone fills are involved. `accept_pad_net_changes` (live backend; `REFERENCE.PAD` names) plans such a change when no track, arc or via touches the pad and reports `refill_needed`; the plan revision covers the list, so apply passes the same list. `backend: "closed_pad_nets"` makes pad net changes only, in the saved board with KiCad closed, rewriting just the changed pads' `(net …)` clauses; it is the path for footprints whose pad fabrication properties the live update refuses to rebuild. |
 
 ### `sch_hierarchy` · 14 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.

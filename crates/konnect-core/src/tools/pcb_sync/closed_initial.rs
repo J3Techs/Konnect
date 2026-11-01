@@ -754,7 +754,7 @@ impl Inventory {
 }
 
 /// One saved footprint in the planner's terms.
-fn file_footprint(node: &SexpNode, index: usize) -> BoardFootprint {
+pub(super) fn file_footprint(node: &SexpNode, index: usize) -> BoardFootprint {
     let at = node.find("at");
     let attr = node
         .find("attr")
@@ -855,7 +855,7 @@ fn identity_values(content: &str) -> (HashSet<String>, usize) {
 // ─── Text helpers ────────────────────────────────────────────────────────────
 
 /// `value` as a KiCad string literal.
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for character in value.chars() {

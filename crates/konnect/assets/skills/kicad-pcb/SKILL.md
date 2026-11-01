@@ -120,6 +120,12 @@ Follow this sequence for a clean PCB workflow:
    is sent (KiCad 10's typed API would drop it): close the board and use the same
    placement tool, whose closed-board file path keeps every pad clause. Read the
    properties back with `get_component_pads` and `source: "saved"`.
+   A later pin swap on such a footprint (the live sync's
+   `fabrication_property_rebuild_refused`) uses `backend: "closed_pad_nets"`
+   with the board saved and closed: the same plan and `accept_pad_net_changes`
+   rules, checked against the saved copper, written as one atomic edit of only
+   the changed pads' `(net …)` clauses. It refuses any other change. Reopen the
+   board, refill zones and run DRC afterwards.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
