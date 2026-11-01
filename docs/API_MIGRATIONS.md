@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: closed-board pad net sync for footprints with pad fabrication properties
+
+`update_pcb_from_schematic` accepts `backend: "closed_pad_nets"`. The live
+backend refuses to update a footprint whose saved or library pads carry a
+fabrication property (`fabrication_property_rebuild_refused`), because KiCad 10
+re-creates the pads of a footprint sent back through `UpdateItems` without it.
+That left no Konnect path for a pin swap on a placed, routed BGA.
+
+`closed_pad_nets` plans from the saved board with the live planner's rules,
+including `accept_pad_net_changes` and its touching-copper check, made here
+against the saved tracks, arcs and vias (a pad the saved-board loader does not
+read counts as unknown, never as untouched). Like `closed_initial`, it requires
+KiCad provably not to hold the board for the dry run and the apply, and the
+apply repeats the dry run's `plan_revision`, which covers the board bytes, the
+netlist and the acceptance list. The write is one atomic replace that changes
+only each planned pad's `(net "…")` clause; the persisted board is read back
+and every footprint's pad nets and pad fabrication-property count are checked
+against the plan.
+
+Anything else the schematic implies is refused: an added footprint, a reference,
+value, DNP or schematic-link change, a pad gaining or losing its net clause, or
+a board not in KiCad 10's names-in-place net format. The response adds
+`backend`, `closure`, `changes` (reference, footprint UUID, pad, from, to),
+`refill_needed` and `write`. There is no KiCad undo step: reopen the board,
+refill zones and run DRC afterwards. The live refusal's message now names this
+backend for pad-net-only updates. The other backends are unchanged.
+
 ## Unreleased: pad clearance and mask/paste margins, DRC rule filters
 
 **Pad clearance and mask/paste margins.** A footprint pad's `(clearance mm)`,

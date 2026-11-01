@@ -205,24 +205,30 @@ pub fn tools() -> Vec<ToolDef> {
              names the pad and every track, arc or via touching it by UUID, or says that only \
              copper elsewhere on the net and zone fills are involved; naming such a pad in \
              accept_pad_net_changes plans the change when no track, arc or via touches it \
-             (refill zones afterwards).",
+             (refill zones afterwards). backend 'closed_pad_nets' makes only pad net changes \
+             in a saved, routed board KiCad provably does not hold (even for a dry run), for \
+             footprints the live path refuses because their pads carry fabrication properties: \
+             the same plan and acceptance rules, the copper check made against the saved \
+             copper, and one atomic, revision-checked write that rewrites only each changed \
+             pad's (net …) clause. Any other change is refused there. Reopen the board, refill \
+             zones and run DRC afterwards.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
-                    "board": { "type": "string", "description": "Matching .kicad_pcb path: open in KiCad for backend 'live', closed for 'closed_initial'" },
+                    "board": { "type": "string", "description": "Matching .kicad_pcb path: open in KiCad for backend 'live', closed for 'closed_initial' and 'closed_pad_nets'" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run of the same backend" },
                     "backend": {
                         "type": "string",
-                        "enum": ["live", "closed_initial"],
+                        "enum": ["live", "closed_initial", "closed_pad_nets"],
                         "default": "live",
-                        "description": "live: KiCad IPC on the open board. closed_initial: one-time verbatim library import into the saved, closed board"
+                        "description": "live: KiCad IPC on the open board. closed_initial: one-time verbatim library import into the saved, closed board. closed_pad_nets: pad net changes only, written into the saved, closed board's pad (net …) clauses, keeping pad fabrication properties"
                     },
                     "accept_pad_net_changes": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 3 },
-                        "description": "backend live: pads (REFERENCE.PAD, e.g. J1.1) whose net change is planned although their old or new net has routed copper, provided no track, arc or via touches the pad (zone fills may; refill afterwards). A touched pad stays a conflict naming that copper. The plan revision covers this list: apply with the same list"
+                        "description": "backends live and closed_pad_nets: pads (REFERENCE.PAD, e.g. J1.1) whose net change is planned although their old or new net has routed copper, provided no track, arc or via touches the pad (zone fills may; refill afterwards). A touched pad stays a conflict naming that copper. The plan revision covers this list: apply with the same list"
                     },
                     "response_detail": {
                         "type": "string",
@@ -237,7 +243,8 @@ pub fn tools() -> Vec<ToolDef> {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
         )
-        // Live for the default backend, closed for closed_initial.
+        // Live for the default backend, closed for closed_initial and
+        // closed_pad_nets.
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ]
 }

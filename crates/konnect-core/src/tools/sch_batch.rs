@@ -309,6 +309,40 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_schematic_text(args, ctx).await }
         ),
         tool!(
+            "list_schematic_texts",
+            "List the free text annotations of one schematic sheet (top-level (text …) items, \
+             as add_schematic_text writes them): text, position, rotation and UUID. Labels, \
+             fields and text boxes are not included. 'contains' keeps only texts containing \
+             that substring (case-sensitive). Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "contains": { "type": "string", "description": "Only texts containing this substring" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_list_schematic_texts(args, ctx).await }
+        ),
+        tool!(
+            "delete_schematic_text",
+            "Delete one free text annotation (a top-level (text …) item) from a schematic \
+             sheet, named by its UUID, or by its exact text together with its x/y position. \
+             Refuses, changing nothing, when no text or more than one matches.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "uuid": { "type": "string", "description": "The text's UUID (preferred)" },
+                    "text": { "type": "string", "description": "The exact text, with x and y, when no uuid is given" },
+                    "x": { "type": "number", "description": "X position in mm" },
+                    "y": { "type": "number", "description": "Y position in mm" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_delete_schematic_text(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_layout",
             "Return a compact spatial summary of the schematic: component positions, \
              transformed drawing/pin bounds (excluding free text), and optionally wire segments \
@@ -1720,6 +1754,119 @@ async fn handle_add_schematic_text(
         "font": font_sexp,
         "uuid": uuid
     })))
+}
+
+/// One free text annotation of a sheet, with its block's byte range.
+struct SheetText {
+    text: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    uuid: Option<String>,
+    range: (usize, usize),
+}
+
+/// The sheet's top-level `(text …)` items. Texts inside symbols, labels,
+/// fields and `(text_box …)` items are not top-level texts and are skipped.
+fn sheet_texts(content: &str) -> Vec<SheetText> {
+    konnect_sexp::writer::find_direct_child_blocks(content, "kicad_sch")
+        .into_iter()
+        .filter(|&(start, end)| {
+            content[start..end]
+                .strip_prefix("(text")
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+        })
+        .filter_map(|range| {
+            let node = konnect_sexp::parse_sexp(&content[range.0..range.1]).ok()?;
+            let at = node.find("at");
+            Some(SheetText {
+                text: node.get(1)?.as_str()?.to_string(),
+                x: at.and_then(|a| a.get_f64(1)).unwrap_or(0.0),
+                y: at.and_then(|a| a.get_f64(2)).unwrap_or(0.0),
+                rotation: at.and_then(|a| a.get_f64(3)).unwrap_or(0.0),
+                uuid: node.find_str("uuid").map(str::to_string),
+                range,
+            })
+        })
+        .collect()
+}
+
+fn sheet_text_json(text: &SheetText) -> Value {
+    json!({
+        "text": text.text,
+        "x": text.x,
+        "y": text.y,
+        "rotation": text.rotation,
+        "uuid": text.uuid,
+    })
+}
+
+async fn handle_list_schematic_texts(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let contains = opt_str(args, "contains");
+    let content = read_consistent(&sch_path)?;
+    let texts = sheet_texts(&content)
+        .into_iter()
+        .filter(|t| contains.is_none_or(|c| t.text.contains(c)))
+        .map(|t| sheet_text_json(&t))
+        .collect::<Vec<_>>();
+    Ok(CallToolResult::json(&json!({
+        "count": texts.len(),
+        "texts": texts,
+    })))
+}
+
+async fn handle_delete_schematic_text(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const TOLERANCE: f64 = 1e-6;
+    let sch_path = get_path(args, "schematic")?;
+    let uuid = opt_str(args, "uuid");
+    let by_place = match (
+        opt_str(args, "text"),
+        opt_f64(args, "x"),
+        opt_f64(args, "y"),
+    ) {
+        (Some(text), Some(x), Some(y)) => Some((text, x, y)),
+        (None, None, None) => None,
+        _ => return Ok(invalid_arg("text", "text, x and y must be given together")),
+    };
+    if uuid.is_none() && by_place.is_none() {
+        return Ok(invalid_arg("uuid", "give uuid, or text with x and y"));
+    }
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+    let matches = sheet_texts(&content)
+        .into_iter()
+        .filter(|t| uuid.is_none_or(|u| t.uuid.as_deref() == Some(u)))
+        .filter(|t| {
+            by_place.is_none_or(|(text, x, y)| {
+                t.text == text && (t.x - x).abs() <= TOLERANCE && (t.y - y).abs() <= TOLERANCE
+            })
+        })
+        .collect::<Vec<_>>();
+    let [found] = matches.as_slice() else {
+        return Ok(CallToolResult::error(format!(
+            "{} texts match; delete_schematic_text removes exactly one. The sheet was not modified.",
+            matches.len()
+        )));
+    };
+    let Some((start, end)) =
+        konnect_sexp::writer::find_block_with_leading_whitespace(&content, found.range.0)
+    else {
+        return Ok(CallToolResult::error(
+            "The text's block could not be delimited. The sheet was not modified.",
+        ));
+    };
+    let new_content = apply_edits(content, vec![SexpEdit::delete(start, end)]);
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    Ok(CallToolResult::json(
+        &json!({ "deleted": sheet_text_json(found) }),
+    ))
 }
 
 async fn handle_get_layout(
@@ -4703,5 +4850,110 @@ mod batch_connect_options_tests {
         assert!(def.input_validator.is_valid(&args(0.0)));
         assert!(def.input_validator.is_valid(&args(2.54)));
         assert!(!def.input_validator.is_valid(&args(-1.0)));
+    }
+}
+
+#[cfg(test)]
+mod sheet_text_tests {
+    use super::tools;
+    use crate::tools::ToolContext;
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// A sheet with two free texts, a label (whose text is not a free text)
+    /// and a symbol after them, as eeschema writes it.
+    const SCH: &str = "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols)\n\t(text \"Reserved: PMIC_MOSI\"\n\t\t(at 81.28 161.29 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left bottom))\n\t\t(uuid \"t-mosi\")\n\t)\n\t(text \"Reserved: PMIC_SCLK\"\n\t\t(at 81.28 163.83 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left bottom))\n\t\t(uuid \"t-sclk\")\n\t)\n\t(label \"Reserved: not a text\"\n\t\t(at 10 10 0)\n\t\t(uuid \"l1\")\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
+
+    async fn run(name: &str, args: Value) -> (crate::mcp::protocol::CallToolResult, String) {
+        let def = tools().into_iter().find(|t| t.name == name).unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let ctx = Arc::new(ToolContext::new(
+            cfg,
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let path = args["schematic"].as_str().unwrap().to_string();
+        let result = (def.handler)(&args, ctx).await.unwrap();
+        (result, std::fs::read_to_string(path).unwrap())
+    }
+
+    fn sheet() -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn body(result: &crate::mcp::protocol::CallToolResult) -> Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).unwrap_or(json!(text))
+            }
+            _ => Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_only_the_free_texts() {
+        let f = sheet();
+        let path = f.path().to_str().unwrap();
+        let (result, _) = run("list_schematic_texts", json!({ "schematic": path })).await;
+        let listed = body(&result);
+        assert_eq!(listed["count"], 2, "{listed}");
+        assert_eq!(listed["texts"][0]["text"], "Reserved: PMIC_MOSI");
+        assert_eq!(listed["texts"][0]["y"], 161.29);
+        assert_eq!(listed["texts"][1]["uuid"], "t-sclk");
+        let (result, _) = run(
+            "list_schematic_texts",
+            json!({ "schematic": path, "contains": "SCLK" }),
+        )
+        .await;
+        assert_eq!(body(&result)["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn deletes_one_text_by_uuid_or_by_text_and_position() {
+        let f = sheet();
+        let path = f.path().to_str().unwrap();
+        let (result, after) = run(
+            "delete_schematic_text",
+            json!({ "schematic": path, "uuid": "t-mosi" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", body(&result));
+        assert!(!after.contains("PMIC_MOSI"));
+        assert!(after.contains("PMIC_SCLK") && after.contains("not a text"));
+        assert_eq!(after, SCH.replace("\n\t(text \"Reserved: PMIC_MOSI\"\n\t\t(at 81.28 161.29 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left bottom))\n\t\t(uuid \"t-mosi\")\n\t)", ""));
+        let (result, after) = run(
+            "delete_schematic_text",
+            json!({ "schematic": path, "text": "Reserved: PMIC_SCLK", "x": 81.28, "y": 163.83 }),
+        )
+        .await;
+        assert!(!result.is_error);
+        assert!(!after.contains("(text "));
+    }
+
+    #[tokio::test]
+    async fn refuses_without_exactly_one_match() {
+        let f = sheet();
+        let path = f.path().to_str().unwrap();
+        for args in [
+            json!({ "schematic": path, "uuid": "missing" }),
+            json!({ "schematic": path, "text": "Reserved: PMIC_SCLK", "x": 81.28, "y": 161.29 }),
+            json!({ "schematic": path, "uuid": "l1" }),
+            json!({ "schematic": path }),
+        ] {
+            let (result, after) = run("delete_schematic_text", args).await;
+            assert!(result.is_error);
+            assert_eq!(after, SCH);
+        }
     }
 }

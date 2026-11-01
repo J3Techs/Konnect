@@ -19,6 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 mod closed_initial;
+mod closed_pad_nets;
 mod pad_contacts;
 #[cfg(test)]
 mod pad_net_change_tests;
@@ -683,16 +684,22 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
-    let closed = match args["backend"].as_str().unwrap_or("live") {
+    let backend = args["backend"].as_str().unwrap_or("live");
+    let closed = match backend {
         "live" => false,
-        closed_initial::BACKEND => true,
+        closed_initial::BACKEND | closed_pad_nets::BACKEND => true,
         other => {
             return Ok(CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
                     field: "backend".to_string(),
-                    reason: format!("must be 'live' or 'closed_initial', got '{other}'"),
+                    reason: format!(
+                        "must be 'live', 'closed_initial' or 'closed_pad_nets', got '{other}'"
+                    ),
                 },
-                format!("Unknown backend '{other}'. Expected 'live' or 'closed_initial'."),
+                format!(
+                    "Unknown backend '{other}'. Expected 'live', 'closed_initial' or \
+                     'closed_pad_nets'."
+                ),
             ))
         }
     };
@@ -709,13 +716,13 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
         Ok(list) => list,
         Err(refusal) => return Ok(refusal),
     };
-    if closed && !accept_pad_net_changes.is_empty() {
+    if backend == closed_initial::BACKEND && !accept_pad_net_changes.is_empty() {
         return Ok(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
                 field: "accept_pad_net_changes".to_string(),
-                reason: "applies to backend live only".to_string(),
+                reason: "applies to backends live and closed_pad_nets only".to_string(),
             },
-            "accept_pad_net_changes applies to backend 'live' only: closed_initial never reassigns a routed pad.",
+            "accept_pad_net_changes applies to backends 'live' and 'closed_pad_nets' only: closed_initial never reassigns a routed pad.",
         ));
     }
     if !schematic.exists() || !board.exists() {
@@ -730,6 +737,17 @@ async fn handle_sync(args: &serde_json::Value, ctx: &ToolContext) -> Result<Call
             },
             format!("{} does not exist", missing.display()),
         ));
+    }
+    if backend == closed_pad_nets::BACKEND {
+        return closed_pad_nets::handle(
+            ctx,
+            &schematic,
+            &board,
+            dry_run,
+            expected_revision,
+            accept_pad_net_changes,
+        )
+        .await;
     }
     if closed {
         return closed_initial::handle(ctx, &schematic, &board, dry_run, expected_revision).await;
@@ -1017,8 +1035,10 @@ fn updates_that_would_drop_pad_properties(
                 footprint_conflict(
                     "fabrication_property_rebuild_refused",
                     format!(
-                        "{} Konnect has no lossless path for updating an existing footprint \
-                         like this one; use KiCad's own Update PCB from Schematic for it.",
+                        "{} Konnect has no lossless live path for updating an existing \
+                         footprint like this one. For pad net changes only, save and close the \
+                         board in KiCad and use backend 'closed_pad_nets'; otherwise use \
+                         KiCad's own Update PCB from Schematic for it.",
                         finding.reason()
                     ),
                     &finding.footprint_id,
