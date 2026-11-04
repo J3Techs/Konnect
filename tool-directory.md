@@ -284,7 +284,16 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_fields` · 2 tools
+### `pcb_fields` · 3 tools
+**Purpose:** Inspect and edit footprint fields and their documentation-layer presentation; set field values in bulk on a live or closed board.
+**Source:** [`crates/konnect-core/src/tools/pcb_fields.rs`](crates/konnect-core/src/tools/pcb_fields.rs), [`pcb_fields/values.rs`](crates/konnect-core/src/tools/pcb_fields/values.rs)
+
+| Tool | Description |
+|------|-------------|
+| `list_footprint_fields` | Inspect live mandatory and custom fields with their text, visibility, layer and board position. |
+| `edit_footprint_fields` | Dry-run and revision-bound field changes with post-commit readback and explicit uncertain-state recovery; never renumbers references or writes board files. |
+| `set_footprint_field_values` | Set, create or remove field values (MPN, LCSC, Value, any custom property) on many footprints in one call. Live boards are edited over IPC in one commit with readback; a board KiCad provably does not hold (no sibling lock) gets one revision-checked atomic write that changes only the named values (a created field copies the Value property's style, hidden; a removed one is cut). Dry run by default; an apply repeats the dry run's `plan_revision`. `edits_file` carries large batches. |
+
 ### `pcb_routing` · 18 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)

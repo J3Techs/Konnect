@@ -90,7 +90,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_fields",
         description: "Inspect and edit live footprint text, visibility, documentation-layer placement and custom properties",
         category: "pcb",
-        tool_count: 2,
+        tool_count: 3,
     },
     ToolsetMeta {
         name: "pcb_routing",

@@ -15,6 +15,7 @@ type Footprint = kiapi::board::types::FootprintInstance;
 type Field = kiapi::board::types::Field;
 const FIELD_TYPE: &str = "kiapi.board.types.Field";
 const FP_TYPE: &str = "kiapi.board.types.FootprintInstance";
+mod values;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Change {
@@ -302,10 +303,11 @@ fn select(items: Vec<prost_types::Any>, name: &str) -> Result<Footprint> {
     }
     found.with_context(|| format!("footprint '{name}' not found"))
 }
-pub(crate) fn tools() -> [ToolDef; 2] {
+pub(crate) fn tools() -> [ToolDef; 3] {
     let schema = json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"},"fields":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"visible":{"type":"boolean"},"x":{"type":"number"},"y":{"type":"number"},"layer":{"type":"string"},"size":{"type":"number"},"stroke":{"type":"number"},"centered":{"type":"boolean","description":"True centers both axes on the field anchor; false preserves existing alignment"},"font_name":{"type":"string","description":"Font family; empty string uses KiCad stroke font"},"rotation":{"type":"number"},"create":{"type":"boolean","default":false}},"required":["name"],"additionalProperties":false}},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","reference","fields"],"additionalProperties":false});
     [tool!("list_footprint_fields","Read mandatory and custom fields from an exact footprint on the requested live board.",json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"}},"required":["board","reference"],"additionalProperties":false}),|args,ctx|async move {handle_list_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
-    tool!("edit_footprint_fields","Plan or apply footprint text visibility, style, position and custom properties through live IPC. Defaults to dry run. Apply requires exact revision and verifies the complete footprint after publishing one undo entry. Never renumbers references. No file fallback.",schema,|args,ctx|async move {handle_edit_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly)]
+    tool!("edit_footprint_fields","Plan or apply footprint text visibility, style, position and custom properties through live IPC. Defaults to dry run. Apply requires exact revision and verifies the complete footprint after publishing one undo entry. Never renumbers references. No file fallback.",schema,|args,ctx|async move {handle_edit_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
+    values::tool()]
 }
 async fn handle_list_footprint_fields(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
     handle(args, ctx, false).await
@@ -551,7 +553,7 @@ mod tests {
     #[test]
     fn schemas_are_registered_and_closed() {
         let tools = super::tools();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let a = args(json!([{"name":"Value","visible":false}]));
         assert!(a.dry_run);
         assert!(!a.fields[0].create);
@@ -624,6 +626,12 @@ mod tests {
             let initial = captured.clone();
             let state = Arc::new(Mutex::new((captured, None::<Footprint>, 0usize)));
             let observed = state.clone();
+            // An absolute path on every platform: KiCad names an open board absolutely.
+            let board_path = std::env::temp_dir()
+                .join("field-test.kicad_pcb")
+                .to_string_lossy()
+                .into_owned();
+            let served_path = board_path.clone();
             let server = crate::test_support::MockIpcServer::spawn("field-commit", move |req| {
                 let msg = req.message.unwrap();
                 let mut s = observed.lock().unwrap();
@@ -634,7 +642,7 @@ mod tests {
                                 r#type: ct::DocumentType::DoctypePcb as i32,
                                 identifier: Some(
                                     ct::document_specifier::Identifier::BoardFilename(
-                                        "/field-test.kicad_pcb".into(),
+                                        served_path.clone(),
                                     ),
                                 ),
                                 project: None,
@@ -716,7 +724,7 @@ mod tests {
                 },
                 Arc::new(crate::router::ToolRouter::new()),
             );
-            let mut request = json!({"board":"/field-test.kicad_pcb","reference":name,"fields":[{"name":"Value","visible":false,"layer":"F.Fab"}]});
+            let mut request = json!({"board":board_path,"reference":name,"fields":[{"name":"Value","visible":false,"layer":"F.Fab"}]});
             let planned = body(handle(&request, &ctx, true).await.unwrap());
             assert_eq!(planned["status"], "ready");
             assert_eq!(state.lock().unwrap().0, initial);

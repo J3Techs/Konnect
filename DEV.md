@@ -101,7 +101,7 @@ Konnect/
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 14 tools (typed Sheet model, sheet-file creation and page size, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_fields.rs     # 2 live footprint field tools
+│   │           ├── pcb_fields.rs     # 3 footprint field tools (live inspection/edit; bulk values live or closed)
 │   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
 │   │           ├── pcb_routing.rs    # 15 tools (traces, vias, nets, netclasses, SES import)
