@@ -16,12 +16,26 @@ fn tools_dir() -> PathBuf {
         .join("konnect-core/src/tools")
 }
 
+/// Every `.rs` file under the tools directory, child modules in
+/// subdirectories included (a toolset may register its tools there).
 fn tool_sources() -> Vec<(PathBuf, String)> {
-    let mut sources = std::fs::read_dir(tools_dir())
-        .expect("read tools source directory")
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+    let mut paths = Vec::new();
+    let mut dirs = vec![tools_dir()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+    let mut sources = paths
+        .into_iter()
         .map(|path| {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));

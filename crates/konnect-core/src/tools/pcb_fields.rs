@@ -119,7 +119,12 @@ fn validate(a: &Args) -> Result<()> {
     }
     let mut names = BTreeSet::new();
     for c in &a.fields {
-        if c.font_name.as_ref().is_some_and(|f| f.contains(['\0', '\n', '\r'])) { bail!("font_name must be single-line"); }
+        if c.font_name
+            .as_ref()
+            .is_some_and(|f| f.contains(['\0', '\n', '\r']))
+        {
+            bail!("font_name must be single-line");
+        }
         if c.name.is_empty() || !names.insert(&c.name) {
             bail!("fields.name must be nonempty and unique");
         }
@@ -233,8 +238,13 @@ fn prepare(fp: &Footprint, changes: &[Change]) -> Result<Footprint> {
             .attributes
             .as_mut()
             .context("field has no text attributes")?;
-        if c.centered == Some(true) { attr.horizontal_alignment = 2; attr.vertical_alignment = 2; }
-        if let Some(font) = &c.font_name { attr.font_name = font.clone(); }
+        if c.centered == Some(true) {
+            attr.horizontal_alignment = 2;
+            attr.vertical_alignment = 2;
+        }
+        if let Some(font) = &c.font_name {
+            attr.font_name = font.clone();
+        }
         if let Some(s) = c.size {
             attr.size = Some(kiapi::common::types::Vector2 {
                 x_nm: builders::mm_to_nm(s),
@@ -457,9 +467,23 @@ mod tests {
     #[test]
     fn font_and_center_changes_preserve_other_field_and_footprint_data() {
         let fp = fixture();
-        let changes: Vec<Change> = serde_json::from_value(json!([{"name":"Reference","font_name":"","centered":true}])).unwrap();
+        let changes: Vec<Change> =
+            serde_json::from_value(json!([{"name":"Reference","font_name":"","centered":true}]))
+                .unwrap();
         let updated = prepare(&fp, &changes).unwrap();
-        let attrs = updated.reference_field.as_ref().unwrap().text.as_ref().unwrap().text.as_ref().unwrap().attributes.as_ref().unwrap();
+        let attrs = updated
+            .reference_field
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
         assert_eq!(attrs.font_name, "");
         assert_eq!(attrs.horizontal_alignment, 2);
         assert_eq!(attrs.vertical_alignment, 2);

@@ -974,11 +974,14 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
     let mut outside: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for p in &load.out_of_range_pads {
         if let Some(n) = p.net {
-            outside.entry(board.net(n).name.as_str()).or_default().push(format!(
-                "{}.{}",
-                p.reference.as_deref().unwrap_or("?"),
-                p.number
-            ));
+            outside
+                .entry(board.net(n).name.as_str())
+                .or_default()
+                .push(format!(
+                    "{}.{}",
+                    p.reference.as_deref().unwrap_or("?"),
+                    p.number
+                ));
         }
     }
     let named = match board_inspect::nets_arg(&board, args) {

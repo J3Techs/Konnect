@@ -55,9 +55,8 @@ pub(crate) fn parse_edits(args: &Value) -> Result<Vec<FootprintEdit>, CallToolRe
         let text = std::fs::read_to_string(p).map_err(|e| {
             super::super::invalid_arg("edits_file", &format!("could not be read: {e}"))
         })?;
-        let v: Value = serde_json::from_str(&text).map_err(|e| {
-            super::super::invalid_arg("edits_file", &format!("is not JSON: {e}"))
-        })?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| super::super::invalid_arg("edits_file", &format!("is not JSON: {e}")))?;
         let list = match v {
             Value::Array(a) => a,
             Value::Object(mut o) => match o.remove("edits") {
@@ -205,10 +204,7 @@ fn head(block: &str) -> &str {
 }
 
 /// The root `(property …)` fields of the footprint at `fp` (board offsets).
-fn saved_fields(
-    source: &str,
-    fp: (usize, usize),
-) -> Result<BTreeMap<String, SavedField>, String> {
+fn saved_fields(source: &str, fp: (usize, usize)) -> Result<BTreeMap<String, SavedField>, String> {
     let block = &source[fp.0..fp.1];
     let mut out = BTreeMap::new();
     for (s, e) in find_direct_child_blocks(block, "footprint") {
@@ -373,9 +369,7 @@ pub(crate) fn plan_saved(source: &str, edits: &[FootprintEdit]) -> Result<SavedP
                 (Some(f), None) => {
                     // Cut the block and the whitespace before it on its line.
                     let mut start = f.block.0;
-                    while start > fp.0
-                        && matches!(source.as_bytes()[start - 1], b' ' | b'\t')
-                    {
+                    while start > fp.0 && matches!(source.as_bytes()[start - 1], b' ' | b'\t') {
                         start -= 1;
                     }
                     if start > fp.0 && source.as_bytes()[start - 1] == b'\n' {
@@ -393,7 +387,10 @@ pub(crate) fn plan_saved(source: &str, edits: &[FootprintEdit]) -> Result<SavedP
             // After the last root property, on new lines with its indentation.
             let last = fields.values().map(|f| f.block).max_by_key(|b| b.1);
             let Some((ls, le)) = last else {
-                reasons.push(format!("{}: has no property to insert after", edit.reference));
+                reasons.push(format!(
+                    "{}: has no property to insert after",
+                    edit.reference
+                ));
                 continue;
             };
             let line_start = source[..ls].rfind('\n').map_or(0, |i| i + 1);
@@ -406,10 +403,7 @@ pub(crate) fn plan_saved(source: &str, edits: &[FootprintEdit]) -> Result<SavedP
             } else {
                 "\n"
             };
-            let text: String = inserts
-                .iter()
-                .map(|b| format!("{nl}{indent}{b}"))
-                .collect();
+            let text: String = inserts.iter().map(|b| format!("{nl}{indent}{b}")).collect();
             spans.push((le, le, text));
         }
         let after: BTreeMap<String, Option<String>> = edit.fields.clone();
@@ -470,7 +464,9 @@ fn verify_saved(
         for (name, v) in want {
             let got = fields.get(name).map(|f| f.value.clone());
             if got != *v {
-                return Err(format!("{reference}.{name} reads back as {got:?}, not {v:?}"));
+                return Err(format!(
+                    "{reference}.{name} reads back as {got:?}, not {v:?}"
+                ));
             }
         }
     }
@@ -577,12 +573,15 @@ pub(crate) fn tool() -> ToolDef {
             },
             "required": ["board"]
         }),
-        |args, ctx| async move { handle(args, ctx).await }
+        |args, ctx| async move { handle_set_footprint_field_values(args, ctx).await }
     )
     .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback)
 }
 
-async fn handle(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
+async fn handle_set_footprint_field_values(
+    args: &Value,
+    ctx: &ToolContext,
+) -> Result<CallToolResult> {
     let board = super::super::get_path(args, "board")?;
     let edits = match parse_edits(args) {
         Ok(e) => e,

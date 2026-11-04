@@ -1328,7 +1328,10 @@ mod tests {
         assert_eq!(p.net, b.net_by_name("GND"));
         assert_eq!(p.x_nm, 1_300_000_000);
         assert_eq!(p.y_nm, 20_500_000);
-        assert!(b.footprints.iter().all(|f| f.reference.as_deref() != Some("R7941")));
+        assert!(b
+            .footprints
+            .iter()
+            .all(|f| f.reference.as_deref() != Some("R7941")));
     }
 
     #[test]
