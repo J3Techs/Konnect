@@ -17,6 +17,7 @@ use konnect_geom::{
 };
 use konnect_route::api::{LayerMask, NetId, Ownership};
 use konnect_route::board::{Pad, PadKind, RouteBoard, Side};
+use konnect_route::loader::OutOfRangePad;
 use konnect_route::{LoadOptions, LoadReport};
 use konnect_sexp::board::{ZoneOutlineElement, ZoneRecord};
 use serde_json::{json, Value};
@@ -45,14 +46,23 @@ pub(crate) struct SavedBoard {
 impl SavedBoard {
     /// What the loader dropped or approximated, or `null` when nothing was.
     pub(crate) fn load_report_json(&self) -> Value {
-        if self.report.skipped.is_empty() && self.report.notes.is_empty() && self.zones_skipped == 0
+        if self.report.skipped.is_empty()
+            && self.report.notes.is_empty()
+            && self.zones_skipped == 0
+            && self.report.out_of_range_pads.is_empty()
         {
             return Value::Null;
+        }
+        let mut out_of_range: BTreeSet<&str> = BTreeSet::new();
+        for p in &self.report.out_of_range_pads {
+            out_of_range.insert(p.reference.as_deref().unwrap_or("?"));
         }
         json!({
             "skipped": self.report.skipped,
             "notes": self.report.notes,
             "zones_unreadable": self.zones_skipped,
+            "out_of_range_footprints": out_of_range.len(),
+            "out_of_range_pads": self.report.out_of_range_pads.len(),
         })
     }
 }
@@ -728,8 +738,14 @@ pub(crate) fn named_pads(
 }
 
 /// Which pads `references` and `pads` name, refusing any name that matches
-/// nothing. `None` when neither is given.
-fn pad_identity_arg(board: &RouteBoard, args: &Value) -> Result<Option<BTreeSet<usize>>, Refusal> {
+/// nothing (a pad of a footprint outside the coordinate range counts as a
+/// match; `outside` collects those). `None` when neither is given.
+fn pad_identity_arg(
+    board: &RouteBoard,
+    report: &LoadReport,
+    args: &Value,
+    outside: &mut BTreeSet<usize>,
+) -> Result<Option<BTreeSet<usize>>, Refusal> {
     let refs = opt_strings(args, "references")?;
     let pads = opt_strings(args, "pads")?;
     if refs.is_none() && pads.is_none() {
@@ -739,6 +755,12 @@ fn pad_identity_arg(board: &RouteBoard, args: &Value) -> Result<Option<BTreeSet<
     let mut missing = Vec::new();
     for r in refs.iter().flatten() {
         let mut any = false;
+        for (i, p) in report.out_of_range_pads.iter().enumerate() {
+            if p.reference.as_deref() == Some(r.as_str()) {
+                any = true;
+                outside.insert(i);
+            }
+        }
         for fp in board
             .footprints
             .iter()
@@ -758,7 +780,27 @@ fn pad_identity_arg(board: &RouteBoard, args: &Value) -> Result<Option<BTreeSet<
         ));
     }
     if let Some(names) = &pads {
-        chosen.extend(named_pads(board, names, "pads")?);
+        let mut on_board = Vec::new();
+        for name in names {
+            let hits: Vec<usize> = split_pad_name(name)
+                .map(|(r, n)| {
+                    report
+                        .out_of_range_pads
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.reference.as_deref() == Some(r) && p.number == n)
+                        .map(|(i, _)| i)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if hits.is_empty() {
+                on_board.push(name.clone());
+            }
+            outside.extend(hits);
+        }
+        if !on_board.is_empty() {
+            chosen.extend(named_pads(board, &on_board, "pads")?);
+        }
     }
     Ok(Some(chosen))
 }
@@ -825,6 +867,20 @@ pub(crate) fn pad_json(board: &RouteBoard, pad: &Pad, compact: bool) -> Value {
     v
 }
 
+/// A pad of a footprint beyond the router's coordinate range.
+pub(crate) fn out_of_range_pad_json(board: &RouteBoard, p: &OutOfRangePad) -> Value {
+    json!({
+        "reference": p.reference,
+        "number": p.number,
+        "net": net_name(board, p.net),
+        "x": p.x_nm as f64 / 1e6,
+        "y": p.y_nm as f64 / 1e6,
+        "layers": layer_names(board, p.layers),
+        "outside_coordinate_range": true,
+        "note": "the footprint lies beyond the ±1,074 mm the copper model represents (e.g. parked off the board); no outline is given and it carries no modelled copper",
+    })
+}
+
 fn pad_kinds_arg(args: &Value) -> Result<Option<BTreeSet<&'static str>>, Refusal> {
     let Some(names) = opt_strings(args, "pad_kinds")? else {
         return Ok(None);
@@ -853,11 +909,12 @@ fn query_pads_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Err(r) => return Ok(r),
     };
     let b = &saved.board;
+    let mut named_outside = BTreeSet::new();
     let parsed = (|| -> Result<_, Refusal> {
         let area = area_arg(args)?;
         let nets = nets_arg(b, args)?;
         let layers = layers_arg(b, args, "layers")?;
-        let identity = pad_identity_arg(b, args)?;
+        let identity = pad_identity_arg(b, &saved.report, args, &mut named_outside)?;
         let kinds = pad_kinds_arg(args)?;
         let compact = opt_bool(args, "compact", false)?;
         let max_items = opt_count(args, "max_items", ITEMS_DEFAULT, ITEMS_MAX)? as usize;
@@ -885,19 +942,42 @@ fn query_pads_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         })
         .map(|(_, p)| p)
         .collect();
-    let pads: Vec<Value> = found
+    // Pads of footprints beyond the coordinate range: listed by identity,
+    // net and position (no copper outline); a box or pad-kind filter, which
+    // they cannot be judged against, leaves them out.
+    let outside: Vec<&OutOfRangePad> = saved
+        .report
+        .out_of_range_pads
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| {
+            area.is_none()
+                && kinds.is_none()
+                && identity.as_ref().is_none_or(|_| named_outside.contains(i))
+                && nets
+                    .as_ref()
+                    .is_none_or(|set| p.net.is_some_and(|n| set.contains(&n)))
+                && layers.is_none_or(|m| m.intersects(p.layers))
+        })
+        .map(|(_, p)| p)
+        .collect();
+    let mut pads: Vec<Value> = found
         .iter()
         .take(max_items)
         .map(|p| pad_json(b, p, compact))
         .collect();
+    let room = max_items.saturating_sub(pads.len());
+    pads.extend(outside.iter().take(room).map(|p| out_of_range_pad_json(b, p)));
+    let matched = found.len() + outside.len();
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",
         "board": saved.path,
         "note": SAVED_FILE_NOTE,
         "outline_note": "shapes are the exact copper in board coordinates (mm), the same on every layer in 'layers': a circle, a stadium (centre line a-b swept by half width_mm), or a polygon grown by corner_radius_mm. 'approximated' marks a pad the loader could only bound (chamfers, per-layer padstacks).",
-        "matched": found.len(),
+        "matched": matched,
+        "outside_coordinate_range": outside.len(),
         "returned": pads.len(),
-        "truncated": pads.len() < found.len(),
+        "truncated": pads.len() < matched,
         "elapsed_ms": t.elapsed().as_millis() as u64,
         "load_report": saved.load_report_json(),
         "pads": pads,

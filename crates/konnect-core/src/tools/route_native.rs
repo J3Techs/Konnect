@@ -271,7 +271,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "query_pads",
-            "List pads of the saved board by box, nets, footprint references and/or REFERENCE.NUMBER names in one call: board-space anchor, rotation, pad type, copper layers, net, drill, a bounding box and the exact copper outline (custom-pad primitives transformed to board space). compact leaves the outlines out. Reads the saved file only.",
+            "List pads of the saved board by box, nets, footprint references and/or REFERENCE.NUMBER names in one call: board-space anchor, rotation, pad type, copper layers, net, drill, a bounding box and the exact copper outline (custom-pad primitives transformed to board space). compact leaves the outlines out. Pads of footprints parked beyond the copper model's ±1,074 mm (KiCad allows ±2,147 mm) are listed too, by identity, net and position with outside_coordinate_range: true (no outline; a box or pad_kinds filter leaves them out). Reads the saved file only.",
             query_pads_schema(),
             |args, ctx| async move { board_inspect::handle_query_pads(args, ctx).await }
         ),
@@ -965,9 +965,22 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
         Ok(n) => n as usize,
         Err(r) => return Ok(r),
     };
-    let (board, _) =
+    let (board, load) =
         konnect_route::load_board_file(&spec.board, &konnect_route::LoadOptions::default())
             .map_err(|e| anyhow::anyhow!("could not read {}: {e}", spec.board.display()))?;
+    // Pads of footprints beyond the coordinate range are not in the copper
+    // model; each is reported per net so a net never looks single-pad (or
+    // complete) only because a part is parked off the board.
+    let mut outside: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for p in &load.out_of_range_pads {
+        if let Some(n) = p.net {
+            outside.entry(board.net(n).name.as_str()).or_default().push(format!(
+                "{}.{}",
+                p.reference.as_deref().unwrap_or("?"),
+                p.number
+            ));
+        }
+    }
     let named = match board_inspect::nets_arg(&board, args) {
         Ok(n) => n,
         Err(r) => return Ok(r),
@@ -1001,6 +1014,11 @@ fn connectivity_report_blocking(args: &Value) -> anyhow::Result<CallToolResult> 
         "connections_needed": report.connection_count(),
         "incomplete_nets": incomplete,
         "unfilled_zones_skipped": report.unfilled_zones_skipped,
+        "pads_outside_coordinate_range": if outside.is_empty() { Value::Null } else { json!({
+            "note": "pads of footprints beyond the ±1,074 mm copper model (e.g. parked off the board): not counted in islands or connections_needed; each still belongs to its net and needs a connection once placed",
+            "pads": load.out_of_range_pads.len(),
+            "by_net": outside,
+        }) },
         "elapsed_ms": t.elapsed().as_millis() as u64,
         "nets": nets.iter().take(listed).map(|(c, name, islands)| json!({
             "net": name, "connections_needed": c, "pad_islands": islands

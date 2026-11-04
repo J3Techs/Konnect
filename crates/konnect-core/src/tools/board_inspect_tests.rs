@@ -366,6 +366,57 @@ async fn query_pads_refuses_pads_and_references_that_are_not_there() {
     }
 }
 
+/// The minimal board plus a two-pad footprint parked at x = 1300 mm, beyond
+/// the copper model's ±1,074 mm (KiCad's own range is ±2,147 mm).
+fn parked_board() -> String {
+    konnect_route::synthetic::MINIMAL_KICAD10_BOARD.replacen(
+        "(footprint",
+        "(footprint \"Parked:R\" (layer \"F.Cu\") (at 1300 20)
+		(property \"Reference\" \"R7941\" (at 0 0 0))
+		(pad \"1\" smd rect (at -0.5 0) (size 0.6 0.5) (layers \"F.Cu\") (net \"GND\"))
+		(pad \"2\" smd rect (at 0.5 0) (size 0.6 0.5) (layers \"F.Cu\") (net \"SIG\")))
+	(footprint",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn query_pads_lists_pads_of_footprints_parked_beyond_the_coordinate_range() {
+    let f = files_with(&parked_board());
+    let all = body(&pads(&f, json!({ "compact": true, "max_items": 1000 })).await);
+    let plain = body(&pads(&files(), json!({ "compact": true, "max_items": 1000 })).await);
+    assert_eq!(
+        all["matched"].as_u64().unwrap(),
+        plain["matched"].as_u64().unwrap() + 2,
+        "{all}"
+    );
+    assert_eq!(all["outside_coordinate_range"], 2);
+    assert_eq!(all["load_report"]["out_of_range_pads"], 2);
+    assert_eq!(all["load_report"]["skipped"], json!({}));
+
+    let r = pads(&f, json!({ "references": ["R7941"] })).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["matched"], 2);
+    assert_eq!(b["pads"][0]["x"], 1299.5);
+    assert_eq!(b["pads"][0]["net"], "GND");
+    assert_eq!(b["pads"][0]["outside_coordinate_range"], true);
+
+    let b = body(&pads(&f, json!({ "pads": ["R7941.2"], "nets": ["SIG"] })).await);
+    assert_eq!(b["matched"], 1);
+    assert_eq!(b["pads"][0]["number"], "2");
+
+    let r = route_native::handle_connectivity_report(&json!({ "board": f.board() }), &ctx())
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["pads_outside_coordinate_range"]["pads"], 2, "{b}");
+    assert_eq!(
+        b["pads_outside_coordinate_range"]["by_net"]["GND"],
+        json!(["R7941.1"])
+    );
+}
+
 // ─── connectivity_report islands ─────────────────────────────────────────────
 
 #[tokio::test]

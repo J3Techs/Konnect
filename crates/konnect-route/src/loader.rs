@@ -53,6 +53,26 @@ pub struct LoadReport {
     pub skipped: BTreeMap<&'static str, usize>,
     /// Approximations and ignored features, by description.
     pub notes: BTreeMap<&'static str, usize>,
+    /// Pads of footprints whose anchor KiCad stores beyond the router's
+    /// coordinate range ([`konnect_geom::MAX_COORD`], about ±1,074 mm), such
+    /// as parts parked far off the board. KiCad itself reaches about
+    /// ±2,147 mm. Their footprints are not in the model (no copper geometry
+    /// can be represented there), but each pad is kept here with its net and
+    /// position so callers still see every pad a net has.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub out_of_range_pads: Vec<OutOfRangePad>,
+}
+
+/// A pad of a footprint outside the representable range: identity, net and
+/// board position (nanometres, `i64` so any KiCad coordinate fits).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutOfRangePad {
+    pub reference: Option<String>,
+    pub number: String,
+    pub net: Option<NetId>,
+    pub x_nm: i64,
+    pub y_nm: i64,
+    pub layers: LayerMask,
 }
 
 impl LoadReport {
@@ -433,6 +453,10 @@ fn load_footprints(
             ))
         })();
         let Some((fx, fy, rot, side, at)) = root else {
+            if let Some(pads) = out_of_range_pads(fp, nets, &board.layers) {
+                report.out_of_range_pads.extend(pads);
+                continue;
+            }
             report.skip("footprint");
             report
                 .skipped
@@ -487,6 +511,60 @@ fn load_footprints(
             pad_range: (first_pad, board.pads.len() as u32),
         });
     }
+}
+
+/// The pads of a footprint whose anchor is finite but beyond
+/// [`konnect_geom::MAX_COORD`], or `None` when the footprint is unreadable
+/// for another reason (then it is skipped and counted as before).
+fn out_of_range_pads(
+    fp: &SexpNode,
+    nets: &NetResolver,
+    layers: &LayerTable,
+) -> Option<Vec<OutOfRangePad>> {
+    let at = fp.find("at")?;
+    let (x, y) = (at.get_f64(1)?, at.get_f64(2)?);
+    let rot = at.get_f64(3).unwrap_or(0.0);
+    if !(x.is_finite() && y.is_finite() && rot.is_finite()) || Point::from_mm(x, y).is_some() {
+        return None;
+    }
+    // KiCad's own limit: a 32-bit nanometre coordinate.
+    let kicad_max = f64::from(i32::MAX) / 1e6;
+    if x.abs() > kicad_max || y.abs() > kicad_max {
+        return None;
+    }
+    if !matches!(fp.find_str("layer")?, "F.Cu" | "B.Cu") {
+        return None;
+    }
+    let reference = fp
+        .find_all("property")
+        .into_iter()
+        .find(|p| p.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+        .and_then(|p| p.get(2).and_then(SexpNode::as_str))
+        .map(str::to_string);
+    let mut out = Vec::new();
+    for pad in fp.find_all("pad") {
+        let number = pad.get(1)?.as_str()?.to_string();
+        let pat = pad.find("at")?;
+        let (lx, ly) = (pat.get_f64(1)?, pat.get_f64(2)?);
+        let (cx, cy) = transform_pad(lx, ly, x, y, rot);
+        let tokens: Vec<&str> = pad
+            .find("layers")
+            .and_then(SexpNode::children)
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .filter_map(SexpNode::as_str)
+            .collect();
+        out.push(OutOfRangePad {
+            reference: reference.clone(),
+            number,
+            net: nets.resolve(pad),
+            x_nm: (cx * 1e6).round() as i64,
+            y_nm: (cy * 1e6).round() as i64,
+            layers: layers.expand_all(tokens),
+        });
+    }
+    Some(out)
 }
 
 fn lower_courtyards(
@@ -1228,6 +1306,29 @@ mod tests {
         assert_eq!(straight.len(), 4);
         assert!(curved.len() >= 8);
         assert!(curved.iter().all(|s| s.width >= 2 * policy.max_error_nm));
+    }
+
+    #[test]
+    fn footprints_parked_beyond_the_coordinate_range_keep_their_pads() {
+        let text = MINIMAL_KICAD10_BOARD.replacen(
+            "(footprint",
+            "(footprint \"Parked:R\" (layer \"F.Cu\") (at 1300 20 90)
+		(property \"Reference\" \"R7941\" (at 0 0 0))
+		(pad \"1\" smd rect (at -0.5 0 90) (size 0.6 0.5) (layers \"F.Cu\") (net \"GND\"))
+		(pad \"2\" smd rect (at 0.5 0 90) (size 0.6 0.5) (layers \"F.Cu\")))
+	(footprint",
+            1,
+        );
+        let (b, report) = load_board_str(&text, &LoadOptions::default()).unwrap();
+        assert_eq!(report.skipped.get("footprint"), None, "{report:?}");
+        assert_eq!(report.out_of_range_pads.len(), 2, "{report:?}");
+        let p = &report.out_of_range_pads[0];
+        assert_eq!(p.reference.as_deref(), Some("R7941"));
+        assert_eq!(p.number, "1");
+        assert_eq!(p.net, b.net_by_name("GND"));
+        assert_eq!(p.x_nm, 1_300_000_000);
+        assert_eq!(p.y_nm, 20_500_000);
+        assert!(b.footprints.iter().all(|f| f.reference.as_deref() != Some("R7941")));
     }
 
     #[test]
