@@ -366,6 +366,57 @@ async fn query_pads_refuses_pads_and_references_that_are_not_there() {
     }
 }
 
+/// The minimal board plus a two-pad footprint parked at x = 1300 mm, beyond
+/// the copper model's ±1,074 mm (KiCad's own range is ±2,147 mm).
+fn parked_board() -> String {
+    konnect_route::synthetic::MINIMAL_KICAD10_BOARD.replacen(
+        "(footprint",
+        "(footprint \"Parked:R\" (layer \"F.Cu\") (at 1300 20)
+		(property \"Reference\" \"R7941\" (at 0 0 0))
+		(pad \"1\" smd rect (at -0.5 0) (size 0.6 0.5) (layers \"F.Cu\") (net \"GND\"))
+		(pad \"2\" smd rect (at 0.5 0) (size 0.6 0.5) (layers \"F.Cu\") (net \"SIG\")))
+	(footprint",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn query_pads_lists_pads_of_footprints_parked_beyond_the_coordinate_range() {
+    let f = files_with(&parked_board());
+    let all = body(&pads(&f, json!({ "compact": true, "max_items": 1000 })).await);
+    let plain = body(&pads(&files(), json!({ "compact": true, "max_items": 1000 })).await);
+    assert_eq!(
+        all["matched"].as_u64().unwrap(),
+        plain["matched"].as_u64().unwrap() + 2,
+        "{all}"
+    );
+    assert_eq!(all["outside_coordinate_range"], 2);
+    assert_eq!(all["load_report"]["out_of_range_pads"], 2);
+    assert_eq!(all["load_report"]["skipped"], json!({}));
+
+    let r = pads(&f, json!({ "references": ["R7941"] })).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["matched"], 2);
+    assert_eq!(b["pads"][0]["x"], 1299.5);
+    assert_eq!(b["pads"][0]["net"], "GND");
+    assert_eq!(b["pads"][0]["outside_coordinate_range"], true);
+
+    let b = body(&pads(&f, json!({ "pads": ["R7941.2"], "nets": ["SIG"] })).await);
+    assert_eq!(b["matched"], 1);
+    assert_eq!(b["pads"][0]["number"], "2");
+
+    let r = route_native::handle_connectivity_report(&json!({ "board": f.board() }), &ctx())
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["pads_outside_coordinate_range"]["pads"], 2, "{b}");
+    assert_eq!(
+        b["pads_outside_coordinate_range"]["by_net"]["GND"],
+        json!(["R7941.1"])
+    );
+}
+
 // ─── connectivity_report islands ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -977,6 +1028,19 @@ async fn plan_trunk_cuts_through_a_carved_zone_and_keeps_clear_of_its_nets_coppe
     let total = b["totals"]["length_mm"].as_f64().unwrap();
     assert!((over - total).abs() < 0.01, "{over} of {total}");
     assert_eq!(carved["by_leg_mm"].as_array().unwrap().len(), 1);
+    // With waypoint vias, each planned via lists the carved pour it sits in.
+    let r = plan(
+        "with_vias.json",
+        json!({ "carve_zones": ["GND plane"], "waypoint_vias": true }),
+    )
+    .await;
+    let b = body(&r);
+    let vias = b["vias"].as_array().unwrap();
+    assert_eq!(vias.len(), 2, "{b}");
+    for v in vias {
+        assert_eq!(v["status"], "planned", "{v}");
+        assert_eq!(v["carves"], json!(["GND plane@In1.Cu"]), "{v}");
+    }
 
     // check_route_rules agrees, with the zone carved or not (the S7 check
     // leaves fills to the refill).
@@ -1046,6 +1110,86 @@ async fn plan_tap_vias_may_place_a_via_inside_a_carved_zone() {
     assert_eq!(b["carve_zones"], json!(["GND plane"]));
 }
 
+/// On In1.Cu, a P12V zone of priority 1 over the GND plane: an island
+/// around R1 that every tap site for R1.1 falls in.
+const P12V_ISLAND: &str = "\t(zone
+\t\t(net \"P12V\")
+\t\t(layer \"In1.Cu\")
+\t\t(uuid \"00000000-0000-0000-0000-000000000030\")
+\t\t(name \"P12V island\")
+\t\t(priority 1)
+\t\t(polygon (pts (xy 12 4) (xy 28 4) (xy 28 17) (xy 12 17)))
+\t\t(filled_polygon
+\t\t\t(layer \"In1.Cu\")
+\t\t\t(pts (xy 12.5 4.5) (xy 27.5 4.5) (xy 27.5 16.5) (xy 12.5 16.5))
+\t\t)
+\t)
+";
+
+#[tokio::test]
+async fn plan_tap_vias_carves_an_island_only_on_a_layer_the_via_passes_when_named() {
+    let board = konnect_route::synthetic::MINIMAL_KICAD10_BOARD
+        .replace("\t(gr_rect", &format!("{P12V_ISLAND}\t(gr_rect"));
+    let f = files_with(&board);
+    let args = json!({ "board": f.board(), "pads": ["R1.1"], "target_layer": "In2.Cu" });
+    let plan = |out: &str, extra: Value| {
+        let a = with(
+            args.clone(),
+            with(json!({ "output_plan": f.path(out) }), extra),
+        );
+        async move {
+            route_plan_tools::handle_plan_tap_vias(&a, &ctx())
+                .await
+                .unwrap()
+        }
+    };
+    // The island on In1.Cu (not the target) refuses every site.
+    let r = plan("none.json", json!({})).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["sites"], json!([]), "{b}");
+    assert_eq!(b["plan_written"], false);
+    let reasons: Vec<&str> = b["failed"][0]["top_rejections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.contains(&"via: inside another net's island"),
+        "{reasons:?}"
+    );
+    assert!(!Path::new(&f.path("none.json")).exists());
+
+    // Named, it is carved: the site sits in it and says so. The GND plane
+    // under it is not named and is not listed.
+    let r = plan("taps.json", json!({ "carve_zones": ["P12V island"] })).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["failed"], json!([]), "{b}");
+    assert_eq!(b["sites"][0]["tap"], "via");
+    assert_eq!(
+        b["sites"][0]["carves"],
+        json!(["P12V island@In1.Cu"]),
+        "{b}"
+    );
+    assert_eq!(b["carves_by_zone"], json!({ "P12V island@In1.Cu": 1 }));
+    assert_eq!(b["check"]["violations"], 0);
+    assert_eq!(b["plan_written"], true);
+
+    // A keep-out box over the whole region leaves no site.
+    let r = plan(
+        "boxed.json",
+        json!({ "carve_zones": ["P12V island"], "keepouts": [{ "x1": 10, "y1": 2, "x2": 30, "y2": 19 }] }),
+    )
+    .await;
+    let b = body(&r);
+    assert_eq!(b["sites"], json!([]), "{b}");
+    assert_eq!(b["keepouts"][0]["x2"], 30.0);
+    let r = plan("bad.json", json!({ "keepouts": [{ "x1": 1 }] })).await;
+    assert_eq!(field_of(&r), "keepouts[0]", "{}", text(&r));
+}
+
 #[tokio::test]
 async fn carve_zones_must_name_a_zone_on_the_layer_used() {
     let f = files();
@@ -1059,11 +1203,19 @@ async fn carve_zones_must_name_a_zone_on_the_layer_used() {
         "output_plan": f.path("t.json")
     });
     // An unknown name, a rule area's name, and a zone with no copper on
-    // the layer the tool works on.
-    for (names, layer) in [
-        (json!(["GND"]), "In1.Cu"),
-        (json!(["GND plane", "no_vias"]), "In1.Cu"),
-        (json!(["GND plane"]), "In2.Cu"),
+    // the layer the trunk runs on.
+    for (names, layer, words) in [
+        (
+            json!(["GND"]),
+            "In1.Cu",
+            "no copper zone of the board is named 'GND'",
+        ),
+        (
+            json!(["GND plane", "no_vias"]),
+            "In1.Cu",
+            "'no_vias' is a rule area, not a copper zone",
+        ),
+        (json!(["GND plane"]), "In2.Cu", "has no copper on In2.Cu"),
     ] {
         let extra = json!({ "carve_zones": names, "layer": layer });
         let r = route_plan_tools::handle_plan_trunk(&with(trunk.clone(), extra.clone()), &ctx())
@@ -1071,7 +1223,13 @@ async fn carve_zones_must_name_a_zone_on_the_layer_used() {
             .unwrap();
         assert!(r.is_error, "plan_trunk accepted {extra}");
         assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
-        let extra = json!({ "carve_zones": names, "target_layer": layer });
+        assert!(text(&r).contains(words), "{}", text(&r));
+        assert!(!Path::new(&f.path("t.json")).exists());
+    }
+    // A tap via is a through via: an unknown name or a rule area is refused,
+    // but a zone on a layer other than target_layer is taken.
+    for names in [json!(["GND"]), json!(["GND plane", "no_vias"])] {
+        let extra = json!({ "carve_zones": names, "target_layer": "In2.Cu" });
         let r = route_plan_tools::handle_plan_tap_vias(&with(taps.clone(), extra.clone()), &ctx())
             .await
             .unwrap();
@@ -1079,6 +1237,15 @@ async fn carve_zones_must_name_a_zone_on_the_layer_used() {
         assert_eq!(field_of(&r), "carve_zones", "{}", text(&r));
         assert!(!Path::new(&f.path("t.json")).exists());
     }
+    let extra = json!({ "carve_zones": ["GND plane"], "target_layer": "In2.Cu" });
+    let r = route_plan_tools::handle_plan_tap_vias(&with(taps.clone(), extra), &ctx())
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["carve_zones"], json!(["GND plane"]));
+    // The via passes the GND fill on In1.Cu: the refill cuts its antipad.
+    assert_eq!(b["sites"][0]["carves"], json!(["GND plane@In1.Cu"]), "{b}");
     // check_route_rules refuses an unknown name but takes a zone on any
     // layer.
     std::fs::write(

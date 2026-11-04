@@ -6,13 +6,19 @@
 //! differences: the pads are named by the caller instead of found by net;
 //! any net qualifies, and the via need not sit inside a plane of its net;
 //! and the via must stay clear of other nets' zone fills on the target
-//! layer, so copper there can leave it, except in zones the caller names to
-//! carve (a refill cuts those around the via). Everything else is the
-//! fanout's:
+//! layer, so copper there can leave it. Everything else is the fanout's:
 //! every candidate is checked exactly against every layer (annulus and stub
 //! clearance with the resolved rules, hole to hole, hole clearance, board
-//! edge, keepouts, the via floor), a via never lands on an SMD pad of its
-//! own net, and sites of different pads are placed so they clear each other.
+//! edge, keepouts, the via floor), the via stays out of other nets' islands
+//! on every layer it passes, a via never lands on an SMD pad of its own net,
+//! and sites of different pads are placed so they clear each other.
+//!
+//! Zones the caller names to carve ([`TapOptions::carve_zones`]) are ones a
+//! refill will cut an antipad into around the via, on whichever copper
+//! layer they lie (a tap via is a through via): neither their islands nor,
+//! on the target layer, their fill rejects a site. [`super::via_carves`]
+//! says which of them each placed via actually sits in. Caller keep-out
+//! boxes ([`TapOptions::keepouts`]) take no via and no stub.
 //!
 //! A through-hole pad already reaches every layer: it gets no via and is
 //! reported as its own tap.
@@ -22,6 +28,7 @@
 //! net of the zone it sits in; the stub keeps the planned net.
 
 use super::*;
+use crate::api::KeepoutId;
 
 /// One pad's tap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,11 +84,24 @@ impl TapPlan {
     }
 }
 
+/// What a tap plan may carve and must keep out of.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TapOptions {
+    /// Zones (exact names) a refill will cut an antipad into around a via,
+    /// on any copper layer: their islands do not reject a site, nor, on the
+    /// target layer, their fill.
+    #[serde(default)]
+    pub carve_zones: Vec<String>,
+    /// Boxes no tap via or stub may touch.
+    #[serde(default)]
+    pub keepouts: Vec<BBox>,
+}
+
 /// Plan a tap for each of `pads` (a pad listed twice is planned once).
 /// `target` is the layer the taps must reach: every via is a through via,
-/// and it must also clear other nets' zone fills on `target`, except the
-/// fills of the zones named in `carve_zones`, which a refill will carve
-/// around the via. On the other layers nothing changes.
+/// and it must also clear other nets' zone fills on `target`. The zones
+/// named in `carve_zones` are carved around the via instead, on every layer
+/// (see [`TapOptions::carve_zones`]).
 pub fn plan_tap_vias(
     board: &RouteBoard,
     rules: &dyn RuleTable,
@@ -90,22 +110,35 @@ pub fn plan_tap_vias(
     carve_zones: &[String],
     settings: &FanoutSettings,
 ) -> TapPlan {
+    let options = TapOptions {
+        carve_zones: carve_zones.to_vec(),
+        keepouts: Vec::new(),
+    };
+    plan_tap_vias_with(board, rules, pads, target, &options, settings)
+}
+
+/// [`plan_tap_vias`] with keep-out boxes as well as carved zones.
+pub fn plan_tap_vias_with(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    pads: &[PadId],
+    target: LayerId,
+    options: &TapOptions,
+    settings: &FanoutSettings,
+) -> TapPlan {
     let t0 = std::time::Instant::now();
     let mut s = *settings;
     s.require_own_plane = false;
     s.partial_plane_fallback = false;
     s.clear_of_zones_on = Some(target);
     let policy = ArcPolicy::default();
-    let mut space = Space::new(board, rules, &policy, true);
-    if !carve_zones.is_empty() {
-        space.planes.retain(|p| {
-            p.layer != target
-                || !board.zones[p.zone.index()]
-                    .zone_name
-                    .as_ref()
-                    .is_some_and(|n| carve_zones.contains(n))
-        });
-    }
+    let space = Space::new(board, rules, &policy, true);
+    let carved = carve_mask(board, &options.carve_zones);
+    let keepouts: Vec<Shape> = options
+        .keepouts
+        .iter()
+        .filter_map(|b| ConvexPoly::axis_rect(*b, 0).map(Shape::ConvexPoly))
+        .collect();
     let mut plan = TapPlan::default();
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
@@ -152,6 +185,8 @@ pub fn plan_tap_vias(
         space: &space,
         rules,
         settings: &s,
+        carved: &carved,
+        keepouts: &keepouts,
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
         .par_iter()
@@ -223,6 +258,83 @@ pub fn plan_tap_vias(
     plan.failed.sort_by_key(|f| f.0);
     plan.details.sort_by_key(|d| d.pad);
     plan
+}
+
+/// Why [`check_via_site`] refuses a site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViaSiteRefusal {
+    /// The rule broken, as the tap planner names it (e.g. `via: copper
+    /// clearance`, `via: inside another net's island`).
+    pub reason: &'static str,
+    /// The board item that breaks it (a pad, track, arc or via), if any.
+    pub item: Option<ItemRef>,
+    /// The zone piece (`board.zones` index) of an island.
+    pub zone: Option<ZoneId>,
+    /// The rule area that forbids the via.
+    pub keepout: Option<KeepoutId>,
+    /// The via floor at the site, when the via is below it.
+    pub floor: Option<ViaRule>,
+}
+
+/// Whether a new through via of `net` at `center` meets the rules a tap via
+/// meets: the via floor at the site, annulus clearance on every layer, hole
+/// to hole, hole clearance, board edge and rule areas, no SMD pad of its own
+/// net under it, and outside other nets' islands on every layer except the
+/// islands of zones named in `carve_zones`. Other nets' base pours are not
+/// obstacles (a refill pours around the via). Copper planned elsewhere is
+/// checked only when the caller has frozen it into `board`.
+pub fn check_via_site(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    net: NetId,
+    center: Point,
+    diameter: Coord,
+    drill: Coord,
+    carve_zones: &[String],
+) -> Result<(), ViaSiteRefusal> {
+    let settings = FanoutSettings {
+        require_own_plane: false,
+        partial_plane_fallback: false,
+        clear_of_zones_on: None,
+        ..FanoutSettings::default()
+    };
+    let policy = ArcPolicy::default();
+    let space = Space::new(board, rules, &policy, true);
+    let carved = carve_mask(board, carve_zones);
+    let ctx = Ctx {
+        space: &space,
+        rules,
+        settings: &settings,
+        carved: &carved,
+        keepouts: &[],
+    };
+    let mut cache = ClearanceCache::default();
+    match check_via(&ctx, &mut cache, net, center, diameter, drill, &[], false) {
+        Ok(_) => Ok(()),
+        Err(why) => {
+            let mut out = ViaSiteRefusal {
+                reason: why.label(),
+                item: None,
+                zone: None,
+                keepout: None,
+                floor: None,
+            };
+            match why {
+                ViaReject::Island(z) | ViaReject::TargetZone(z) => out.zone = Some(z),
+                ViaReject::Floor(f) => out.floor = Some(f),
+                ViaReject::OwnSmdPad(p) => out.item = Some(ItemRef::Pad(p)),
+                ViaReject::Conflict(c) => match c {
+                    Conflict::Copper { item, .. }
+                    | Conflict::HoleToHole { item }
+                    | Conflict::HoleClearance { item } => out.item = Some(item),
+                    Conflict::Keepout { id } => out.keepout = Some(id),
+                    Conflict::Edge => {}
+                },
+                ViaReject::OutsideOwnPlane | ViaReject::FewSpokes => {}
+            }
+            Err(out)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +463,164 @@ mod tests {
         assert_ne!(gap_cmp(&disc, &gnd_via, 200_000), Ordering::Less);
         let report = check_routed(&board, &rules, &plan.routed(&board));
         assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    /// A P5V pad on F.Cu; on In1.Cu a P12V zone of priority 1 (an island
+    /// over the GND base pour) covers every site the planner tries. The
+    /// target layer In2.Cu is empty.
+    fn island_board() -> RouteBoard {
+        let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        for n in ["GND", "P5V", "P12V"] {
+            b.net(n);
+        }
+        let c1 = b.footprint("C1", (10.0, 10.0));
+        b.smd_pad(c1, "1", "P5V", (9.5, 10.0), (0.6, 0.6), "F.Cu");
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 29.5, 19.5));
+        b.zone("P12V", "In1.Cu", (3.0, 3.0, 17.0, 17.0));
+        let mut board = b.build();
+        board.zones[0].zone_name = Some("GND plane".to_string());
+        board.zones[1].zone_name = Some("P12V island".to_string());
+        board.zones[1].priority = 1;
+        board
+    }
+
+    #[test]
+    fn an_island_on_a_layer_the_via_only_passes_is_carved_only_when_named() {
+        let board = island_board();
+        let rules = UniformRules::default();
+        let target = board.layers.by_name("In2.Cu").unwrap();
+        let pad = board.pads[0].id;
+        let s = FanoutSettings::default();
+        let plan = plan_tap_vias(&board, &rules, &[pad], target, &[], &s);
+        assert!(plan.sites.is_empty(), "{:?}", plan.sites);
+        let reasons = &plan.details[0].rejections;
+        assert!(
+            reasons.contains_key("via: inside another net's island"),
+            "{reasons:?}"
+        );
+        // Naming the base pour changes nothing: it never was an obstacle.
+        let plan = plan_tap_vias(&board, &rules, &[pad], target, &["GND plane".into()], &s);
+        assert!(plan.sites.is_empty());
+
+        let carve = ["P12V island".to_string()];
+        let plan = plan_tap_vias(&board, &rules, &[pad], target, &carve, &s);
+        assert!(plan.failed.is_empty(), "{:?}", plan.details);
+        let site = &plan.sites[0];
+        let (d, _) = site.via.unwrap();
+        let carves = via_carves(&board, &rules, &[(site.net, site.at, d)], &carve);
+        assert_eq!(carves, vec![vec![ZoneId(1)]], "the via sits in the island");
+        // A zone that is not named is never reported.
+        let none = via_carves(&board, &rules, &[(site.net, site.at, d)], &[]);
+        assert_eq!(none, vec![Vec::<ZoneId>::new()]);
+        let report = check_routed(&board, &rules, &plan.routed(&board));
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    #[test]
+    fn keep_out_boxes_take_no_tap_via_or_stub() {
+        let board = board();
+        let rules = UniformRules::default();
+        let target = board.layers.by_name("In2.Cu").unwrap();
+        let pad = board
+            .pads
+            .iter()
+            .find(|p| p.number == "1" && p.center.y == 10_000_000)
+            .unwrap()
+            .id;
+        let free = plan_tap_vias(
+            &board,
+            &rules,
+            &[pad],
+            target,
+            &[],
+            &FanoutSettings::default(),
+        );
+        let at = free.sites[0].at;
+        // A box over the chosen site: the next site lies outside it.
+        let b = BBox::new(
+            Point::new(at.x - 100_000, at.y - 100_000),
+            Point::new(at.x + 100_000, at.y + 100_000),
+        );
+        let options = TapOptions {
+            carve_zones: Vec::new(),
+            keepouts: vec![b],
+        };
+        let plan = plan_tap_vias_with(
+            &board,
+            &rules,
+            &[pad],
+            target,
+            &options,
+            &FanoutSettings::default(),
+        );
+        assert!(plan.failed.is_empty(), "{:?}", plan.details);
+        let s = &plan.sites[0];
+        let ko = Shape::ConvexPoly(ConvexPoly::axis_rect(b, 0).unwrap());
+        let (d, _) = s.via.unwrap();
+        assert!(!touches(
+            &Shape::Circle(Circle::from_diameter(s.at, d)),
+            &ko
+        ));
+        let (a, z, w) = s.stub.unwrap();
+        assert!(!touches(&Shape::Segment(Segment::new(a, z, w)), &ko));
+        // A box over the whole pad leaves no site at all.
+        let everything = TapOptions {
+            carve_zones: Vec::new(),
+            keepouts: vec![BBox::new(
+                Point::new(0, 0),
+                Point::new(30_000_000, 20_000_000),
+            )],
+        };
+        let plan = plan_tap_vias_with(
+            &board,
+            &rules,
+            &[pad],
+            target,
+            &everything,
+            &FanoutSettings::default(),
+        );
+        assert!(plan.sites.is_empty());
+        assert!(plan.details[0]
+            .rejections
+            .keys()
+            .any(|k| k.contains("keep-out box")));
+    }
+
+    #[test]
+    fn a_single_via_site_is_judged_as_a_tap_via_and_names_what_refuses_it() {
+        let board = island_board();
+        let rules = UniformRules::default();
+        let net = board.net_by_name("P5V").unwrap();
+        let at = Point::new(12_000_000, 10_000_000);
+        let r = check_via_site(&board, &rules, net, at, 600_000, 300_000, &[]).unwrap_err();
+        assert_eq!(r.reason, "via: inside another net's island");
+        assert_eq!(r.zone, Some(ZoneId(1)));
+        let carve = ["P12V island".to_string()];
+        assert_eq!(
+            check_via_site(&board, &rules, net, at, 600_000, 300_000, &carve),
+            Ok(())
+        );
+        // Below the floor (UniformRules' floor is the class via).
+        let r = check_via_site(&board, &rules, net, at, 500_000, 300_000, &carve).unwrap_err();
+        assert_eq!(r.reason, "via: below the via floor here");
+        assert!(r.floor.is_some());
+        // Too close to another net's via.
+        let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu", "B.Cu"]);
+        b.net("A");
+        b.via("B", (10.0, 10.0), 0.6, 0.3, false);
+        let board = b.build();
+        let a = board.net_by_name("A").unwrap();
+        let r = check_via_site(
+            &board,
+            &rules,
+            a,
+            Point::new(10_700_000, 10_000_000),
+            600_000,
+            300_000,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(r.reason, "via: copper clearance");
+        assert_eq!(r.item, Some(ItemRef::Via(crate::api::ViaId(0))));
     }
 }

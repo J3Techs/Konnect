@@ -35,7 +35,10 @@
 //!   `plane_margin` lies inside one of the net's filled pieces, and at least
 //!   `min_spokes` of four spoke directions reach plane copper;
 //! - on every layer, the grown disc stays outside other nets' islands
-//!   (higher-priority or flagged pieces: the small pours inside a plane).
+//!   (higher-priority or flagged pieces: the small pours inside a plane),
+//!   except the islands of zones the caller names to carve
+//!   ([`plan_plane_vias_carving`]): a refill cuts an antipad around the via
+//!   in those.
 //!
 //! Plane fills are not obstacles: a refill pours around the new via. Between
 //! candidates of different islands the same clearances and hole-to-hole
@@ -52,13 +55,18 @@
 //! site whose island can move to another candidate. Output is sorted by
 //! pad, so 1-thread and N-thread runs give the same plan.
 
-use crate::api::{FootprintId, Generation, ItemKind, ItemRef, LayerId, NetId, PadId, TILE_CORE_NM};
+use crate::api::{
+    FootprintId, Generation, ItemKind, ItemRef, LayerId, NetId, PadId, ZoneId, TILE_CORE_NM,
+};
 use crate::board::{PadKind, RouteBoard};
 use crate::connectivity::ConnectivityReport;
 use crate::plan::{PlanError, RoutePlan, RoutedCopper, RoutedTrack, RoutedVia};
-use crate::rules::{RuleSubject, RuleTable};
+use crate::rules::{RuleSubject, RuleTable, ViaRule};
+use crate::space::poly::{PolyIndex, DEFAULT_TARGET_CELLS};
 use crate::space::{radius_of, ClearanceCache, Conflict, Space, SubjectKey};
-use konnect_geom::{gap_cmp, touches, ArcPolicy, BBox, Circle, Coord, Point, Segment, Shape};
+use konnect_geom::{
+    gap_cmp, touches, ArcPolicy, BBox, Circle, ConvexPoly, Coord, Point, Segment, Shape,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -417,9 +425,26 @@ pub fn plan_plane_vias_excluding(
     settings: &FanoutSettings,
     exclude: &[FootprintId],
 ) -> PlaneViaPlan {
+    plan_plane_vias_carving(board, rules, connectivity, settings, exclude, &[])
+}
+
+/// [`plan_plane_vias_excluding`], where a via may also sit inside the
+/// islands of the zones named in `carve_zones` (exact names), on whatever
+/// layer they lie: a refill cuts an antipad around the via there. Other
+/// nets' islands still reject a site; the own-plane test is unchanged.
+/// [`via_carves`] tells which carved zones each placed via sits in.
+pub fn plan_plane_vias_carving(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    connectivity: &ConnectivityReport,
+    settings: &FanoutSettings,
+    exclude: &[FootprintId],
+    carve_zones: &[String],
+) -> PlaneViaPlan {
     let t0 = std::time::Instant::now();
     let policy = ArcPolicy::default();
     let space = Space::new(board, rules, &policy, true);
+    let carved = carve_mask(board, carve_zones);
     let mut plan = PlaneViaPlan::default();
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
@@ -440,6 +465,8 @@ pub fn plan_plane_vias_excluding(
         space: &space,
         rules,
         settings,
+        carved: &carved,
+        keepouts: &[],
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
         .par_iter()
@@ -596,6 +623,81 @@ struct Ctx<'a> {
     space: &'a Space<'a>,
     rules: &'a dyn RuleTable,
     settings: &'a FanoutSettings,
+    /// By zone piece (`board.zones` index): pieces of zones named to carve,
+    /// which never reject a via site (empty: none).
+    carved: &'a [bool],
+    /// Regions no via or stub may touch (caller keep-out boxes).
+    keepouts: &'a [Shape],
+}
+
+impl Ctx<'_> {
+    fn is_carved(&self, zone: ZoneId) -> bool {
+        self.carved.get(zone.index()).copied().unwrap_or(false)
+    }
+}
+
+/// Which zone pieces (`board.zones` index) belong to a zone named in
+/// `carve_zones` (exact names).
+pub(crate) fn carve_mask(board: &RouteBoard, carve_zones: &[String]) -> Vec<bool> {
+    if carve_zones.is_empty() {
+        return Vec::new();
+    }
+    board
+        .zones
+        .iter()
+        .map(|z| {
+            z.zone_name
+                .as_ref()
+                .is_some_and(|n| carve_zones.contains(n))
+        })
+        .collect()
+}
+
+/// For each via `(net, centre, diameter)`, the pieces (`board.zones`
+/// indexes, ascending) of zones named in `carve_zones` that a refill will
+/// cut an antipad into around it: pieces of another net whose copper (the
+/// fill, or the outline of an unfilled zone) comes within the via-to-zone
+/// clearance of the via's annulus. Through vias are assumed (every copper
+/// layer).
+pub fn via_carves(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    vias: &[(NetId, Point, Coord)],
+    carve_zones: &[String],
+) -> Vec<Vec<ZoneId>> {
+    let mut out = vec![Vec::new(); vias.len()];
+    if carve_zones.is_empty() || vias.is_empty() {
+        return out;
+    }
+    let pieces: Vec<(&crate::board::ZonePiece, PolyIndex)> = board
+        .zones
+        .iter()
+        .filter(|z| {
+            z.zone_name
+                .as_ref()
+                .is_some_and(|n| carve_zones.contains(n))
+        })
+        .map(|z| {
+            let cells = (z.region.rings().map(<[Point]>::len).sum::<usize>() * 16)
+                .clamp(1_024, DEFAULT_TARGET_CELLS);
+            (z, PolyIndex::with_target(&z.region, cells))
+        })
+        .collect();
+    for (i, &(net, at, diameter)) in vias.iter().enumerate() {
+        let via = RuleSubject::new(ItemKind::Via, Some(net));
+        for (z, index) in &pieces {
+            if z.net == Some(net) {
+                continue;
+            }
+            let zone = RuleSubject::new(ItemKind::Zone, z.net);
+            let reach = radius_of(diameter) + rules.clearance(&via, &zone, z.layer);
+            if index.bbox().inflate(reach).contains(at) && !index.disc_outside(at, reach) {
+                out[i].push(z.id);
+            }
+        }
+        out[i].sort_unstable();
+    }
+    out
 }
 
 /// One unjoined island to give a via.
@@ -924,10 +1026,17 @@ fn try_exit(
             ),
             ctx.settings.snap,
         );
+        if !ctx.keepouts.is_empty() {
+            let disc = Shape::Circle(Circle::from_diameter(via, diameter));
+            if ctx.keepouts.iter().any(|k| touches(&disc, k)) {
+                last = (via, "via: in a keep-out box", 0);
+                continue;
+            }
+        }
         let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers, partial) {
             Ok(k) => k,
-            Err((why, kind)) => {
-                last = (via, why, kind);
+            Err(why) => {
+                last = (via, why.label(), why.class());
                 continue;
             }
         };
@@ -940,6 +1049,10 @@ fn try_exit(
                 continue;
             }
             let shape = Shape::Segment(stub);
+            if ctx.keepouts.iter().any(|k| touches(&shape, k)) {
+                last = (via, "stub: in a keep-out box", 0);
+                continue;
+            }
             let stub_key = space.subject_for(ItemKind::Track, Some(net), &shape);
             if let Some(cf) =
                 space.track_conflict(cache, ctx.rules, pp.layer, stub, Some(net), &stub_key)
@@ -1117,8 +1230,48 @@ fn via_label(c: &Conflict) -> &'static str {
     }
 }
 
-/// Exact via legality against the board and the planes. The error carries
-/// a reason and its class (0 board, 1 plane, 2 spokes).
+/// Why a via site is illegal, with what makes it so.
+#[derive(Debug, Clone, Copy)]
+enum ViaReject {
+    OutsideOwnPlane,
+    FewSpokes,
+    /// The via's copper meets another net's island (a zone piece) on some
+    /// layer.
+    Island(ZoneId),
+    /// Within the via-to-zone clearance of another net's fill on the target
+    /// layer.
+    TargetZone(ZoneId),
+    /// Below the via floor that applies at the site.
+    Floor(ViaRule),
+    Conflict(Conflict),
+    /// On an SMD pad of the via's own net.
+    OwnSmdPad(PadId),
+}
+
+impl ViaReject {
+    fn label(&self) -> &'static str {
+        match self {
+            ViaReject::OutsideOwnPlane => "via: outside its own plane piece",
+            ViaReject::FewSpokes => "via: too few spokes reach its plane",
+            ViaReject::Island(_) => "via: inside another net's island",
+            ViaReject::TargetZone(_) => "via: in another net's zone on the target layer",
+            ViaReject::Floor(_) => "via: below the via floor here",
+            ViaReject::Conflict(c) => via_label(c),
+            ViaReject::OwnSmdPad(_) => "via: on an SMD pad of its own net",
+        }
+    }
+
+    /// 0 board, 1 plane, 2 spokes.
+    fn class(&self) -> u8 {
+        match self {
+            ViaReject::OutsideOwnPlane | ViaReject::Island(_) | ViaReject::TargetZone(_) => 1,
+            ViaReject::FewSpokes => 2,
+            _ => 0,
+        }
+    }
+}
+
+/// Exact via legality against the board and the planes.
 #[allow(clippy::too_many_arguments)]
 fn check_via(
     ctx: &Ctx<'_>,
@@ -1129,7 +1282,7 @@ fn check_via(
     drill: Coord,
     own_layers: &[LayerId],
     partial: bool,
-) -> Result<SubjectKey, (&'static str, u8)> {
+) -> Result<SubjectKey, ViaReject> {
     let space = ctx.space;
     let s = ctx.settings;
     let r = radius_of(diameter);
@@ -1148,7 +1301,7 @@ fn check_via(
             if partial {
                 continue;
             }
-            return Err(("via: outside its own plane piece", 1));
+            return Err(ViaReject::OutsideOwnPlane);
         };
         if s.min_spokes > 0 {
             let spoke_w = 100_000.max(r / 2);
@@ -1171,26 +1324,27 @@ fn check_via(
                     spokes_short = true;
                     continue;
                 }
-                return Err(("via: too few spokes reach its plane", 2));
+                return Err(ViaReject::FewSpokes);
             }
         }
         joined += 1;
     }
     if partial && joined == 0 {
         return Err(if spokes_short {
-            ("via: too few spokes reach its plane", 2)
+            ViaReject::FewSpokes
         } else {
-            ("via: outside its own plane piece", 1)
+            ViaReject::OutsideOwnPlane
         });
     }
-    let islands = space
-        .planes
-        .iter()
-        .filter(|p| s.avoid_other_islands && p.island && p.net != Some(net));
+    // Islands of zones named to carve never reject a site: the refill cuts
+    // an antipad around the via there.
+    let islands = space.planes.iter().filter(|p| {
+        s.avoid_other_islands && p.island && p.net != Some(net) && !ctx.is_carved(p.zone)
+    });
     for p in islands {
         let bb = p.index.bbox().inflate(grown);
         if bb.contains(via) && !p.index.disc_outside(via, grown) {
-            return Err(("via: inside another net's island", 1));
+            return Err(ViaReject::Island(p.zone));
         }
     }
     if let Some(target) = s.clear_of_zones_on {
@@ -1198,13 +1352,13 @@ fn check_via(
         for p in space
             .planes
             .iter()
-            .filter(|p| p.layer == target && p.net != Some(net))
+            .filter(|p| p.layer == target && p.net != Some(net) && !ctx.is_carved(p.zone))
         {
             let zone_subject = RuleSubject::new(ItemKind::Zone, p.net);
             let reach = r + ctx.rules.clearance(&via_subject, &zone_subject, target);
             let bb = p.index.bbox().inflate(reach);
             if bb.contains(via) && !p.index.disc_outside(via, reach) {
-                return Err(("via: in another net's zone on the target layer", 1));
+                return Err(ViaReject::TargetZone(p.zone));
             }
         }
     }
@@ -1216,7 +1370,7 @@ fn check_via(
         || drill < floor.min_drill
         || (diameter - drill) / 2 < floor.min_annular
     {
-        return Err(("via: below the via floor here", 0));
+        return Err(ViaReject::Floor(floor));
     }
     if let Some(c) = space.via_conflict(
         cache,
@@ -1228,7 +1382,7 @@ fn check_via(
         Some(net),
         &key,
     ) {
-        return Err((via_label(&c), 0));
+        return Err(ViaReject::Conflict(c));
     }
     // No via-in-pad by accident: stay off the net's own SMD pads (other
     // nets' pads are already kept at their clearance).
@@ -1240,7 +1394,7 @@ fn check_via(
                     && space.board.pads[pid.index()].kind == PadKind::Smd
                     && gap_cmp(&disc, &it.shape, 1) == Ordering::Less
                 {
-                    return Err(("via: on an SMD pad of its own net", 0));
+                    return Err(ViaReject::OwnSmdPad(pid));
                 }
             }
         }
@@ -1943,6 +2097,40 @@ mod tests {
         assert!(p.details[0]
             .rejections
             .contains_key("via: outside its own plane piece"));
+    }
+
+    #[test]
+    fn a_plane_via_may_sit_in_a_carved_island_of_another_layer() {
+        // GND pours on In1; on In2 a P12V zone of priority 1 over the P3V3
+        // base pour covers every site around the GND pad.
+        let mut b = BoardBuilder::new(30.0, 20.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 29.5, 19.5));
+        b.zone("P3V3", "In2.Cu", (0.5, 0.5, 29.5, 19.5));
+        b.zone("P12V", "In2.Cu", (3.0, 3.0, 17.0, 17.0));
+        let f = b.footprint("C1", (10.0, 10.0));
+        b.smd_pad(f, "1", "GND", (10.0, 10.0), (0.6, 0.6), "F.Cu");
+        let mut board = b.build();
+        board.zones[2].zone_name = Some("P12V island".to_string());
+        board.zones[2].priority = 1;
+        let rules = UniformRules::default();
+        let conn = ConnectivityReport::build(&board, &ArcPolicy::default());
+        let s = FanoutSettings::default();
+        let p = plan_plane_vias(&board, &rules, &conn, &s);
+        assert_eq!(p.failed.len(), 1, "{:?}", p.sites);
+        assert!(p.details[0]
+            .rejections
+            .contains_key("via: inside another net's island"));
+        let carve = ["P12V island".to_string()];
+        let p = plan_plane_vias_carving(&board, &rules, &conn, &s, &[], &carve);
+        assert_eq!(p.sites.len(), 1, "{:?}", p.details);
+        let site = &p.sites[0];
+        let carves = via_carves(
+            &board,
+            &rules,
+            &[(site.net, site.via, site.via_diameter)],
+            &carve,
+        );
+        assert_eq!(carves, vec![vec![ZoneId(2)]]);
     }
 
     #[test]

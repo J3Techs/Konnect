@@ -1,7 +1,9 @@
 //! Planning tools of the `native_routing` toolset that write a routing_file
 //! for named copper: `plan_tap_vias` (a via and stub per named pad, reaching
 //! a target layer) and `plan_trunk` (one net's wide trunk on one layer
-//! through ordered waypoints).
+//! through ordered waypoints). Also the arguments the planning tools share:
+//! `carve_zones` (zones a refill carves around new copper) and `replaces`
+//! (board copper a plan replaces).
 //!
 //! Both read the saved board and the project's rules, write nothing to the
 //! board, refuse to replace an existing output file, and check what they
@@ -70,18 +72,31 @@ pub(crate) fn write_plan(output: &Path, plan: &RoutePlan) -> Result<(), CallTool
 }
 
 /// The `carve_zones` argument: exact names of zones a refill will carve
-/// around the planned copper. Each must name a copper zone of the board;
-/// with `layer`, each must also have copper there (carving it elsewhere
-/// would do nothing, so it is taken for a mistake).
+/// around the planned copper. Each must name a copper zone of the board
+/// (a rule area's name is refused as such); with `layer`, each must also
+/// have copper there (carving it elsewhere would do nothing, so it is taken
+/// for a mistake). Without `layer` a zone on any copper layer is accepted:
+/// the planned copper is a through via, or the check covers every layer.
 pub(crate) fn carve_zones_arg(
     board: &RouteBoard,
     args: &Value,
     layer: Option<LayerId>,
 ) -> Result<Vec<String>, Refusal> {
+    carve_zones_arg_hint(board, args, layer, "")
+}
+
+/// [`carve_zones_arg`], with `hint` added to the refusal of a zone that has
+/// no copper on `layer`.
+pub(crate) fn carve_zones_arg_hint(
+    board: &RouteBoard,
+    args: &Value,
+    layer: Option<LayerId>,
+    hint: &str,
+) -> Result<Vec<String>, Refusal> {
     let Some(names) = opt_strings(args, "carve_zones")? else {
         return Ok(Vec::new());
     };
-    let quoted = |list: Vec<&String>| {
+    let quoted = |list: &[&String]| {
         list.iter()
             .map(|n| format!("'{n}'"))
             .collect::<Vec<_>>()
@@ -95,10 +110,24 @@ pub(crate) fn carve_zones_arg(
     };
     let missing: Vec<&String> = names.iter().filter(|n| !on(n, None)).collect();
     if !missing.is_empty() {
-        return Err(invalid(
-            "carve_zones",
-            &format!("no copper zone of the board is named {}", quoted(missing)),
-        ));
+        let (areas, unknown): (Vec<&String>, Vec<&String>) = missing
+            .into_iter()
+            .partition(|n| board.keepouts.iter().any(|k| k.name.as_ref() == Some(*n)));
+        let mut why = Vec::new();
+        if !unknown.is_empty() {
+            why.push(format!(
+                "no copper zone of the board is named {}",
+                quoted(&unknown)
+            ));
+        }
+        if !areas.is_empty() {
+            why.push(format!(
+                "{} {} a rule area, not a copper zone: a refill pours no copper there to carve",
+                quoted(&areas),
+                if areas.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        return Err(invalid("carve_zones", &why.join("; ")));
     }
     if let Some(l) = layer {
         let off: Vec<&String> = names.iter().filter(|n| !on(n, Some(l))).collect();
@@ -106,14 +135,168 @@ pub(crate) fn carve_zones_arg(
             return Err(invalid(
                 "carve_zones",
                 &format!(
-                    "{} has no copper on {}, so there is nothing to carve there",
-                    quoted(off),
+                    "{} has no copper on {}, so there is nothing to carve there{hint}",
+                    quoted(&off),
                     board.layers.name(l)
                 ),
             ));
         }
     }
     Ok(names)
+}
+
+/// Carved zone pieces as `NAME@LAYER`, in order, each once.
+pub(crate) fn carve_labels(
+    board: &RouteBoard,
+    zones: &[konnect_route::api::ZoneId],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for z in zones {
+        let p = &board.zones[z.index()];
+        let label = format!(
+            "{}@{}",
+            p.zone_name.as_deref().unwrap_or("(unnamed)"),
+            board.layers.name(p.layer)
+        );
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Board copper a plan replaces, from `replaces` (UUIDs) and/or
+/// `replaces_file` (a JSON array of UUIDs, or an object whose
+/// `delete_uuids` or `uuids` holds one, as `delete_routing`'s `uuids_file`
+/// takes): each is a track, arc or via of the saved board, found by UUID.
+#[derive(Debug, Default)]
+pub(crate) struct Replaced {
+    /// Every UUID, sorted.
+    pub uuids: Vec<String>,
+    pub file: Option<PathBuf>,
+    /// Board indexes of the replaced tracks, arcs and vias.
+    pub tracks: std::collections::BTreeSet<usize>,
+    pub arcs: std::collections::BTreeSet<usize>,
+    pub vias: std::collections::BTreeSet<usize>,
+}
+
+impl Replaced {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.uuids.is_empty()
+    }
+
+    /// The board without the replaced copper, ids renumbered: the board as
+    /// it will be once `delete_routing` has removed them.
+    pub(crate) fn apply(&self, board: &RouteBoard) -> RouteBoard {
+        let mut b = board.clone();
+        if self.is_empty() {
+            return b;
+        }
+        let mut i = 0;
+        b.tracks.retain(|_| {
+            i += 1;
+            !self.tracks.contains(&(i - 1))
+        });
+        for (n, t) in b.tracks.iter_mut().enumerate() {
+            t.id = konnect_route::api::TrackId(n as u32);
+        }
+        let mut i = 0;
+        b.arcs.retain(|_| {
+            i += 1;
+            !self.arcs.contains(&(i - 1))
+        });
+        for (n, a) in b.arcs.iter_mut().enumerate() {
+            a.id = konnect_route::api::ArcId(n as u32);
+        }
+        let mut i = 0;
+        b.vias.retain(|_| {
+            i += 1;
+            !self.vias.contains(&(i - 1))
+        });
+        for (n, v) in b.vias.iter_mut().enumerate() {
+            v.id = konnect_route::api::ViaId(n as u32);
+        }
+        b
+    }
+
+    /// Whether the board via with this UUID is replaced.
+    pub(crate) fn has_via(&self, board: &RouteBoard, uuid: &str) -> bool {
+        self.vias
+            .iter()
+            .any(|&i| board.vias[i].uuid.as_deref() == Some(uuid))
+    }
+
+    /// The reply's echo.
+    pub(crate) fn json(&self) -> Value {
+        if self.is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "uuids": self.uuids,
+            "file": self.file,
+            "tracks": self.tracks.len(),
+            "arcs": self.arcs.len(),
+            "vias": self.vias.len(),
+        })
+    }
+}
+
+/// The `replaces` and `replaces_file` arguments, resolved on `board`. A
+/// UUID that is not a track, arc or via of the saved board refuses the
+/// call, naming it.
+pub(crate) fn replaces_arg(board: &RouteBoard, args: &Value) -> Result<Replaced, Refusal> {
+    use crate::tools::routing_batch::{uuid_list, uuids_in_file};
+    let mut out = Replaced::default();
+    let mut from: Vec<(String, &'static str)> = Vec::new();
+    if let Some(v) = args.get("replaces").filter(|v| !v.is_null()) {
+        for u in uuid_list(v, "replaces").map_err(|(f, r)| invalid(&f, &r))? {
+            from.push((u, "replaces"));
+        }
+    }
+    if let Some(f) = args.get("replaces_file").filter(|v| !v.is_null()) {
+        let path = f.as_str().map(PathBuf::from);
+        if let Some(p) = &path {
+            crate::tools::route_native::file_must_exist(p, "replaces_file")?;
+        }
+        for u in uuids_in_file(f, "replaces_file").map_err(|(f, r)| invalid(&f, &r))? {
+            from.push((u, "replaces_file"));
+        }
+        out.file = path;
+    }
+    let mut unknown: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for (u, field) in &from {
+        let at = |uuid: &Option<String>| uuid.as_deref() == Some(u.as_str());
+        if let Some(i) = board.tracks.iter().position(|t| at(&t.uuid)) {
+            out.tracks.insert(i);
+        } else if let Some(i) = board.arcs.iter().position(|a| at(&a.uuid)) {
+            out.arcs.insert(i);
+        } else if let Some(i) = board.vias.iter().position(|v| at(&v.uuid)) {
+            out.vias.insert(i);
+        } else {
+            unknown.entry(field).or_default().push(u.clone());
+        }
+    }
+    if let Some((field, list)) = unknown.into_iter().next() {
+        let shown: Vec<String> = list.iter().take(10).map(|u| format!("'{u}'")).collect();
+        return Err(invalid(
+            field,
+            &format!(
+                "{}{} {} not a track, arc or via of the saved board",
+                shown.join(", "),
+                if list.len() > 10 {
+                    format!(" and {} more", list.len() - 10)
+                } else {
+                    String::new()
+                },
+                if list.len() == 1 { "is" } else { "are" }
+            ),
+        ));
+    }
+    let mut uuids: Vec<String> = from.into_iter().map(|(u, _)| u).collect();
+    uuids.sort();
+    uuids.dedup();
+    out.uuids = uuids;
+    Ok(out)
 }
 
 /// The routing_file of `copper`; empty when nothing was planned (the reply
@@ -247,10 +430,23 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             &format!("'{target_name}' is not a copper layer of the board"),
         ));
     };
-    let carve = match carve_zones_arg(&board, args, Some(target)) {
+    // A tap via is a through via: a zone on any copper layer may be carved.
+    let carve = match carve_zones_arg(&board, args, None) {
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
+    let mut keepouts: Vec<BBox> = Vec::new();
+    if let Some(list) = args.get("keepouts").filter(|v| !v.is_null()) {
+        let Some(list) = list.as_array() else {
+            return Ok(invalid("keepouts", "must be an array of boxes"));
+        };
+        for (i, b) in list.iter().enumerate() {
+            match board_inspect::box_arg(b, &format!("keepouts[{i}]")) {
+                Ok(b) => keepouts.push(b),
+                Err(r) => return Ok(r),
+            }
+        }
+    }
     let indices = match board_inspect::named_pads(&board, &names, "pads") {
         Ok(v) => v,
         Err(r) => return Ok(r),
@@ -272,9 +468,15 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         retry_failed,
         ..Default::default()
     };
+    let options = konnect_route::fanout::tap::TapOptions {
+        carve_zones: carve.clone(),
+        keepouts: keepouts.clone(),
+    };
     let t = std::time::Instant::now();
     let plan = match guarded("tap vias", || {
-        konnect_route::fanout::tap::plan_tap_vias(&board, &rules, &pads, target, &carve, &settings)
+        konnect_route::fanout::tap::plan_tap_vias_with(
+            &board, &rules, &pads, target, &options, &settings,
+        )
     }) {
         Ok(p) => p,
         Err(e) => return Ok(stage_failure("plan_tap_vias", e)),
@@ -287,11 +489,29 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let report = konnect_route::check::check_routed(&board, &rules, &copper);
     let label =
         |p: konnect_route::api::PadId| board_inspect::pad_label(&board, &board.pads[p.index()]);
+    // Which carved pours each via sits in: those get an antipad at the
+    // refill.
+    let via_sites: Vec<(NetId, Point, Coord)> = plan
+        .sites
+        .iter()
+        .map(|s| (s.net, s.at, s.via.map_or(0, |v| v.0)))
+        .collect();
+    let carves = konnect_route::fanout::via_carves(&board, &rules, &via_sites, &carve);
+    let mut carves_by_zone: BTreeMap<String, usize> = BTreeMap::new();
     let sites: Vec<Value> = plan
         .sites
         .iter()
-        .map(|s| {
+        .zip(&carves)
+        .map(|(s, zones)| {
             let (x, y) = s.at.to_mm();
+            let carved = if s.via.is_some() {
+                carve_labels(&board, zones)
+            } else {
+                Vec::new()
+            };
+            for c in &carved {
+                *carves_by_zone.entry(c.clone()).or_default() += 1;
+            }
             json!({
                 "pad": label(s.pad),
                 "net": board.net(s.net).name,
@@ -303,6 +523,7 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                     "from": pt(a), "to": pt(b), "width_mm": mm(w),
                     "length_mm": nm_to_mm((b - a).length_f64().round() as i64),
                 })),
+                "carves": carved,
             })
         })
         .collect();
@@ -349,6 +570,10 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "board": spec.board,
         "target_layer": board.layers.name(target),
         "carve_zones": carve,
+        "carves_by_zone": carves_by_zone,
+        "keepouts": keepouts.iter().map(|b| json!({
+            "x1": mm(b.min.x), "y1": mm(b.min.y), "x2": mm(b.max.x), "y2": mm(b.max.y),
+        })).collect::<Vec<_>>(),
         "requested": names.len(),
         "sites": sites,
         "failed": failed,
@@ -722,15 +947,30 @@ fn plan_trunk_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             })
         })
         .collect();
+    // The carved pours on the trunk's layer a planned waypoint via sits in.
+    let via_carves = konnect_route::fanout::via_carves(
+        &board,
+        &rules,
+        &plan
+            .vias
+            .iter()
+            .map(|v| (net, v.at, v.diameter))
+            .collect::<Vec<_>>(),
+        &a.spec.carve_zones,
+    );
     let vias: Vec<Value> = plan
         .vias
         .iter()
-        .map(|v| {
+        .zip(&via_carves)
+        .map(|(v, zones)| {
             let (x, y) = v.at.to_mm();
             let mut o =
                 json!({ "x": x, "y": y, "diameter_mm": mm(v.diameter), "drill_mm": mm(v.drill) });
             match &v.status {
-                ViaStatus::Planned => o["status"] = json!("planned"),
+                ViaStatus::Planned => {
+                    o["status"] = json!("planned");
+                    o["carves"] = json!(carve_labels(&board, zones));
+                }
                 ViaStatus::Existing => o["status"] = json!("existing_on_board"),
                 ViaStatus::NotRequested => o["status"] = json!("not_requested"),
                 ViaStatus::Illegal { reason } => {

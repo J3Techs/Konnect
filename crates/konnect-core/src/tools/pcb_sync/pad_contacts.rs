@@ -234,12 +234,15 @@ fn pad_copper(pad: &kiapi::board::types::Pad) -> PadCopper {
 /// The arc as two chords, widened by their sagitta so the chords cover the
 /// curve.
 fn arc_shapes(a: &kiapi::board::types::Arc) -> Option<Vec<Shape>> {
-    let (s, m, e) = (
+    arc_chords(
         nm_point(a.start.as_ref())?,
         nm_point(a.mid.as_ref())?,
         nm_point(a.end.as_ref())?,
-    );
-    let width = a.width.as_ref().map_or(0, |w| w.value_nm);
+        a.width.as_ref().map_or(0, |w| w.value_nm),
+    )
+}
+
+fn arc_chords(s: Point, m: Point, e: Point, width: i64) -> Option<Vec<Shape>> {
     let sag = |p: Point, q: Point| -> f64 {
         // Distance from the chord p-q to the arc is at most the distance
         // from the chord's midpoint to the arc's mid point.
@@ -340,6 +343,86 @@ impl CopperGeometry {
                 ))])
             })();
             geometry.push("via", id_of(&v.id), net_of(&v.net), None, shapes);
+        }
+        geometry
+    }
+
+    /// The same geometry read from a saved board, for a backend that edits
+    /// the closed file. `pads` maps each saved pad's UUID to its footprint's
+    /// UUID and its number. A saved pad the loader did not read (it leaves out
+    /// footprints parked off the board) is recorded as unknown, never as
+    /// untouched. Pad outlines are the loader's, a superset where it
+    /// approximates; vias are taken on every layer, as the live read does.
+    pub fn from_saved(
+        board: &konnect_route::RouteBoard,
+        pads: &BTreeMap<String, (String, String)>,
+        zones: usize,
+    ) -> Self {
+        use konnect_route::api::{LayerId, NetId};
+        let mut geometry = CopperGeometry {
+            zones,
+            ..CopperGeometry::default()
+        };
+        let layer = |id: LayerId| -> i32 {
+            konnect_ipc::builders::layer_from_name(&board.layers.copper[id.index()].name) as i32
+        };
+        let net = |id: Option<NetId>| id.map(|n| board.net(n).name.clone()).unwrap_or_default();
+        for pad in &board.pads {
+            let Some(key) = pad.uuid.as_ref().and_then(|uuid| pads.get(uuid)) else {
+                continue;
+            };
+            let layers = pad.drill.is_none().then(|| {
+                board
+                    .layers
+                    .copper
+                    .iter()
+                    .filter(|l| pad.layers.contains(l.id))
+                    .map(|l| layer(l.id))
+                    .collect::<Vec<_>>()
+            });
+            let copper = if pad.shapes.is_empty() {
+                PadCopper::Unknown("the saved pad has no copper shape".to_string())
+            } else {
+                PadCopper::Known(
+                    pad.shapes
+                        .iter()
+                        .map(|shape| (layers.clone(), shape.clone()))
+                        .collect(),
+                )
+            };
+            geometry.pads.insert(key.clone(), copper);
+        }
+        for key in pads.values() {
+            geometry.pads.entry(key.clone()).or_insert_with(|| {
+                PadCopper::Unknown("the saved-board loader did not read this pad".to_string())
+            });
+        }
+        for t in &board.tracks {
+            geometry.push(
+                "track",
+                t.uuid.clone().unwrap_or_default(),
+                net(t.net),
+                Some(layer(t.layer)),
+                Some(vec![Shape::Segment(t.seg)]),
+            );
+        }
+        for a in &board.arcs {
+            geometry.push(
+                "arc",
+                a.uuid.clone().unwrap_or_default(),
+                net(a.net),
+                Some(layer(a.layer)),
+                arc_chords(a.start, a.mid, a.end, i64::from(a.width)),
+            );
+        }
+        for v in &board.vias {
+            geometry.push(
+                "via",
+                v.uuid.clone().unwrap_or_default(),
+                net(v.net),
+                None,
+                Some(vec![v.shape()]),
+            );
         }
         geometry
     }

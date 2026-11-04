@@ -9,7 +9,18 @@
 //! computing the vertex that lands it exactly. Each end may be anchored on a
 //! pad (`REF.PAD`), a via by UUID or a via by position; the end vertex must
 //! lie within 1 micron of it, and the anchor must be of the route's net with
-//! copper on its layer.
+//! copper on its layer. An end may instead place a `new_via`: a through via
+//! of the route's net exactly on the end vertex, so the route changes layers
+//! there and a later call lands on it with `via_at` (this plan in its
+//! `avoid_routing_files`). A new via meets the tap-via site rules
+//! (`fanout::tap::check_via_site`: the via floor, clearances, no SMD pad of
+//! its own net, outside other nets' islands on every layer unless
+//! `carve_zones` names them) and goes into the plan with the tracks.
+//!
+//! `replaces` / `replaces_file` name board tracks, arcs and vias the plan
+//! replaces: the check and the lint run on the board without them, an anchor
+//! may not be one of them, and their UUIDs are written beside the plan
+//! (`<stem>.replaces.json`, `{"delete_uuids": [...]}`) for `delete_routing`.
 //!
 //! The geometry is refused, naming the segment or vertex, when a segment is
 //! not 0, 45 or 90 degrees within 1 nm (unless `allow_any_angle`), is shorter
@@ -26,17 +37,17 @@ use crate::tools::route_native::{
     base_spec, invalid, loaded, opt_bool, opt_strings, stage_failure, Refusal,
 };
 use crate::tools::route_plan_tools::{
-    absolute, board_item_label, check_json, length_arg, point_arg, read_avoid, refuse_existing,
-    write_plan,
+    absolute, board_item_label, carve_labels, carve_zones_arg_hint, check_json, length_arg,
+    point_arg, read_avoid, refuse_existing, replaces_arg, write_plan, Replaced,
 };
 use crate::tools::{board_lint, get_path, route_geometry, ToolContext};
 use konnect_geom::{Coord, Point, Segment};
 use konnect_route::api::{Generation, LayerId, NetId};
 use konnect_route::check::CheckedItem;
-use konnect_route::plan::{RoutePlan, RoutedCopper, RoutedTrack};
+use konnect_route::plan::{RoutePlan, RoutedCopper, RoutedTrack, RoutedVia};
 use konnect_route::RouteBoard;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How far an end vertex may lie from its anchor, nm (1 micron).
 const ANCHOR_TOL_NM: f64 = 1_000.0;
@@ -64,12 +75,18 @@ pub(crate) fn schema() -> Value {
     let anchor = |end: &str| {
         json!({
             "type": "object",
-            "description": format!("What the {end} vertex lands on: exactly one of pad, via_uuid or via_at. It must be of the route's net with copper on its layer, and the vertex must lie within 1 micron of it (a pad's anchor, the hole centre of a through-hole pad; a via's centre)"),
+            "description": format!("What the {end} vertex lands on: exactly one of pad, via_uuid, via_at or new_via. A pad or via must be of the route's net with copper on its layer, and the vertex must lie within 1 micron of it (a pad's anchor, the hole centre of a through-hole pad; a via's centre). A via listed in replaces cannot be an anchor"),
             "properties": {
                 "pad": { "type": "string", "minLength": 3, "description": "REFERENCE.NUMBER, e.g. J1.4" },
                 "via_uuid": { "type": "string", "minLength": 1, "description": "UUID of a via on the saved board" },
                 "via_at": { "type": "object", "description": "Position of a via on the saved board or in avoid_routing_files, mm (within 1 micron)",
-                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] }
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] },
+                "new_via": { "type": "object", "additionalProperties": false,
+                             "description": format!("Place a new through via of the route's net exactly at the {end} vertex, so the route can change layers there (a later build_route anchors on it with via_at and this plan in avoid_routing_files). It goes into the routing_file and is checked with the tracks; it must also meet the tap-via site rules (the via floor, clearances, no SMD pad of its own net under it, and outside other nets' islands on every layer unless carve_zones names them). Refused when a via of the net already sits there (use via_at), or together with extend_to on the same end"),
+                             "properties": {
+                                 "diameter_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Default: the net class via diameter" },
+                                 "drill_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Default: the net class via drill" }
+                             } }
             }
         })
     };
@@ -95,6 +112,10 @@ pub(crate) fn schema() -> Value {
             "min_segment_mm": { "type": "number", "minimum": 0.001, "maximum": 50, "default": 0.25, "description": "Shortest segment allowed" },
             "avoid_routing_files": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1,
                                      "description": "Planned copper (routing_files) the route is checked against as if it were on the board; their vias also serve via_at anchors" },
+            "carve_zones": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1,
+                             "description": "Zones (exact names) a refill will carve around the new copper. On the route's layer their fill is no obstacle (as for plan_trunk; the exact check leaves fills to the refill anyway) and the reply gives the route length over each; a new_via may sit inside their islands on any copper layer and lists the pours it carves. Each must be a copper zone of the board; without a new_via it must have copper on the route's layer" },
+            "replaces": crate::tools::route_native::replaces_prop(),
+            "replaces_file": crate::tools::route_native::replaces_file_prop(),
             "parallel_to": { "type": "object", "description": "Instead of vertices: the polyline offset sideways from another route, one unbranched chain of tracks of one net on this layer in a routing_file (another net's plan, or a build_route output), run in the direction of its first listed track. Collinear tracks are one run. That file is also checked against",
                              "properties": {
                                  "routing_file": { "type": "string", "minLength": 1 },
@@ -103,7 +124,7 @@ pub(crate) fn schema() -> Value {
                                  "side": { "type": "string", "enum": ["left", "right"], "description": "Which side of the chain, looking along it as drawn on the board (y down)" }
                              },
                              "required": ["routing_file", "pitch_mm", "side"] },
-            "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" }
+            "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced. With replaces, the UUIDs are also written beside it as <output_plan stem>.replaces.json ({\"delete_uuids\": [...]}) for delete_routing's uuids_file; that file is never replaced either" }
         }),
         &["board", "net", "layer", "output_plan"],
     )
@@ -213,33 +234,147 @@ impl Anchor {
     }
 }
 
+/// A new through via the route places at an end vertex.
+#[derive(Debug, Clone)]
+pub(crate) struct NewVia {
+    diameter: Coord,
+    drill: Coord,
+    /// `net_class` or `arguments`: where the size came from.
+    sized_from: &'static str,
+}
+
+/// What an end lands on.
+#[derive(Debug, Clone)]
+pub(crate) enum End {
+    Anchor(Anchor),
+    NewVia(NewVia),
+}
+
+impl End {
+    fn anchor(&self) -> Option<&Anchor> {
+        match self {
+            End::Anchor(a) => Some(a),
+            End::NewVia(_) => None,
+        }
+    }
+}
+
+/// `{key}.new_via`: the via size, the net class via's where not given.
+fn new_via_arg(
+    v: &Value,
+    field: &str,
+    rules: &konnect_route::ProjectRuleTable,
+    net: NetId,
+) -> Result<NewVia, Refusal> {
+    let Some(o) = v.as_object() else {
+        return Err(invalid(
+            field,
+            "must be an object (diameter_mm and drill_mm are optional)",
+        ));
+    };
+    if let Some(k) = o
+        .keys()
+        .find(|k| !["diameter_mm", "drill_mm"].contains(&k.as_str()))
+    {
+        return Err(invalid(
+            &format!("{field}.{k}"),
+            "is not diameter_mm or drill_mm",
+        ));
+    }
+    let class = konnect_route::RuleTable::via(
+        rules,
+        &konnect_route::rules::RuleSubject::new(konnect_route::api::ItemKind::Via, Some(net)),
+    );
+    let size = |k: &str| -> Result<Option<Coord>, Refusal> {
+        match o.get(k).filter(|v| !v.is_null()) {
+            None => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .filter(|x| x.is_finite() && *x > 0.0 && *x <= MAX_WIDTH_MM)
+                .and_then(konnect_geom::mm_to_nm)
+                .filter(|n| *n > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    invalid(
+                        &format!("{field}.{k}"),
+                        &format!("must be a size above 0 and at most {MAX_WIDTH_MM} mm"),
+                    )
+                }),
+        }
+    };
+    let (d, dr) = (size("diameter_mm")?, size("drill_mm")?);
+    let sized_from = if d.is_none() && dr.is_none() {
+        "net_class"
+    } else {
+        "arguments"
+    };
+    let (diameter, drill) = (d.unwrap_or(class.diameter), dr.unwrap_or(class.drill));
+    if drill >= diameter {
+        return Err(invalid(
+            field,
+            &format!(
+                "the drill ({} mm) must be smaller than the diameter ({} mm)",
+                mm(drill),
+                mm(diameter)
+            ),
+        ));
+    }
+    Ok(NewVia {
+        diameter,
+        drill,
+        sized_from,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn anchor_arg(
     board: &RouteBoard,
+    rules: &konnect_route::ProjectRuleTable,
     avoid: &RoutedCopper,
+    replaced: &Replaced,
     args: &Value,
     key: &str,
     net: NetId,
     layer: LayerId,
-) -> Result<Option<Anchor>, Refusal> {
+) -> Result<Option<End>, Refusal> {
     let Some(v) = args.get(key).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
     let Some(o) = v.as_object() else {
         return Err(invalid(
             key,
-            "must be an object with one of pad, via_uuid or via_at",
+            "must be an object with one of pad, via_uuid, via_at or new_via",
         ));
     };
-    let given: Vec<&str> = ["pad", "via_uuid", "via_at"]
+    let given: Vec<&str> = ["pad", "via_uuid", "via_at", "new_via"]
         .into_iter()
         .filter(|k| o.get(*k).is_some_and(|v| !v.is_null()))
         .collect();
     let [which] = given[..] else {
         return Err(invalid(
             key,
-            "give exactly one of pad (REFERENCE.NUMBER), via_uuid or via_at",
+            "give exactly one of pad (REFERENCE.NUMBER), via_uuid, via_at or new_via",
         ));
     };
+    if which == "new_via" {
+        let field = format!("{key}.new_via");
+        return new_via_arg(&o["new_via"], &field, rules, net).map(|n| Some(End::NewVia(n)));
+    }
+    anchor_existing(board, avoid, replaced, o, which, key, net, layer).map(|a| a.map(End::Anchor))
+}
+
+/// A `pad`, `via_uuid` or `via_at` anchor, resolved.
+#[allow(clippy::too_many_arguments)]
+fn anchor_existing(
+    board: &RouteBoard,
+    avoid: &RoutedCopper,
+    replaced: &Replaced,
+    o: &serde_json::Map<String, Value>,
+    which: &str,
+    key: &str,
+    net: NetId,
+    layer: LayerId,
+) -> Result<Option<Anchor>, Refusal> {
     let net_name = |n: Option<NetId>| n.map_or("no net".to_string(), |n| board.net(n).name.clone());
     let layer_name = board.layers.name(layer);
     let route_net = &board.net(net).name;
@@ -305,6 +440,12 @@ fn anchor_arg(
                     ),
                 ));
             }
+            if replaced.has_via(board, uuid.trim()) {
+                return Err(invalid(
+                    &field,
+                    &format!("the via {uuid} is listed in replaces: it will be deleted, so the route cannot land on it (place a new_via there, or leave the via out of replaces)"),
+                ));
+            }
             Ok(Some(Anchor {
                 kind: "via",
                 name: uuid.to_string(),
@@ -315,19 +456,29 @@ fn anchor_arg(
             let field = format!("{key}.via_at");
             let at = point_arg(&o["via_at"], &field)?;
             let near = |c: Point| (c - at).length_f64() <= ANCHOR_TOL_NM;
-            let mut found: Vec<(Point, Option<NetId>, String)> = board
+            // (centre, net, source, replaced)
+            let mut found: Vec<(Point, Option<NetId>, String, bool)> = board
                 .vias
                 .iter()
-                .filter(|v| near(v.center) && v.layers.contains(layer))
-                .map(|v| (v.center, v.net, "saved board".to_string()))
+                .enumerate()
+                .filter(|(_, v)| near(v.center) && v.layers.contains(layer))
+                .map(|(i, v)| {
+                    (
+                        v.center,
+                        v.net,
+                        "saved board".to_string(),
+                        replaced.vias.contains(&i),
+                    )
+                })
                 .collect();
-            found.extend(
-                avoid
-                    .vias
-                    .iter()
-                    .filter(|v| near(v.center))
-                    .map(|v| (v.center, Some(v.net), "avoid_routing_files".to_string())),
-            );
+            found.extend(avoid.vias.iter().filter(|v| near(v.center)).map(|v| {
+                (
+                    v.center,
+                    Some(v.net),
+                    "avoid_routing_files".to_string(),
+                    false,
+                )
+            }));
             if found.is_empty() {
                 return Err(invalid(
                     &field,
@@ -337,7 +488,16 @@ fn anchor_arg(
                     ),
                 ));
             }
-            let Some((center, _, source)) = found.iter().find(|f| f.1 == Some(net)) else {
+            if !found.iter().any(|f| f.1 == Some(net) && !f.3) {
+                if let Some((center, ..)) = found.iter().find(|f| f.1 == Some(net) && f.3) {
+                    return Err(invalid(
+                        &field,
+                        &format!("the via of {route_net} at {} is listed in replaces: it will be deleted, so the route cannot land on it (place a new_via there, or leave the via out of replaces)", fmt_pt(*center)),
+                    ));
+                }
+            }
+            let Some((center, _, source, _)) = found.iter().find(|f| f.1 == Some(net) && !f.3)
+            else {
                 return Err(invalid(
                     &field,
                     &format!(
@@ -971,8 +1131,26 @@ fn build(
         }
     }
     let avoid = read_avoid(board, &avoid_files)?;
-    let start = anchor_arg(board, &avoid, args, "start", net, layer)?;
-    let end = anchor_arg(board, &avoid, args, "end", net, layer)?;
+    // Board copper the plan replaces: checked and linted as deleted, and
+    // written beside the plan for delete_routing.
+    let replaced = replaces_arg(board, args)?;
+    let replaces_out = (!replaced.is_empty()).then(|| replaces_path(output));
+    if let Some(r) = replaces_out.as_deref().and_then(refuse_existing) {
+        return Err(r);
+    }
+    let start = anchor_arg(board, rules, &avoid, &replaced, args, "start", net, layer)?;
+    let end = anchor_arg(board, rules, &avoid, &replaced, args, "end", net, layer)?;
+    let any_new_via = [&start, &end]
+        .iter()
+        .any(|e| matches!(e, Some(End::NewVia(_))));
+    // A new via is a through via: a zone on any copper layer may be carved.
+    // Without one the route has copper on its own layer only.
+    let carve = carve_zones_arg_hint(
+        board,
+        args,
+        (!any_new_via).then_some(layer),
+        ", and without a start or end new_via the route has no copper on other layers",
+    )?;
 
     // The polyline as given.
     let given = vertices_arg(args)?;
@@ -1016,11 +1194,23 @@ fn build(
             continue;
         };
         let field = format!("extend_to.{end_name}");
-        let Some(anchor) = anchor else {
-            return Err(invalid(
-                &field,
-                &format!("needs a {end_name} anchor to land on"),
-            ));
+        let anchor = match anchor {
+            None => {
+                return Err(invalid(
+                    &field,
+                    &format!("needs a {end_name} anchor to land on"),
+                ))
+            }
+            Some(End::NewVia(_)) => {
+                return Err(invalid(
+                    &field,
+                    &format!(
+                        "cannot be used with {end_name}.new_via: the new via is placed exactly at the {} vertex as given, so there is no anchor to turn into. Drop extend_to.{end_name}, or land on a pad or an existing via",
+                        if end_name == "start" { "first" } else { "last" }
+                    ),
+                ))
+            }
+            Some(End::Anchor(a)) => a,
         };
         let before = verts.len();
         verts = if end_name == "start" {
@@ -1055,7 +1245,14 @@ fn build(
         ("start", &start, verts[0], 0),
         ("end", &end, verts[verts.len() - 1], verts.len() - 1),
     ] {
-        let Some(anchor) = anchor else {
+        let Some(anchor) = anchor.as_ref().and_then(End::anchor) else {
+            if matches!(anchor, Some(End::NewVia(_))) {
+                anchors.insert(
+                    end_name.to_string(),
+                    json!({ "kind": "new_via", "name": format!("new via at {}", fmt_pt(vertex)),
+                            "at": pt(vertex), "offset_mm": 0.0 }),
+                );
+            }
             continue;
         };
         let off = (vertex - anchor.at).length_f64();
@@ -1077,8 +1274,9 @@ fn build(
     }
     check_polyline(&verts, field, any_angle, min_segment, min_bend)?;
 
-    // The copper, checked against the board and the avoided copper.
-    let copper = RoutedCopper {
+    // The copper, checked against the board (without the copper it
+    // replaces) and the avoided copper.
+    let mut copper = RoutedCopper {
         tracks: verts
             .windows(2)
             .zip(&widths)
@@ -1091,11 +1289,83 @@ fn build(
             .collect(),
         vias: Vec::new(),
     };
-    let mut base_board = board.clone();
+    let mut base_board = replaced.apply(board);
     avoid.freeze_into(&mut base_board);
     // Board tracks the route repeats exactly are the route already applied
     // (re-planning a hand route): checked as the route, not against it.
     let (checked, repeated) = board_lint::without_repeated(&base_board, &copper);
+
+    // New vias at the ends: placed exactly on the end vertex, judged by the
+    // tap-via site rules before the exact check.
+    let mut new_vias: Vec<(&'static str, Point, NewVia)> = Vec::new();
+    for (end_name, e, vertex) in [
+        ("start", &start, verts[0]),
+        ("end", &end, verts[verts.len() - 1]),
+    ] {
+        if let Some(End::NewVia(nv)) = e {
+            new_vias.push((end_name, vertex, nv.clone()));
+        }
+    }
+    let route_net = board.net(net).name.clone();
+    for (i, (end_name, at, nv)) in new_vias.iter().enumerate() {
+        let field = format!("{end_name}.new_via");
+        let near = |c: Point| (c - *at).length_f64() <= ANCHOR_TOL_NM;
+        let on_board = board
+            .vias
+            .iter()
+            .enumerate()
+            .any(|(k, v)| v.net == Some(net) && near(v.center) && !replaced.vias.contains(&k));
+        let in_avoid = avoid.vias.iter().any(|v| v.net == net && near(v.center));
+        if on_board || in_avoid {
+            return Err(invalid(
+                &field,
+                &format!(
+                    "a via of {route_net} already sits at {} ({}): land on it with {end_name}.via_at instead",
+                    fmt_pt(*at),
+                    if on_board { "saved board" } else { "avoid_routing_files" }
+                ),
+            ));
+        }
+        if i == 1 && near(new_vias[0].1) {
+            return Err(invalid(
+                &field,
+                "lies on the start's new via: the route would place two vias at one point",
+            ));
+        }
+        let verdict = match guarded("via site", || {
+            konnect_route::fanout::tap::check_via_site(
+                &checked,
+                rules,
+                net,
+                *at,
+                nv.diameter,
+                nv.drill,
+                &carve,
+            )
+        }) {
+            Ok(v) => v,
+            Err(e) => return Err(stage_failure("check_via_site", e)),
+        };
+        if let Err(why) = verdict {
+            return Err(invalid(
+                &field,
+                &site_refusal(&checked, &why, &route_net, *at, nv),
+            ));
+        }
+    }
+    let all_layers = board.layers.all();
+    copper.vias = new_vias
+        .iter()
+        .map(|(_, at, nv)| RoutedVia {
+            net,
+            center: *at,
+            diameter: nv.diameter,
+            drill: nv.drill,
+            layers: all_layers,
+            gen: Generation(0),
+        })
+        .collect();
+
     let report = match guarded("check", || {
         konnect_route::check::check_routed(&checked, rules, &copper)
     }) {
@@ -1105,15 +1375,21 @@ fn build(
     let mut check = check_json(
         &checked,
         &report,
-        if avoid_files.is_empty() {
-            "saved board"
-        } else {
-            "saved board plus the avoided routing files"
+        match (avoid_files.is_empty(), replaced.is_empty()) {
+            (true, true) => "saved board",
+            (false, true) => "saved board plus the avoided routing files",
+            (true, false) => "saved board without the replaced copper",
+            (false, false) => {
+                "saved board without the replaced copper, plus the avoided routing files"
+            }
         },
         50,
         |item| match item {
             CheckedItem::RoutedTrack { index } => json!(format!("segment {index}")),
-            CheckedItem::RoutedVia { index } => json!(format!("via {index}")),
+            CheckedItem::RoutedVia { index } => match new_vias.get(*index as usize) {
+                Some((end_name, ..)) => json!(format!("new via at the {end_name}")),
+                None => json!(format!("via {index}")),
+            },
             CheckedItem::Board { item } => json!(board_item_label(&checked, *item)),
             CheckedItem::Edge => json!("board edge"),
         },
@@ -1135,7 +1411,49 @@ fn build(
         let routing = RoutePlan::from_routed(board, &copper)
             .map_err(|e| CallToolResult::error(format!("plan not built: {e}")))?;
         write_plan(output, &routing)?;
+        if let Some(path) = &replaces_out {
+            let body = json!({ "delete_uuids": replaced.uuids, "routing_file": output });
+            let text = serde_json::to_string_pretty(&body).unwrap_or_default();
+            crate::native_route_job::write_new_atomic(path, text.as_bytes()).map_err(|e| {
+                CallToolResult::error(format!(
+                    "the plan was written to {}, but the replaced UUIDs could not be written to {}: {e:#}",
+                    output.display(),
+                    path.display()
+                ))
+            })?;
+        }
     }
+    // The pours a refill carves around the new copper: each new via's, and
+    // the route's length over each named zone on its layer.
+    let via_carves = konnect_route::fanout::via_carves(
+        &checked,
+        rules,
+        &new_vias
+            .iter()
+            .map(|(_, at, nv)| (net, *at, nv.diameter))
+            .collect::<Vec<_>>(),
+        &carve,
+    );
+    let segs: Vec<Segment> = copper.tracks.iter().map(|t| t.seg).collect();
+    let carved: Vec<Value> = carve
+        .iter()
+        .map(|z| {
+            let over = konnect_route::trunk::length_over_zone(board, layer, z, &segs);
+            json!({ "zone": z, "route_length_mm": round4(over / 1e6) })
+        })
+        .collect();
+    let new_vias_json: Vec<Value> = new_vias
+        .iter()
+        .zip(&via_carves)
+        .map(|((end_name, at, nv), zones)| {
+            json!({
+                "end": end_name, "at": pt(*at),
+                "diameter_mm": mm(nv.diameter), "drill_mm": mm(nv.drill),
+                "sized_from": nv.sized_from,
+                "carves": carve_labels(&checked, zones),
+            })
+        })
+        .collect();
     let segments: Vec<Value> = copper
         .tracks
         .iter()
@@ -1179,16 +1497,74 @@ fn build(
             "min_bend_angle_deg": min_bend,
         },
         "avoid_routing_files": avoid_files,
+        "new_vias": new_vias_json,
+        "carve_zones": carved,
+        "replaces": replaced.json(),
+        "replaces_output": if clean { json!(replaces_out) } else { Value::Null },
         "check": check,
         "lint": lint,
         "plan_written": clean,
         "output_plan": if clean { json!(output) } else { Value::Null },
-        "next": if clean {
-            "Review with render_board_layers_png (overlay_routing_files with the other plans); apply with add_routing (routing_files to add several plans as one batch), then refill and run DRC."
-        } else {
-            "Nothing was written: the exact check found violations (listed). Move the vertices, narrow the widths or change the avoided plans, and build again."
+        "next": match (clean, replaces_out.is_some()) {
+            (true, false) => "Review with render_board_layers_png (overlay_routing_files with the other plans); apply with add_routing (routing_files to add several plans as one batch), then refill and run DRC. A new via here is a via_at anchor for the next build_route with this plan in avoid_routing_files.",
+            (true, true) => "Review with render_board_layers_png (overlay_routing_files with the other plans). Apply in the open board: delete_routing with uuids_file set to replaces_output (dry run, then expected_count; include_locked if any is locked), then add_routing with this routing_file; refill and run DRC.",
+            (false, _) => "Nothing was written: the exact check found violations (listed). Move the vertices, narrow the widths or change the avoided plans, and build again.",
         },
     })))
+}
+
+/// `<output_plan stem>.replaces.json` beside the plan.
+fn replaces_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plan".to_string());
+    output.with_file_name(format!("{stem}.replaces.json"))
+}
+
+/// Why a new via's site is refused, naming what refuses it.
+fn site_refusal(
+    board: &RouteBoard,
+    why: &konnect_route::fanout::tap::ViaSiteRefusal,
+    net: &str,
+    at: Point,
+    nv: &NewVia,
+) -> String {
+    let mut s = format!(
+        "a new via of {net} (diameter {} mm, drill {} mm) at {} breaks the via-site rules: {}",
+        mm(nv.diameter),
+        mm(nv.drill),
+        fmt_pt(at),
+        why.reason
+    );
+    if let Some(item) = why.item {
+        s.push_str(&format!(" ({})", board_item_label(board, item)));
+    }
+    if let Some(z) = why.zone {
+        let p = &board.zones[z.index()];
+        s.push_str(&format!(
+            " (zone {} of {} on {}; name it in carve_zones if the refill may cut an antipad around the via)",
+            p.zone_name.as_deref().unwrap_or("(unnamed)"),
+            p.net.map_or("no net".to_string(), |n| board.net(n).name.clone()),
+            board.layers.name(p.layer)
+        ));
+    }
+    if let Some(k) = why.keepout {
+        let area = &board.keepouts[k.index()];
+        s.push_str(&format!(
+            " (rule area {})",
+            area.name.as_deref().unwrap_or("(unnamed)")
+        ));
+    }
+    if let Some(f) = why.floor {
+        s.push_str(&format!(
+            " (the floor here: diameter {} mm, drill {} mm, annular ring {} mm)",
+            mm(f.min_diameter),
+            mm(f.min_drill),
+            mm(f.min_annular)
+        ));
+    }
+    s
 }
 
 #[cfg(test)]

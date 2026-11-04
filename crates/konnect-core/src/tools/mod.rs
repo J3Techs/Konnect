@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+pub(crate) mod board_analysis;
 #[cfg(test)]
 mod board_extents_tests;
 mod board_graphics;
@@ -37,6 +38,7 @@ pub(crate) mod navigation_target;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
+pub(crate) mod pcb_fields;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;

@@ -862,7 +862,9 @@ via, track and hole as an obstacle.
 - **Tools.** `plan_trunk`, `plan_tap_vias` and `check_route_rules` take
   `carve_zones`. A name that matches no copper zone of the board is refused
   (`invalid_argument`, field `carve_zones`); so is a zone with no copper on
-  the trunk's layer or on `target_layer`, since carving it would do nothing.
+  the trunk's layer or on `target_layer`, since carving it would do nothing
+  (for `plan_tap_vias`, superseded by *Carving on every layer a via
+  passes* below).
   `check_route_rules` accepts a zone on any layer: its S7 check
   (`check_routed`) leaves every fill to KiCad's refill, so only the interim
   checker, which treats fills as copper under `zones_are_obstacles`, is
@@ -977,6 +979,71 @@ Additive; no frozen type changed meaning.
   to the per-call item cap. `check_route_rules`' required arguments are now
   `board` and one of the two forms; with a list each violation's routed
   side carries `file` and `member`.
+
+### Carving on every layer a via passes, new vias and replaced copper
+
+Additive; no frozen type changed meaning. No tool was added (`native_routing`
+stays at 20).
+
+- **The island rule.** A tap via, a plane via and now a `build_route` new
+  via must keep its copper out of other nets' islands (zone pieces KiCad
+  flags, or above the lowest priority on their layer) on every layer it
+  passes. A zone named in `carve_zones` is exempt on whatever copper layer
+  it lies: a refill cuts an antipad around the via there. Unnamed islands
+  still refuse a site. On the target layer of a tap the named zone's fill
+  is also no obstacle, as before.
+- **`fanout`.** The candidate context carries a carved mask (by zone piece)
+  and keep-out shapes; `check_via` reports a typed rejection internally
+  (the labels in `FailureDetail::rejections` are unchanged).
+  - `plan_plane_vias_carving(board, rules, connectivity, settings, exclude,
+    carve_zones)`; `plan_plane_vias_excluding` calls it with none.
+  - `via_carves(board, rules, vias: &[(NetId, Point, Coord)], carve_zones)
+    -> Vec<Vec<ZoneId>>`: per via, the named zone pieces of another net
+    whose copper (the fill, or an unfilled zone's outline) comes within the
+    via-to-zone clearance of its annulus, ascending.
+- **`fanout::tap`.** `TapOptions { carve_zones, keepouts: Vec<BBox> }` and
+  `plan_tap_vias_with(board, rules, pads, target, &TapOptions, settings)`;
+  `plan_tap_vias` keeps its signature. Behaviour change: the carved zones'
+  pieces used to be dropped from the index on the target layer only; now a
+  named zone's islands are exempt on every layer. Keep-out boxes take no
+  via (`via: in a keep-out box`) and no stub (`stub: in a keep-out box`).
+  `check_via_site(board, rules, net, centre, diameter, drill, carve_zones)
+  -> Result<(), ViaSiteRefusal { reason, item, zone, keepout, floor }>`
+  judges one through via by the tap rules (no target-layer zone test).
+- **Tools.**
+  - `plan_tap_vias`: `carve_zones` accepts a copper zone on any layer (a
+    tap via is a through via); a rule area's name is refused as such. New
+    `keepouts`. Each site reports `carves` (`NAME@LAYER`), and the reply
+    `carves_by_zone` and `keepouts`.
+  - `plan_plane_vias`: `carve_zones` (any copper zone); reply
+    `carve_zones`, `carves_by_zone`, `carving_sites`.
+  - `plan_trunk`: unchanged validation (trunk layer only). Its waypoint
+    vias were never held out of other nets' islands, so nothing there needs
+    carving; each planned via now reports `carves`.
+  - `build_route`: an end anchor may be `new_via` (`diameter_mm`,
+    `drill_mm`, default the net class via): a through via of the net
+    exactly on the end vertex, written with the tracks and exact-checked
+    with them, after `check_via_site` against the board (minus replaced
+    copper, plus avoided copper). Refused (`invalid_argument`,
+    `start.new_via` / `end.new_via`) when a site rule fails (naming the
+    item, island or floor), when a via of the net already sits within 1
+    micron (saved board or avoided files; use `via_at`), or when the two
+    ends' new vias coincide; `extend_to` on the same end is refused
+    (`extend_to.<end>`). `carve_zones`: any copper zone with a new via,
+    else one with copper on the route's layer; the reply gives
+    `route_length_mm` over each and each new via's `carves`.
+  - `build_route` and `check_route_rules`: `replaces` (UUIDs) and/or
+    `replaces_file` (a JSON array, or an object with `delete_uuids` or
+    `uuids`, as `delete_routing`'s `uuids_file`). Each must be a track, arc
+    or via of the saved board, else the call is refused naming it. The
+    check (and `build_route`'s lint) runs on the board without them, ids
+    renumbered. `build_route` refuses a `via_uuid` / `via_at` anchor on a
+    replaced via, allows a `new_via` where one was, and, when it writes the
+    plan, writes `<stem>.replaces.json` (`{"delete_uuids": [...],
+    "routing_file": ...}`) beside it (never replacing an existing file;
+    `replaces_output` in the reply). `check_route_rules` echoes `replaces`
+    and labels each board side of a violation (`label`).
+  - `routing_batch::uuids_in_file` is the shared reader of those files.
 
 ### Workspace
 

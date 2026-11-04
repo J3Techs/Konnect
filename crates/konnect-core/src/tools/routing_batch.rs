@@ -468,7 +468,9 @@ pub(crate) struct Selection {
 /// Most UUIDs one call may name.
 pub(crate) const MAX_UUIDS: usize = MAX_ITEMS;
 
-fn uuid_list(v: &serde_json::Value, field: &str) -> Result<BTreeSet<String>, Refusal> {
+/// A JSON array of UUID strings (1 to [`MAX_UUIDS`]); the refusal is
+/// `(field, reason)`.
+pub(crate) fn uuid_list(v: &serde_json::Value, field: &str) -> Result<BTreeSet<String>, Refusal> {
     let Some(items) = v.as_array() else {
         return Err(refuse(field, "must be an array of UUID strings"));
     };
@@ -504,33 +506,40 @@ fn uuids_arg(args: &serde_json::Value) -> Result<Option<BTreeSet<String>>, Refus
     match (inline, file) {
         (Some(_), Some(_)) => Err(refuse("uuids_file", "give uuids or uuids_file, not both")),
         (Some(v), None) => uuid_list(v, "uuids").map(Some),
-        (None, Some(f)) => {
-            let Some(path) = f.as_str().filter(|p| !p.is_empty()) else {
-                return Err(refuse("uuids_file", "must be a path"));
-            };
-            let v: serde_json::Value = std::fs::read_to_string(path)
-                .map_err(|e| e.to_string())
-                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
-                .map_err(|e| refuse("uuids_file", format!("cannot be read as JSON: {e}")))?;
-            let list = match &v {
-                serde_json::Value::Array(_) => &v,
-                serde_json::Value::Object(o) => {
-                    match o.get("delete_uuids").or_else(|| o.get("uuids")) {
-                        Some(list) => list,
-                        None => {
-                            return Err(refuse(
-                                "uuids_file",
-                                "holds neither an array nor a delete_uuids or uuids list",
-                            ))
-                        }
-                    }
-                }
-                _ => return Err(refuse("uuids_file", "must hold an array of UUIDs")),
-            };
-            uuid_list(list, "uuids_file").map(Some)
-        }
+        (None, Some(f)) => uuids_in_file(f, "uuids_file").map(Some),
         (None, None) => Ok(None),
     }
+}
+
+/// The UUIDs in the file named by `path` (a path string): a JSON array of
+/// UUIDs, or an object whose `delete_uuids` (as `plan_dogleg_fixes` and
+/// `build_route` write it) or `uuids` holds one. The refusal is `(field,
+/// reason)`.
+pub(crate) fn uuids_in_file(
+    path: &serde_json::Value,
+    field: &str,
+) -> Result<BTreeSet<String>, Refusal> {
+    let Some(path) = path.as_str().filter(|p| !p.is_empty()) else {
+        return Err(refuse(field, "must be a path"));
+    };
+    let v: serde_json::Value = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        .map_err(|e| refuse(field, format!("cannot be read as JSON: {e}")))?;
+    let list = match &v {
+        serde_json::Value::Array(_) => &v,
+        serde_json::Value::Object(o) => match o.get("delete_uuids").or_else(|| o.get("uuids")) {
+            Some(list) => list,
+            None => {
+                return Err(refuse(
+                    field,
+                    "holds neither an array nor a delete_uuids or uuids list",
+                ))
+            }
+        },
+        _ => return Err(refuse(field, "must hold an array of UUIDs")),
+    };
+    uuid_list(list, field)
 }
 
 pub(crate) fn parse_selection(args: &serde_json::Value) -> Result<Selection, Refusal> {
