@@ -203,7 +203,13 @@ mod tests {
                         "copy_routing_pattern/properties/net_map" |
                         "apply_template/properties/net_mappings" |
                         "route_native_region/properties/class_layers" |
-                        "start_native_route_job/properties/class_layers"
+                        "start_native_route_job/properties/class_layers" |
+                        "set_footprint_field_values/properties/edits/items/properties/fields" |
+                        "analyze_ir_drop/properties/sinks" |
+                        "check_voltage_spacing/properties/voltages" |
+                        "check_thermal_pads/properties/recommended" |
+                        "check_thermal_pads/properties/recommended/additionalProperties/properties/area_mm2_min" |
+                        "measure_net_lengths/properties/groups/items/properties/endpoints"
                     ),
                         "unreviewed open input record: {path}"
                     );

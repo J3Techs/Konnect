@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+pub(crate) mod board_analysis;
 #[cfg(test)]
 mod board_extents_tests;
 mod board_graphics;

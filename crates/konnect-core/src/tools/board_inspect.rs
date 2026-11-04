@@ -74,6 +74,14 @@ pub(crate) fn load_saved_board(args: &Value) -> anyhow::Result<Result<SavedBoard
 }
 
 pub(crate) fn load_board_at(path: &Path) -> Result<SavedBoard, Refusal> {
+    load_board_and_tree(path).map(|(saved, _)| saved)
+}
+
+/// [`load_board_at`] plus the parsed tree, for callers that also read other
+/// parts of the file (the stackup, footprint layers) without parsing twice.
+pub(crate) fn load_board_and_tree(
+    path: &Path,
+) -> Result<(SavedBoard, konnect_sexp::SexpNode), Refusal> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -99,13 +107,16 @@ pub(crate) fn load_board_at(path: &Path) -> Result<SavedBoard, Refusal> {
             ))
         })?;
     let zones = konnect_sexp::board::zone_records(&tree);
-    Ok(SavedBoard {
-        path: path.to_path_buf(),
-        board,
-        report,
-        zones: zones.items,
-        zones_skipped: zones.skipped,
-    })
+    Ok((
+        SavedBoard {
+            path: path.to_path_buf(),
+            board,
+            report,
+            zones: zones.items,
+            zones_skipped: zones.skipped,
+        },
+        tree,
+    ))
 }
 
 // ─── Shared filters ──────────────────────────────────────────────────────────
@@ -967,7 +978,12 @@ fn query_pads_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         .map(|p| pad_json(b, p, compact))
         .collect();
     let room = max_items.saturating_sub(pads.len());
-    pads.extend(outside.iter().take(room).map(|p| out_of_range_pad_json(b, p)));
+    pads.extend(
+        outside
+            .iter()
+            .take(room)
+            .map(|p| out_of_range_pad_json(b, p)),
+    );
     let matched = found.len() + outside.len();
     Ok(CallToolResult::json(&json!({
         "source": "saved_file",

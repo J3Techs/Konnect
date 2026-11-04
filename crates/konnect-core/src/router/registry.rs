@@ -87,6 +87,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 20,
     },
     ToolsetMeta {
+        name: "board_analysis",
+        description: "Layout adequacy analyses of the saved board: zone hygiene, IPC-2152 current capacity, DC IR drop, stitching vias, decoupling distance, thermal pads, IPC-2221B voltage spacing, net lengths and skew",
+        category: "pcb",
+        tool_count: 8,
+    },
+    ToolsetMeta {
         name: "pcb_fields",
         description: "Inspect and edit live footprint text, visibility, documentation-layer placement and custom properties",
         category: "pcb",
@@ -196,6 +202,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_fields" => Some(Vec::from(pcb_fields::tools())),
+        "board_analysis" => Some(board_analysis::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "native_routing" => Some(route_native::tools()),
         "placement" => Some(placement::tools()),

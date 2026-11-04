@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **22 toolsets** organized into 10 categories
-- **262 registered tools** + **7 always-visible meta-tools** = **269 total**
+- **24 toolsets** organized into 10 categories
+- **273 registered tools** + **7 always-visible meta-tools** = **280 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 24 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -293,6 +293,21 @@ and Windows servers do not.
 | `list_footprint_fields` | Inspect live mandatory and custom fields with their text, visibility, layer and board position. |
 | `edit_footprint_fields` | Dry-run and revision-bound field changes with post-commit readback and explicit uncertain-state recovery; never renumbers references or writes board files. |
 | `set_footprint_field_values` | Set, create or remove field values (MPN, LCSC, Value, any custom property) on many footprints in one call. Live boards are edited over IPC in one commit with readback; a board KiCad provably does not hold (no sibling lock) gets one revision-checked atomic write that changes only the named values (a created field copies the Value property's style, hidden; a removed one is cut). Dry run by default; an apply repeats the dry run's `plan_revision`. `edits_file` carries large batches. |
+
+### `board_analysis` · 8 tools
+**Purpose:** Read-only layout adequacy analyses of the saved board, with copper thickness and layer depth from its stackup: zone hygiene, IPC-2152 current capacity, DC IR drop, stitching, decoupling distance, thermal pads, IPC-2221B voltage spacing, net lengths. Each answers with a summary, writes the full result to `output` and render markers to `markers_output`, and cites its method.
+**Source:** [`crates/konnect-core/src/tools/board_analysis.rs`](crates/konnect-core/src/tools/board_analysis.rs)
+
+| Tool | Description |
+|------|-------------|
+| `check_zone_hygiene` | Same-net and cross-net zone overlaps (polygon intersection area, priorities, equal priorities flagged), zones whose outline encloses foreign pads or vias, fill necks and slivers narrower than `sliver_width_mm` (exact narrowest chords), and each fill piece with the same-net pads, vias and tracks it touches (dead pieces). |
+| `check_current_capacity` | Per net case (current, peak and pulse; source pads; sink pads, `"all"` or `sink_layers`), a DC solve of the net's tracks, via barrels and meshed fills, then every conductor on the path against IPC-2152 (Figure 5-2 fit): tracks, vias, parallel via sets and pour necks with the current through each; the bottleneck with location and margin, and everything below requirement. Onderdonk fusing for pulses. |
+| `analyze_ir_drop` | DC IR drop of a rail from source pads at a voltage to loads (inline, JSON or CSV): voltage and drop at each load, worst drop, source-to-load resistance, current-density hotspots and the rail's fill necks with their current. Sparse SSOR-preconditioned conjugate gradients. |
+| `check_stitching_vias` | For a net's pours (default GND): the largest via-free circle per piece, stitch pitch and longest unstitched run along pour and board edges, the vias tying each island to the planes, stitches around focus footprints, each focus-net via's nearest stitch, and a density heat map. |
+| `check_decoupling_placement` | For each IC power pin, the nearest same-net capacitor by copper path length (tracks, via barrels, pours), the capacitor's and the IC's ground-pin distance to the nearest ground via, and shared ground vias. |
+| `check_thermal_pads` | Exposed/thermal pads (detected or named): vias in the pad with drills, plating, barrel copper and thermal resistance, same-net spreading copper per layer within a radius, and paste windowing, against an optional datasheet record. |
+| `check_voltage_spacing` | IPC-2221B Table 6-1 clearance (B1 inner; B2, B3, B4 or A5–A7 outer) for a net-to-voltage map, every closer approach per layer, and optional `.kicad_dru` rules so DRC enforces them. |
+| `measure_net_lengths` | Routed length per net (tracks, arcs and the via barrels they use; optional pad to pad), pair skew and group spread against targets. |
 
 ### `pcb_routing` · 18 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
