@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **273 registered tools** + **7 always-visible meta-tools** = **280 total**
+- **274 registered tools** + **7 always-visible meta-tools** = **281 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -309,7 +309,7 @@ and Windows servers do not.
 | `check_voltage_spacing` | IPC-2221B Table 6-1 clearance (B1 inner; B2, B3, B4 or A5–A7 outer) for a net-to-voltage map, every closer approach per layer, and optional `.kicad_dru` rules so DRC enforces them. |
 | `measure_net_lengths` | Routed length per net (tracks, arcs and the via barrels they use; optional pad to pad), pair skew and group spread against targets. |
 
-### `pcb_routing` · 18 tools
+### `pcb_routing` · 19 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -327,8 +327,9 @@ and Windows servers do not.
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Create or update a netclass (including differential-pair width, gap and via gap, written only when given) in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
-| `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
+| `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets KiCad puts in it, matched by KiCad's rules: explicit `netclass_assignments` plus every pattern fitting the whole name as an anchored regular expression or a wildcard, bus patterns expanded, and a net that fits nothing but reads as a bus taking its members' class (`Net-(U1-A{slash}B)` is a group with the one member `slash`; such nets are listed in `matched_via_bus_members`). Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked), any pattern naming a class that does not exist, and patterns that fit no net. |
 | `assign_net_to_class` | Assign a net (`net_name`) or many (`net_names`, one write) to an existing netclass via `netclass_patterns` entries in the `.kicad_pro`; reassigning moves the entry. |
+| `remove_netclass_patterns` | Remove `netclass_patterns` entries from the `.kicad_pro` by their exact text, optionally only those naming one class. Reports the entries removed, the patterns not found, and the saved board's nets whose classes change (before and after, by `get_netclasses`' rules); `dry_run` writes nothing. Refuses while KiCad holds the board. |
 | `add_routing` | Add many tracks and through vias to the open board in one `CreateItems` (one undo step), inline, from `routing_file`, or from `routing_files` (several files merged in order, tracks then vias file by file, and validated and linted as one batch; a bad member is refused naming its file's index and path). Every member is validated and every net resolved in one `GetNets` before anything is sent; `locked` creates the copper locked so later bulk edits and the autorouter leave it alone. |
 | `delete_routing` | Delete tracks, arcs and vias from the open board by area, nets, exact `uuids` (or `uuids_file`, e.g. `plan_dogleg_fixes`' `output_fixes`) and kind, every given filter matching; a UUID that is not a track, arc or via of the board refuses the call (`stale_target`, naming it). Locked items kept unless `include_locked`. Dry run by default; apply needs `expected_count` from that dry run and refuses if the selection changed. One undo step; footprints, pads and zones are never touched. |
 | `delete_zones` | Delete zones from the open board by name, net and layer; locked zones kept unless `include_locked`. Dry run by default listing name, net, layers, priority and outline size; apply needs `expected_count`, deletes in one undo step and proves the zones gone. Replacing a zone is `delete_zones` then `add_zone`. |

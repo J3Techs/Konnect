@@ -184,6 +184,146 @@ impl NetclassResolver {
     }
 }
 
+/// Every class a net belongs to, by name, under the same rules as
+/// [`NetclassResolver`] but without choosing one: what a report of netclass
+/// membership needs (`get_netclasses`), where the router needs one class.
+///
+/// It follows KiCad more closely in two places the rule table does not need:
+///
+/// - explicit `netclass_assignments` and matching patterns are combined,
+///   not one in place of the other;
+/// - a bus takes its members' class only when every member resolves to the
+///   same class *object*. A member that matches one class setting every
+///   field the Default would otherwise fill resolves to that class; a member
+///   that matches several, or one that leaves a field to the Default, gets a
+///   composite of its own, which no other member shares. So a bus of two or
+///   more such members falls back to `Default`, and a one-member group (a
+///   `{slash}` name) takes the member's composite.
+pub struct NetclassMembership {
+    /// Expanded pattern members, each with the index of its entry in the
+    /// project's `netclass_patterns` and the class it names.
+    patterns: Vec<(Matcher, usize, String)>,
+    explicit: BTreeMap<String, Vec<String>>,
+    /// Classes that set every field the Default would otherwise fill.
+    complete: std::collections::BTreeSet<String>,
+}
+
+/// One net's membership.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Membership {
+    /// Every class the net belongs to, sorted, without the Default KiCad adds
+    /// to fill fields (an explicit or pattern match to `Default` is listed).
+    /// Empty: the net is in `Default` alone.
+    pub classes: Vec<String>,
+    /// The bus members the classes came through, when the net matched
+    /// nothing itself and took its members' class; empty otherwise.
+    pub via_bus_members: Vec<String>,
+    /// Indices of the `netclass_patterns` entries that decided it.
+    pub entries: Vec<usize>,
+}
+
+impl NetclassMembership {
+    /// `patterns` are the project's `netclass_patterns` entries in file
+    /// order as (pattern, class name); `explicit` its `netclass_assignments`;
+    /// `complete` the classes that set every field the Default would fill.
+    pub fn new(
+        patterns: &[(String, String)],
+        explicit: BTreeMap<String, Vec<String>>,
+        complete: std::collections::BTreeSet<String>,
+    ) -> Self {
+        let mut expanded = Vec::new();
+        // An empty pattern fits only the empty name, which is never resolved.
+        for (index, (p, class)) in patterns
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| !p.is_empty())
+        {
+            for member in bus_members(p).unwrap_or_else(|| vec![p.clone()]) {
+                expanded.push((Matcher::new(&member), index, class.clone()));
+            }
+        }
+        NetclassMembership {
+            patterns: expanded,
+            explicit,
+            complete,
+        }
+    }
+
+    /// The classes of `name`.
+    pub fn of(&self, name: &str) -> Membership {
+        self.of_depth(name, 0)
+    }
+
+    /// What a member resolves to, as KiCad compares it: the class's name
+    /// when it alone decides every field, otherwise a composite owned by
+    /// this member alone.
+    fn identity(&self, name: &str, m: &Membership) -> String {
+        match m.classes.as_slice() {
+            [] => "Default".to_string(),
+            [one] if one == "Default" || self.complete.contains(one) => one.clone(),
+            _ => format!("composite for {name}"),
+        }
+    }
+
+    fn of_depth(&self, name: &str, depth: u32) -> Membership {
+        if name.is_empty() {
+            return Membership::default();
+        }
+        let mut classes: Vec<String> = self.explicit.get(name).cloned().unwrap_or_default();
+        let chars: Vec<char> = name.chars().collect();
+        let mut entries = Vec::new();
+        for (m, index, class) in &self.patterns {
+            if m.matches(name, &chars) {
+                classes.push(class.clone());
+                entries.push(*index);
+            }
+        }
+        classes.sort();
+        classes.dedup();
+        entries.sort_unstable();
+        entries.dedup();
+        if !classes.is_empty() {
+            return Membership {
+                classes,
+                via_bus_members: Vec::new(),
+                entries,
+            };
+        }
+        if depth >= 4 {
+            return Membership::default();
+        }
+        let Some(members) = bus_members(name) else {
+            return Membership::default();
+        };
+        let mut shared: Option<(String, Membership)> = None;
+        let mut used = Vec::new();
+        for member in members.iter().filter(|m| m.as_str() != name) {
+            let got = self.of_depth(member, depth + 1);
+            let id = self.identity(member, &got);
+            match &shared {
+                Some((first, _)) if *first != id => return Membership::default(),
+                Some(_) => {}
+                None => shared = Some((id, got.clone())),
+            }
+            used.extend(got.entries);
+        }
+        match shared {
+            Some((id, got)) if id != "Default" => {
+                used.sort_unstable();
+                used.dedup();
+                let mut via: Vec<String> = members.into_iter().filter(|m| m != name).collect();
+                via.dedup();
+                Membership {
+                    classes: got.classes,
+                    via_bus_members: via,
+                    entries: used,
+                }
+            }
+            _ => Membership::default(),
+        }
+    }
+}
+
 /// A character that makes the brace after it formatting (subscript,
 /// superscript, overbar), not a bus group.
 fn formatting(c: Option<char>) -> bool {
@@ -418,6 +558,77 @@ mod tests {
         let explicit = BTreeMap::from([("N".to_string(), vec![ClassId(2)])]);
         let r = NetclassResolver::new(&classes, &[None, None, None], &pats, explicit);
         assert_eq!(r.resolve("N").class, ClassId(2));
+    }
+
+    fn membership(patterns: &[(&str, &str)], complete: &[&str]) -> NetclassMembership {
+        let patterns: Vec<(String, String)> = patterns
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect();
+        NetclassMembership::new(
+            &patterns,
+            BTreeMap::new(),
+            complete.iter().map(|c| c.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn membership_follows_a_slash_name_to_its_member() {
+        // A class leaving fields to the Default: the member gets a
+        // composite, which the one-member group still takes.
+        let m = membership(&[("USB_*", "USB"), ("slash", "USB")], &[]);
+        let got = m.of("Net-(U8001-EN{slash}IN1)");
+        assert_eq!(got.classes, vec!["USB".to_string()]);
+        assert_eq!(got.via_bus_members, vec!["slash".to_string()]);
+        assert_eq!(got.entries, vec![1]);
+        // Without the pattern the net is in Default alone.
+        let m = membership(&[("USB_*", "USB")], &[]);
+        assert_eq!(m.of("Net-(U8001-EN{slash}IN1)"), Membership::default());
+        // Direct matches name no members.
+        let got = m.of("USB_DP");
+        assert_eq!((got.classes.len(), got.via_bus_members.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_bus_shares_a_class_only_through_one_complete_class() {
+        let pats = [("D0", "A"), ("D1", "A")];
+        // Each member gets its own composite: no shared class.
+        assert!(membership(&pats, &[]).of("D[0..1]").classes.is_empty());
+        // A complete class is one object for both members.
+        let got = membership(&pats, &["A"]).of("D[0..1]");
+        assert_eq!(got.classes, vec!["A".to_string()]);
+        assert_eq!(
+            got.via_bus_members,
+            vec!["D0".to_string(), "D1".to_string()]
+        );
+        // Two classes on one member make a composite even when complete.
+        let got = membership(&[("D0", "A"), ("D0", "B"), ("D1", "A")], &["A", "B"]).of("D[0..1]");
+        assert!(got.classes.is_empty());
+    }
+
+    #[test]
+    fn membership_combines_explicit_assignments_and_patterns() {
+        let m = NetclassMembership::new(
+            &[("N".to_string(), "A".to_string())],
+            BTreeMap::from([("N".to_string(), vec!["B".to_string()])]),
+            Default::default(),
+        );
+        let got = m.of("N");
+        assert_eq!(got.classes, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(got.entries, vec![0]);
+    }
+
+    #[test]
+    fn membership_matches_anchored_regex_and_wildcards() {
+        let m = membership(
+            &[("ADC[0-9]+", "A"), ("HV_*", "B"), ("Net-(R1-Pad1)", "C")],
+            &[],
+        );
+        assert_eq!(m.of("ADC12").classes, vec!["A".to_string()]);
+        assert!(m.of("XADC1").classes.is_empty());
+        assert_eq!(m.of("HV_IN").classes, vec!["B".to_string()]);
+        assert!(m.of("LV_IN").classes.is_empty());
+        assert_eq!(m.of("Net-(R1-Pad1)").classes, vec!["C".to_string()]);
     }
 
     #[test]

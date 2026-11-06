@@ -266,7 +266,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_netclasses",
             "Read every netclass in the project's design rules, with its settings, \
-             its netclass_patterns and the board nets those patterns match. The \
+             its netclass_patterns and the board nets KiCad puts in it: explicit \
+             netclass_assignments plus every pattern matching the whole net name as an \
+             anchored regular expression or a wildcard, bus patterns expanded, and a net \
+             that matches nothing but reads as a bus (Net-(U1-A{slash}B) is a group with \
+             the one member 'slash') taking its members' class \
+             ('matched_via_bus_members' lists those). The \
              answer is mixed-source and says so in 'sources': definitions and \
              patterns always come from the sibling .kicad_pro, while the board nets \
              come from the board KiCad holds open where it can and from the saved \
@@ -282,7 +287,7 @@ pub fn tools() -> Vec<ToolDef> {
              lists patterns naming a class that does not exist; \
              'unmatched_patterns' lists patterns whose class exists but which \
              fit no net on the board read (null when its nets are \
-             unavailable).",
+             unavailable). remove_netclass_patterns drops a pattern.",
             json!({
                 "type": "object",
                 "properties": {
@@ -313,6 +318,28 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "netclass"]
             }),
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
+        ),
+        tool!(
+            "remove_netclass_patterns",
+            "Remove netclass_patterns entries from the sibling .kicad_pro, by their exact \
+             pattern text, optionally only those naming 'netclass'. The other way to \
+             take a net out of a class, or to drop a stray pattern (assign_net_to_class \
+             can only add or move one). Reports every entry removed, the patterns not \
+             found, and the saved board's nets whose classes change, before and after, \
+             by KiCad's matching rules (get_netclasses). 'dry_run' reports without \
+             writing. Refuses while KiCad holds the board open, because KiCad's next \
+             save rewrites the project file from its own copy.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
+                    "patterns": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "maxItems": 5000, "description": "Exact pattern texts to remove (as get_netclasses lists them)" },
+                    "netclass": { "type": "string", "description": "Remove only entries naming this class; every class when omitted" },
+                    "dry_run":  { "type": "boolean", "default": false, "description": "Report what would be removed and which nets change, without writing" }
+                },
+                "required": ["board", "patterns"]
+            }),
+            |args, ctx| async move { handle_remove_netclass_patterns(args, ctx).await }
         ),
         tool!(
             "add_routing",
@@ -2527,41 +2554,99 @@ async fn handle_create_netclass(
     })))
 }
 
-/// KiCad's netclass patterns are wildcard expressions: `*` stands for any run
-/// of characters including none, `?` for exactly one. A pattern carrying
-/// neither is an exact name — which is the shape `assign_net_to_class` writes.
-///
-/// Iterative rather than recursive: a pattern is user data, and `*`-heavy input
-/// makes the naive recursion blow the stack on names a real board can carry.
-fn wildcard_matches(pattern: &str, name: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = name.chars().collect();
-    let (mut p, mut t) = (0usize, 0usize);
-    // Where to resume if the current `*` turns out to have consumed too little.
-    let (mut star, mut retry) = (None, 0usize);
+/// The fields KiCad fills from the Default when no class a net belongs to
+/// sets them. A class setting every one of them stands alone; any other
+/// becomes a composite with the Default, which matters to a bus's fallback
+/// (see `konnect_route::rules::NetclassMembership`).
+const DEFAULT_FILLED_FIELDS: [&str; 10] = [
+    "clearance",
+    "track_width",
+    "via_diameter",
+    "via_drill",
+    "microvia_diameter",
+    "microvia_drill",
+    "diff_pair_width",
+    "diff_pair_gap",
+    "wire_width",
+    "bus_width",
+];
 
-    while t < txt.len() {
-        if p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pat.len() && pat[p] == '*' {
-            star = Some(p);
-            retry = t;
-            p += 1;
-        } else if let Some(s) = star {
-            // Backtrack: let the last `*` swallow one more character.
-            p = s + 1;
-            retry += 1;
-            t = retry;
-        } else {
-            return false;
+/// Netclass membership from a project's `net_settings` by KiCad's rules:
+/// the resolver the router uses (anchored regex or wildcard, bus patterns
+/// expanded, a bus name falling back to its members), built by class name.
+/// Also returns the pattern entries in file order, as (pattern, class), so
+/// `Membership::entries` indexes them.
+fn netclass_membership(
+    settings: &serde_json::Value,
+) -> (
+    konnect_route::rules::NetclassMembership,
+    Vec<(String, String)>,
+) {
+    let ns = &settings["net_settings"];
+    let entries: Vec<(String, String)> = ns["netclass_patterns"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    (
+                        p["pattern"].as_str().unwrap_or_default().to_string(),
+                        p["netclass"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Only entries with a string pattern and class reach KiCad's matcher;
+    // others keep their index (so `entries` stays aligned with the file) but
+    // match nothing.
+    let usable: Vec<(String, String)> = entries
+        .iter()
+        .zip(ns["netclass_patterns"].as_array().into_iter().flatten())
+        .map(|(e, raw)| {
+            if raw["pattern"].is_string() && raw["netclass"].is_string() {
+                e.clone()
+            } else {
+                // An empty pattern fits only the empty name, which is never a net.
+                (String::new(), String::new())
+            }
+        })
+        .collect();
+    let mut explicit = std::collections::BTreeMap::new();
+    if let Some(map) = ns["netclass_assignments"].as_object() {
+        for (net, value) in map {
+            let classes: Vec<String> = match value {
+                serde_json::Value::String(c) if !c.is_empty() => vec![c.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|c| c.as_str().filter(|c| !c.is_empty()).map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !classes.is_empty() {
+                explicit.insert(net.clone(), classes);
+            }
         }
     }
-    // Trailing `*`s may still match the empty rest.
-    while p < pat.len() && pat[p] == '*' {
-        p += 1;
-    }
-    p == pat.len()
+    let classes = ns["classes"].as_array().cloned().unwrap_or_default();
+    let default_profile = classes
+        .iter()
+        .find(|c| c["name"] == json!(DEFAULT_CLASS_NAME))
+        .and_then(|c| c["tuning_profile"].as_str())
+        .is_some_and(|p| !p.is_empty());
+    let complete = classes
+        .iter()
+        .filter(|c| {
+            DEFAULT_FILLED_FIELDS
+                .iter()
+                .all(|k| c.get(*k).is_some_and(|v| !v.is_null()))
+                && (!default_profile || c["tuning_profile"].as_str().is_some_and(|p| !p.is_empty()))
+        })
+        .filter_map(|c| c["name"].as_str().map(String::from))
+        .collect();
+    (
+        konnect_route::rules::NetclassMembership::new(&usable, explicit, complete),
+        entries,
+    )
 }
 
 /// The four settings `create_netclass` writes, as (KiCad's key, this API's
@@ -2676,6 +2761,18 @@ async fn handle_get_netclasses(
         .cloned()
         .unwrap_or_else(|| seeded.clone());
 
+    // Membership by KiCad's own rules, net by net, so a class lists the nets
+    // KiCad puts in it and not only those a pattern names outright.
+    let (membership, _) = netclass_membership(&settings);
+    let memberships: Vec<(String, konnect_route::rules::Membership)> = net_names
+        .iter()
+        .map(|net| (net.clone(), membership.of(net)))
+        .collect();
+    let fired: std::collections::BTreeSet<usize> = memberships
+        .iter()
+        .flat_map(|(_, m)| m.entries.iter().copied())
+        .collect();
+
     let mut out = Vec::new();
     for class in &classes {
         let name = class["name"].as_str().unwrap_or_default().to_string();
@@ -2692,13 +2789,16 @@ async fn handle_get_netclasses(
             .filter_map(|p| p["pattern"].as_str().map(String::from))
             .collect();
 
-        let mut matched: Vec<String> = net_names
-            .iter()
-            .filter(|net| pattern_strings.iter().any(|pat| wildcard_matches(pat, net)))
-            .cloned()
-            .collect();
-        matched.sort();
-        matched.dedup();
+        let mut matched: Vec<String> = Vec::new();
+        let mut through_members: Vec<String> = Vec::new();
+        for (net, m) in &memberships {
+            if m.classes.contains(&name) {
+                matched.push(net.clone());
+                if !m.via_bus_members.is_empty() {
+                    through_members.push(net.clone());
+                }
+            }
+        }
 
         let mut entry = json!({
             "name": name,
@@ -2706,6 +2806,7 @@ async fn handle_get_netclasses(
             "priority": class["priority"],
             "patterns": pattern_strings,
             "matched_nets": matched,
+            "matched_via_bus_members": through_members,
         });
         let mut inherits: Vec<&str> = Vec::new();
         for (key, api) in NETCLASS_FIELDS {
@@ -2772,15 +2873,13 @@ async fn handle_get_netclasses(
     let unmatched_patterns: serde_json::Value = if nets_readable {
         json!(patterns
             .iter()
-            .filter(|p| {
+            .enumerate()
+            .filter(|(index, p)| {
                 let target = p["netclass"].as_str().unwrap_or_default();
                 let class_exists = classes.iter().any(|c| c["name"] == json!(target));
-                class_exists
-                    && p["pattern"]
-                        .as_str()
-                        .is_some_and(|pat| !net_names.iter().any(|net| wildcard_matches(pat, net)))
+                class_exists && p["pattern"].is_string() && !fired.contains(index)
             })
-            .cloned()
+            .map(|(_, p)| p.clone())
             .collect::<Vec<_>>())
     } else {
         serde_json::Value::Null
@@ -2798,9 +2897,14 @@ async fn handle_get_netclasses(
         "nets_source": nets_note,
         "orphan_patterns": orphan_patterns,
         "unmatched_patterns": unmatched_patterns,
-        "note": "A net can match several classes; KiCad then takes each property from the \
-                 highest-priority class that sets it and falls back to Default. Lower \
-                 priority numbers rank higher.",
+        "note": "Membership follows KiCad: explicit netclass_assignments plus every pattern \
+                 matching the whole net name as an anchored regular expression or a \
+                 wildcard (bus-notation patterns expanded to their members); a net matching \
+                 nothing that parses as a bus takes its members' shared class (so \
+                 Net-(U1-A{slash}B) is matched through its member 'slash'), listed in \
+                 matched_via_bus_members. A net can match several classes; KiCad then takes \
+                 each property from the highest-priority class that sets it and falls back \
+                 to Default. Lower priority numbers rank higher.",
     });
     board_source::provenance(
         &mut body,
@@ -2976,6 +3080,129 @@ async fn handle_assign_net_to_class(
         "netclass": netclass,
         "previous_class": previous_class,
         "file": pro.display().to_string()
+    })))
+}
+
+async fn handle_remove_netclass_patterns(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let wanted: Vec<String> = match args.get("patterns").and_then(|v| v.as_array()) {
+        Some(items)
+            if !items.is_empty()
+                && items
+                    .iter()
+                    .all(|i| i.as_str().is_some_and(|s| !s.is_empty())) =>
+        {
+            let mut v: Vec<String> = items
+                .iter()
+                .filter_map(|i| i.as_str().map(String::from))
+                .collect();
+            v.dedup();
+            v
+        }
+        _ => {
+            return Ok(crate::tools::invalid_arg(
+                "patterns",
+                "must be a non-empty array of non-empty pattern texts",
+            ))
+        }
+    };
+    let netclass = match args.get("netclass").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str().filter(|s| !s.is_empty()) {
+            Some(s) => Some(s.to_string()),
+            None => {
+                return Ok(crate::tools::invalid_arg(
+                    "netclass",
+                    "must be a non-empty class name",
+                ))
+            }
+        },
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
+    let (pro, mut settings) = match load_project_settings(&board_path)? {
+        Ok(v) => v,
+        Err(refusal) => return Ok(refusal),
+    };
+    let Some(list) = settings["net_settings"]["netclass_patterns"].as_array() else {
+        return Ok(CallToolResult::error(format!(
+            "{} has no net_settings.netclass_patterns list: nothing to remove.",
+            pro.display()
+        )));
+    };
+
+    let selected = |p: &serde_json::Value| {
+        p["pattern"]
+            .as_str()
+            .is_some_and(|t| wanted.iter().any(|w| w == t))
+            && netclass
+                .as_deref()
+                .is_none_or(|c| p["netclass"].as_str() == Some(c))
+    };
+    let removed: Vec<serde_json::Value> = list.iter().filter(|p| selected(p)).cloned().collect();
+    let not_found: Vec<&String> = wanted
+        .iter()
+        .filter(|w| {
+            !removed
+                .iter()
+                .any(|p| p["pattern"].as_str() == Some(w.as_str()))
+        })
+        .collect();
+    let kept: Vec<serde_json::Value> = list.iter().filter(|p| !selected(p)).cloned().collect();
+
+    let mut after = settings.clone();
+    after["net_settings"]["netclass_patterns"] = json!(kept);
+
+    // What the change does, net by net, on the saved board: KiCad does not
+    // hold it (refused above), so the file is what KiCad will load.
+    let (nets_changed, nets_note) = match saved_net_names(&board_path) {
+        Ok(names) => {
+            let (before_m, _) = netclass_membership(&settings);
+            let (after_m, _) = netclass_membership(&after);
+            let changed: Vec<serde_json::Value> = names
+                .iter()
+                .filter_map(|net| {
+                    let (b, a) = (before_m.of(net), after_m.of(net));
+                    (b.classes != a.classes).then(|| {
+                        json!({
+                            "net": net,
+                            "before": if b.classes.is_empty() { vec![DEFAULT_CLASS_NAME.to_string()] } else { b.classes },
+                            "after": if a.classes.is_empty() { vec![DEFAULT_CLASS_NAME.to_string()] } else { a.classes },
+                        })
+                    })
+                })
+                .collect();
+            (json!(changed), json!("saved board nets"))
+        }
+        Err(reason) => (
+            serde_json::Value::Null,
+            json!(format!("{reason}; net changes unknown")),
+        ),
+    };
+
+    let written = !dry_run && !removed.is_empty();
+    if written {
+        settings = after;
+        save_project_settings(&pro, &settings)?;
+    }
+    Ok(CallToolResult::json(&json!({
+        "removed": removed,
+        "removed_count": removed.len(),
+        "not_found": not_found,
+        "dry_run": dry_run,
+        "written": written,
+        "nets_changed": nets_changed,
+        "nets_changed_count": nets_changed.as_array().map(Vec::len),
+        "nets_source": nets_note,
+        "file": pro.display().to_string(),
     })))
 }
 
@@ -3862,26 +4089,144 @@ mod netclass_tests {
         serde_json::from_str(&text_of(&result)).unwrap()
     }
 
+    fn classes_of(patterns: serde_json::Value, net: &str) -> Vec<String> {
+        let settings = json!({ "net_settings": {
+            "classes": [{ "name": "Default" }, { "name": "A" }],
+            "netclass_patterns": patterns,
+        }});
+        netclass_membership(&settings).0.of(net).classes
+    }
+
     #[test]
-    fn wildcards_match_the_way_kicad_documents_them() {
+    fn patterns_match_the_way_kicad_matches_them() {
+        let a = |p: &str, net: &str| {
+            !classes_of(json!([{ "pattern": p, "netclass": "A" }]), net).is_empty()
+        };
         // An exact pattern — what assign_net_to_class writes.
-        assert!(wildcard_matches("GND", "GND"));
-        assert!(!wildcard_matches("GND", "GNDA"));
+        assert!(a("GND", "GND"));
+        assert!(!a("GND", "GNDA"));
         // `*` spans any run, including none.
-        assert!(wildcard_matches("HV_*", "HV_IN"));
-        assert!(wildcard_matches("HV_*", "HV_"));
-        assert!(!wildcard_matches("HV_*", "LV_IN"));
-        assert!(wildcard_matches("*", "anything"));
-        assert!(wildcard_matches("/Power/*", "/Power/VBUS"));
+        assert!(a("HV_*", "HV_IN"));
+        assert!(a("HV_*", "HV_"));
+        assert!(!a("HV_*", "LV_IN"));
+        assert!(a("*", "anything"));
+        assert!(a("/Power/*", "/Power/VBUS"));
         // `?` is exactly one character.
-        assert!(wildcard_matches("D?", "D0"));
-        assert!(!wildcard_matches("D?", "D"));
-        assert!(!wildcard_matches("D?", "D12"));
+        assert!(a("D?", "D0"));
+        assert!(!a("D?", "D12"));
         // Backtracking: the first `*` must give characters back.
-        assert!(wildcard_matches("*_P", "USB_D_P"));
-        assert!(!wildcard_matches("*_P", "USB_D_N"));
-        // A run of stars must not blow up or mis-answer.
-        assert!(wildcard_matches("**a**", "xxaxx"));
+        assert!(a("*_P", "USB_D_P"));
+        assert!(!a("*_P", "USB_D_N"));
+        assert!(a("**a**", "xxaxx"));
+        // The same text also counts as an anchored regular expression.
+        assert!(a("ADC[0-9]+", "ADC12"));
+        assert!(!a("ADC[0-9]+", "XADC12"));
+        // Not a substring: a bare word fits only the whole name...
+        assert!(!a("slash", "slash_net"));
+        // ...or the member of a name KiCad reads as a one-member bus group.
+        assert!(a("slash", "Net-(U8001-EN{slash}IN1)"));
+        // A malformed entry matches nothing.
+        assert!(classes_of(json!([{ "pattern": 7, "netclass": "A" }]), "7").is_empty());
+    }
+
+    const SLASH_NETS: [&str; 2] = ["Net-(U1-SYNC{slash}MODE)", "Net-(U8001-EN{slash}IN1)"];
+
+    /// A `slash` pattern on a `{slash}`-named board, as KiCad sees it.
+    async fn slash_board() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, board) = fixture_with_nets(&[SLASH_NETS[0], SLASH_NETS[1], "USB_DP", "GND"]);
+        create(&board, json!({ "name": "USB", "trace_width": 0.106 })).await;
+        assign(&board, "USB_DP", "USB").await;
+        assign(&board, "slash", "USB").await;
+        (dir, board)
+    }
+
+    async fn remove(board: &std::path::Path, args: serde_json::Value) -> serde_json::Value {
+        let mut args = args;
+        args["board"] = json!(board.to_str().unwrap());
+        let result = handle_remove_netclass_patterns(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        serde_json::from_str(&text_of(&result)).unwrap()
+    }
+
+    /// R4-K12: KiCad puts a `{slash}` name in the class of its member
+    /// `slash`; the read must list those nets, not call the pattern unmatched.
+    #[tokio::test]
+    async fn get_netclasses_lists_nets_matched_through_their_bus_member() {
+        let (_dir, board) = slash_board().await;
+        let body = get_classes(&board).await;
+        let usb = &body["netclasses"][0];
+        assert_eq!(usb["name"], json!("USB"));
+        assert_eq!(
+            usb["matched_nets"],
+            json!([SLASH_NETS[0], SLASH_NETS[1], "USB_DP"])
+        );
+        assert_eq!(usb["matched_via_bus_members"], json!(SLASH_NETS));
+        assert_eq!(body["unmatched_patterns"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn remove_netclass_patterns_returns_the_nets_to_default() {
+        let (_dir, board) = slash_board().await;
+        let pro = project_settings_path(&board);
+        let before = std::fs::read(&pro).unwrap();
+
+        // A dry run reports the change and writes nothing.
+        let dry = remove(
+            &board,
+            json!({ "patterns": ["slash", "nope"], "dry_run": true }),
+        )
+        .await;
+        assert_eq!(dry["written"], json!(false));
+        assert_eq!(
+            dry["removed"],
+            json!([{ "netclass": "USB", "pattern": "slash" }])
+        );
+        assert_eq!(dry["not_found"], json!(["nope"]));
+        assert_eq!(dry["nets_changed_count"], json!(2));
+        assert_eq!(
+            dry["nets_changed"][1],
+            json!({ "net": SLASH_NETS[1], "before": ["USB"], "after": ["Default"] })
+        );
+        assert_eq!(std::fs::read(&pro).unwrap(), before);
+
+        // An entry naming another class is left alone.
+        let other = remove(
+            &board,
+            json!({ "patterns": ["slash"], "netclass": "Default" }),
+        )
+        .await;
+        assert_eq!(
+            (other["removed_count"].clone(), other["written"].clone()),
+            (json!(0), json!(false))
+        );
+        assert_eq!(std::fs::read(&pro).unwrap(), before);
+
+        let applied = remove(&board, json!({ "patterns": ["slash"], "netclass": "USB" })).await;
+        assert_eq!(applied["written"], json!(true));
+        let body = get_classes(&board).await;
+        assert_eq!(body["netclasses"][0]["patterns"], json!(["USB_DP"]));
+        assert_eq!(body["netclasses"][0]["matched_nets"], json!(["USB_DP"]));
+        assert_eq!(body["netclasses"][0]["matched_via_bus_members"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn remove_netclass_patterns_refuses_bad_arguments() {
+        let (_dir, board) = slash_board().await;
+        for args in [
+            json!({}),
+            json!({ "patterns": [] }),
+            json!({ "patterns": [""] }),
+            json!({ "patterns": ["slash"], "netclass": "" }),
+        ] {
+            let mut args = args;
+            args["board"] = json!(board.to_str().unwrap());
+            let r = handle_remove_netclass_patterns(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(r.is_error, "{args}");
+        }
     }
 
     /// The read path is the whole point of #222: what a class holds must be

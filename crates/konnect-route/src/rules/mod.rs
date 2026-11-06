@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub(crate) use condition::wildcard_match_chars;
+pub use netclass::{Membership, NetclassMembership};
 
 /// One item as rules see it.
 #[derive(Debug, Clone, Copy)]

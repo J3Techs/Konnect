@@ -1,8 +1,8 @@
-//! The three `.kicad_pro` writers while KiCad holds the board (#791).
+//! The `.kicad_pro` writers while KiCad holds the board (#791).
 //!
 //! Saving the board in KiCad rewrites the project file from KiCad's own copy.
-//! So `set_design_rules`, `create_netclass` and `assign_net_to_class` must not
-//! write while KiCad holds the board: the write would be reported and then
+//! So `set_design_rules`, `create_netclass`, `assign_net_to_class` and
+//! `remove_netclass_patterns` must not write while KiCad holds the board: the write would be reported and then
 //! reverted. Measured on KiCad 10.0.5 before the fix: all three reported
 //! success, and `run_drc` with `sync_live_board` then put every value back.
 //!
@@ -91,6 +91,7 @@ fn arguments_for(tool: &str) -> Value {
         "set_design_rules" => json!({ "min_trace_width": 0.35 }),
         "create_netclass" => json!({ "name": "Power", "trace_width": 0.5 }),
         "assign_net_to_class" => json!({ "net_name": "VCC", "netclass": "Default" }),
+        "remove_netclass_patterns" => json!({ "patterns": ["GND"] }),
         other => panic!("no arguments for {other}"),
     }
 }
@@ -137,6 +138,11 @@ async fn create_netclass_refuses_while_kicad_holds_the_board() {
 #[tokio::test]
 async fn assign_net_to_class_refuses_while_kicad_holds_the_board() {
     assert_refused_while_kicad_holds_the_board("assign_net_to_class").await;
+}
+
+#[tokio::test]
+async fn remove_netclass_patterns_refuses_while_kicad_holds_the_board() {
+    assert_refused_while_kicad_holds_the_board("remove_netclass_patterns").await;
 }
 
 /// The control: a KiCad holding some other board does not own this project
