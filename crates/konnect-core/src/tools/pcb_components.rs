@@ -30,7 +30,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 mod attributes;
+pub(crate) mod pad_fabrication;
 pub(crate) mod reference_field;
+mod saved_graphics;
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
@@ -2662,22 +2664,28 @@ pub fn tools() -> Vec<ToolDef> {
         super::pcb_footprint_update::tool(),
         tool!(
             "list_board_footprint_graphics",
-            "List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Points are footprint-local millimetres, as the .kicad_mod shows them. Each item reports 'editable', plus 'outlines' and 'holes' for polygons: 'points' covers the first outline only, so an item with more than one outline or any holes is reported but cannot be edited here. Requires KiCAD running with the board open.",
+            "List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit or delete one. Points are footprint-local millimetres, as the .kicad_mod shows them (on a back-side footprint, already mirrored as the saved board stores them): polygon vertices, segment [start, end], arc [start, mid, end], circle [center, point on circle], rectangle [corner, corner]. Reads the board open in KiCad when one holds it, else the saved file ('source' says which; source 'saved' always reads the file). Each item reports 'editable' (whether edit_board_footprint_graphic can replace its points from this source), plus 'outlines' and 'holes' for polygons: 'points' covers the first outline only, so an item with more than one outline or any holes is reported but cannot be edited.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string", "description": "Reference designator, e.g. 'J2'" },
-                    "layer":     { "type": "string", "description": "Only list items on this layer, e.g. 'F.SilkS' (optional)" }
+                    "layer":     { "type": "string", "description": "Only list items on this layer, e.g. 'F.SilkS' (optional)" },
+                    "source": {
+                        "type": "string",
+                        "enum": ["auto", "saved"],
+                        "default": "auto",
+                        "description": "auto: the live board when KiCad holds it, else the saved file. saved: always the saved file (the last save, not unsaved edits)."
+                    }
                 },
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_list_board_footprint_graphics(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "edit_board_footprint_graphic",
-            "Replace the vertices of a polygon inside a footprint placed on the board, selected by UUID. Points are footprint-local millimetres, as the .kicad_mod shows them. Use this to bring one placed instance in line with a library change without re-placing the part. Only a single-outline polygon with no holes can be replaced; anything else is refused by name rather than flattened. Requires KiCAD running with the board open.",
+            "Replace the defining points of, or delete, one graphic item inside a footprint placed on the board, selected by UUID from list_board_footprint_graphics, without re-placing the part. Give 'points' in that tool's order and frame (polygon vertices, segment [start, end], arc [start, mid, end], circle [center, point on circle], rectangle [corner, corner]) or 'delete': true. When KiCad holds the board, the footprint is updated live (polygon, segment, arc, circle; one undo step) and read back; a footprint whose pads carry a fabrication property (pad_prop_heatsink, pad_prop_bga, …) is refused live, because KiCad 10's typed update re-creates pads without it. When KiCad does not hold the board (no sibling lock), the saved file is edited instead: only the item's point clauses change, or its block is cut, so pad fabrication properties, nets and every other byte stay as they were, checked on readback. The closed path takes dry_run and expected_revision. A polygon with an arc in its outline, a Bezier, or an item named elsewhere (a group member, for delete) is refused rather than flattened.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2686,7 +2694,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "uuid":      { "type": "string", "description": "UUID of the graphic item, from list_board_footprint_graphics" },
                     "points": {
                         "type": "array",
-                        "description": "Replacement vertices in footprint-local millimetres; at least 3.",
+                        "description": "Replacement points in footprint-local millimetres, in list_board_footprint_graphics order: polygon vertices (at least 3), segment [start, end], arc [start, mid, end], circle [center, point on circle], rectangle [corner, corner]. Omit when delete is true.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2695,13 +2703,27 @@ pub fn tools() -> Vec<ToolDef> {
                             },
                             "required": ["x", "y"]
                         }
+                    },
+                    "delete": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Remove the item instead of editing it."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Closed board only: plan and report before/after and the revision without writing."
+                    },
+                    "expected_revision": {
+                        "type": "string",
+                        "description": "Closed board only, optional: the revision a dry run returned; the write is refused if the saved board or request changed since."
                     }
                 },
-                "required": ["board", "reference", "uuid", "points"]
+                "required": ["board", "reference", "uuid"]
             }),
             |args, ctx| async move { handle_edit_board_footprint_graphic(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_component_pads",
             "Return live board-space pad positions, effective rotations, physical geometry, drills, \
@@ -3033,32 +3055,78 @@ async fn handle_list_board_footprint_graphics(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
     let layer_filter = args["layer"].as_str().map(|s| s.to_string());
+    let saved_only = match args["source"].as_str().unwrap_or("auto") {
+        "auto" => false,
+        "saved" => true,
+        other => {
+            return Ok(crate::tools::invalid_arg(
+                "source",
+                &format!("must be 'auto' or 'saved', got '{other}'"),
+            ))
+        }
+    };
+    let keep = |layer: &str| layer_filter.as_deref().is_none_or(|l| layer == l);
 
-    let ref_ipc = reference.clone();
-    let graphics: Vec<konnect_ipc::types::IpcFootprintGraphic> =
-        ipc!(ctx, args, |c| c.list_footprint_graphics(&ref_ipc));
-
-    let graphics: Vec<_> = graphics
-        .into_iter()
-        .filter(|g| layer_filter.as_deref().is_none_or(|l| g.layer == l))
-        .collect();
-
-    Ok(CallToolResult::json(&json!({
+    let mut fallback = None;
+    if !saved_only {
+        let ref_ipc = reference.clone();
+        match attempt_ipc_write(ctx, &board, "footprint graphics read", move |c| {
+            c.list_footprint_graphics(&ref_ipc)
+        })
+        .await?
+        {
+            BoardWrite::Ipc(graphics) => {
+                let graphics: Vec<_> = graphics.into_iter().filter(|g| keep(&g.layer)).collect();
+                return Ok(CallToolResult::json(&json!({
+                    "count": graphics.len(),
+                    "reference": reference,
+                    "graphics": graphics,
+                    "source": "ipc",
+                })));
+            }
+            BoardWrite::Refused(result) => return Ok(result),
+            BoardWrite::File(reason) => fallback = Some(reason.evidence()),
+        }
+    }
+    let graphics = match saved_graphics::list_saved(&board, &reference) {
+        Ok(graphics) => graphics,
+        Err(reason) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::PlanBlocked {
+                    operation: "list_board_footprint_graphics".to_string(),
+                    reasons: vec![reason.clone()],
+                },
+                format!("The saved board could not be listed: {reason}"),
+            ))
+        }
+    };
+    let graphics: Vec<_> = graphics.into_iter().filter(|g| keep(&g.layer)).collect();
+    let mut body = json!({
         "count": graphics.len(),
         "reference": reference,
         "graphics": graphics,
-    })))
+        "source": "saved",
+        "note": "Read from the saved file: the last save, not unsaved editor state. 'editable' says whether edit_board_footprint_graphic can replace the item's points on this closed board; any item with a UUID can be deleted.",
+    });
+    if let Some(evidence) = fallback {
+        body["fallback_reason"] = evidence;
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_edit_board_footprint_graphic(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use saved_graphics::GraphicChange;
+
+    let board = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -3067,41 +3135,97 @@ async fn handle_edit_board_footprint_graphic(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let delete = match &args["delete"] {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(delete) => *delete,
+        _ => return Ok(crate::tools::invalid_arg("delete", "must be a boolean")),
+    };
     // A malformed `points` is the caller's mistake, so it gets the structured
     // `invalid_argument` the rest of this file returns — bubbling `anyhow`
     // here would surface it as a handler error with the offending field
     // flattened into prose, which is the class #194 is open against.
-    let points = match parse_points(&args["points"]) {
-        Ok(p) => p,
-        Err(e) => return Ok(e),
+    let change = match (&args["points"], delete) {
+        (serde_json::Value::Null, true) => GraphicChange::Delete,
+        (serde_json::Value::Null, false) => {
+            return Ok(crate::tools::invalid_arg(
+                "points",
+                "required unless delete is true",
+            ))
+        }
+        (_, true) => {
+            return Ok(crate::tools::invalid_arg(
+                "delete",
+                "give either points or delete: true, not both",
+            ))
+        }
+        (points, false) => match parse_points(points) {
+            Ok(points) => GraphicChange::Points(points),
+            Err(e) => return Ok(e),
+        },
     };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let expected_revision = args["expected_revision"].as_str().map(str::to_string);
 
-    let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
-    let guard_board = get_path(args, "board")?;
-    let kind: Result<String, _> = ipc!(ctx, args, |c| {
+    let (ref_ipc, uuid_ipc, live_change) = (reference.clone(), uuid.clone(), change.clone());
+    let guard_board = board.clone();
+    let closed_only = dry_run || expected_revision.is_some();
+    let result = attempt_ipc_write(ctx, &board, "footprint graphic edit", move |c| {
+        if closed_only {
+            return Ok(Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::PlanBlocked {
+                    operation: saved_graphics::OPERATION.to_string(),
+                    reasons: vec!["dry_run_requires_closed_board".to_string()],
+                },
+                "KiCad holds this board. dry_run and expected_revision belong to the closed-board path, which plans against the saved file; on a live board the edit is applied directly and Ctrl-Z reverses it. Nothing was changed.",
+            )));
+        }
         if let Err(refusal) = guard_live_rebuild(
             c,
             &guard_board,
-            "edit_board_footprint_graphic",
+            saved_graphics::OPERATION,
             &[&ref_ipc],
-            NoLosslessPath,
+            ClosedBoardPath,
         )? {
-            return Ok(Err(refusal));
+            return Ok(Err(refusal.into_result()));
         }
-        c.set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts)
-            .map(Ok)
-    });
-    let kind = match kind {
-        Ok(kind) => kind,
-        Err(refusal) => return Ok(refusal.into_result()),
-    };
-
-    Ok(CallToolResult::json(&json!({
-        "edited": reference,
-        "uuid": uuid,
-        "kind": kind,
-        "points": points.len(),
-    })))
+        let points = match &live_change {
+            GraphicChange::Points(points) => Some(points.as_slice()),
+            GraphicChange::Delete => None,
+        };
+        c.edit_footprint_graphic(&ref_ipc, &uuid_ipc, points).map(Ok)
+    })
+    .await?;
+    match result {
+        BoardWrite::Ipc(Ok(kind)) => Ok(CallToolResult::json(&json!({
+            "edited": reference,
+            "uuid": uuid,
+            "kind": kind,
+            "action": match &change {
+                GraphicChange::Delete => "delete",
+                GraphicChange::Points(_) => "edit",
+            },
+            "points": match &change {
+                GraphicChange::Points(points) => points.len(),
+                GraphicChange::Delete => 0,
+            },
+            "source": "ipc",
+            "readback": "verified against KiCad's footprint after the update",
+            "undo": "Ctrl-Z in KiCad reverses the edit.",
+        }))),
+        BoardWrite::Ipc(Err(refusal)) | BoardWrite::Refused(refusal) => Ok(refusal),
+        BoardWrite::File(_) => {
+            saved_graphics::handle_closed(
+                ctx,
+                &board,
+                &reference,
+                &uuid,
+                &change,
+                dry_run,
+                expected_revision.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_rotate_component(
@@ -9817,7 +9941,7 @@ mod board_footprint_graphics_tests {
             ("list_board_footprint_graphics", vec!["board", "reference"]),
             (
                 "edit_board_footprint_graphic",
-                vec!["board", "reference", "uuid", "points"],
+                vec!["board", "reference", "uuid"],
             ),
         ] {
             let def = tools

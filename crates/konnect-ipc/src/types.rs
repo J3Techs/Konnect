@@ -1104,8 +1104,10 @@ pub struct IpcFootprintGraphic {
     /// letting the caller infer a simple triangle from three points.
     pub outlines: usize,
     pub holes: usize,
-    /// Whether `edit_board_footprint_graphic` can address this item: a
-    /// single-outline polygon with no holes, carrying a UUID.
+    /// Whether `edit_board_footprint_graphic` can replace this item's points
+    /// on the live board: a single-outline polygon with no holes, a segment,
+    /// an arc or a circle, carrying a UUID. Any item with a UUID can be
+    /// deleted, and the closed-board path also edits rectangles.
     pub editable: bool,
 }
 

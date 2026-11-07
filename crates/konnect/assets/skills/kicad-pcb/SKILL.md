@@ -139,7 +139,12 @@ Follow this sequence for a clean PCB workflow:
    differences (pad, typed field, library expected value, board observed value);
    read them before applying, and read the response's pad parity notes when
    native DRC reports a library footprint mismatch on a footprint the plan calls
-   unchanged.
+   unchanged. A library pad's fabrication property (a fiducial, heatsink,
+   BGA or other pad property) cannot travel through KiCad 10's typed API, so a
+   library carrying one is refused here; with the board saved and closed,
+   `set_pad_fabrication_properties` (toolset `pcb_fields`) with `references` copies it from the library
+   onto the placed pads (dry run, then apply its `revision`), changing only each
+   pad's `(property …)` clause.
 4. **Place components** — position all footprints
 5. **Route traces** — connect all nets
 6. **Copper pour** — add ground/power zones last
@@ -169,6 +174,8 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 |---------------------------|---------------------------------------------|
 | `place_component`         | Position one footprint via IPC or safe file fallback |
 | `update_footprints_from_library` | Refresh placed definitions from linked libraries |
+| `set_pad_fabrication_properties` | Closed board: copy pad fabrication properties from the library, or set them |
+| `list_board_footprint_graphics` / `edit_board_footprint_graphic` | Inspect, move the points of, or delete one item of a placed footprint's artwork by UUID; closed board keeps pad properties |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
 | `flip_component`          | Set F.Cu/B.Cu via native IPC (KiCad 10.0.6+) or safe file fallback |

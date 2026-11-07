@@ -317,6 +317,77 @@ fn replace_polygon_outline(
     Ok(kind)
 }
 
+/// Refuse or rewrite `shape`'s defining points, returning the kind it was: a
+/// polygon's outline (see [`replace_polygon_outline`]), a segment's start and
+/// end, an arc's start, mid and end, or a circle's centre and radius point.
+/// A rectangle is refused: in a rotated footprint its two corners do not
+/// survive the turn into board coordinates as a rectangle. Every refusal
+/// happens before any mutation.
+fn replace_shape_points(
+    shape: &mut kiapi::board::types::BoardGraphicShape,
+    reference: &str,
+    uuid: &str,
+    points_mm: &[(f64, f64)],
+    anchor: (i64, i64),
+    to_board: &crate::transform::Xform,
+) -> Result<&'static str> {
+    use kiapi::common::types::graphic_shape::Geometry;
+    let kind = shape
+        .shape
+        .as_ref()
+        .and_then(|s| s.geometry.as_ref())
+        .map(geometry_kind)
+        .unwrap_or("unknown");
+    let want = match kind {
+        "polygon" => {
+            return replace_polygon_outline(shape, reference, uuid, points_mm, anchor, to_board)
+        }
+        "segment" | "circle" => 2,
+        "arc" => 3,
+        other => anyhow::bail!(
+            "graphic '{uuid}' on '{reference}' is a {other}; a live board edits polygons, \
+             segments, arcs and circles — save and close the board to edit it in the saved file"
+        ),
+    };
+    if points_mm.len() != want {
+        anyhow::bail!(
+            "a {kind} takes exactly {want} points, got {}",
+            points_mm.len()
+        );
+    }
+    let board: Vec<kiapi::common::types::Vector2> = points_mm
+        .iter()
+        .map(|&(x, y)| {
+            let (rx, ry) =
+                to_board.point(crate::builders::mm_to_nm(x), crate::builders::mm_to_nm(y));
+            kiapi::common::types::Vector2 {
+                x_nm: anchor.0 + rx,
+                y_nm: anchor.1 + ry,
+            }
+        })
+        .collect();
+    if board.windows(2).any(|pair| pair[0] == pair[1]) || (want == 3 && board[0] == board[2]) {
+        anyhow::bail!("a {kind}'s points must be distinct");
+    }
+    match shape.shape.as_mut().and_then(|s| s.geometry.as_mut()) {
+        Some(Geometry::Segment(segment)) => {
+            segment.start = Some(board[0]);
+            segment.end = Some(board[1]);
+        }
+        Some(Geometry::Circle(circle)) => {
+            circle.center = Some(board[0]);
+            circle.radius_point = Some(board[1]);
+        }
+        Some(Geometry::Arc(arc)) => {
+            arc.start = Some(board[0]);
+            arc.mid = Some(board[1]);
+            arc.end = Some(board[2]);
+        }
+        _ => unreachable!("the kind was matched above"),
+    }
+    Ok(kind)
+}
+
 /// The defining vertices of a graphic geometry, in absolute board nanometres.
 fn geometry_points(geometry: &kiapi::common::types::graphic_shape::Geometry) -> Vec<(i64, i64)> {
     use kiapi::common::types::graphic_shape::Geometry;
@@ -3293,7 +3364,12 @@ impl KiCadIpcClient {
             let kind = geometry_kind(geometry).to_string();
             let (outlines, holes) = polygon_extent(geometry);
             out.push(IpcFootprintGraphic {
-                editable: kind == "polygon" && outlines == 1 && holes == 0 && !uuid.is_empty(),
+                editable: !uuid.is_empty()
+                    && match kind.as_str() {
+                        "polygon" => outlines == 1 && holes == 0,
+                        "segment" | "arc" | "circle" => true,
+                        _ => false,
+                    },
                 uuid,
                 kind,
                 outlines,
@@ -3381,6 +3457,105 @@ impl KiCadIpcClient {
             uuid,
             reference
         )
+    }
+
+    /// Replace the defining points of one graphic item inside a placed
+    /// footprint — `points` for a polygon, `[start, end]` for a segment,
+    /// `[start, mid, end]` for an arc, `[center, point on circle]` for a
+    /// circle, the order `list_footprint_graphics` reports — or, with
+    /// `points_mm` `None`, remove the item. Footprint-local millimetres, as
+    /// for [`Self::set_footprint_graphic_points`].
+    ///
+    /// KiCad 10 has no per-child update for footprint artwork, so this sends
+    /// the whole footprint back, as the polygon edit does; the caller guards
+    /// that rebuild. The result is then read back from KiCad: an item whose
+    /// points differ, or a removed item KiCad still holds, is an error.
+    pub fn edit_footprint_graphic(
+        &self,
+        reference: &str,
+        uuid: &str,
+        points_mm: Option<&[(f64, f64)]>,
+    ) -> Result<String> {
+        let (mut fp, _) = self.find_footprint_instance(reference)?;
+        let (anchor, angle) = footprint_frame(&fp);
+        let to_board = crate::transform::Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: angle,
+        };
+        let definition = fp
+            .definition
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("footprint '{}' carries no definition", reference))?;
+        let position = definition.items.iter().position(|any| {
+            crate::builders::any_is(any, "kiapi.board.types.BoardGraphicShape")
+                && kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice())
+                    .is_ok_and(|shape| shape.id.as_ref().map(|k| k.value.as_str()) == Some(uuid))
+        });
+        let Some(position) = position else {
+            anyhow::bail!(
+                "graphic '{}' not found on footprint '{}' — call list_board_footprint_graphics \
+                 for the UUIDs it does have",
+                uuid,
+                reference
+            )
+        };
+        let mut shape = kiapi::board::types::BoardGraphicShape::decode(
+            definition.items[position].value.as_slice(),
+        )?;
+        let kind = shape
+            .shape
+            .as_ref()
+            .and_then(|s| s.geometry.as_ref())
+            .map(geometry_kind)
+            .unwrap_or("unknown");
+        match points_mm {
+            Some(points) => {
+                replace_shape_points(&mut shape, reference, uuid, points, anchor, &to_board)?;
+                definition.items[position] =
+                    pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+            }
+            None => {
+                definition.items.remove(position);
+            }
+        }
+        let packed = pack_any(&fp, "kiapi.board.types.FootprintInstance");
+        self.update_items(vec![packed])?;
+
+        let after = self.list_footprint_graphics(reference)?;
+        let found: Vec<_> = after.iter().filter(|g| g.uuid == uuid).collect();
+        match (points_mm, found.as_slice()) {
+            (None, []) => {}
+            (None, _) => anyhow::bail!(
+                "KiCad accepted the update but still holds graphic '{uuid}' on '{reference}'"
+            ),
+            (Some(points), [graphic]) => {
+                let want: Vec<_> = if kind == "polygon" {
+                    let mut want = points.to_vec();
+                    if want.len() > 3 && want.first() == want.last() {
+                        want.pop();
+                    }
+                    want
+                } else {
+                    points.to_vec()
+                };
+                let close = graphic.points.len() == want.len()
+                    && graphic.points.iter().zip(&want).all(|(have, &(x, y))| {
+                        (have.x - x).abs() < 2e-6 && (have.y - y).abs() < 2e-6
+                    });
+                if !close {
+                    anyhow::bail!(
+                        "KiCad accepted the update but graphic '{uuid}' on '{reference}' reads \
+                         back as {:?}, not the requested points",
+                        graphic.points
+                    );
+                }
+            }
+            (Some(_), _) => anyhow::bail!(
+                "after the update graphic '{uuid}' on '{reference}' is not exactly one item"
+            ),
+        }
+        Ok(kind.to_string())
     }
 
     /// The placed footprint carrying `reference`, and its index among items.
@@ -7295,6 +7470,93 @@ mod footprint_graphic_tests {
             (anchor.0, anchor.1 - builders::mm_to_nm(2.0)),
             "local +X must rotate to board -Y"
         );
+    }
+
+    // ─── replace_shape_points: segments, arcs, circles ─────────────────────
+
+    #[test]
+    fn segment_arc_and_circle_points_follow_the_footprints_frame() {
+        let anchor = (builders::mm_to_nm(10.0), builders::mm_to_nm(20.0));
+        let rotate = Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: 90.0,
+        };
+        let mm = builders::mm_to_nm;
+
+        let mut seg = builders::board_segment("B.SilkS", 0.12, 0.0, 0.0, 1.0, 0.0);
+        let kind = replace_shape_points(
+            &mut seg,
+            "D6602",
+            "u-1",
+            &[(0.0, 0.0), (2.0, 0.0)],
+            anchor,
+            &rotate,
+        )
+        .expect("a segment takes two points");
+        assert_eq!(kind, "segment");
+        assert_eq!(
+            outline_of(&seg),
+            vec![anchor, (anchor.0, anchor.1 - mm(2.0))]
+        );
+
+        let mut arc = builders::board_arc("F.SilkS", 0.12, 0.0, -1.0, 1.0, 0.0, 0.0, 1.0);
+        replace_shape_points(
+            &mut arc,
+            "D1",
+            "u-2",
+            &[(0.0, -1.0), (-1.0, 0.0), (0.0, 1.0)],
+            (0, 0),
+            &no_rotation(),
+        )
+        .expect("an arc takes three points");
+        assert_eq!(
+            outline_of(&arc),
+            vec![(0, mm(-1.0)), (mm(-1.0), 0), (0, mm(1.0))]
+        );
+
+        let mut circle = builders::board_circle("F.CrtYd", 0.05, 0.0, 0.0, 0.5, false);
+        replace_shape_points(
+            &mut circle,
+            "D1",
+            "u-3",
+            &[(0.0, 0.0), (0.75, 0.0)],
+            (0, 0),
+            &no_rotation(),
+        )
+        .expect("a circle takes centre and radius point");
+        assert_eq!(outline_of(&circle), vec![(0, 0), (mm(0.75), 0)]);
+    }
+
+    #[test]
+    fn wrong_counts_rectangles_and_repeated_points_are_refused_untouched() {
+        let mut seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let before = seg.clone();
+        for points in [
+            vec![(0.0, 0.0)],
+            vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            vec![(1.0, 1.0), (1.0, 1.0)],
+        ] {
+            assert!(
+                replace_shape_points(&mut seg, "J2", "u-1", &points, (0, 0), &no_rotation())
+                    .is_err()
+            );
+            assert_eq!(seg, before);
+        }
+
+        let mut rect = builders::board_rectangle("F.Fab", 0.1, 0.0, 0.0, 1.0, 1.0, false);
+        let before = rect.clone();
+        let error = replace_shape_points(
+            &mut rect,
+            "J2",
+            "u-4",
+            &[(0.0, 0.0), (2.0, 2.0)],
+            (0, 0),
+            &no_rotation(),
+        )
+        .expect_err("a live rectangle is refused");
+        assert!(format!("{error:#}").contains("save and close"));
+        assert_eq!(rect, before);
     }
 }
 

@@ -3,6 +3,44 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: closed-board footprint graphics and pad fabrication properties
+
+KiCad 10's typed API reaches a placed footprint's artwork and pads only by
+sending the whole footprint back, which re-creates its pads without their
+fabrication property, and it has no field to set one. Three closed-board paths
+fill the gap.
+
+`set_pad_fabrication_properties` (new, `pcb_fields`, `ClosedBoardOnly`)
+sets placed pads' `(property pad_prop_…)` in the saved file: `references`
+copies each pad's property from its library pad of the same number (all
+library pads of a number agreeing, or matched in order), and `pads` sets named
+pads (`none` clears). It requires KiCad provably not to hold the board, even for
+the dry run (the default), which lists each changed pad's before, after and
+UUID and returns a `revision` covering the board bytes, the request and each
+library file; apply repeats it. The write changes only each changed pad's
+property clause, inserted before `(layers …)` as KiCad writes it, and every
+touched footprint's pads are read back. `update_footprints_from_library`'s
+refusal of a library pad property now names this tool.
+
+`edit_board_footprint_graphic` no longer requires `points`: it takes `points`
+or `delete: true`. `points` follows `list_board_footprint_graphics`' order for
+each kind (polygon vertices, segment start/end, arc start/mid/end, circle centre
+and a point on it, rectangle corners). Live, it edits polygons, segments, arcs
+and circles and deletes any item, then reads the footprint back from KiCad; the
+pad-property guard still refuses those footprints live, now naming the closed
+path. With no KiCad holding the board (board access
+`LivePreferredWithFallback`, was `LiveOnly`) it edits the saved file: only the
+item's point clauses change, or its block and line are cut, so pad properties
+and every other byte stay; it adds `dry_run` and an optional
+`expected_revision`, and refuses an arc-edged polygon, a Bezier and, for
+delete, an item named elsewhere such as a group member. `dry_run` or
+`expected_revision` on a live board is refused (`dry_run_requires_closed_board`).
+
+`list_board_footprint_graphics` reads the saved file when no KiCad holds the
+board, or always with `source: "saved"`, and reports `source`. Saved items add
+`stroke_width_mm` and, when not editable, `not_editable_reason`; `editable` now
+also covers segments, arcs and circles live, and rectangles saved.
+
 ## Unreleased: closed-board pad net sync for footprints with pad fabrication properties
 
 `update_pcb_from_schematic` accepts `backend: "closed_pad_nets"`. The live

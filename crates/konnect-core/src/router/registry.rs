@@ -82,7 +82,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
+        description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect, edit and delete a placed footprint's graphics",
         category: "pcb",
         tool_count: 20,
     },
@@ -94,9 +94,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_fields",
-        description: "Inspect and edit live footprint text, visibility, documentation-layer placement and custom properties",
+        description: "Inspect and edit live footprint text, visibility, documentation-layer placement and custom properties; set placed pads' fabrication properties on a closed board",
         category: "pcb",
-        tool_count: 3,
+        tool_count: 4,
     },
     ToolsetMeta {
         name: "pcb_routing",
