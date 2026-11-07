@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **274 registered tools** + **7 always-visible meta-tools** = **281 total**
+- **275 registered tools** + **7 always-visible meta-tools** = **282 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -258,7 +258,7 @@ and Windows servers do not.
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
 ### `pcb_components` · 20 tools
-**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
+**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect, edit and delete a placed footprint's graphics; edit its 3D models.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -273,8 +273,8 @@ and Windows servers do not.
 | `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placed-instance state and pad nets while refreshing supported library-owned content. |
-| `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
-| `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
+| `list_board_footprint_graphics` | List the graphic items inside a placed footprint — silkscreen, fabrication and courtyard artwork — with the UUID needed to edit or delete one. Points are footprint-local (polygon vertices, segment start/end, arc start/mid/end, circle centre and a point on it, rectangle corners). Reads the board KiCad holds, else the saved file (`source` says which; `source: "saved"` always reads the file). Reports `editable`, plus `outlines` and `holes` for polygons. |
+| `edit_board_footprint_graphic` | Replace the defining points of, or delete (`delete: true`), one graphic item inside a placed footprint, selected by UUID, without re-placing the part. Live: polygons, segments, arcs and circles in one undo step with readback; a footprint whose pads carry a fabrication property is refused. With the exact board closed in KiCad: the saved file is edited, changing only the item's point clauses or cutting its block, so pad fabrication properties stay; takes `dry_run`/`expected_revision`. Arc-edged polygons, Beziers and grouped items (for delete) are refused rather than flattened. |
 | `set_placed_footprint_models` | Inspect, append, replace, or remove one exact indexed 3D-model entry on a placed footprint through live KiCad IPC. Mutations require the latest inspection revision, update the complete parent footprint in one undo step, preserve unrelated entries, and return fresh readback. There is no open-board file fallback. |
 | `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. `detail: "connectivity"` returns only each physical pad's number, net, board-space position, rotation, type, UUID and fabrication property plus the footprint's pose, UUID, layer and library ID; `pad_numbers`/`nets` filter on exact values, keep duplicate pad numbers, and list requested values that matched nothing. |
 | `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
@@ -284,15 +284,16 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_fields` · 3 tools
-**Purpose:** Inspect and edit footprint fields and their documentation-layer presentation; set field values in bulk on a live or closed board.
-**Source:** [`crates/konnect-core/src/tools/pcb_fields.rs`](crates/konnect-core/src/tools/pcb_fields.rs), [`pcb_fields/values.rs`](crates/konnect-core/src/tools/pcb_fields/values.rs)
+### `pcb_fields` · 4 tools
+**Purpose:** Inspect and edit footprint fields and their documentation-layer presentation; set field values in bulk on a live or closed board; set placed pads' fabrication properties on a closed board.
+**Source:** [`crates/konnect-core/src/tools/pcb_fields.rs`](crates/konnect-core/src/tools/pcb_fields.rs), [`pcb_fields/values.rs`](crates/konnect-core/src/tools/pcb_fields/values.rs), [`pcb_components/pad_fabrication.rs`](crates/konnect-core/src/tools/pcb_components/pad_fabrication.rs)
 
 | Tool | Description |
 |------|-------------|
 | `list_footprint_fields` | Inspect live mandatory and custom fields with their text, visibility, layer and board position. |
 | `edit_footprint_fields` | Dry-run and revision-bound field changes with post-commit readback and explicit uncertain-state recovery; never renumbers references or writes board files. |
 | `set_footprint_field_values` | Set, create or remove field values (MPN, LCSC, Value, any custom property) on many footprints in one call. Live boards are edited over IPC in one commit with readback; a board KiCad provably does not hold (no sibling lock) gets one revision-checked atomic write that changes only the named values (a created field copies the Value property's style, hidden; a removed one is cut). Dry run by default; an apply repeats the dry run's `plan_revision`. `edits_file` carries large batches. |
+| `set_pad_fabrication_properties` | Set placed pads' fabrication property (`pad_prop_fiducial_glob`, `pad_prop_heatsink`, … or `none`) in the saved board of a board KiCad does not hold. `references` copies each pad's property from its library pad of the same number (the closed-board form of Update Footprint from Library for the clause KiCad 10's typed API cannot carry); `pads` sets named pads. Dry run by default with a per-pad before/after and a revision; apply repeats the revision and writes only each changed `(property …)` clause, read back. |
 
 ### `board_analysis` · 8 tools
 **Purpose:** Read-only layout adequacy analyses of the saved board, with copper thickness and layer depth from its stackup: zone hygiene, IPC-2152 current capacity, DC IR drop, stitching, decoupling distance, thermal pads, IPC-2221B voltage spacing, net lengths. Each answers with a summary, writes the full result to `output` and render markers to `markers_output`, and cites its method.

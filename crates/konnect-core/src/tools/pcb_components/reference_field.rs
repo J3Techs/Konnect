@@ -172,7 +172,7 @@ pub(crate) struct Observed {
     pub stroke_mm: Option<f64>,
 }
 
-fn round_nm(value: f64) -> f64 {
+pub(super) fn round_nm(value: f64) -> f64 {
     let rounded = (value * 1e6).round() / 1e6;
     if rounded == 0.0 {
         0.0
@@ -240,7 +240,7 @@ struct FieldSpans {
     thickness: Option<(usize, usize)>,
 }
 
-fn head_of(block: &str) -> &str {
+pub(super) fn head_of(block: &str) -> &str {
     sexp_block_tokens(block)
         .first()
         .map_or("", |&(s, e)| &block[s..e])
@@ -266,7 +266,9 @@ fn one(
 }
 
 /// Footprint spans by Reference, in board order.
-fn footprints_by_reference(source: &str) -> Result<BTreeMap<String, Vec<(usize, usize)>>, String> {
+pub(super) fn footprints_by_reference(
+    source: &str,
+) -> Result<BTreeMap<String, Vec<(usize, usize)>>, String> {
     check_single_board_form(source)?;
     let mut out: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     for (start, end) in find_direct_child_blocks(source, "kicad_pcb") {
@@ -433,7 +435,7 @@ fn read_field(source: &str, footprint: (usize, usize)) -> Result<(Observed, Fiel
     ))
 }
 
-fn mm(value: f64) -> String {
+pub(super) fn mm(value: f64) -> String {
     let text = format!("{:.6}", round_nm(value));
     let text = text.trim_end_matches('0').trim_end_matches('.');
     if text == "-0" {

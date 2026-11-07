@@ -336,8 +336,9 @@ pub(crate) async fn handle_update_footprints_from_library(
         BoardWrite::Ipc(response) => response,
         BoardWrite::File(reason) => preflight_conflict(format!(
             "{} update_footprints_from_library is live-IPC-only and never edits the board \
-             file directly. Open the requested board in KiCad and retry.",
-            reason.premise()
+             file directly. Open the requested board in KiCad and retry.{}",
+            reason.premise(),
+            PAD_PROPERTY_REMEDY
         )),
         BoardWrite::Refused(result) => {
             let message = result
@@ -352,6 +353,12 @@ pub(crate) async fn handle_update_footprints_from_library(
         }
     })
 }
+
+/// Where a library pad's fabrication property can go instead.
+const PAD_PROPERTY_REMEDY: &str = " A library pad's fabrication property (pad_prop_…) cannot \
+     travel through KiCad 10's typed API; on a board KiCad does not hold, \
+     set_pad_fabrication_properties with 'references' copies it from the library onto the \
+     placed pads and changes nothing else.";
 
 /// Each prepared update sends a whole footprint back, and KiCad re-creates
 /// its pads from a message with no field for a pad's fabrication property.
@@ -727,9 +734,13 @@ fn plan_updates(
         let library = match parse_library_footprint(&candidate.library_id, &source) {
             Ok(library) => library,
             Err(error) => {
+                let mut message = format!("{error:#}");
+                if message.contains("pad clause 'property'") {
+                    message.push_str(PAD_PROPERTY_REMEDY);
+                }
                 diagnostics.push(UpdateDiagnostic {
                     code: "unsupported_library_footprint".to_string(),
-                    message: format!("{error:#}"),
+                    message,
                     reference: Some(candidate.reference),
                 });
                 continue;
