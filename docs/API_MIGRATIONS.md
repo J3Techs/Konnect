@@ -3,6 +3,20 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: per-file net queries say when they cover one file
+
+`get_net_components`, `get_net_connections`, `get_net_connectivity`,
+`find_single_pin_nets` and `export_netlist_summary` read only the file they are
+given. Asked on a root sheet about a global rail, `get_net_components` answered
+`{"components": []}` with nothing to say the rail's eight pins were on other
+sheets. Each now adds a `coverage` object when its answer cannot be the whole
+design's: `scope` (`this_file_only`), `file`, and `reasons`, any of
+`sheet_has_child_sheets`, `named_by_global_label`, `named_by_power_symbol`,
+`named_by_hierarchical_label`, and — for the tools that take a `net` —
+`not_named_on_this_sheet`. An answer that is complete, such as a local net on
+a leaf sheet, carries no `coverage` and reads exactly as before. No field was
+renamed or removed. The design-wide answer is the new `get_net_members`.
+
 ## Unreleased: closed-board footprint graphics and pad fabrication properties
 
 KiCad 10's typed API reaches a placed footprint's artwork and pads only by

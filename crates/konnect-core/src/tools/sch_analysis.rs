@@ -55,7 +55,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_connections",
-            "Get all pins and labels connected to a named net.",
+            "Get all pins and labels connected to a named net, in this file only. The \
+             response's 'coverage' says when that cannot be the whole net (child sheets, a \
+             global label, power symbol or hierarchical label); get_net_members answers for the \
+             whole hierarchy.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -67,7 +70,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_net_connectivity",
             "Build the full connectivity graph for a net using union-find. \
-             Returns all wire segments, labels, and T-junction locations.",
+             Returns all wire segments, labels, and T-junction locations in this file; \
+             'coverage' says when the net continues beyond it.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -113,7 +117,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_components",
-            "Get all components (and their pins) connected to a named net.",
+            "Get all components (and their pins) connected to a named net in this file. The \
+             response's 'coverage' says when that cannot be the whole net (child sheets, a \
+             global label, power symbol or hierarchical label, or nothing here naming it); \
+             get_net_members answers for the whole hierarchy.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -169,7 +176,8 @@ pub fn tools() -> Vec<ToolDef> {
              sheet pins count; a power symbol's own pin names the rail rather than consuming \
              it and does not. Reports the pin and label counts, and every label kind that \
              named the net. Read per sheet: a net a global, hierarchical or power label can \
-             carry off this one is flagged cross_sheet_unverified.",
+             carry off this one is flagged cross_sheet_unverified, and 'coverage' says so for \
+             the response as a whole.",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -210,6 +218,65 @@ pub fn tools() -> Vec<ToolDef> {
     .into_iter()
     .chain(crate::tools::design_nets::tools())
     .collect()
+}
+
+// ─── Coverage ─────────────────────────────────────────────────────────────────
+
+/// Say when a per-file answer cannot be the whole design's.
+///
+/// These tools read the one file they are given. On a sheet with child sheets,
+/// or for a net that a global label, a power symbol or a hierarchical label
+/// carries off the sheet, the answer is part of one — and asked on a root
+/// sheet about a global rail it was an empty list with nothing to say so. The
+/// object is added only when one of those holds, so an answer that is complete
+/// reads exactly as before; `net` is `None` for a tool that answers about every
+/// net on the sheet.
+pub(crate) fn single_file_coverage(
+    path: &std::path::Path,
+    tree: &konnect_sexp::SexpNode,
+    labels: &[Label],
+    net: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut reasons = Vec::new();
+    if !tree.find_all("sheet").is_empty() {
+        reasons.push("sheet_has_child_sheets");
+    }
+    let naming = labels
+        .iter()
+        .filter(|label| net.is_none_or(|net| label.net == net));
+    let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
+    let mut named = false;
+    for label in naming {
+        named = true;
+        match label.kind {
+            LabelKind::GlobalLabel => {
+                kinds.insert("named_by_global_label");
+            }
+            LabelKind::PowerSymbol => {
+                kinds.insert("named_by_power_symbol");
+            }
+            LabelKind::HierarchicalLabel => {
+                kinds.insert("named_by_hierarchical_label");
+            }
+            LabelKind::NetLabel => {}
+        }
+    }
+    reasons.extend(kinds);
+    if net.is_some() && !named {
+        reasons.push("not_named_on_this_sheet");
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "scope": "this_file_only",
+        "file": path.display().to_string(),
+        "reasons": reasons,
+        "detail": "This answer reads only this file. A net that leaves it through a child \
+                   sheet, a global label, a power symbol or a hierarchical label has members \
+                   elsewhere that are not counted here; get_net_members answers for the whole \
+                   hierarchy.",
+    }))
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -286,9 +353,11 @@ async fn handle_get_net_connections(
         .collect();
     let mut g = net_graph_for(&tree, &wires, &labels);
     let pts = g.points_on_net(&net).len();
-    Ok(CallToolResult::json(
-        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
-    ))
+    let mut response = json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts });
+    if let Some(coverage) = single_file_coverage(&sch_path, &tree, &labels, Some(&net)) {
+        response["coverage"] = coverage;
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_get_net_connectivity(
@@ -321,12 +390,16 @@ async fn handle_get_net_connectivity(
         .cloned()
         .collect();
     let t_junctions = konnect_sexp::schematic::find_t_junctions(&net_wire_objs, 0.01);
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "net": net,
         "wires": net_wires,
         "labels": net_labels,
         "t_junctions": t_junctions.iter().map(|(x,y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
-    })))
+    });
+    if let Some(coverage) = single_file_coverage(&sch_path, &tree, &labels, Some(&net)) {
+        response["coverage"] = coverage;
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_get_pin_connections(
@@ -442,9 +515,11 @@ async fn handle_get_net_components(
             }
         })
         .collect();
-    Ok(CallToolResult::json(
-        &json!({ "net": net, "components": result }),
-    ))
+    let mut response = json!({ "net": net, "components": result });
+    if let Some(coverage) = single_file_coverage(&sch_path, &tree, &labels, Some(&net)) {
+        response["coverage"] = coverage;
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_trace_from_point(
@@ -834,9 +909,11 @@ async fn handle_find_single_pin_nets(
         })
         .collect();
 
-    Ok(CallToolResult::json(
-        &json!({ "single_pin_net_count": singles.len(), "nets": singles }),
-    ))
+    let mut response = json!({ "single_pin_net_count": singles.len(), "nets": singles });
+    if let Some(coverage) = single_file_coverage(&sch_path, &tree, &labels, None) {
+        response["coverage"] = coverage;
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_get_connected_items(
@@ -2124,5 +2201,82 @@ mod trace_from_point_tests {
         let tight = at_within(100.35, 96.52, json!(0.01)).await;
         assert!(pins(&tight).is_empty(), "{tight}");
         assert_eq!(count(&tight, "junctions_here"), 0, "{tight}");
+    }
+}
+
+/// The per-file net tools say when their answer is one file's part of a net.
+/// Fixture: the `design_nets` pair, whose root holds a child sheet and a global
+/// rail sourced on that child (see `design_nets.README.md`).
+#[cfg(test)]
+mod coverage_tests {
+    use super::tool_call_support::call;
+    use super::*;
+
+    const ROOT: &str = include_str!("../../tests/fixtures/design_nets.kicad_sch");
+    const CHILD: &str = include_str!("../../tests/fixtures/design_nets_child.kicad_sch");
+
+    fn reasons(response: &serde_json::Value) -> Vec<&str> {
+        response["coverage"]["reasons"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no coverage: {response}"))
+            .iter()
+            .map(|reason| reason.as_str().unwrap())
+            .collect()
+    }
+
+    /// The round-1 case: the root's answer for a rail sourced on a child.
+    #[tokio::test]
+    async fn a_root_sheet_says_its_answer_covers_only_itself() {
+        let response = call(ROOT, "get_net_components", json!({ "net": "RAIL_A" })).await;
+
+        assert_eq!(
+            reasons(&response),
+            ["sheet_has_child_sheets", "named_by_global_label"]
+        );
+        assert_eq!(response["coverage"]["scope"], "this_file_only");
+    }
+
+    /// The silent empty answer: nothing on the root names the child's net.
+    #[tokio::test]
+    async fn an_empty_answer_says_why_it_may_be_empty() {
+        let response = call(ROOT, "get_net_components", json!({ "net": "CHILD_LOCAL" })).await;
+
+        assert_eq!(response["components"], json!([]));
+        assert_eq!(
+            reasons(&response),
+            ["sheet_has_child_sheets", "not_named_on_this_sheet"]
+        );
+    }
+
+    /// A local net on a leaf sheet is answered in full, and the response is
+    /// exactly what it was before.
+    #[tokio::test]
+    async fn a_complete_answer_carries_no_coverage_note() {
+        let response = call(CHILD, "get_net_components", json!({ "net": "CHILD_LOCAL" })).await;
+
+        assert!(response.get("coverage").is_none(), "{response}");
+        assert_eq!(response["components"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn power_symbols_and_hierarchical_labels_are_named() {
+        let rail = call(CHILD, "get_net_connections", json!({ "net": "+3V3" })).await;
+        assert_eq!(reasons(&rail), ["named_by_power_symbol"]);
+
+        let enable = call(CHILD, "get_net_connectivity", json!({ "net": "EN" })).await;
+        assert_eq!(reasons(&enable), ["named_by_hierarchical_label"]);
+    }
+
+    #[tokio::test]
+    async fn whole_sheet_answers_say_which_names_leave_the_sheet() {
+        let singles = call(CHILD, "find_single_pin_nets", json!({})).await;
+        assert_eq!(
+            reasons(&singles),
+            [
+                "named_by_global_label",
+                "named_by_hierarchical_label",
+                "named_by_power_symbol"
+            ]
+        );
     }
 }
