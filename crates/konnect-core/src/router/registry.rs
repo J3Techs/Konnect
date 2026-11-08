@@ -52,15 +52,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_analysis",
-        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, and design-wide net members, undriven nets and sheet-removal dry runs from KiCad's netlist",
+        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, junction dots and what meets at each, and design-wide net members, undriven nets and sheet-removal dry runs from KiCad's netlist",
         category: "schematic",
-        tool_count: 18,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "sch_batch",
-        description: "Bulk add, edit, delete, and move schematic elements in one call",
+        description: "Bulk add, edit, delete, and move schematic elements in one call, and prune the junction dots KiCad's rule does not call for",
         category: "schematic",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "sch_export",

@@ -533,11 +533,67 @@ pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -
 /// another unit's pins as phantom connection points (#35).
 pub(crate) struct PlacedPin {
     pub(crate) reference: String,
+    /// The placed unit that owns the pin. KiCad treats each unit as its own
+    /// symbol, so two units meeting on one point are two connections there.
+    pub(crate) unit: u32,
     /// The owning component's value, carried so a caller reporting a pin does
     /// not re-walk the instances this was built from.
     pub(crate) value: String,
     pub(crate) pin: LibPin,
     pub(crate) at: (f64, f64),
+}
+
+/// Which part of a wire meets a point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WireMeets {
+    /// The wire's first `(xy …)` point is here.
+    Start,
+    /// The wire's second `(xy …)` point is here.
+    End,
+    /// The point lies inside the wire's span.
+    Through,
+}
+
+/// What meets one point, counted the way KiCad decides whether a junction dot
+/// belongs there.
+///
+/// KiCad's rule (`JUNCTION_HELPERS::AnalyzePoint`) counts the distinct
+/// directions in which connections leave the point. A wire ending here leaves
+/// one way, toward its other end. A wire running through leaves two ways,
+/// because a dot splits it there. Each symbol unit and each sheet pin with a
+/// connection point here is one more exit of its own. Labels and no-connect
+/// flags are not exits. A dot is needed when three or more exits meet: a T, a
+/// pin landing on a wire's span, a crossing joined on purpose. Two wires
+/// meeting end to end, a corner or a straight join, connect without one, and so
+/// does a wire ending on a pin.
+///
+/// Points touching a bus or a bus entry are not judged here: bus junctions
+/// follow their own rule and stay outside ordinary wire-junction mutation.
+pub(crate) struct JunctionSite<'i> {
+    /// Each wire meeting the point and how it meets it, in file order.
+    pub(crate) wires: Vec<(&'i Wire, WireMeets)>,
+    /// Component pins with their connection point here, in sheet order.
+    pub(crate) pins: Vec<&'i PlacedPin>,
+    /// A bus or a bus entry touches the point.
+    pub(crate) bus: bool,
+    /// Distinct exits, as KiCad counts them.
+    pub(crate) exits: usize,
+}
+
+impl JunctionSite<'_> {
+    /// Whether KiCad's rule calls for a dot here: `None` where a bus or bus
+    /// entry touches the point, which this rule does not judge.
+    pub(crate) fn needed(&self) -> Option<bool> {
+        (!self.bus).then_some(self.exits >= 3)
+    }
+}
+
+/// The direction from `from` toward `to`, in whole degrees in `[0, 360)`.
+/// KiCad compares exits by rounded angle, so two wires leaving the same way
+/// are one exit, as they are in Eeschema.
+fn exit_angle(from: (f64, f64), to: (f64, f64)) -> i64 {
+    let degrees = (to.1 - from.1).atan2(to.0 - from.0).to_degrees().round() as i64;
+    degrees.rem_euclid(360)
 }
 
 /// The items sitting on one point, rather than the counts and booleans the
@@ -585,6 +641,7 @@ impl<'a> ConnectivityIndex<'a> {
             .flat_map(|(inst, pins)| {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
                     reference: inst.reference.clone(),
+                    unit: inst.unit,
                     value: inst.value.clone(),
                     at: pin_endpoint(&pin, transform),
                     pin,
@@ -727,6 +784,69 @@ impl<'a> ConnectivityIndex<'a> {
         PointDetail {
             pins: pins.into_iter().map(|(_, pin)| pin).collect(),
             junctions: junctions.into_iter().map(|(_, at)| at).collect(),
+        }
+    }
+
+    /// Everything KiCad's junction rule counts at `(x, y)`; see [`JunctionSite`].
+    /// Every caller that keeps, prunes or reports a junction dot reads this,
+    /// so the delete, move and prune paths cannot disagree about a dot.
+    pub(crate) fn junction_site(&self, x: f64, y: f64) -> JunctionSite<'_> {
+        let tol = self.on_wire.tolerance();
+        let mut wires = Vec::new();
+        for wire in self.wires {
+            // Eeschema ignores a zero-length line when it counts exits.
+            if points_coincident(wire.x1, wire.y1, wire.x2, wire.y2, tol) {
+                continue;
+            }
+            let meets = if points_coincident(x, y, wire.x1, wire.y1, tol) {
+                WireMeets::Start
+            } else if points_coincident(x, y, wire.x2, wire.y2, tol) {
+                WireMeets::End
+            } else if point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, tol) {
+                WireMeets::Through
+            } else {
+                continue;
+            };
+            wires.push((wire, meets));
+        }
+
+        let mut pins: Vec<(usize, &PlacedPin)> = self
+            .pin_points
+            .hits_at(x, y)
+            .map(|(_, _, ordinal)| (ordinal, &self.placed_pins[ordinal]))
+            .collect();
+        pins.sort_by_key(|(ordinal, _)| *ordinal);
+        let pins: Vec<&PlacedPin> = pins.into_iter().map(|(_, pin)| pin).collect();
+        let sheet_pins = self.sheet_pin_points.count_at(x, y);
+
+        let mut angles = HashSet::new();
+        for (wire, meets) in &wires {
+            let (start, end) = ((wire.x1, wire.y1), (wire.x2, wire.y2));
+            match meets {
+                WireMeets::Start => {
+                    angles.insert(exit_angle((x, y), end));
+                }
+                WireMeets::End => {
+                    angles.insert(exit_angle((x, y), start));
+                }
+                WireMeets::Through => {
+                    angles.insert(exit_angle((x, y), start));
+                    angles.insert(exit_angle((x, y), end));
+                }
+            }
+        }
+        // One exit per placed unit, however many of its pins stack here: a
+        // symbol is one item to Eeschema.
+        let symbols: HashSet<(&str, u32)> = pins
+            .iter()
+            .map(|pin| (pin.reference.as_str(), pin.unit))
+            .collect();
+
+        JunctionSite {
+            exits: angles.len() + symbols.len() + sheet_pins,
+            bus: self.on_bus(x, y) || self.has_bus_entry_wire_end(x, y),
+            wires,
+            pins,
         }
     }
 

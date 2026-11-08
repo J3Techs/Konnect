@@ -217,6 +217,7 @@ pub fn tools() -> Vec<ToolDef> {
     ]
     .into_iter()
     .chain(crate::tools::design_nets::tools())
+    .chain(std::iter::once(crate::tools::sch_junctions::list_tool()))
     .collect()
 }
 

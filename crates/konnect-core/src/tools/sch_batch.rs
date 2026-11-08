@@ -152,7 +152,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
-             or component reference designator — single file write.",
+             or component reference designator — single file write. Junction dots the \
+             deleted wires, components and sheets leave unjustified by KiCad's junction \
+             rule go in the same write, reported as junctions_pruned_count and \
+             junctions_pruned_uuids; a junction named in uuids is reported as deleted, \
+             not pruned.",
             json!({
                 "type": "object",
                 "properties": {
@@ -236,7 +240,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_delete_schematic_components",
-            "Delete multiple components by reference designator in a single atomic file write.",
+            "Delete multiple components by reference designator in a single atomic file write. \
+             Junction dots their pins leave unjustified by KiCad's junction rule go in the \
+             same write, reported as junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -399,6 +405,11 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_validate_component_connections(args, ctx).await }
         ),
     ]
+    .into_iter()
+    // The whole-sheet junction prune pass lives beside the junction listing
+    // in `sch_junctions`; it is a one-write sheet edit like the batch tools.
+    .chain(std::iter::once(crate::tools::sch_junctions::prune_tool()))
+    .collect()
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────

@@ -94,9 +94,10 @@ Konnect/
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
 │   │           ├── sch_components.rs # 18 tools (component placement with lib_symbols embedding)
 │   │           ├── sch_wiring.rs     # 20 tools (incl. connect_pins, power symbol embedding; edit_schematic_label's handler)
-│   │           ├── sch_analysis.rs   # 18 tools (union-find net graph, connectivity; 3 come from design_nets.rs)
+│   │           ├── sch_analysis.rs   # 19 tools (union-find net graph, connectivity; 3 come from design_nets.rs, 1 from sch_junctions.rs)
 │   │           ├── design_nets.rs    # design-wide nets: KiCad netlist + sheet walk, drive analysis, sheet-removal dry run
-│   │           ├── sch_batch.rs      # 12 tools (single-read/single-write atomic operations)
+│   │           ├── sch_batch.rs      # 15 tools (single-read/single-write atomic operations; 1 comes from sch_junctions.rs)
+│   │           ├── sch_junctions.rs  # junction dots: list what meets each, prune by KiCad's junction rule (rule itself in sch_connectivity.rs)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
@@ -376,7 +377,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 279 tools (286 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 281 tools (288 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -461,12 +462,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **24 toolsets, 279 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **24 toolsets, 281 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 286 tools (279 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 288 tools (281 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

@@ -59,6 +59,7 @@ does not establish that a missing server-side check ran.
 | "Change R5 from 10k to 4.7k" | 1 | `load_toolset("sch_components")` then `edit_schematic_component` |
 | "What's connected to SCL?" | 2 | `load_toolset("sch_analysis")` then `get_net_members` on the root (whole hierarchy); `get_net_connections` reads one sheet |
 | "What breaks if I delete this sheet?" | 2 | `load_toolset("sch_analysis")` then `plan_sheet_removal` (dry run; writes nothing) |
+| "Clean up stray junction dots" | 1 | `load_toolset("sch_batch")` then `prune_schematic_junctions` (`dry_run` first); `list_schematic_junctions` in `sch_analysis` shows what meets each dot |
 | "Add a 100nF cap to U3 VCC" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Rename net /CLK to /SYS_CLK" | 1 | Warn about downstream effects, then MCP tools |
 | "Run DRC" | 1 | `load_toolset("verification")` then `run_drc` — read each item's `owner`/`ownership_status` before advising a fix (board geometry vs. a footprint's own) |

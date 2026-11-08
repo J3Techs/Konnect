@@ -64,6 +64,7 @@ pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
+pub(crate) mod sch_junctions;
 pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]

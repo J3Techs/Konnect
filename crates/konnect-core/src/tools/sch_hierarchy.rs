@@ -142,7 +142,9 @@ pub fn tools() -> Vec<ToolDef> {
             "delete_sheet",
             "Remove a sheet reference from the parent schematic. Does NOT delete the child \
              .kicad_sch file on disk. Remaining sheets' page numbers may now have a gap — \
-             call renumber_sheet_pages afterward if that matters.",
+             call renumber_sheet_pages afterward if that matters. Junction dots on the \
+             sheet's pins that KiCad's junction rule no longer calls for go in the same \
+             write, reported as junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1432,6 +1434,56 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     }
 }
 
+/// The junction dots that deleting sheet `uuid` leaves unjustified by KiCad's
+/// junction rule. Only a dot on one of the sheet's own pins can lose an exit,
+/// so only those are judged, on the document as it will be without the sheet.
+fn junctions_pruned_by_sheet_delete(
+    path: &Path,
+    before: &str,
+    uuid: &str,
+) -> anyhow::Result<Vec<String>> {
+    let tree = parse_sexp(before)?;
+    let dots = konnect_sexp::schematic::extract_junctions(&tree);
+    let Some(sheet) = tree
+        .find_all("sheet")
+        .into_iter()
+        .find(|sheet| sheet.find_str("uuid") == Some(uuid))
+    else {
+        return Ok(Vec::new());
+    };
+    let points: Vec<(f64, f64)> = sheet
+        .find_all("pin")
+        .into_iter()
+        .filter_map(konnect_sexp::schematic::parse_at)
+        .map(|(x, y, _)| (x, y))
+        .filter(|&(x, y)| {
+            dots.iter()
+                .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+        })
+        .collect();
+    if points.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sheet_only = SchematicCommand::delete_item(before, ItemId::new(uuid)?, "Delete sheet")?;
+    let (without_sheet, _) = prepare_command(path, before, &sheet_only)?;
+    let (reconciled, _, _) =
+        super::sch_wiring::reconcile_junctions_at(without_sheet.clone(), &points);
+    let junction_uuids = |source: &str| -> BTreeSet<String> {
+        parse_sexp(source)
+            .map(|tree| {
+                tree.find_all("junction")
+                    .into_iter()
+                    .filter_map(|dot| dot.find_str("uuid").map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(junction_uuids(&without_sheet)
+        .difference(&junction_uuids(&reconciled))
+        .cloned()
+        .collect())
+}
+
 async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
@@ -1445,8 +1497,14 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
         Some(removed) => {
             let child_file = removed.file().to_owned();
             let uuid = removed.uuid.clone();
-            let command =
-                SchematicCommand::delete_item(&before, ItemId::new(uuid.clone())?, "Delete sheet")?;
+            // The dots on the sheet's own pins go in the same write when the
+            // sheet leaves them unjustified by KiCad's junction rule.
+            let pruned = junctions_pruned_by_sheet_delete(&sch_path, &before, &uuid)?;
+            let ids = std::iter::once(uuid.clone())
+                .chain(pruned.iter().cloned())
+                .map(ItemId::new)
+                .collect::<Result<Vec<_>, _>>()?;
+            let command = SchematicCommand::delete_items(&before, ids, "Delete sheet")?;
             let intent = SheetMutationIntent::Absent { uuid };
             if let Some(error) = commit_verified_sheet_mutation(
                 &sch_path,
@@ -1460,6 +1518,8 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
             Ok(CallToolResult::json(&json!({
                 "deleted": sheet_name,
                 "child_file_preserved": child_file,
+                "junctions_pruned_count": pruned.len(),
+                "junctions_pruned_uuids": pruned,
                 "note": "The child schematic file was not deleted. Remaining sheets' page \
                          numbers may now have a gap — call renumber_sheet_pages if needed."
             })))

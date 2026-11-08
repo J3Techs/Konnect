@@ -71,7 +71,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Delete a wire segment by its UUID, or by matching BOTH endpoints \
              (all four of x1/y1/x2/y2, either direction). Fails without deleting \
              anything when no wire matches. Junction dots the wire leaves \
-             unjustified are removed with it.",
+             unjustified by KiCad's junction rule (fewer than three exits: a \
+             corner, a straight join, a lone wire, a wire end on a pin) are \
+             removed with it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -88,8 +90,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete_schematic_wire",
             "Delete multiple wire segments in a single file read/write cycle. \
-             Junction dots the wires leave unjustified are removed with them, \
-             reported as junctions_pruned_count.",
+             Junction dots the wires leave unjustified by KiCad's junction rule \
+             (fewer than three exits: a corner, a straight join, a lone wire, a \
+             wire end on a pin) are removed with them, reported as \
+             junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -787,8 +791,8 @@ struct IdentifiedPin {
 ///
 /// Fails rather than answering short: a `lib_symbols` lookup that failed, or an
 /// instance with no UUID, is stale state and not evidence that no pin is there.
-/// [`reconcile_junctions_at`] draws the same distinction with `pins_known`,
-/// more coarsely — it cannot see one symbol of ten failing to resolve.
+/// [`reconcile_junctions_at`] draws the same distinction before it drops a
+/// dot, through `resolved_placed_pins_by_reference`.
 fn identified_pins(
     tree: &konnect_sexp::SexpNode,
 ) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
@@ -1314,13 +1318,17 @@ pub(crate) fn reconcile_junctions_for_placement(
 ///
 /// All connectivity answers come from the shared [`ConnectivityIndex`] — this
 /// must not become a fifth private definition of "what is attached here"
-/// (#323). A dot is kept when anything still justifies it:
+/// (#323). A dot is kept when KiCad's junction rule still calls for it
+/// ([`JunctionSite`]): three or more distinct exits meet there, such as a T, a
+/// pin on a wire's span, or a crossing joined on purpose. A corner, a straight
+/// join or a wire ending on a pin has two, so its dot goes. Two exceptions
+/// keep a dot the rule would drop:
 ///
-/// * two or more wires under the point — a T, a crossing joined on purpose, or
-///   wire ends meeting: never touched;
-/// * a pin or a hierarchical sheet pin still at the point;
+/// * a bus or bus entry touches the point — bus junctions are not judged here;
 /// * pins unresolvable (`lib_symbols` lookup failed) — that is not the same as
 ///   "no pin here", so only the unambiguous zero-wire case prunes then.
+///
+/// [`JunctionSite`]: crate::tools::sch_connectivity::JunctionSite
 ///
 /// A dot is added only where a pin has landed mid-span on **exactly one** wire
 /// and no no-connect flag sits there. One wire is the unambiguous case: with
@@ -1353,7 +1361,12 @@ pub(crate) fn reconcile_junctions_at(
     // A bus junction remains outside ordinary wire-junction mutation. The
     // shared index owns this geometric answer so validators and mutation do
     // not drift apart again (#328).
-    let pins_known = !idx.placed_pins().is_empty() || extract_symbol_instances(&tree).is_empty();
+    //
+    // Whether every placed symbol's pins resolved. Only asked when the rule
+    // would drop a dot: then a pin the lookup could not place may be the
+    // missing third exit. Resolving walks every symbol, so it waits until a
+    // verdict depends on it.
+    let mut pins_resolved: Option<bool> = None;
 
     // Existing dots at the candidate points, with the byte range to delete —
     // the one thing the index does not hold.
@@ -1390,7 +1403,6 @@ pub(crate) fn reconcile_junctions_at(
             .iter()
             .filter(|d| konnect_sexp::geometry::points_coincident(px, py, d.at.0, d.at.1, TOL))
             .collect();
-        let attached = idx.has_pin(px, py) || idx.has_sheet_pin(px, py);
         if here.is_empty() {
             if idx.wires_at(px, py) == 1
                 && idx.on_wire_interior(px, py)
@@ -1400,10 +1412,14 @@ pub(crate) fn reconcile_junctions_at(
                 to_add.push((px, py));
             }
         } else {
-            let keep = match idx.wires_at(px, py) {
-                0 => false,
-                1 => !pins_known || attached,
-                _ => true,
+            let keep = match idx.junction_site(px, py).needed() {
+                None | Some(true) => true,
+                Some(false) => {
+                    let resolved = *pins_resolved.get_or_insert_with(|| {
+                        crate::tools::resolved_placed_pins_by_reference(&tree).is_some()
+                    });
+                    !resolved && idx.wires_at(px, py) > 0
+                }
             };
             if !keep {
                 ranges.extend(here.iter().map(|d| d.range));
@@ -1440,34 +1456,37 @@ pub(crate) fn reconcile_junctions_at(
     (out, added, pruned)
 }
 
-/// Drop the junction dots the removed wires left with nothing to justify them.
+/// Drop the junction dots the removed wires left unjustified.
 ///
 /// Deleting a wire used to leave its dots behind, so relocating a block — delete
 /// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
-/// A dot needs two wires to mean anything, with one exception: one wire plus a
-/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
-/// So a junction is pruned when no wire is left through it, or one is and no pin
-/// sits there. Junctions no removed wire touched are left alone, and moves that
-/// strand a dot without deleting a wire are #120's half of the problem.
+/// Only the dots a removed wire ended on or ran through can have lost an exit,
+/// so those are the candidates, and [`reconcile_junctions_at`] judges each by
+/// KiCad's junction rule: a dot left on a corner or a straight join goes, as
+/// does one left on a single wire or a wire end on a pin. Junctions no removed
+/// wire touched are left alone; [`prune_schematic_junctions`] sweeps a whole
+/// sheet.
+///
+/// [`prune_schematic_junctions`]: crate::tools::sch_junctions
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
-    const TOL: f64 = 0.01;
-    // Two is as high as this needs to count, so it stops there.
-    let wires_through = |wires: &[Wire], jx: f64, jy: f64| {
-        wires
-            .iter()
-            .filter(|w| {
-                konnect_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
-            })
-            .take(2)
-            .count()
-    };
+    let dots = dots_on_wires(&content, removed);
+    if dots.is_empty() {
+        return (content, 0);
+    }
+    let (content, _, pruned) = reconcile_junctions_at(content, &dots);
+    (content, pruned)
+}
 
-    // The dots the removed wires ran through, with the block to delete. Most
-    // deletions find none, and the document parse below is only for those.
-    let mut candidates: Vec<((usize, usize), (f64, f64))> = Vec::new();
-    for start in find_block_starts(&content, "junction") {
-        let Some((ws_start, block_end)) = find_block_with_leading_whitespace(&content, start)
-        else {
+/// The junction dots that lie on any of `wires`, at an end or inside the span —
+/// the dots whose justification a change to those wires can alter.
+pub(crate) fn dots_on_wires(content: &str, wires: &[Wire]) -> Vec<(f64, f64)> {
+    const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
+    if wires.is_empty() {
+        return Vec::new();
+    }
+    let mut dots = Vec::new();
+    for start in find_block_starts(content, "junction") {
+        let Some((_, block_end)) = find_block_with_leading_whitespace(content, start) else {
             continue;
         };
         let Ok(node) = parse_sexp(&content[start..block_end]) else {
@@ -1476,54 +1495,16 @@ fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize
         let Some((jx, jy, _)) = parse_at(&node) else {
             continue;
         };
-        if wires_through(removed, jx, jy) > 0 {
-            candidates.push(((ws_start, block_end), (jx, jy)));
+        let touched = wires.iter().any(|w| {
+            konnect_sexp::geometry::points_coincident(jx, jy, w.x1, w.y1, TOL)
+                || konnect_sexp::geometry::points_coincident(jx, jy, w.x2, w.y2, TOL)
+                || konnect_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
+        });
+        if touched {
+            dots.push((jx, jy));
         }
     }
-    if candidates.is_empty() {
-        return (content, 0);
-    }
-
-    let Ok(tree) = parse_sexp(&content) else {
-        return (content, 0);
-    };
-    let remaining = extract_wires(&tree);
-    // Resolving pins walks every symbol against `lib_symbols`, so it waits
-    // until a dot is down to its last wire and the answer decides the case.
-    let mut pins: Option<(Vec<(f64, f64)>, bool)> = None;
-
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (range, (jx, jy)) in candidates {
-        let orphaned = match wires_through(&remaining, jx, jy) {
-            0 => true,
-            1 => {
-                let (pins, pins_known) = pins.get_or_insert_with(|| {
-                    let pins = crate::tools::all_pin_endpoints(&tree);
-                    // A sheet with symbols but no resolvable pin means the
-                    // `lib_symbols` lookup failed, not that nothing is
-                    // connected. Only the unambiguous zero-wire case prunes
-                    // then, rather than guess a pin isn't there.
-                    let known = !pins.is_empty() || extract_symbol_instances(&tree).is_empty();
-                    (pins, known)
-                });
-                *pins_known
-                    && !pins.iter().any(|&(px, py)| {
-                        konnect_sexp::geometry::points_coincident(px, py, jx, jy, TOL)
-                    })
-            }
-            _ => false,
-        };
-        if orphaned {
-            ranges.push(range);
-        }
-    }
-
-    let pruned = ranges.len();
-    let edits = ranges
-        .into_iter()
-        .map(|(s, e)| SexpEdit::delete(s, e))
-        .collect();
-    (apply_edits(content, edits), pruned)
+    dots
 }
 
 async fn handle_batch_delete_wire(

@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: junction dots follow KiCad's junction rule
+
+Deleting or moving wires, components and sheets re-judges the junction dots
+they touched by KiCad's own rule: a dot is needed where three or more distinct
+exits meet. A wire ending at the dot is one exit, a wire running through it is
+two, and each symbol unit and sheet pin there is one more; labels and
+no-connect flags are not exits. Before, a dot stayed whenever two wires were
+still under it, or one wire and a pin, so a corner, a straight join or a wire
+ending on a pin kept a stray dot. That dot counted as a connection for
+`find_orphan_items` and `validate_wire_connections`, hiding a dangling end, and
+joined any wire later drawn through it. Such dots are now removed in the same
+write and counted in the existing `junctions_pruned_count`.
+
+`batch_delete` now also re-judges the dots on wires and sheets it deletes by
+UUID; it used to prune none of them. A junction named in its `uuids` is
+reported in `deleted_item_uuids` and no longer also in
+`junctions_pruned_uuids`. `delete_sheet` re-judges the dots on the sheet's pins
+and adds `junctions_pruned_count` and `junctions_pruned_uuids`. No field was
+renamed or removed.
+
+New: `list_schematic_junctions` (`sch_analysis`) lists every dot with its UUID,
+what meets it and KiCad's verdict (`needed`, `unneeded`, `duplicate`,
+`not_judged`), and `prune_schematic_junctions` (`sch_batch`) removes a sheet's
+unneeded and duplicate dots in one write, with `dry_run`. Dots touching a bus
+or bus entry are left alone throughout, and so are dots whose verdict could
+depend on a symbol with unresolved library pins.
+
 ## Unreleased: per-file net queries say when they cover one file
 
 `get_net_components`, `get_net_connections`, `get_net_connectivity`,
