@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **275 registered tools** + **7 always-visible meta-tools** = **282 total**
+- **278 registered tools** + **7 always-visible meta-tools** = **285 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -149,9 +149,9 @@ and Windows servers do not.
 | `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `x`/`y` are the wire-side end; `direction` picks which corner the tick runs to (`down_right` default, `down_left`, `up_right`, `up_left`). |
 | `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
 
-### `sch_analysis` · 15 tools
-**Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
-**Source:** [`crates/konnect-core/src/tools/sch_analysis.rs`](crates/konnect-core/src/tools/sch_analysis.rs)
+### `sch_analysis` · 18 tools
+**Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection, and design-wide net members, undriven nets and sheet-removal dry runs from KiCad's netlist.
+**Source:** [`crates/konnect-core/src/tools/sch_analysis.rs`](crates/konnect-core/src/tools/sch_analysis.rs); the design-wide tools (`get_net_members`, `plan_sheet_removal`, `find_undriven_nets`) in [`crates/konnect-core/src/tools/design_nets.rs`](crates/konnect-core/src/tools/design_nets.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -169,6 +169,9 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
+| `get_net_members` | Everything on a net across the whole sheet hierarchy: every component pin (reference, pin number and name, electrical type, sheet file and path), every label (kind, sheet, position, rotation, shape), power symbols, PWR_FLAGs and sheet pins, and what drives the net. Connectivity is KiCad's own (kicad-cli netlist of the saved files); labels come from walking the sheet tree. Match by net name, label text or `net_glob`; nets KiCad does not export because they reach no pin are found through their labels. Summary inline, full result in `output`. |
+| `plan_sheet_removal` | Read-only dry run of deleting sheets: KiCad netlists a temporary copy of the hierarchy with the sheet blocks removed. Reports each net crossing the boundary, what remains, whether it keeps a source, inputs left without a driver, dead rails and orphaned pull-ups, open-drain nets losing their pull-up rail, nets reduced to one pin or label, nets that lose their drive one series part away, and the nets entirely inside. Nothing in the project is written. |
+| `find_undriven_nets` | Design-wide check for nets with no source, which ERC does not report: no driving pin, PWR_FLAG or connector, and no series path from a push-pull output or connector. Lists undriven nets with their pins and labels, nets that reach no pin, and global labels used once; nets held only by a pull resistor (`biased`) or by a pin that may be driven inside its part (`indeterminate`) are counted and named. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 14 tools

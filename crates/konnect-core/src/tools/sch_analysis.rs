@@ -1,7 +1,11 @@
 //! `sch_analysis` toolset — net connectivity, pin queries, trace paths, overlap/orphan detection.
 //!
-//! All operations are read-only S-expression analysis. Connectivity — the net
+//! All operations are read-only. The per-file tools below are S-expression
+//! analysis of the one sheet they are given; connectivity there — the net
 //! graph and what counts as attached at a point — lives in `sch_connectivity`.
+//! The design-wide tools (`get_net_members`, `plan_sheet_removal`,
+//! `find_undriven_nets`) live in `design_nets` and read KiCad's own netlist of
+//! the whole hierarchy.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -203,6 +207,9 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_check_overlaps(args, ctx).await }
         ),
     ]
+    .into_iter()
+    .chain(crate::tools::design_nets::tools())
+    .collect()
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

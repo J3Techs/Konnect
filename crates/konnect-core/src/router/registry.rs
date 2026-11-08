@@ -52,9 +52,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_analysis",
-        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection",
+        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, and design-wide net members, undriven nets and sheet-removal dry runs from KiCad's netlist",
         category: "schematic",
-        tool_count: 15,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "sch_batch",

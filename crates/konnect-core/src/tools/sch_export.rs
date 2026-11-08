@@ -1632,7 +1632,9 @@ mod connectivity_edit_tests {
 ///
 /// Returns `None` for a proven root or a loose schematic with no project
 /// candidate. Unproven or ambiguous ownership is a structured conflict.
-fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+pub(crate) fn owning_project_root(
+    file: &Path,
+) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
     Ok(
         crate::tools::resolve_schematic_ownership(file)?.and_then(|ownership| {
             (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)

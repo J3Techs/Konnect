@@ -1566,6 +1566,43 @@ pub async fn export_netlist(
     Ok(())
 }
 
+/// KiCad's own S-expression netlist of the hierarchy rooted at `schematic`,
+/// as text.
+///
+/// `sch export netlist` resolves every sheet, global label, power symbol and
+/// sheet pin, so this is the one place Konnect gets design-wide connectivity
+/// without re-deriving it. The export goes to a private temporary directory
+/// and must exist and be non-empty before it is read: a zero exit status
+/// alone is not evidence that KiCad wrote anything (#252).
+pub(crate) async fn export_netlist_text(cli: &str, schematic: &Path) -> Result<String> {
+    let staging = tempfile::Builder::new()
+        .prefix("konnect-netlist-")
+        .tempdir()
+        .context("failed to create a temporary netlist directory")?;
+    let output = staging.path().join("design.net");
+    let args = [
+        "sch",
+        "export",
+        "netlist",
+        "--output",
+        output
+            .to_str()
+            .context("temporary netlist path is not UTF-8")?,
+        "--format",
+        "kicadsexpr",
+        schematic.to_str().context("schematic path is not UTF-8")?,
+    ];
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(&output, "Netlist").await?;
+    let text = tokio::fs::read_to_string(&output)
+        .await
+        .context("KiCad's netlist export could not be read")?;
+    staging
+        .close()
+        .context("failed to clean up the temporary netlist directory")?;
+    Ok(text)
+}
+
 // ─── PCB Export ──────────────────────────────────────────────────────────────
 
 /// Argument vector for Gerber export. KiCad's plural `gerbers` subcommand
