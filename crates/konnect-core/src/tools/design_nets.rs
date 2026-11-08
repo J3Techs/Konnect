@@ -482,6 +482,9 @@ pub(crate) struct SheetFile {
     pub(crate) blocks: Vec<BlockItem>,
     /// Symbol UUID → every `(path, reference)` its `(instances …)` records.
     symbol_refs: HashMap<String, Vec<(String, String)>>,
+    /// Symbol UUID → its `Reference` property, for a symbol whose instances
+    /// name no reference for the path being asked about.
+    symbol_reference_properties: HashMap<String, String>,
     pub(crate) unresolved_symbols: usize,
 }
 
@@ -670,6 +673,28 @@ impl Hierarchy {
         false
     }
 
+    /// Every reference a placed symbol carries in the design, with the sheet
+    /// path it is on: the `(instances …)` entry for each instance of its
+    /// sheet, else its `Reference` property. KiCad's own rule, so a reference
+    /// a sheet's file keeps only for another, stale path is not counted.
+    pub(crate) fn placed_references(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for instance in &self.instances {
+            let file = &self.files[instance.file];
+            for (uuid, refs) in &file.symbol_refs {
+                let reference = refs
+                    .iter()
+                    .find(|(path, _)| *path == instance.uuid_path)
+                    .map(|(_, reference)| reference.clone())
+                    .or_else(|| file.symbol_reference_properties.get(uuid).cloned());
+                if let Some(reference) = reference {
+                    out.push((reference, instance.names_path.clone()));
+                }
+            }
+        }
+        out
+    }
+
     fn instance_named(&self, names_path: &str) -> Option<usize> {
         self.instances
             .iter()
@@ -727,6 +752,7 @@ fn read_sheet_file(path: &Path) -> Result<SheetFile> {
     }
 
     let mut symbol_refs = HashMap::new();
+    let mut symbol_reference_properties = HashMap::new();
     for node in tree.find_all("symbol") {
         if node.find("lib_id").is_none() {
             continue;
@@ -734,6 +760,15 @@ fn read_sheet_file(path: &Path) -> Result<SheetFile> {
         let Some(uuid) = node.find_str("uuid") else {
             continue;
         };
+        if let Some(reference) = node
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+            .and_then(|property| property.get(2))
+            .and_then(SexpNode::as_str)
+        {
+            symbol_reference_properties.insert(uuid.to_owned(), reference.to_owned());
+        }
         let mut refs = Vec::new();
         if let Some(instances) = node.find("instances") {
             for project in instances.find_all("project") {
@@ -862,6 +897,7 @@ fn read_sheet_file(path: &Path) -> Result<SheetFile> {
         pins,
         blocks,
         symbol_refs,
+        symbol_reference_properties,
         unresolved_symbols,
     })
 }
@@ -2148,7 +2184,7 @@ impl<'a> DriveModel<'a> {
 // ─── Rendering ────────────────────────────────────────────────────────────────
 
 /// Compare designators the way a person reads them: `R2` before `R10`.
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut left, mut right) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (left.peek().copied(), right.peek().copied()) {

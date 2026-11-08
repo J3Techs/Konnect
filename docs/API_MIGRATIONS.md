@@ -3,6 +3,38 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: duplicate_sheet writes one instance path, renumbers and renames
+
+A sheet's copy kept, on every symbol, the instance entry for the source
+sheet's path beside the new one. KiCad ignored it, but it was cruft, and the
+new entry took its reference from the `Reference` property rather than from
+the source sheet's instance. Each copied symbol now carries exactly one
+instance entry: the new sheet's path in this project, with the reference and
+unit the symbol has on the source sheet (that path's entry, else its only
+entry, else the `Reference` property), and its `Reference` property is set to
+match. Entries for other projects or paths are dropped from the copy.
+`patched_symbol_instances` counts the symbols rewritten; the response adds
+`instance_path`.
+
+New, both optional:
+
+- `renumber: {from, to}`, two runs of digits, moves the copy's references into
+  another block: a reference whose number starts with `from` has that part
+  replaced by `to`, so 104 to 105 turns U10401 into U10501 and C10407 into
+  C10507, every unit of a symbol together. Power and other `#` references keep
+  their names. A reference outside the block (`renumber.from`), or a new one
+  that any sheet of the design already uses (`renumber.to`, naming each clash
+  and its sheet), refuses the whole duplicate before anything is written. The
+  response adds `renumbered_count` and `renumbered_references` (from, to).
+- `label_substitutions: [{from, to}]` replaces, in order, every occurrence of
+  each `from` in the text of every local, global and hierarchical label in the
+  copy. Only the text changes. The response adds `substituted_label_count` and
+  `label_substitutions` (kind, UUID, position, from, to).
+
+Unchanged limitations: the parent must be the root sheet for the instance
+path to be right, a sheet nested inside the copied one is not re-pathed, and
+the new sheet block has no sheet pins.
+
 ## Unreleased: labels listed with their UUIDs
 
 `list_schematic_labels` returned each label's net, type, position and

@@ -315,6 +315,59 @@ impl SchematicCommand {
         Self::from_changes(source, label, changes).map(Some)
     }
 
+    /// Give every placed symbol exactly one hierarchical instance: `path`
+    /// under `project_name`, with the reference and unit `assignments` holds
+    /// for its UUID, and set its `Reference` property to that reference.
+    /// Every other instance entry is dropped, whatever its project or path:
+    /// a copied sheet belongs to its own path alone. Returns `None` when
+    /// every symbol already reads that way.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a placed symbol lacks a UUID or an assignment, has
+    /// malformed instance data, or the replacements fail command validation.
+    pub fn set_sole_symbol_instances(
+        source: &str,
+        project_name: &str,
+        path: &str,
+        assignments: &std::collections::HashMap<String, (String, u32)>,
+        label: impl Into<String>,
+    ) -> Result<Option<Self>, SexpError> {
+        let items = document_items(source)?;
+        let mut changes = Vec::new();
+        for item in items
+            .iter()
+            .filter(|item| item.kind.as_deref() == Some("symbol"))
+        {
+            let node = parse_sexp(item.source)?;
+            if node.find("lib_id").is_none() {
+                continue;
+            }
+            let id = item.id.clone().ok_or_else(|| {
+                SexpError::MissingNode("placed symbol UUID for instance patch".to_owned())
+            })?;
+            let (reference, unit) = assignments.get(&id.to_string()).ok_or_else(|| {
+                SexpError::InvalidValue(format!("no reference was assigned to symbol {id}"))
+            })?;
+            let replaced =
+                replace_symbol_instances(item.source, project_name, path, reference, *unit)?;
+            let replaced = set_symbol_reference_property(&replaced, reference)?;
+            if replaced == item.source {
+                continue;
+            }
+            changes.push(ItemChange {
+                id,
+                before: Some(item.source.to_owned()),
+                after: Some(replaced),
+                anchor: ItemAnchor::EndOfDocument,
+            });
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        Self::from_changes(source, label, changes).map(Some)
+    }
+
     /// Insert one nested pin into a hierarchical sheet as a sheet-item
     /// replacement command.
     ///
@@ -944,6 +997,92 @@ fn symbol_property<'a>(node: &'a SexpNode, name: &str) -> Option<&'a str> {
         .find(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
         .and_then(|property| property.get(2))
         .and_then(SexpNode::as_str)
+}
+
+/// `symbol` with its `(instances …)` replaced by one project holding one
+/// path, written at the block's own indentation; one is added when the symbol
+/// has none.
+fn replace_symbol_instances(
+    symbol: &str,
+    project_name: &str,
+    path: &str,
+    reference: &str,
+    unit: u32,
+) -> Result<String, SexpError> {
+    let direct = find_direct_child_blocks(symbol, "symbol");
+    let instances = direct.iter().find_map(|(start, end)| {
+        parse_sexp(&symbol[*start..*end])
+            .ok()
+            .filter(|node| node.head() == Some("instances"))
+            .map(|_| (*start, *end))
+    });
+    let Some((start, end)) = instances else {
+        return insert_symbol_instance_path(symbol, project_name, path, reference, unit);
+    };
+    let indent = line_indent(symbol, start);
+    let unit_indent = indentation_unit(&indent);
+    let project_indent = format!("{indent}{unit_indent}");
+    let path_indent = format!("{project_indent}{unit_indent}");
+    let field_indent = format!("{path_indent}{unit_indent}");
+    let block = format!(
+        "(instances\n{project_indent}(project \"{}\"\n{path_indent}(path \"{}\"\n{field_indent}(reference \"{}\")\n{field_indent}(unit {unit})\n{path_indent})\n{project_indent})\n{indent})",
+        escape_quoted(project_name),
+        escape_quoted(path),
+        escape_quoted(reference),
+    );
+    Ok(apply_edits(
+        symbol.to_owned(),
+        vec![SexpEdit::replace(start, end, block)],
+    ))
+}
+
+/// `symbol` with its `Reference` property's value set to `reference`, every
+/// other byte kept.
+fn set_symbol_reference_property(symbol: &str, reference: &str) -> Result<String, SexpError> {
+    for (start, end) in find_direct_child_blocks(symbol, "symbol") {
+        let block = &symbol[start..end];
+        let node = parse_sexp(block)?;
+        if node.head() != Some("property")
+            || node.get(1).and_then(SexpNode::as_str) != Some("Reference")
+        {
+            continue;
+        }
+        if node.get(2).and_then(SexpNode::as_str) == Some(reference) {
+            return Ok(symbol.to_owned());
+        }
+        // The value is the block's second quoted string.
+        let mut quotes = Vec::new();
+        let mut escaped = false;
+        for (offset, byte) in block.bytes().enumerate() {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => {
+                    quotes.push(offset);
+                    if quotes.len() == 4 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let [_, _, open, close] = quotes[..] else {
+            return Err(SexpError::InvalidValue(
+                "the Reference property has no value string".to_owned(),
+            ));
+        };
+        return Ok(apply_edits(
+            symbol.to_owned(),
+            vec![SexpEdit::replace(
+                start + open + 1,
+                start + close,
+                escape_quoted(reference),
+            )],
+        ));
+    }
+    Err(SexpError::MissingNode(
+        "placed symbol Reference property".to_owned(),
+    ))
 }
 
 fn insert_symbol_instance_path(
