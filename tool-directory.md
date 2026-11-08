@@ -134,7 +134,7 @@ and Windows servers do not.
 | `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net, global or hierarchical label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. `label_orientation: along_stub` turns the label along a vertical stub (90 up, 270 down); `shape` sets a global or hierarchical label's shape, or `from_pin` takes it from the pin's type. Junction dots follow KiCad's rule. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
@@ -181,7 +181,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
+| `batch_connect_to_net` | Connect many pins to nets by adding labels at each endpoint, oriented away from the symbol body: one net for the call, or each pin its own `net`, `label_type`, `shape` and `label_orientation` (a pin-to-net map in one call). `stub_length`, `direction`, `label_type`, `shape` and `label_orientation` give `connect_to_net`'s stub and label for every pin. Every pin is checked first; an unknown pin, bad option or pin already on another net refuses the call with a result per pin and writes nothing. Junction dots follow KiCad's rule. Single read → all edits → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. Junction dots the deleted wires, components and sheets leave unjustified by KiCad's junction rule go in the same write (`junctions_pruned_uuids`). |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |

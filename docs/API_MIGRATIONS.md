@@ -3,6 +3,51 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: label orientation and shape for the connect tools, and a pin-to-net map
+
+`connect_to_net` and `batch_connect_to_net` add three options, each omitted by
+default with the old result:
+
+- `label_orientation`: `horizontal` (default, as before) or `along_stub`,
+  which turns a label on a stub going up to 90 and one going down to 270, so
+  it reads away from the pin and labels on neighbouring top or bottom pins no
+  longer overlap. On a left or right stub the two are the same.
+- `shape`, for a global or hierarchical label: `input` (default, as before),
+  `output`, `bidirectional`, `tri_state`, `passive`, or `from_pin` (input and
+  power input give input; output, power output, open collector and open
+  emitter give output; bidirectional and tri-state their own; anything else
+  passive). A shape for a net label is refused rather than ignored.
+- `label_type` accepts `hierarchical_label` beside `net_label` and
+  `global_label`.
+
+`batch_connect_to_net` items accept their own `net`, `label_type`, `shape` and
+`label_orientation`, overriding the call's, so a sheet's pin-to-net map goes in
+one call; `net_name` may then be left out. Every item is now read, resolved and
+checked before anything is written, and one wrong item refuses the whole
+call: before, an unresolvable pin was listed in `errors` and the other pins
+were still written. The refusal is an `invalid_argument` naming the first bad
+field (such as `pins[3].pin_number`), with `written: false` and a `results`
+entry per item (`valid` or `refused`, with its field and reason). Also
+refused: a pin, or its label's spot, already on a net of another name, and two
+items putting different nets on one spot, since each would join two nets.
+`errors` stays in a successful response, now always empty.
+
+Junction dots for the stubs both tools draw follow KiCad's rule for drawn
+wiring: the candidates are each stub's ends and every wire end, pin or sheet
+pin on its span, and a dot goes where three or more exits meet. A stub leaving
+a pin that a wire already ends on now gets the dot KiCad would add there; a
+stub crossing another wire's span never does; and a missing dot at an
+unrelated T elsewhere on the sheet is no longer added as a side effect.
+
+Response fields are only added. `connect_to_net` adds `label_type`,
+`label_orientation`, `junctions_added` and, for a global or hierarchical label,
+`label.shape`. `batch_connect_to_net` keeps its keys exactly in the default
+placement (net labels on the pins, `direction` auto, no per-pin options); with
+a stub, a direction or any label option, each entry also carries `net`,
+`label.type`, `label.shape` when there is one and `label_orientation`, and the
+response `label_orientation`, `junctions_added_count` and `junctions_added`.
+`net` in the response is null when the call named no net of its own.
+
 ## Unreleased: the design-wide net tools judge rails by KiCad's power rule
 
 `plan_sheet_removal`, `find_undriven_nets` and `get_net_members` share one

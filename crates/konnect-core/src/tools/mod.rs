@@ -1314,6 +1314,9 @@ pub(crate) struct StubDirection {
     /// Unit offset in schematic space (Y grows downward).
     pub dx: f64,
     pub dy: f64,
+    /// The angle the stub points along: right 0, up 90, left 180, down 270.
+    pub angle: f64,
+    /// The label's rotation when it stays horizontal (`horizontal_label_rotation`).
     pub label_rotation: f64,
 }
 
@@ -1339,7 +1342,66 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
         name: row.0,
         dx: row.1,
         dy: row.2,
+        angle: row.3,
         label_rotation: horizontal_label_rotation(row.3),
+    }
+}
+
+/// How a stub's label is turned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LabelOrientation {
+    /// The text stays horizontal and reads away from the body on a left or
+    /// right pin: KiCad's own choice for a label anchored on a pin.
+    Horizontal,
+    /// The text runs along the stub, away from the pin: rotation 90 on a stub
+    /// going up and 270 on one going down, as KiCad shows a label rotated on a
+    /// vertical wire. Labels on neighbouring top or bottom pins then run side
+    /// by side instead of across each other.
+    AlongStub,
+}
+
+impl LabelOrientation {
+    pub(crate) const NAMES: [&'static str; 2] = ["horizontal", "along_stub"];
+
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "horizontal" => Some(LabelOrientation::Horizontal),
+            "along_stub" => Some(LabelOrientation::AlongStub),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            LabelOrientation::Horizontal => "horizontal",
+            LabelOrientation::AlongStub => "along_stub",
+        }
+    }
+
+    /// The rotation a label at the end of a stub along `dir` gets.
+    pub(crate) fn rotation(self, dir: &StubDirection) -> f64 {
+        match self {
+            LabelOrientation::Horizontal => dir.label_rotation,
+            LabelOrientation::AlongStub => dir.angle,
+        }
+    }
+}
+
+/// The shapes KiCad gives a global or hierarchical label.
+pub(crate) const LABEL_SHAPES: [&str; 5] =
+    ["input", "output", "bidirectional", "tri_state", "passive"];
+
+/// The label shape a pin's electrical type implies, for `shape: "from_pin"`:
+/// an input or power input takes `input`; an output, power output, open
+/// collector or open emitter `output`; bidirectional and tri-state their
+/// own; anything else (passive, unspecified, free, not connected) `passive`.
+pub(crate) fn label_shape_for_pin(electrical_type: &str) -> &'static str {
+    match electrical_type {
+        "input" | "power_in" => "input",
+        "output" | "power_out" | "open_collector" | "open_emitter" => "output",
+        "bidirectional" => "bidirectional",
+        "tri_state" => "tri_state",
+        _ => "passive",
     }
 }
 
