@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **278 registered tools** + **7 always-visible meta-tools** = **285 total**
+- **279 registered tools** + **7 always-visible meta-tools** = **286 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -212,9 +212,9 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. A pad whose net changes while its old or new net has routed copper is a `routed_pad_net_change` conflict carrying `pad` and, by UUID, every track, arc or via touching it (`touching_copper`), or saying that only copper elsewhere on the net and zone fills are involved. `accept_pad_net_changes` (live backend; `REFERENCE.PAD` names) plans such a change when no track, arc or via touches the pad and reports `refill_needed`; the plan revision covers the list, so apply passes the same list. `backend: "closed_pad_nets"` makes pad net changes only, in the saved board with KiCad closed, rewriting just the changed pads' `(net …)` clauses; it is the path for footprints whose pad fabrication properties the live update refuses to rebuild. |
 
-### `sch_hierarchy` · 14 tools
-**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
-**Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
+### `sch_hierarchy` · 15 tools
+**Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation, re-pointing a label in place.
+**Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs); `edit_schematic_label`'s handler is in [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs) with the other label tools
 
 | Tool | Description |
 |------|-------------|
@@ -232,6 +232,7 @@ and Windows servers do not.
 | `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
 | `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
 | `validate_sheet_pins` | Read-only. Walk the sheet tree and report unmatched hierarchical labels/pins and stored pin positions inconsistent with their rotation-selected edge or its span. Geometry findings identify the pin, stored position, expected edge and recovery action; no pins are repaired. |
+| `edit_schematic_label` | Re-point one label in place: rename the label of `net` at (`x`, `y`) to `new_net`, keeping its position, rotation, justification, shape, fields and UUID; optionally change its shape (`new_shape`) or kind (`new_label_type`). Only the edited tokens change, and the result is read back before it is reported. |
 
 ---
 

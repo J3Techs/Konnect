@@ -294,6 +294,39 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_validate_sheet_pins(args, ctx).await }
         ),
+        // Lives in `sch_wiring` beside the label helpers it shares; listed here
+        // because `sch_wiring` is at the 20-tool cap a toolset may hold.
+        tool!(
+            "edit_schematic_label",
+            "Re-point one label in place: rename the label of net 'net' at (x, y) to \
+             'new_net', keeping its position, rotation, justification, shape, fields and UUID. \
+             Optionally change its shape, or its kind (a local label has no shape; one that \
+             becomes global or hierarchical needs 'new_shape', and the global label's \
+             Intersheetrefs field is dropped when it stops being global). Only the edited \
+             tokens change, and the result is read back before it is reported.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "net": { "type": "string", "description": "The label's current text" },
+                    "x": { "type": "number", "description": "Label anchor X in mm" },
+                    "y": { "type": "number", "description": "Label anchor Y in mm" },
+                    "new_net": { "type": "string", "minLength": 1, "description": "The text the label takes" },
+                    "new_label_type": {
+                        "type": "string",
+                        "enum": ["net_label", "global_label", "hierarchical_label"],
+                        "description": "Change the label's kind; omitted keeps it"
+                    },
+                    "new_shape": {
+                        "type": "string",
+                        "enum": super::sch_wiring::LABEL_SHAPES,
+                        "description": "Change a global or hierarchical label's shape; omitted keeps it"
+                    }
+                },
+                "required": ["schematic", "net", "x", "y", "new_net"]
+            }),
+            |args, ctx| async move { super::sch_wiring::handle_edit_label(args, ctx).await }
+        ),
     ]
 }
 
