@@ -1387,10 +1387,6 @@ impl LabelOrientation {
     }
 }
 
-/// The shapes KiCad gives a global or hierarchical label.
-pub(crate) const LABEL_SHAPES: [&str; 5] =
-    ["input", "output", "bidirectional", "tri_state", "passive"];
-
 /// The label shape a pin's electrical type implies, for `shape: "from_pin"`:
 /// an input or power input takes `input`; an output, power output, open
 /// collector or open emitter `output`; bidirectional and tri-state their

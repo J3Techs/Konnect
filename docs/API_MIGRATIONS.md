@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: labels listed with their UUIDs
+
+`list_schematic_labels` returned each label's net, type, position and
+rotation, but no UUID, so a label it listed could not be passed to
+`batch_delete`, and `delete_schematic_net_label` takes one label per call.
+Each entry now adds `uuid`, `kind` (the S-expression tag: `label`,
+`global_label` or `hierarchical_label`), `justify` (the words the file writes,
+null when it writes none) and, for a label that has one, `shape`. `net`,
+`type`, `x`, `y` and `rotation` are unchanged. `batch_delete` already deleted
+labels of every kind by UUID; it is now tested with UUIDs taken from the
+listing.
+
+`batch_rotate_labels` counted every requested label in `rotated`, including
+one it could not find, and dropped the error. `rotated` now counts only the
+labels rotated, and the response adds `failed_count` and `errors` (each with
+the item's index, net, position and message). A label not found is left as it
+was; the labels found are still rotated, one write each, as before.
+
 ## Unreleased: label orientation and shape for the connect tools, and a pin-to-net map
 
 `connect_to_net` and `batch_connect_to_net` add three options, each omitted by

@@ -126,7 +126,7 @@ and Windows servers do not.
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
-| `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
+| `batch_rotate_labels` | Rotate multiple labels, each named by net and position as `list_schematic_labels` reports them. `rotated` counts only the labels rotated; one not found is listed in `errors` (`failed_count`) and left as it was. |
 | `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Snaps to the 1.27mm grid like the other placers and reports the placed coordinates. Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
@@ -157,7 +157,7 @@ and Windows servers do not.
 |------|-------------|
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
-| `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
+| `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types, and each one's `uuid`, `kind` (its S-expression tag), rotation, `justify` and `shape`: the UUID names it to `batch_delete`, net and position to `edit_schematic_label`, `rotate_schematic_label` and `batch_rotate_labels`. |
 | `get_net_connections` | Get all pins and labels connected to a named net, in this file only; `coverage` says when the net continues beyond it. |
 | `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations in this file; `coverage` says when the net continues beyond it. |
 | `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |

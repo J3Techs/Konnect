@@ -47,7 +47,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "list_schematic_labels",
             "List all label instances (net_label, global_label, hierarchical_label) \
-             with their positions, net names, and types.",
+             with their positions, net names, and types, and each one's UUID, kind (its \
+             S-expression tag), rotation, justification and shape: the UUID names it to \
+             batch_delete, and net plus position to edit_schematic_label, \
+             rotate_schematic_label and batch_rotate_labels.",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -322,17 +325,73 @@ async fn handle_list_labels(
     let sch = cse::Schematic::load(&sch_path)?;
     let mut items: Vec<serde_json::Value> = Vec::new();
     for l in sch.labels.iter() {
-        items.push(json!({ "net": l.text, "type": "NetLabel", "x": l.at.x, "y": l.at.y, "rotation": l.at.rotation.unwrap_or(0.0) }));
+        items.push(label_entry(
+            &l.text,
+            "NetLabel",
+            "label",
+            &l.at,
+            &l.uuid,
+            l.effects.as_ref(),
+            l.shape.as_deref(),
+        ));
     }
     for g in sch.global_labels.iter() {
-        items.push(json!({ "net": g.text, "type": "GlobalLabel", "x": g.at.x, "y": g.at.y, "rotation": g.at.rotation.unwrap_or(0.0) }));
+        items.push(label_entry(
+            &g.text,
+            "GlobalLabel",
+            "global_label",
+            &g.at,
+            &g.uuid,
+            g.effects.as_ref(),
+            Some(&g.shape),
+        ));
     }
     for h in sch.hierarchical_labels.iter() {
-        items.push(json!({ "net": h.text, "type": "HierarchicalLabel", "x": h.at.x, "y": h.at.y, "rotation": h.at.rotation.unwrap_or(0.0) }));
+        items.push(label_entry(
+            &h.text,
+            "HierarchicalLabel",
+            "hierarchical_label",
+            &h.at,
+            &h.uuid,
+            h.effects.as_ref(),
+            h.shape.as_deref(),
+        ));
     }
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "labels": items }),
     ))
+}
+
+/// One `list_schematic_labels` entry. `type` is the old name for the kind and
+/// stays; `kind` is the tag the file itself uses. `justify` is what the file
+/// writes, null when it writes none; `shape` is left out for a label without
+/// one.
+fn label_entry(
+    net: &str,
+    type_name: &str,
+    kind: &str,
+    at: &cse::types::At,
+    uuid: &str,
+    effects: Option<&cse::types::Effects>,
+    shape: Option<&str>,
+) -> serde_json::Value {
+    let justify = effects
+        .and_then(|effects| effects.0.find("justify"))
+        .map(|justify| justify.scalar_args().join(" "));
+    let mut item = json!({
+        "net": net,
+        "type": type_name,
+        "kind": kind,
+        "uuid": (!uuid.is_empty()).then_some(uuid),
+        "x": at.x,
+        "y": at.y,
+        "rotation": at.rotation.unwrap_or(0.0),
+        "justify": justify,
+    });
+    if let Some(shape) = shape {
+        item["shape"] = json!(shape);
+    }
+    item
 }
 
 async fn handle_get_net_connections(
@@ -2279,5 +2338,167 @@ mod coverage_tests {
                 "named_by_power_symbol"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod label_listing_tests {
+    //! R3-3: every label listed with its UUID, kind, position, rotation,
+    //! justification and shape, and that listing taken straight into the
+    //! tools that act on labels. The sheet is KiCad's own (the `design_nets`
+    //! child, saved by eeschema): two local labels, four global labels and a
+    //! hierarchical label.
+    use super::*;
+    use crate::tools::ServerConfig;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    const CHILD: &str = include_str!("../../tests/fixtures/design_nets_child.kicad_sch");
+
+    fn sheet() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child.kicad_sch");
+        std::fs::write(&path, CHILD).unwrap();
+        (dir, path)
+    }
+
+    /// Run any schematic tool on `path` as the dispatch does.
+    async fn run(path: &std::path::Path, tool: &str, mut args: Value) -> CallToolResult {
+        args["schematic"] = json!(path.display().to_string());
+        let def = tools()
+            .into_iter()
+            .chain(crate::tools::sch_batch::tools())
+            .chain(crate::tools::sch_wiring::tools())
+            .chain(crate::tools::sch_hierarchy::tools())
+            .find(|def| def.name == tool)
+            .unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        (def.handler)(&args, Arc::new(ctx)).await.unwrap()
+    }
+
+    async fn ok(path: &std::path::Path, tool: &str, args: Value) -> Value {
+        let result = run(path, tool, args).await;
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(!result.is_error, "{tool} failed: {text}");
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn listed(path: &std::path::Path) -> Vec<Value> {
+        ok(path, "list_schematic_labels", json!({})).await["labels"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn find<'a>(labels: &'a [Value], net: &str, x: f64, y: f64) -> &'a Value {
+        labels
+            .iter()
+            .find(|label| label["net"] == net && label["x"] == x && label["y"] == y)
+            .unwrap_or_else(|| panic!("no {net} at ({x}, {y}): {labels:?}"))
+    }
+
+    /// The fields read off KiCad's own file: kind, rotation, justify, shape
+    /// and the UUID it wrote.
+    #[tokio::test]
+    async fn each_label_is_listed_with_its_uuid_kind_justify_and_shape() {
+        let (_d, path) = sheet();
+        let labels = listed(&path).await;
+        assert_eq!(labels.len(), 7);
+
+        let local = find(&labels, "CHILD_LOCAL", 45.72, 101.6);
+        assert_eq!(local["kind"], "label");
+        assert_eq!(local["type"], "NetLabel");
+        assert_eq!(local["rotation"], 180.0);
+        assert_eq!(local["justify"], "right bottom");
+        assert!(local.get("shape").is_none());
+
+        let global = find(&labels, "RAIL_A", 88.9, 57.15);
+        assert_eq!(global["kind"], "global_label");
+        assert_eq!(global["shape"], "input");
+        assert_eq!(global["rotation"], 90.0);
+
+        let hierarchical = find(&labels, "EN", 53.34, 63.5);
+        assert_eq!(hierarchical["kind"], "hierarchical_label");
+        assert_eq!(hierarchical["shape"], "input");
+        assert_eq!(hierarchical["justify"], "right");
+
+        // Every UUID is the one the file carries, once.
+        for label in &labels {
+            let uuid = label["uuid"].as_str().unwrap();
+            assert_eq!(
+                CHILD.matches(&format!("(uuid \"{uuid}\")")).count(),
+                1,
+                "{label}"
+            );
+        }
+    }
+
+    /// A listed UUID is enough for batch_delete, whatever the label's kind.
+    #[tokio::test]
+    async fn batch_delete_removes_listed_labels_by_uuid() {
+        let (_d, path) = sheet();
+        let labels = listed(&path).await;
+        let doomed: Vec<String> = [
+            find(&labels, "CHILD_LOCAL", 45.72, 101.6),
+            find(&labels, "RAIL_A", 88.9, 57.15),
+            find(&labels, "EN", 53.34, 63.5),
+        ]
+        .iter()
+        .map(|label| label["uuid"].as_str().unwrap().to_owned())
+        .collect();
+        let response = ok(&path, "batch_delete", json!({ "uuids": doomed })).await;
+        assert_eq!(response["deleted_count"], 3, "{response}");
+
+        let after = listed(&path).await;
+        assert_eq!(after.len(), 4);
+        for uuid in &doomed {
+            assert!(after.iter().all(|label| label["uuid"] != uuid.as_str()));
+        }
+        assert!(after.iter().any(|label| label["net"] == "CHILD_LOCAL"));
+    }
+
+    /// Net and position from the listing name a label to batch_rotate_labels
+    /// and edit_schematic_label, which keep its UUID.
+    #[tokio::test]
+    async fn listed_positions_feed_rotation_and_edits() {
+        let (_d, path) = sheet();
+        let labels = listed(&path).await;
+        let local = find(&labels, "CHILD_LOCAL", 38.1, 107.95).clone();
+        let global = find(&labels, "PGOOD", 78.74, 101.6).clone();
+
+        let rotated = ok(
+            &path,
+            "batch_rotate_labels",
+            json!({ "labels": [
+                { "net": local["net"], "x": local["x"], "y": local["y"], "rotation": 90 },
+                { "net": "NOT_HERE", "x": 1.0, "y": 2.0, "rotation": 90 }
+            ] }),
+        )
+        .await;
+        assert_eq!(rotated["rotated"], 1, "{rotated}");
+        assert_eq!(rotated["failed_count"], 1, "{rotated}");
+        assert_eq!(rotated["errors"][0]["index"], 1, "{rotated}");
+
+        ok(
+            &path,
+            "edit_schematic_label",
+            json!({ "net": global["net"], "x": global["x"], "y": global["y"],
+                    "new_net": "PGOOD_RENAMED" }),
+        )
+        .await;
+
+        let after = listed(&path).await;
+        let turned = find(&after, "CHILD_LOCAL", 38.1, 107.95);
+        assert_eq!(turned["rotation"], 90.0);
+        assert_eq!(turned["justify"], "left bottom");
+        assert_eq!(turned["uuid"], local["uuid"]);
+        let renamed = find(&after, "PGOOD_RENAMED", 78.74, 101.6);
+        assert_eq!(renamed["uuid"], global["uuid"]);
+        assert_eq!(renamed["shape"], global["shape"]);
     }
 }

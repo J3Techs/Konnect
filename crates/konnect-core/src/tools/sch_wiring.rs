@@ -208,7 +208,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_rotate_labels",
-            "Rotate multiple labels by net name in a single file read/write cycle.",
+            "Rotate multiple labels, each named by net and position as list_schematic_labels \
+             reports them. Each label is rewritten in turn; rotated counts the labels \
+             rotated, and a label not found is listed in errors and left as it was.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2514,8 +2516,11 @@ async fn handle_batch_rotate_labels(
         Ok(a) => a.clone(),
         Err(e) => return Ok(e),
     };
+    // `rotated` counts what was rotated, never what was asked for: a label
+    // that is not where the caller says is reported, not counted.
     let mut rotated = 0usize;
-    for label_arg in &labels {
+    let mut errors = Vec::new();
+    for (index, label_arg) in labels.iter().enumerate() {
         let full_args = json!({
             "schematic": sch_path.display().to_string(),
             "net": label_arg["net"],
@@ -2523,10 +2528,28 @@ async fn handle_batch_rotate_labels(
             "y": label_arg["y"],
             "rotation": label_arg["rotation"]
         });
-        handle_rotate_label(&full_args, ctx).await?;
-        rotated += 1;
+        let result = handle_rotate_label(&full_args, ctx).await?;
+        if result.is_error {
+            let message = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                _ => "not rotated".to_owned(),
+            };
+            errors.push(json!({
+                "index": index,
+                "net": label_arg["net"],
+                "x": label_arg["x"],
+                "y": label_arg["y"],
+                "message": message,
+            }));
+        } else {
+            rotated += 1;
+        }
     }
-    Ok(CallToolResult::json(&json!({ "rotated": rotated })))
+    Ok(CallToolResult::json(&json!({
+        "rotated": rotated,
+        "failed_count": errors.len(),
+        "errors": errors,
+    })))
 }
 
 /// The lowest `#PWR` number no symbol on the sheet is using.
@@ -3098,7 +3121,7 @@ impl StubLabel {
                 Some(_) => Err((format!("{field}{name}"), "must be a string".to_owned())),
             }
         };
-        let mut shapes: Vec<&'static str> = crate::tools::LABEL_SHAPES.to_vec();
+        let mut shapes: Vec<&'static str> = LABEL_SHAPES.to_vec();
         shapes.push("from_pin");
         let kind = word("label_type", &LABEL_KINDS)?;
         let shape = word("shape", &shapes)?;
