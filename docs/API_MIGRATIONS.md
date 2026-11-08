@@ -3,6 +3,50 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the design-wide net tools judge rails by KiCad's power rule
+
+`plan_sheet_removal`, `find_undriven_nets` and `get_net_members` share one
+drive model. It reached a rail through its pull-ups: with PT_A_VCCIO's only
+source removed, the rail was reported `driven_through_series` because a 10 kΩ
+pull-up led to a chip select that a buffer drives through a series resistor,
+and the six VCC pins it powers were not flagged.
+
+A net with a power-input pin is now a rail, and so is one with a power-output
+pin, a PWR_FLAG or a power symbol. As in KiCad's ERC, only a power-output pin
+or a PWR_FLAG on a rail drives it; a logic pin tied to it does not, and a
+rail's `sources` list only its power-output pins. A rail is also
+`driven_through_series` when a series path reaches another driven rail: through
+links (inductor, ferrite, fuse, jumper, net tie, or a resistor whose value
+reads zero ohms), or through a resistor, when the drive adds `resistive: true`
+and `through_resistors`. A path between rails passes only filter nodes (nets
+of passive pins of simple and series parts), and a ground feeds only a
+ground, so a pull-up that reaches a logic output, or a bleed resistor to
+ground, never supplies a rail. A rail with a connector or a part's passive pin
+on it, or with one or a logic output linked to it, is `indeterminate`: before,
+a connector made a rail `external`. Any other rail is `undriven`, a dead rail,
+and its `level_after` reads `no supply`.
+
+Other nets keep their rules, except that a path now ends at every rail,
+driven or not: before, a dead rail was walked through, so an input pulled up
+to it could be called driven by whatever another pull-up on the rail reached.
+A pull-up to a rail fed through series parts still reports the source behind
+it, with the rail's own feed appended to `via`.
+
+New fields, none renamed or removed: the drive object adds `rail` (on rails
+only) and, for a resistive feed, `resistive` and `through_resistors`.
+`plan_sheet_removal` adds `findings.dead_rails` (each rail that loses its
+supply, with its lost sources and every power-input pin it strands: reference,
+pin, pin name, sheet file and sheet path) and
+`findings.rails_fed_only_through_resistors`, and its remainder summaries add
+`rail`, `resistive` and `through_resistors`. `find_undriven_nets` adds
+`dead_rail_count`, `rails_fed_through_resistors` with its count, and `rail` and
+`power_in_pins` on each dead rail in `undriven_nets`.
+
+On DB2 as of 2026-11-08, the intact design changes only PT_A_LOAD_FEED and
+PT_B_LOAD_FEED (`external` to `indeterminate`, matching KiCad's
+`power_pin_not_driven` on U10401 and U10501 VBATT). Removing sheets 18, 19, 25,
+27, 28 and 29 now reports PT_A_VCCIO and PT_B_VCCIO as dead rails.
+
 ## Unreleased: junction dots follow KiCad's junction rule
 
 Deleting or moving wires, components and sheets re-judges the junction dots

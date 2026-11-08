@@ -94,7 +94,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              as saved. Reports every net that crosses the removed sheets' boundary, what remains \
              on it, whether it keeps a source, input and power-input pins left with no driver \
              (a pull resistor alone does not drive; an open drain's surviving pull-up keeps its \
-             input defined), passive-only remainders with no source (dead rails, orphaned \
+             input defined), dead rails with the power-input pins they strand (a net with a \
+             power-input pin is a rail, supplied only by a power-output pin, a PWR_FLAG or a \
+             series feed from another driven rail, never by a pull-up to a logic output), rails \
+             kept only through a resistor, passive-only remainders with no source (orphaned \
              pull-ups), nets reduced to a single pin or label, open-drain nets whose only pull-up \
              rail dies, nets that lose their drive one series part away, and the nets entirely \
              inside the removed sheets. Nothing in the project is written.",
@@ -120,11 +123,14 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              power-out, tri-state, bidirectional, open-collector or open-emitter pin, no PWR_FLAG \
              and no connector pin, and nothing feeding them through a series part (a resistor or \
              crystal from a push-pull output or connector, or an inductor, ferrite, fuse or jumper \
-             from a supply). Lists each with its pins and labels, the nets that reach no pin at \
-             all, and global labels that occur only once. Nets held only by a pull resistor \
-             ('biased') or by a pin that may be driven inside its part ('indeterminate') are \
-             counted and named; unlabelled single-pin nets are counted only, since ERC reports \
-             those.",
+             from a supply). A net with a power-input pin is a rail and is judged as KiCad's ERC \
+             judges one: only a power-output pin, a PWR_FLAG, or a series feed from another driven \
+             rail supplies it, never a pull-up to a logic output; a dead rail lists the \
+             power-input pins it leaves unsupplied. Lists each with its pins and labels, the nets \
+             that reach no pin at all, and global labels that occur only once. Nets held only by \
+             a pull resistor ('biased'), by a pin that may be driven inside its part \
+             ('indeterminate'), and rails fed only through a resistor are counted and named; \
+             unlabelled single-pin nets are counted only, since ERC reports those.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1268,8 +1274,9 @@ fn label_only_name(items: &[Item], hierarchy: &Hierarchy) -> String {
 
 // ─── Drive ────────────────────────────────────────────────────────────────────
 
-/// Pin types that drive a net on their own, as the specification lists them,
-/// with the open emitter beside the open collector.
+/// Pin types that drive a signal net on their own, as the specification
+/// lists them, with the open emitter beside the open collector. A rail
+/// follows its own rule (see [`DriveModel::judge_rails`]).
 const SOURCE_TYPES: [&str; 6] = [
     "output",
     "power_out",
@@ -1284,13 +1291,25 @@ const SOURCE_TYPES: [&str; 6] = [
 /// only: it drives its own net, never the far side of its pull-up.
 const PUSH_PULL_TYPES: [&str; 3] = ["output", "tri_state", "bidirectional"];
 
+/// Every logic output. None of them supplies a rail.
+const LOGIC_OUTPUT_TYPES: [&str; 5] = [
+    "output",
+    "tri_state",
+    "bidirectional",
+    "open_collector",
+    "open_emitter",
+];
+
 /// Two-terminal parts a net is fed through, by reference prefix. A resistor
-/// or a crystal feeds a signal; only an inductor, ferrite, fuse, jumper or net
-/// tie feeds a supply, because a resistor to a rail is a pull-up, not a feed.
-/// A capacitor or diode never counts: a dead rail keeps its decoupling and
-/// its TVS.
+/// or a crystal feeds a signal. A capacitor or diode never counts: a dead
+/// rail keeps its decoupling and its TVS.
 const SERIES_PREFIXES: [&str; 7] = ["R", "Y", "L", "FB", "F", "JP", "NT"];
 const RESISTIVE_PREFIXES: [&str; 2] = ["R", "Y"];
+
+/// Series parts that carry a supply without dropping it: an inductor,
+/// ferrite, fuse, jumper or net tie. A resistor carries one too, as a
+/// resistive feed, unless its value says zero ohms, when it is a link.
+const LINK_PREFIXES: [&str; 5] = ["L", "FB", "F", "JP", "NT"];
 
 /// Connectors bring a net in from off the board.
 const CONNECTOR_PREFIXES: [&str; 4] = ["J", "P", "CN", "X"];
@@ -1306,24 +1325,66 @@ fn reference_prefix(reference: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// A resistor value that says zero ohms: `0`, `0R`, `0Ω`, `0 Ω`, `0R0`, `0E`,
+/// `0 ohm`, `0.0`. Only the first word is read, so `0R 1%` is zero, while
+/// `0R5` is half an ohm and `0.5m` a shunt.
+fn is_zero_ohm(value: &str) -> bool {
+    let Some(word) = value.split_whitespace().next() else {
+        return false;
+    };
+    let word = word.to_lowercase();
+    let number_end = word
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(word.len());
+    let (number, rest) = word.split_at(number_end);
+    let zero = number.contains('0')
+        && number.matches('.').count() <= 1
+        && number.chars().all(|c| c == '0' || c == '.');
+    if !zero {
+        return false;
+    }
+    let rest = ["ohms", "ohm", "ω", "r", "e"]
+        .iter()
+        .find_map(|unit| rest.strip_prefix(unit))
+        .unwrap_or(rest);
+    rest.chars().all(|c| c == '0')
+}
+
+/// A ground by its name: `GND`, `AGND`, `GNDA`, `PGND`, `VSS`, `0V`, earth or
+/// chassis, on its own or as the last part of a sheet-local name.
+fn is_ground_name(name: &str) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name).to_ascii_uppercase();
+    leaf.contains("GND")
+        || leaf.starts_with("VSS")
+        || leaf == "0V"
+        || leaf.contains("EARTH")
+        || leaf.contains("CHASSIS")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DriveStatus {
-    /// A source pin or a `PWR_FLAG` is on the net.
+    /// A source pin or a `PWR_FLAG` is on the net. A rail counts only a
+    /// power-output pin or a `PWR_FLAG`.
     Driven,
-    /// No source pin, but a connector pin: driven from off the board.
+    /// No source pin, but a connector pin: driven from off the board. Never
+    /// a rail's status: a connector may as well take the rail off the board.
     External,
     /// No source of its own; a series part reaches a push-pull output or a
     /// connector, or a supply through an inductor, ferrite, fuse or jumper.
+    /// A rail reaches another driven rail, through links or — `resistive` —
+    /// through a resistor.
     DrivenThroughSeries,
     /// No drive; a resistor path to a rail sets a static level — a pull-up or
-    /// pull-down.
+    /// pull-down. Never a rail's status.
     Biased,
     /// No drive found, but a pin that may be driven from inside its part: a
     /// passive pin of an IC, analog switch or transistor, or a `free` or
     /// `unspecified` pin — on the net itself, which outranks a bias, or
-    /// reached through a series part when nothing else is.
+    /// reached through a series part when nothing else is. A rail is
+    /// indeterminate when such a pin or a connector is on it, or one or a
+    /// logic output is linked to it.
     Indeterminate,
-    /// Pins, and nothing that drives or biases them.
+    /// Pins, and nothing that drives or biases them. For a rail: no supply.
     Undriven,
     /// No pin at all: labels or power symbols only.
     LabelOnly,
@@ -1358,10 +1419,22 @@ enum AnchorKind {
     Signal,
     /// A connector pin.
     External,
-    /// A `power_out` pin or a `PWR_FLAG`.
+    /// A rail that is driven: its own power-output pin or `PWR_FLAG`, or a
+    /// feed from another driven rail.
     Rail,
-    /// A pin that may be driven inside its part.
+    /// A pin that may be driven inside its part, or a rail that only such a
+    /// pin may supply.
     Opaque,
+}
+
+/// Where a path may stop. A rail fed through series parts carries its own
+/// supply path onward, so a pull-up to it names the source behind it.
+struct Anchor {
+    kind: AnchorKind,
+    description: String,
+    onward: Vec<SeriesHop>,
+    /// The onward path crosses a resistor.
+    resistive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1375,7 +1448,8 @@ pub(crate) struct SeriesHop {
 #[derive(Debug, Clone)]
 pub(crate) struct Drive {
     pub(crate) status: DriveStatus,
-    /// Node indices of the source pins in the net.
+    /// Node indices of the source pins in the net: for a rail, its
+    /// power-output pins only.
     pub(crate) sources: Vec<usize>,
     pub(crate) power_flags: usize,
     /// The series path behind `DrivenThroughSeries`, `Biased` or an
@@ -1388,24 +1462,60 @@ pub(crate) struct Drive {
     /// Every source on the net is an open collector or open emitter and
     /// nothing else drives it: its other level comes from a pull resistor.
     pub(crate) open_drain_only: bool,
+    /// A power-input pin, a power-output pin, a `PWR_FLAG` or a power symbol
+    /// is on the net, so the rail rule judged it.
+    pub(crate) rail: bool,
+    /// A rail's supply path crosses a resistor: an RC-filtered supply, or a
+    /// resistor left between two rails.
+    pub(crate) resistive: bool,
+}
+
+/// A rail's supply under the rail rule, judged once for the whole design.
+#[derive(Debug, Clone)]
+struct RailSupply {
+    /// `Driven`, `DrivenThroughSeries`, `Indeterminate` or `Undriven`.
+    status: DriveStatus,
+    /// From the rail to its source, through series parts and other rails.
+    via: Vec<SeriesHop>,
+    /// The source at the end of `via`, or what may supply the rail.
+    reaches: Option<String>,
+    /// The supply path crosses a resistor that is not a zero-ohm link.
+    resistive: bool,
+}
+
+/// One way a rail can be fed: from another rail, through series parts and
+/// the passive filter nodes between them.
+#[derive(Debug, Clone)]
+struct RailFeed {
+    from: usize,
+    hops: Vec<SeriesHop>,
+    resistive: bool,
 }
 
 /// Drive analysis over one netlist and the walked items resolved onto it.
 pub(crate) struct DriveModel<'a> {
     netlist: &'a Netlist,
     flags: Vec<usize>,
+    /// Power symbols on each net. KiCad gives each a power-input pin, so a
+    /// net one names is a rail even where no component's power pin is on it.
+    power_symbols: Vec<usize>,
     component_nodes: HashMap<&'a str, Vec<(usize, usize)>>,
+    /// The rail rule's verdict for every rail; `None` for a signal net.
+    rails: Vec<Option<RailSupply>>,
 }
 
 impl<'a> DriveModel<'a> {
     pub(crate) fn new(netlist: &'a Netlist, resolved: &Resolved) -> Self {
         let mut flags = vec![0; netlist.nets.len()];
+        let mut power_symbols = vec![0; netlist.nets.len()];
         for (index, net) in resolved.nets.iter().enumerate().take(netlist.nets.len()) {
-            flags[index] = net
-                .items
-                .iter()
-                .filter(|item| matches!(item, Item::Flag(..)))
-                .count();
+            for item in &net.items {
+                match item {
+                    Item::Flag(..) => flags[index] += 1,
+                    Item::Power(..) => power_symbols[index] += 1,
+                    Item::Label(..) | Item::SheetPin(..) => {}
+                }
+            }
         }
         let mut component_nodes: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
         for (net_index, net) in netlist.nets.iter().enumerate() {
@@ -1416,11 +1526,15 @@ impl<'a> DriveModel<'a> {
                     .push((net_index, node_index));
             }
         }
-        DriveModel {
+        let mut model = DriveModel {
             netlist,
             flags,
+            power_symbols,
             component_nodes,
-        }
+            rails: Vec::new(),
+        };
+        model.rails = model.judge_rails();
+        model
     }
 
     fn node(&self, (net, node): (usize, usize)) -> &NetlistNode {
@@ -1466,33 +1580,350 @@ impl<'a> DriveModel<'a> {
         }
     }
 
-    /// What a series path stopping at `net` would have reached, with a
-    /// description of the pin or flag.
-    ///
-    /// A supply decides first. GND and a 3.3 V rail carry logic pins tied to
-    /// them, and a 10 kΩ resistor to such a rail is a pull-down or pull-up,
-    /// not a path from the output that happens to share the net.
-    fn anchors(&self, net: usize) -> Vec<(AnchorKind, String)> {
+    /// A rail: a power-input pin is on the net, or a power-output pin, a
+    /// `PWR_FLAG` or a power symbol (whose own pin is a power input).
+    fn is_rail(&self, net: usize) -> bool {
+        self.flags[net] > 0
+            || self.power_symbols[net] > 0
+            || self.netlist.nets[net]
+                .nodes
+                .iter()
+                .any(|node| matches!(node.electrical_type.as_str(), "power_in" | "power_out"))
+    }
+
+    /// A rail's own source, as KiCad's ERC counts one: a power-output pin,
+    /// else a `PWR_FLAG`.
+    fn rail_source(&self, net: usize) -> Option<String> {
         let name = &self.netlist.nets[net].name;
-        let nodes = &self.netlist.nets[net].nodes;
-        if let Some(node) = nodes
+        if let Some(node) = self.netlist.nets[net]
+            .nodes
             .iter()
             .find(|node| node.electrical_type == "power_out")
         {
-            return vec![(
-                AnchorKind::Rail,
-                format!("{}.{} (power_out) on {name}", node.reference, node.pin),
-            )];
+            return Some(format!(
+                "{}.{} (power_out) on {name}",
+                node.reference, node.pin
+            ));
         }
-        if self.flags[net] > 0 {
-            return vec![(AnchorKind::Rail, format!("PWR_FLAG on {name}"))];
+        (self.flags[net] > 0).then(|| format!("PWR_FLAG on {name}"))
+    }
+
+    /// How a series part carries a supply: as a link (`Some(false)`),
+    /// through resistance (`Some(true)`), or not at all (`None`: a crystal).
+    fn supply_hop(&self, reference: &str) -> Option<bool> {
+        let prefix = reference_prefix(reference);
+        if LINK_PREFIXES.contains(&prefix.as_str()) {
+            return Some(false);
         }
+        if prefix == "R" {
+            let zero = self
+                .netlist
+                .component(reference)
+                .is_some_and(|component| is_zero_ohm(&component.value));
+            return Some(!zero);
+        }
+        None
+    }
+
+    /// The resistors on a rail's supply path, named for review.
+    pub(crate) fn resistors_on(&self, via: &[SeriesHop]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for hop in via {
+            if self.supply_hop(&hop.reference) == Some(true) && !names.contains(&hop.reference) {
+                names.push(hop.reference.clone());
+            }
+        }
+        names
+    }
+
+    /// A net a supply path may pass through: only passive pins of simple
+    /// and series parts, as at an RC or LC filter node or the joint between
+    /// a fuse and a ferrite. A net with a logic, power, connector or IC pin
+    /// is where such a path stops.
+    fn is_filter_node(&self, net: usize) -> bool {
+        self.netlist.nets[net].nodes.iter().all(|node| {
+            node.electrical_type == "passive"
+                && !self.is_opaque(node)
+                && !Self::is_connector(&node.reference)
+        })
+    }
+
+    /// What on `net` may supply a rail though the rule does not count it: a
+    /// part's own passive pin (a load switch, a pass element), a connector,
+    /// or — linked to the rail rather than tied to it — a logic output. A
+    /// logic pin tied to a rail is a strap, never its supply.
+    fn possible_supply(&self, net: usize, on_the_rail: bool) -> Option<String> {
+        let name = &self.netlist.nets[net].name;
+        let nodes = &self.netlist.nets[net].nodes;
+        if let Some(node) = nodes.iter().find(|node| self.is_opaque(node)) {
+            return Some(format!(
+                "{}.{} ({}, may be driven inside its part) on {name}",
+                node.reference, node.pin, node.electrical_type
+            ));
+        }
+        if let Some(node) = nodes
+            .iter()
+            .find(|node| Self::is_connector(&node.reference))
+        {
+            return Some(format!(
+                "{}.{} (connector, may bring a supply from off the board) on {name}",
+                node.reference, node.pin
+            ));
+        }
+        if on_the_rail {
+            return None;
+        }
+        nodes
+            .iter()
+            .find(|node| LOGIC_OUTPUT_TYPES.contains(&node.electrical_type.as_str()))
+            .map(|node| {
+                format!(
+                    "{}.{} ({}, a logic output) on {name}",
+                    node.reference, node.pin, node.electrical_type
+                )
+            })
+    }
+
+    /// The rails `rail` can be fed from — for each, the shortest path through
+    /// links alone, else the shortest through a resistor — passing only
+    /// filter nodes on the way. Also the first thing linked to it that may
+    /// supply it although the rule does not count it.
+    fn rail_feeds(
+        &self,
+        rail: usize,
+        is_rail: &[bool],
+    ) -> (Vec<RailFeed>, Option<(Vec<SeriesHop>, String)>) {
+        let mut best: BTreeMap<usize, RailFeed> = BTreeMap::new();
+        let mut possible = None;
+        let mut seen = HashSet::from([(rail, false)]);
+        let mut queue = VecDeque::from([(rail, false, Vec::<SeriesHop>::new())]);
+        while let Some((net, resistive, path)) = queue.pop_front() {
+            for node in &self.netlist.nets[net].nodes {
+                if !self.is_series(&node.reference) {
+                    continue;
+                }
+                let Some(hop_resistive) = self.supply_hop(&node.reference) else {
+                    continue;
+                };
+                let crossing = resistive || hop_resistive;
+                for &(other_net, other_node) in &self.component_nodes[node.reference.as_str()] {
+                    let other = &self.netlist.nets[other_net].nodes[other_node];
+                    if other.pin == node.pin
+                        || other_net == rail
+                        || !seen.insert((other_net, crossing))
+                    {
+                        continue;
+                    }
+                    let mut next = path.clone();
+                    next.push(SeriesHop {
+                        reference: node.reference.clone(),
+                        from_pin: node.pin.clone(),
+                        to_pin: other.pin.clone(),
+                        to_net: other_net,
+                    });
+                    if is_rail[other_net] {
+                        let better = best
+                            .get(&other_net)
+                            .is_none_or(|held| held.resistive && !crossing);
+                        if better {
+                            best.insert(
+                                other_net,
+                                RailFeed {
+                                    from: other_net,
+                                    hops: next,
+                                    resistive: crossing,
+                                },
+                            );
+                        }
+                    } else if self.is_filter_node(other_net) {
+                        queue.push_back((other_net, crossing, next));
+                    } else if !crossing && possible.is_none() {
+                        possible = self
+                            .possible_supply(other_net, false)
+                            .map(|description| (next, description));
+                    }
+                }
+            }
+        }
+        (best.into_values().collect(), possible)
+    }
+
+    /// Judge every rail by the rail rule, after KiCad's ERC: a net with a
+    /// power-input pin is a rail, and only a power-output pin or a `PWR_FLAG`
+    /// on it drives it — a logic pin tied to it does not. A rail is also
+    /// driven through series parts from another driven rail: through links
+    /// (inductor, ferrite, fuse, jumper, net tie, zero-ohm resistor), or
+    /// through a resistor, which is reported as resistive. A path between
+    /// rails passes only filter nodes, so a pull-up that reaches a logic
+    /// output through a signal net never supplies a rail; and a ground feeds
+    /// only a ground, so a bleed resistor never supplies one. The shortest
+    /// supply wins, links before resistors.
+    fn judge_rails(&self) -> Vec<Option<RailSupply>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let count = self.netlist.nets.len();
+        let is_rail: Vec<bool> = (0..count).map(|net| self.is_rail(net)).collect();
+        let ground: Vec<bool> = (0..count)
+            .map(|net| is_ground_name(&self.netlist.nets[net].name))
+            .collect();
+        let mut source: Vec<Option<String>> = vec![None; count];
+        // `feeds[y]`: the rails `y` can feed, each with the path from it to `y`.
+        let mut feeds: Vec<Vec<(usize, RailFeed)>> = vec![Vec::new(); count];
+        let mut possible: Vec<Option<(Vec<SeriesHop>, String)>> = vec![None; count];
+        let mut best: Vec<Option<(bool, usize)>> = vec![None; count];
+        let mut chosen: Vec<Option<RailFeed>> = vec![None; count];
+        let mut heap = BinaryHeap::new();
+        for rail in (0..count).filter(|&net| is_rail[net]) {
+            if let Some(own) = self.rail_source(rail) {
+                source[rail] = Some(own);
+                best[rail] = Some((false, 0));
+                heap.push(Reverse((false, 0usize, rail)));
+                continue;
+            }
+            let (found, linked) = self.rail_feeds(rail, &is_rail);
+            for feed in found {
+                if ground[feed.from] == ground[rail] {
+                    feeds[feed.from].push((rail, feed));
+                }
+            }
+            possible[rail] = self
+                .possible_supply(rail, true)
+                .map(|description| (Vec::new(), description))
+                .or(linked);
+        }
+
+        while let Some(Reverse((resistive, hops, rail))) = heap.pop() {
+            if best[rail] != Some((resistive, hops)) {
+                continue;
+            }
+            for (fed, feed) in &feeds[rail] {
+                let candidate = (resistive || feed.resistive, hops + feed.hops.len());
+                if best[*fed].is_none_or(|held| candidate < held) {
+                    best[*fed] = Some(candidate);
+                    chosen[*fed] = Some(feed.clone());
+                    heap.push(Reverse((candidate.0, candidate.1, *fed)));
+                }
+            }
+        }
+
+        let mut supplies: Vec<Option<RailSupply>> = vec![None; count];
+        for rail in (0..count).filter(|&net| is_rail[net]) {
+            let Some((resistive, _)) = best[rail] else {
+                continue;
+            };
+            if source[rail].is_some() {
+                supplies[rail] = Some(RailSupply {
+                    status: DriveStatus::Driven,
+                    via: Vec::new(),
+                    reaches: None,
+                    resistive: false,
+                });
+                continue;
+            }
+            // Follow the chosen feeds back to a rail with its own source;
+            // each step strictly lowers the cost, so the walk ends.
+            let mut via = Vec::new();
+            let mut at = rail;
+            while let Some(feed) = &chosen[at] {
+                via.extend(feed.hops.iter().cloned());
+                at = feed.from;
+            }
+            supplies[rail] = Some(RailSupply {
+                status: DriveStatus::DrivenThroughSeries,
+                via,
+                reaches: source[at].clone(),
+                resistive,
+            });
+        }
+
+        // What may supply a rail spreads to the rails it feeds.
+        let mut queue = VecDeque::new();
+        for rail in 0..count {
+            if !is_rail[rail] || supplies[rail].is_some() {
+                continue;
+            }
+            if let Some((via, description)) = possible[rail].take() {
+                supplies[rail] = Some(RailSupply {
+                    status: DriveStatus::Indeterminate,
+                    via,
+                    reaches: Some(description),
+                    resistive: false,
+                });
+                queue.push_back(rail);
+            }
+        }
+        while let Some(rail) = queue.pop_front() {
+            for (fed, feed) in &feeds[rail] {
+                if supplies[*fed].is_some() {
+                    continue;
+                }
+                let upstream = supplies[rail].clone().expect("judged above");
+                let mut via = feed.hops.clone();
+                via.extend(upstream.via);
+                supplies[*fed] = Some(RailSupply {
+                    status: DriveStatus::Indeterminate,
+                    via,
+                    reaches: upstream.reaches,
+                    resistive: feed.resistive || upstream.resistive,
+                });
+                queue.push_back(*fed);
+            }
+        }
+
+        for (rail, supply) in supplies.iter_mut().enumerate() {
+            if !is_rail[rail] || supply.is_some() {
+                continue;
+            }
+            *supply = Some(RailSupply {
+                status: DriveStatus::Undriven,
+                via: Vec::new(),
+                reaches: None,
+                resistive: false,
+            });
+        }
+        supplies
+    }
+
+    /// What a series path stopping at `net` would have reached, with a
+    /// description of the pin or flag.
+    ///
+    /// A rail decides by its own supply. GND and a 3.3 V rail carry logic
+    /// pins tied to them, and a 10 kΩ resistor to such a rail is a pull-down
+    /// or pull-up, not a path from the output that happens to share the net.
+    /// A rail with no supply anchors nothing.
+    fn anchors(&self, net: usize) -> Vec<Anchor> {
+        if let Some(supply) = &self.rails[net] {
+            let (kind, description) = match supply.status {
+                DriveStatus::Driven => (AnchorKind::Rail, self.rail_source(net)),
+                DriveStatus::DrivenThroughSeries => (AnchorKind::Rail, supply.reaches.clone()),
+                DriveStatus::Indeterminate => (AnchorKind::Opaque, supply.reaches.clone()),
+                _ => return Vec::new(),
+            };
+            return description
+                .map(|description| Anchor {
+                    kind,
+                    description,
+                    onward: supply.via.clone(),
+                    resistive: supply.resistive,
+                })
+                .into_iter()
+                .collect();
+        }
+        let name = &self.netlist.nets[net].name;
+        let nodes = &self.netlist.nets[net].nodes;
+        let anchor = |kind, description| Anchor {
+            kind,
+            description,
+            onward: Vec::new(),
+            resistive: false,
+        };
         let mut found = Vec::new();
         if let Some(node) = nodes
             .iter()
             .find(|node| PUSH_PULL_TYPES.contains(&node.electrical_type.as_str()))
         {
-            found.push((
+            found.push(anchor(
                 AnchorKind::Signal,
                 format!(
                     "{}.{} ({}) on {name}",
@@ -1504,13 +1935,13 @@ impl<'a> DriveModel<'a> {
             .iter()
             .find(|node| Self::is_connector(&node.reference))
         {
-            found.push((
+            found.push(anchor(
                 AnchorKind::External,
                 format!("{}.{} (connector) on {name}", node.reference, node.pin),
             ));
         }
         if let Some(node) = nodes.iter().find(|node| self.is_opaque(node)) {
-            found.push((
+            found.push(anchor(
                 AnchorKind::Opaque,
                 format!(
                     "{}.{} ({}, may be driven inside its part) on {name}",
@@ -1532,17 +1963,21 @@ impl<'a> DriveModel<'a> {
         let mut queue = VecDeque::from([(start, false, Vec::<SeriesHop>::new())]);
         while let Some((net, resistive, path)) = queue.pop_front() {
             if net != start {
-                let anchors = self.anchors(net);
-                if let Some((_, description)) =
-                    anchors.iter().find(|(kind, _)| accept(*kind, resistive))
+                if let Some(anchor) = self
+                    .anchors(net)
+                    .into_iter()
+                    .find(|anchor| accept(anchor.kind, resistive || anchor.resistive))
                 {
-                    return Some((path, description.clone()));
+                    let mut path = path;
+                    path.extend(anchor.onward);
+                    return Some((path, anchor.description));
                 }
-                // A supply is where a path ends, never what it runs through:
+                // A rail is where a path ends, never what it runs through:
                 // every pull-up on the board meets at the 3.3 V rail, and
                 // walking on from there would call each of them driven by
-                // whatever another pull-up happens to reach.
-                if anchors.iter().any(|(kind, _)| *kind == AnchorKind::Rail) {
+                // whatever another pull-up happens to reach. A dead rail
+                // ends it too, with nothing.
+                if self.rails[net].is_some() {
                     continue;
                 }
             }
@@ -1572,7 +2007,7 @@ impl<'a> DriveModel<'a> {
     }
 
     /// A path that drives: to a push-pull output or a connector through any
-    /// series parts, or to a supply through non-resistive ones.
+    /// series parts, or to a driven rail through non-resistive ones.
     fn drive_path(&self, net: usize) -> Option<(Vec<SeriesHop>, String)> {
         self.search(net, |kind, resistive| match kind {
             AnchorKind::Signal | AnchorKind::External => true,
@@ -1581,7 +2016,7 @@ impl<'a> DriveModel<'a> {
         })
     }
 
-    /// A path that only biases: through a resistor to a supply.
+    /// A path that only biases: through a resistor to a driven rail.
     fn bias_path(&self, net: usize) -> Option<(Vec<SeriesHop>, String)> {
         self.search(net, |kind, _| kind == AnchorKind::Rail)
     }
@@ -1596,27 +2031,43 @@ impl<'a> DriveModel<'a> {
             has_inputs: false,
             passive_only: false,
             open_drain_only: false,
+            rail: false,
+            resistive: false,
         };
         let Some(net) = net else {
             return drive;
         };
         let nodes = &self.netlist.nets[net].nodes;
-        drive.sources = nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| SOURCE_TYPES.contains(&node.electrical_type.as_str()))
-            .map(|(index, _)| index)
-            .collect();
         drive.power_flags = self.flags[net];
         drive.has_inputs = nodes
             .iter()
             .any(|node| matches!(node.electrical_type.as_str(), "input" | "power_in"));
         drive.passive_only =
             !nodes.is_empty() && nodes.iter().all(|node| node.electrical_type == "passive");
-        let connector = nodes.iter().any(|node| Self::is_connector(&node.reference));
         if nodes.is_empty() {
             return drive;
         }
+        if let Some(supply) = &self.rails[net] {
+            drive.rail = true;
+            drive.sources = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.electrical_type == "power_out")
+                .map(|(index, _)| index)
+                .collect();
+            drive.status = supply.status;
+            drive.via = supply.via.clone();
+            drive.reaches = supply.reaches.clone();
+            drive.resistive = supply.resistive;
+            return drive;
+        }
+        drive.sources = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| SOURCE_TYPES.contains(&node.electrical_type.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        let connector = nodes.iter().any(|node| Self::is_connector(&node.reference));
         if !drive.sources.is_empty() || drive.power_flags > 0 {
             drive.status = DriveStatus::Driven;
             drive.open_drain_only = drive.power_flags == 0
@@ -2012,10 +2463,35 @@ impl<'a> View<'a> {
         if drive.open_drain_only {
             value["open_drain_only"] = json!(true);
         }
+        if drive.rail {
+            value["rail"] = json!(true);
+        }
+        if drive.resistive {
+            value["resistive"] = json!(true);
+            value["through_resistors"] = json!(self.drive.resistors_on(&drive.via));
+        }
         if detail == Detail::Full {
             value["has_inputs"] = json!(drive.has_inputs);
         }
         value
+    }
+
+    /// A rail's power-input pins: what loses its supply when the rail dies.
+    fn power_in_pins_json(&self, nodes: &[&NetlistNode]) -> Vec<Value> {
+        nodes
+            .iter()
+            .filter(|node| node.electrical_type == "power_in")
+            .map(|node| {
+                let (sheet_path, sheet_file, _) = self.pin_sheet(node);
+                json!({
+                    "reference": node.reference,
+                    "pin": node.pin,
+                    "pin_name": self.netlist.pin_name(node),
+                    "sheet_file": sheet_file,
+                    "sheet_path": sheet_path,
+                })
+            })
+            .collect()
     }
 
     /// One line saying what holds a net's level once its drive is gone.
@@ -2039,6 +2515,7 @@ impl<'a> View<'a> {
                     .unwrap_or("a pin on the net may be driven inside its part")
             )),
             DriveStatus::LabelOnly => json!("no pins"),
+            DriveStatus::Undriven if drive.rail => json!("no supply"),
             _ => json!("floating"),
         }
     }
@@ -2405,6 +2882,8 @@ struct UndrivenReport {
     biased: Vec<usize>,
     label_only: Vec<usize>,
     indeterminate: Vec<usize>,
+    /// Rails supplied only through a resistor: driven, but worth a look.
+    resistive_rails: Vec<usize>,
     single_globals: Vec<(String, Item)>,
     skipped_unconnected: usize,
     skipped_no_connect: usize,
@@ -2416,6 +2895,7 @@ fn undriven_report(view: &View) -> UndrivenReport {
         biased: Vec::new(),
         label_only: Vec::new(),
         indeterminate: Vec::new(),
+        resistive_rails: Vec::new(),
         single_globals: Vec::new(),
         skipped_unconnected: 0,
         skipped_no_connect: 0,
@@ -2442,6 +2922,9 @@ fn undriven_report(view: &View) -> UndrivenReport {
             DriveStatus::Undriven => report.undriven.push(index),
             DriveStatus::Biased => report.biased.push(index),
             DriveStatus::Indeterminate => report.indeterminate.push(index),
+            DriveStatus::DrivenThroughSeries if drive.rail && drive.resistive => {
+                report.resistive_rails.push(index);
+            }
             _ => {}
         }
     }
@@ -2469,6 +2952,7 @@ fn undriven_report(view: &View) -> UndrivenReport {
     report.biased.sort_by(by_name);
     report.label_only.sort_by(by_name);
     report.indeterminate.sort_by(by_name);
+    report.resistive_rails.sort_by(by_name);
     report
 }
 
@@ -2501,6 +2985,11 @@ fn undriven_net_json(view: &View, index: usize, detail: Detail) -> Value {
     });
     if !others.is_empty() {
         value["other_pins"] = json!(others);
+    }
+    if view.drive_of(index).rail {
+        // A dead rail: name what it was meant to power.
+        value["rail"] = json!(true);
+        value["power_in_pins"] = json!(view.power_in_pins_json(&nodes));
     }
     if detail == Detail::Full {
         value["pins"] = json!(nodes
@@ -2580,14 +3069,34 @@ fn undriven_json(view: &View, report: &UndrivenReport, detail: Detail) -> Value 
             json!(view.net(index).name)
         }
     };
+    let resistive_entry = |&index: &usize| -> Value {
+        let drive = view.drive_of(index);
+        let mut value = json!({
+            "net": view.net(index).name,
+            "through_resistors": view.drive.resistors_on(&drive.via),
+            "reaches": drive.reaches,
+        });
+        if full {
+            value["drive"] = view.drive_json(index, &drive, Detail::Full);
+        }
+        value
+    };
     let limit = if full { usize::MAX } else { SUMMARY_LIST_LIMIT };
     let (singles, singles_more) = capped_to(report.single_globals.iter().map(single_entry), limit);
     let (biased, biased_more) = capped_to(report.biased.iter().map(biased_entry), limit);
     let (indeterminate, indeterminate_more) =
         capped_to(report.indeterminate.iter().map(indeterminate_entry), limit);
+    let (resistive, resistive_more) =
+        capped_to(report.resistive_rails.iter().map(resistive_entry), limit);
+    let dead_rails = report
+        .undriven
+        .iter()
+        .filter(|&&index| view.drive_of(index).rail)
+        .count();
 
     let mut value = json!({
         "undriven_net_count": report.undriven.len(),
+        "dead_rail_count": dead_rails,
         "undriven_nets": report.undriven.iter().map(|&index| undriven_net_json(view, index, detail)).collect::<Vec<_>>(),
         "label_only_net_count": label_only.len(),
         "label_only_nets": label_only,
@@ -2597,6 +3106,8 @@ fn undriven_json(view: &View, report: &UndrivenReport, detail: Detail) -> Value 
         "biased_nets": biased,
         "indeterminate_net_count": report.indeterminate.len(),
         "indeterminate_nets": indeterminate,
+        "rails_fed_through_resistors_count": report.resistive_rails.len(),
+        "rails_fed_through_resistors": resistive,
         "skipped": {
             "unlabelled_single_pin_nets": report.skipped_unconnected,
             "no_connect_nets": report.skipped_no_connect,
@@ -2606,6 +3117,7 @@ fn undriven_json(view: &View, report: &UndrivenReport, detail: Detail) -> Value 
         ("single_global_labels", singles_more),
         ("biased_nets", biased_more),
         ("indeterminate_nets", indeterminate_more),
+        ("rails_fed_through_resistors", resistive_more),
     ]
     .into_iter()
     .filter(|(_, more)| *more > 0)
@@ -2616,14 +3128,23 @@ fn undriven_json(view: &View, report: &UndrivenReport, detail: Detail) -> Value 
     value
 }
 
-const UNDRIVEN_RULE: &str = "A net is driven by an output, power-out, tri-state, bidirectional, \
-     open-collector or open-emitter pin or a PWR_FLAG on it; by a connector pin (J, P, CN, X); \
-     or through two-pin series parts (R, Y, L, FB, F, JP, NT) from a push-pull output or a \
-     connector, or from a supply through L, FB, F, JP or NT alone. A resistor path to a supply \
-     only biases a net: 'biased_nets' have a pull-up or pull-down holding a level and nothing \
-     driving them. A pin that may be driven inside its part (an IC's passive pin, a free or \
-     unspecified pin) makes a net 'indeterminate'. 'undriven_nets' are the rest that have pins: \
-     dead rails and floating inputs. A path ends at a supply rather than running through it.";
+const UNDRIVEN_RULE: &str = "A rail is a net with a power-input pin (or a power-output pin, a \
+     PWR_FLAG or a power symbol). As in KiCad's ERC, only a power-output pin or a PWR_FLAG on it \
+     drives a rail; so does a series path to another driven rail, through L, FB, F, JP, NT or a \
+     zero-ohm resistor, or through a resistor, which is reported in \
+     'rails_fed_through_resistors'. A path between rails passes only passive filter nodes, and a \
+     ground feeds only a ground: a pull-up that reaches a logic output, or a bleed resistor to \
+     ground, never supplies a rail. A rail with a connector or an IC's passive pin on it, or a \
+     logic output linked to it, is 'indeterminate'. Any other net is driven by an output, \
+     power-out, tri-state, bidirectional, open-collector or open-emitter pin or a PWR_FLAG on \
+     it; by a connector pin (J, P, CN, X); or through two-pin series parts (R, Y, L, FB, F, JP, \
+     NT) from a push-pull output or a connector, or from a driven rail through L, FB, F, JP or \
+     NT alone. A resistor path to a driven rail only biases a net: 'biased_nets' have a pull-up \
+     or pull-down holding a level and nothing driving them. A pin that may be driven inside its \
+     part (an IC's passive pin, a free or unspecified pin) makes a net 'indeterminate'. \
+     'undriven_nets' are the rest that have pins: dead rails ('rail': true, with the power-input \
+     pins they leave unsupplied) and floating inputs. A path ends at a rail rather than running \
+     through it.";
 
 async fn handle_find_undriven_nets(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
     let output = match output_path(args) {
@@ -3043,6 +3564,8 @@ fn verdict_severity(verdict: &str) -> u8 {
 struct Findings {
     inputs_losing_driver: Vec<Value>,
     dead_remainders: Vec<Value>,
+    dead_rails: Vec<Value>,
+    rails_fed_only_through_resistors: Vec<Value>,
     single_pin: Vec<Value>,
     single_label: Vec<Value>,
     open_drain: Vec<Value>,
@@ -3071,6 +3594,12 @@ fn affected_net(
     let net_name = before.net(index).name.clone();
     let nodes = before.nodes(index);
     let before_drive = before.drive_of(index);
+    let lost_sources: Vec<usize> = before_drive
+        .sources
+        .iter()
+        .copied()
+        .filter(|source| split.removed_nodes.contains(source))
+        .collect();
 
     let mut remainders: BTreeSet<usize> = BTreeSet::new();
     for &position in &split.kept_nodes {
@@ -3137,6 +3666,39 @@ fn affected_net(
             Vec::new()
         };
         let level = after.level_json(&drive);
+        // A rail left without a supply, with every power input it strands:
+        // the finding a pull-up to a logic output must never hide.
+        if drive.rail && lost == Some("drive") {
+            findings.dead_rails.push(json!({
+                "net": net_name,
+                "net_after": net_after,
+                "drive_before": before_drive.status.as_str(),
+                "drive_after": drive.status.as_str(),
+                "level_after": level.clone(),
+                "lost_sources": lost_sources
+                    .iter()
+                    .map(|&position| before.pin_tag(&nodes[position]))
+                    .collect::<Vec<_>>(),
+                "power_in_pins": after.power_in_pins_json(&after_nodes),
+            }));
+        }
+        // Kept, but now only through a resistor: a feed that was a regulator
+        // or a link has become whatever resistor is left between two rails.
+        if drive.rail
+            && drive.status == DriveStatus::DrivenThroughSeries
+            && drive.resistive
+            && before_drive.status.is_driven()
+            && !before_drive.resistive
+        {
+            findings.rails_fed_only_through_resistors.push(json!({
+                "net": net_name,
+                "net_after": net_after,
+                "drive_before": before_drive.status.as_str(),
+                "through_resistors": after.drive.resistors_on(&drive.via),
+                "reaches": drive.reaches,
+                "power_in_pins": after.power_in_pins_json(&after_nodes),
+            }));
+        }
         for node in &stranded {
             let mut pin = after.pin_json(node, Detail::Compact);
             pin["net"] = json!(net_name);
@@ -3203,6 +3765,13 @@ fn affected_net(
         if drive.status == DriveStatus::DrivenThroughSeries {
             summary["driven_by"] = json!(drive.reaches);
         }
+        if drive.rail {
+            summary["rail"] = json!(true);
+        }
+        if drive.resistive {
+            summary["resistive"] = json!(true);
+            summary["through_resistors"] = json!(after.drive.resistors_on(&drive.via));
+        }
         if !healthy {
             let (pins, more) = capped(after_nodes.iter().map(|node| after.pin_tag(node)));
             summary["pins"] = json!(pins);
@@ -3233,12 +3802,6 @@ fn affected_net(
         fulls.push(full);
     }
 
-    let lost_sources: Vec<usize> = before_drive
-        .sources
-        .iter()
-        .copied()
-        .filter(|source| split.removed_nodes.contains(source))
-        .collect();
     let (removed_pins, removed_not_listed) = capped(
         split
             .removed_nodes
@@ -3454,6 +4017,8 @@ fn removal_report(
         .collect();
 
     let findings_json = json!({
+        "dead_rails": findings.dead_rails,
+        "rails_fed_only_through_resistors": findings.rails_fed_only_through_resistors,
         "inputs_losing_driver": findings.inputs_losing_driver,
         "dead_remainders": findings.dead_remainders,
         "single_pin_remainders": findings.single_pin,
@@ -3511,10 +4076,13 @@ fn removal_report(
 /// The verdict vocabulary, stated in every removal report.
 const VERDICTS: &str = "keeps_drive: something still drives the remainder. remains_defined: an \
      open-drain source was removed and its pull-up stays, so the input reads the released level. \
-     loses_drive: the remainder had a driver and now has only a pull resistor, or nothing. \
+     loses_drive: the remainder had a driver and now has only a pull resistor, or nothing; for a \
+     rail (a net with a power-input pin), no power-output pin, PWR_FLAG or feed from another \
+     driven rail is left, and 'findings.dead_rails' lists the power inputs it strands. \
      loses_bias: the remainder had only a pull resistor, and that is gone too. indeterminate: \
      only a pin that may be driven inside its part is left. had_no_drive: nothing drove it \
-     before either.";
+     before either. A rail kept only through a resistor is in \
+     'findings.rails_fed_only_through_resistors'.";
 
 #[cfg(test)]
 #[path = "design_nets_tests.rs"]
