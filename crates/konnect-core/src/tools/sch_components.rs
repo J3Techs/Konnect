@@ -2410,34 +2410,43 @@ fn property_insert_edit(
         })
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
-    // Match the block's own indentation rather than assuming: eeschema saves
-    // with tabs, this crate's writer uses two spaces.
-    let indent = block
-        .find("(property ")
-        .map(|p| {
-            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
-            block[line_start..p].to_string()
-        })
-        .unwrap_or_else(|| "\t\t".to_string());
+    // Match the block's own layout rather than assuming one: eeschema saves a
+    // property per line indented with tabs, this crate's writer uses two
+    // spaces, and a compactly written sheet keeps a whole symbol on one line.
+    // There the text before the first property is the symbol's own head, not
+    // an indent, so the new property goes inline as well.
+    let lead = block.find("(property ").map(|p| {
+        let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
+        &block[line_start..p]
+    });
+    let inline = lead.is_some_and(|lead| !lead.chars().all(char::is_whitespace));
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
-    let newline = if content.contains("\r\n") {
-        "\r\n"
+    let prop = if inline {
+        format!(
+            " (property \"{escaped_name}\" \"{escaped_value}\" (at {x} {y} 0) (hide yes) \
+             (effects (font (size 1.27 1.27))))"
+        )
     } else {
-        "\n"
+        let indent = lead.unwrap_or("\t\t");
+        let newline = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        format!(
+            "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+             {indent}\t(at {x} {y} 0){newline}\
+             {indent}\t(hide yes){newline}\
+             {indent}\t(effects{newline}\
+             {indent}\t\t(font{newline}\
+             {indent}\t\t\t(size 1.27 1.27){newline}\
+             {indent}\t\t){newline}\
+             {indent}\t){newline}\
+             {indent})"
+        )
     };
-    let prop = format!(
-        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
-         {indent}\t(at {x} {y} 0){newline}\
-         {indent}\t(hide yes){newline}\
-         {indent}\t(effects{newline}\
-         {indent}\t\t(font{newline}\
-         {indent}\t\t\t(size 1.27 1.27){newline}\
-         {indent}\t\t){newline}\
-         {indent}\t){newline}\
-         {indent})"
-    );
 
     // Insert before the block's closing paren so the property stays inside it.
     let close = block
@@ -6390,6 +6399,51 @@ mod tests {
             .unwrap();
         let text = cse::sexp::writer::write(&property.to_sexp());
         assert!(text.contains("(hide yes)"), "{text}");
+    }
+
+    /// A sheet written compactly keeps a whole symbol on one line. The text
+    /// before its first property is then the symbol's head, not an indent,
+    /// and a property added there must go inline instead of repeating it.
+    #[test]
+    fn a_property_added_to_a_one_line_symbol_stays_on_its_line() {
+        let symbol = concat!(
+            r#"(symbol (lib_id "Device:R") (at 101.6 50.8 0) (unit 1) (uuid "s1") "#,
+            r#"(property "Reference" "R1" (at 101.6 48.26 0) (effects (font (size 1.27 1.27)))) "#,
+            r#"(property "Value" "1k" (at 101.6 53.34 0) (effects (font (size 1.27 1.27)))) "#,
+            r#"(pin "1" (uuid "p1")) (pin "2" (uuid "p2")) "#,
+            r#"(instances (project "p" (path "/root" (reference "R1") (unit 1)))))"#,
+        );
+        let content = format!(
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"root\")\n{symbol}\n)\n"
+        );
+
+        let (updated, counts) = set_property_value(
+            &content,
+            "R1",
+            "Datasheet",
+            "https://example.com/r.pdf",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!((counts.updated, counts.added), (0, 1));
+        assert_eq!(
+            updated.lines().count(),
+            content.lines().count(),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(concat!(
+                r#"(unit 1)))) (property "Datasheet" "https://example.com/r.pdf" "#,
+                r#"(at 101.6 50.8 0) (hide yes) (effects (font (size 1.27 1.27)))))"#,
+            )),
+            "{updated}"
+        );
+        assert_eq!(updated.matches("(symbol ").count(), 1, "{updated}");
+        let tree = parse_sexp(&updated).unwrap();
+        let placed = tree.find_all("symbol");
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].find_all("property").len(), 3);
     }
 
     /// Item 7: replacing R1 (pins 1 and 2) with a one-pin symbol refuses
