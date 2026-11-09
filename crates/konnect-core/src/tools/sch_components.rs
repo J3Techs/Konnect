@@ -362,7 +362,11 @@ pub fn tools() -> Vec<ToolDef> {
              symbol, so editing one in its library leaves the sheet drawing the old \
              shape — this refreshes it. A symbol whose pins moved or disappeared in \
              the library is refused (reported in pins_moved) unless allow_pin_moves \
-             is set, because wires and labels attach at pin coordinates.",
+             is set, because wires and labels attach at pin coordinates. With \
+             allow_pin_moves, every pin end that moved on a placed instance is listed, \
+             with whatever it left behind (left_dangling); drag_connections carries \
+             those wires, labels and no-connect flags to the new pin ends, keeping wires \
+             orthogonal, and judges the junction dots it touched by KiCad's rule.",
             json!({
                 "type": "object",
                 "properties": {
@@ -375,7 +379,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "default": false,
                         "description": "Report what would change without writing." },
                     "allow_pin_moves": { "type": "boolean", "default": false,
-                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." }
+                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them unless drag_connections is set; what each moved pin leaves behind is listed in left_dangling." },
+                    "drag_connections": { "type": "boolean", "default": false,
+                        "description": "With allow_pin_moves: carry what sits on each moved pin's old end to its new one. A label or no-connect flag on the end moves with it; a wire whose far end holds only labels moves whole with them when its new place is clear; a wire lying along the move has its end slid; any other gets an orthogonal jog, as does an old end something else still holds. A pin the library removed cannot be followed and stays in left_dangling." }
                 },
                 "required": ["schematic"]
             }),
@@ -3976,6 +3982,13 @@ async fn handle_update_symbols_from_library(
     });
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let allow_pin_moves = args["allow_pin_moves"].as_bool().unwrap_or(false);
+    let drag = args["drag_connections"].as_bool().unwrap_or(false);
+    if drag && !allow_pin_moves {
+        return Ok(crate::tools::invalid_arg(
+            "drag_connections",
+            "drags what moved pins leave behind, so it needs allow_pin_moves too",
+        ));
+    }
 
     let (mut content, tree) = read_schematic(&sch_path)?;
     let expected = content.clone();
@@ -4033,6 +4046,41 @@ async fn handle_update_symbols_from_library(
         }
     }
 
+    // Pin ends the update moved on placed instances, and what each left
+    // behind, dragged along when asked.
+    let mut moved_report = None;
+    if allow_pin_moves && !updated.is_empty() {
+        let after_tree = konnect_sexp::parse_sexp(&content)?;
+        let moved = super::pin_drag::moved_pin_ends(&tree, &after_tree, &updated);
+        if !moved.is_empty() {
+            let ends: Vec<serde_json::Value> = moved
+                .iter()
+                .map(|end| {
+                    json!({
+                        "reference": end.reference,
+                        "unit": end.unit,
+                        "pin": end.number,
+                        "from": { "x": end.from.0, "y": end.from.1 },
+                        "to": end.to.map(|(x, y)| json!({ "x": x, "y": y })),
+                    })
+                })
+                .collect();
+            let mut report = json!({ "pins_moved_on_instances": ends });
+            if drag {
+                let dragged = super::pin_drag::drag_connections(&sch_path, &content, &moved)?;
+                content = dragged.content;
+                report["dragged"] = json!(dragged.dragged);
+                report["left_dangling"] = json!(dragged.left_dangling);
+                report["junctions_added_count"] = json!(dragged.junctions_added);
+                report["junctions_pruned_count"] = json!(dragged.junctions_pruned);
+            } else {
+                report["left_dangling"] =
+                    json!(super::pin_drag::left_dangling(&sch_path, &content, &moved)?);
+            }
+            moved_report = Some(report);
+        }
+    }
+
     if !updated.is_empty() && !dry_run {
         write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     }
@@ -4045,6 +4093,11 @@ async fn handle_update_symbols_from_library(
         "errors": errors,
         "dry_run": dry_run
     });
+    if let Some(serde_json::Value::Object(report)) = moved_report {
+        for (key, value) in report {
+            body[key] = value;
+        }
+    }
     if !pins_moved.is_empty() {
         body["hint"] = json!(
             "Symbols listed in pins_moved were left untouched: the library moved or \
@@ -6044,6 +6097,170 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("(at 0 -5.08 90)"), "{after}");
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// R1 at (101.6, 101.6) on the stub library, pin 1's end at (101.6, 97.79)
+    /// and pin 2's at (101.6, 105.41). Below pin 2 a label stub ends in BOT;
+    /// from pin 1 a wire runs right to a corner another wire holds, up to TOP.
+    /// Then the library moves pin 1 up 1.27 and pin 2 down 5.08, past the far
+    /// end of its stub.
+    async fn sheet_with_moved_pins() -> (
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+        std::path::PathBuf,
+    ) {
+        let (symdir, env) = stub_symbol_dir();
+        let path = symdir.path().join("drag.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.add_wire(101.6, 105.41, 101.6, 107.95);
+        sch.add_label("BOT", 101.6, 107.95).set_rotation(0.0);
+        sch.add_wire(101.6, 97.79, 106.68, 97.79);
+        sch.add_wire(106.68, 97.79, 106.68, 91.44);
+        sch.add_label("TOP", 106.68, 91.44).set_rotation(0.0);
+        sch.overwrite().unwrap();
+
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib)
+            .unwrap()
+            .replace("(at 0 3.81 270)", "(at 0 5.08 270)")
+            .replace("(at 0 -3.81 90)", "(at 0 -8.89 90)");
+        std::fs::write(&lib, edited).unwrap();
+        (symdir, env, path)
+    }
+
+    fn wires_of(path: &std::path::Path) -> Vec<((f64, f64), (f64, f64))> {
+        let sch = cse::Schematic::load(path).unwrap();
+        let mut wires: Vec<_> = sch
+            .wires
+            .iter()
+            .map(|wire| {
+                let r =
+                    |(x, y): (f64, f64)| ((x * 100.0).round() / 100.0, (y * 100.0).round() / 100.0);
+                let (a, b) = (r(wire.start), r(wire.end));
+                if a <= b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect();
+        wires.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wires
+    }
+
+    /// R3-5: without drag_connections the update lists each moved pin end
+    /// and what it left behind there, and moves nothing.
+    #[tokio::test]
+    async fn moved_pins_list_what_they_leave_dangling() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let before_wires = wires_of(&path);
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(
+            body["pins_moved_on_instances"].as_array().unwrap().len(),
+            2,
+            "{body}"
+        );
+        let dangling = body["left_dangling"].as_array().unwrap();
+        assert_eq!(dangling.len(), 2, "{body}");
+        let pin2 = dangling.iter().find(|entry| entry["pin"] == "2").unwrap();
+        assert_eq!(pin2["from"], json!({ "x": 101.6, "y": 105.41 }));
+        assert_eq!(pin2["to"], json!({ "x": 101.6, "y": 110.49 }));
+        assert_eq!(
+            pin2["left_at_old_end"]["wires"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(wires_of(&path), before_wires, "nothing is dragged");
+    }
+
+    /// R3-5: drag_connections moves the label stub below pin 2 whole, and
+    /// joins pin 1's new end to its held wire with an orthogonal jog.
+    #[tokio::test]
+    async fn moved_pins_drag_their_connections_when_asked() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true,
+                     "drag_connections": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["left_dangling"], json!([]), "{body}");
+        let actions = |pin: &str| -> Vec<String> {
+            body["dragged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["pin"] == pin)
+                .unwrap()["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| action["action"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(actions("2"), ["moved_stub"], "{body}");
+        assert_eq!(actions("1"), ["jog"], "{body}");
+
+        assert_eq!(
+            wires_of(&path),
+            [
+                ((101.6, 96.52), (101.6, 97.79)),
+                ((101.6, 97.79), (106.68, 97.79)),
+                ((101.6, 110.49), (101.6, 113.03)),
+                ((106.68, 91.44), (106.68, 97.79)),
+            ]
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        let bot = sch.labels.iter().find(|label| label.text == "BOT").unwrap();
+        assert!((bot.at.x - 101.6).abs() < 1e-6 && (bot.at.y - 113.03).abs() < 1e-6);
+        // Every wire is horizontal or vertical.
+        for ((x1, y1), (x2, y2)) in wires_of(&path) {
+            assert!(x1 == x2 || y1 == y2, "({x1}, {y1}) to ({x2}, {y2})");
+        }
+    }
+
+    #[tokio::test]
+    async fn dragging_needs_allow_pin_moves() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "drag_connections": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// #203: annotating the same key twice must update the one property in

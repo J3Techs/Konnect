@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **281 registered tools** + **7 always-visible meta-tools** = **288 total**
+- **282 registered tools** + **7 always-visible meta-tools** = **289 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -107,7 +107,7 @@ and Windows servers do not.
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
 | `group_components` | Add or update a group property across every placed unit of multiple components. |
 | `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
-| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
+| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set; then every moved pin end is listed with what it left behind (`left_dangling`), and `drag_connections` carries those wires, labels and no-connect flags to the new ends, keeping wires orthogonal. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
 
@@ -409,7 +409,7 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 17 tools
+### `library` · 18 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -424,6 +424,7 @@ and Windows servers do not.
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
+| `edit_symbol` | Edit a symbol in a `.kicad_sym` library in place: per unit, move pins (position, orientation, length), rename their names and numbers, change their electrical types, and resize body rectangles, keeping every other property, field and graphic byte for byte. The whole request is checked before anything is written, and the file is read back. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |

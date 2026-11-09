@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: edit a library symbol in place, and drag what moved pins leave
+
+New: `edit_symbol` (`library`) edits a symbol in a `.kicad_sym` library
+without deleting and re-creating it. Each pin edit names a pin by its current
+`number` in a `unit` (1 by default, 0 for pins common to every unit) and
+`body_style`, and sets any of `x`/`y` or `dx`/`dy` (library mm, Y up),
+`orientation`, `length`, `new_name`, `new_number` and `electrical_type`. Each
+rectangle edit names a rectangle by `unit` and `index` and sets `start`/`end`
+or moves an edge (`move_top`, `move_bottom`, `move_left`, `move_right`). Only
+the named tokens change; every other byte of the library is kept. The whole
+request is checked first (each pin and rectangle found exactly once, no
+edited pin sharing a number in its body style, a rectangle keeping its area),
+nothing is written on a refusal, `dry_run` reports without writing, and the
+written pins are read back.
+
+`update_symbols_from_library` adds `drag_connections` (default false; it needs
+`allow_pin_moves`). With `allow_pin_moves`, the response now adds
+`pins_moved_on_instances` (reference, unit, pin, from, to) and `left_dangling`
+(each moved pin end with the wires, labels and no-connect flags it left
+behind). `drag_connections` carries them instead: a label or flag on the end
+moves with it; a wire whose far end holds only labels moves whole with them
+when its new place is clear; a wire lying along the move has its end slid;
+any other wire, or an old end that something else still holds, gets an
+orthogonal jog. The response then adds `dragged` (per pin, what was done),
+`junctions_added_count` and `junctions_pruned_count`; dots at every point
+touched are judged by KiCad's junction rule. A pin the library removed stays
+in `left_dangling`. Without the new option nothing is dragged, as before.
+
 ## Unreleased: duplicate_sheet writes one instance path, renumbers and renames
 
 A sheet's copy kept, on every symbol, the instance entry for the source
