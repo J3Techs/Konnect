@@ -3,6 +3,207 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a missing Datasheet field is added; a replacement can drop orphaned no-connect flags
+
+`edit_schematic_component` refused `datasheet` on a placed unit with no
+Datasheet property, which instances copied from older sheets lack, so the link
+stayed only on the library symbol. A missing Datasheet is now added, hidden as
+KiCad places it, in the same write that updates the units that have one; the
+change line reads `Datasheet → … (n updated, m added)`.
+
+`replace_component` refuses while a no-connect flag sits on a pin the new
+symbol lacks. New `drop_orphaned_no_connects` (default false) deletes such
+flags in the same write instead, listing each in `no_connects_dropped` (UUID,
+position, the pin it protected) with `no_connects_dropped_count`, and checks
+the written file no longer has them. A flag that still protects another pin
+follows that pin, and a duplicated pin still refuses. Without the option the
+refusal is unchanged.
+
+## Unreleased: sheet moves and sheet-pin edits judge junction dots; a split adds only a needed dot
+
+`move_sheet`, `edit_sheet_pin` and `delete_sheet_pin` left junction dots as
+they were, so a dot a sheet pin had justified stayed after the pin moved away
+or was deleted, and the prune pass had to follow. Each now judges the dots at
+the pins' old and new ends by KiCad's junction rule in the same write: a dot
+the rule no longer calls for goes, and a sheet pin landing on one wire's span
+gets the dot it needs to connect. Each response adds
+`junctions_added_count`, `junctions_pruned_count` and
+`junctions_pruned_uuids`; renaming or retyping a pin judges nothing. The
+dot a component move adds where a pin lands mid-span is now added for a sheet
+pin too.
+
+`split_wire_at_point` always added a dot at the split. Two halves of one wire
+meeting there are a straight join, two exits, and KiCad draws no dot, so the
+dot now goes only where the rule calls for one: another wire ending there, or
+a pin or sheet pin on the point. The response adds `junction_added`.
+
+## Unreleased: edit a library symbol in place, and drag what moved pins leave
+
+New: `edit_symbol` (`library`) edits a symbol in a `.kicad_sym` library
+without deleting and re-creating it. Each pin edit names a pin by its current
+`number` in a `unit` (1 by default, 0 for pins common to every unit) and
+`body_style`, and sets any of `x`/`y` or `dx`/`dy` (library mm, Y up),
+`orientation`, `length`, `new_name`, `new_number` and `electrical_type`. Each
+rectangle edit names a rectangle by `unit` and `index` and sets `start`/`end`
+or moves an edge (`move_top`, `move_bottom`, `move_left`, `move_right`). Only
+the named tokens change; every other byte of the library is kept. The whole
+request is checked first (each pin and rectangle found exactly once, no
+edited pin sharing a number in its body style, a rectangle keeping its area),
+nothing is written on a refusal, `dry_run` reports without writing, and the
+written pins are read back.
+
+`update_symbols_from_library` adds `drag_connections` (default false; it needs
+`allow_pin_moves`). With `allow_pin_moves`, the response now adds
+`pins_moved_on_instances` (reference, unit, pin, from, to) and `left_dangling`
+(each moved pin end with the wires, labels and no-connect flags it left
+behind). `drag_connections` carries them instead: a label or flag on the end
+moves with it; a wire whose far end holds only labels moves whole with them
+when its new place is clear; a wire lying along the move has its end slid;
+any other wire, or an old end that something else still holds, gets an
+orthogonal jog. The response then adds `dragged` (per pin, what was done),
+`junctions_added_count` and `junctions_pruned_count`; dots at every point
+touched are judged by KiCad's junction rule. A pin the library removed stays
+in `left_dangling`. Without the new option nothing is dragged, as before.
+
+## Unreleased: duplicate_sheet writes one instance path, renumbers and renames
+
+A sheet's copy kept, on every symbol, the instance entry for the source
+sheet's path beside the new one. KiCad ignored it, but it was cruft, and the
+new entry took its reference from the `Reference` property rather than from
+the source sheet's instance. Each copied symbol now carries exactly one
+instance entry: the new sheet's path in this project, with the reference and
+unit the symbol has on the source sheet (that path's entry, else its only
+entry, else the `Reference` property), and its `Reference` property is set to
+match. Entries for other projects or paths are dropped from the copy.
+`patched_symbol_instances` counts the symbols rewritten; the response adds
+`instance_path`.
+
+New, both optional:
+
+- `renumber: {from, to}`, two runs of digits, moves the copy's references into
+  another block: a reference whose number starts with `from` has that part
+  replaced by `to`, so 104 to 105 turns U10401 into U10501 and C10407 into
+  C10507, every unit of a symbol together. Power and other `#` references keep
+  their names. A reference outside the block (`renumber.from`), or a new one
+  that any sheet of the design already uses (`renumber.to`, naming each clash
+  and its sheet), refuses the whole duplicate before anything is written. The
+  response adds `renumbered_count` and `renumbered_references` (from, to).
+- `label_substitutions: [{from, to}]` replaces, in order, every occurrence of
+  each `from` in the text of every local, global and hierarchical label in the
+  copy. Only the text changes. The response adds `substituted_label_count` and
+  `label_substitutions` (kind, UUID, position, from, to).
+
+Unchanged limitations: the parent must be the root sheet for the instance
+path to be right, a sheet nested inside the copied one is not re-pathed, and
+the new sheet block has no sheet pins.
+
+## Unreleased: labels listed with their UUIDs
+
+`list_schematic_labels` returned each label's net, type, position and
+rotation, but no UUID, so a label it listed could not be passed to
+`batch_delete`, and `delete_schematic_net_label` takes one label per call.
+Each entry now adds `uuid`, `kind` (the S-expression tag: `label`,
+`global_label` or `hierarchical_label`), `justify` (the words the file writes,
+null when it writes none) and, for a label that has one, `shape`. `net`,
+`type`, `x`, `y` and `rotation` are unchanged. `batch_delete` already deleted
+labels of every kind by UUID; it is now tested with UUIDs taken from the
+listing.
+
+`batch_rotate_labels` counted every requested label in `rotated`, including
+one it could not find, and dropped the error. `rotated` now counts only the
+labels rotated, and the response adds `failed_count` and `errors` (each with
+the item's index, net, position and message). A label not found is left as it
+was; the labels found are still rotated, one write each, as before.
+
+## Unreleased: label orientation and shape for the connect tools, and a pin-to-net map
+
+`connect_to_net` and `batch_connect_to_net` add three options, each omitted by
+default with the old result:
+
+- `label_orientation`: `horizontal` (default, as before) or `along_stub`,
+  which turns a label on a stub going up to 90 and one going down to 270, so
+  it reads away from the pin and labels on neighbouring top or bottom pins no
+  longer overlap. On a left or right stub the two are the same.
+- `shape`, for a global or hierarchical label: `input` (default, as before),
+  `output`, `bidirectional`, `tri_state`, `passive`, or `from_pin` (input and
+  power input give input; output, power output, open collector and open
+  emitter give output; bidirectional and tri-state their own; anything else
+  passive). A shape for a net label is refused rather than ignored.
+- `label_type` accepts `hierarchical_label` beside `net_label` and
+  `global_label`.
+
+`batch_connect_to_net` items accept their own `net`, `label_type`, `shape` and
+`label_orientation`, overriding the call's, so a sheet's pin-to-net map goes in
+one call; `net_name` may then be left out. Every item is now read, resolved and
+checked before anything is written, and one wrong item refuses the whole
+call: before, an unresolvable pin was listed in `errors` and the other pins
+were still written. The refusal is an `invalid_argument` naming the first bad
+field (such as `pins[3].pin_number`), with `written: false` and a `results`
+entry per item (`valid` or `refused`, with its field and reason). Also
+refused: a pin, or its label's spot, already on a net of another name, and two
+items putting different nets on one spot, since each would join two nets.
+`errors` stays in a successful response, now always empty.
+
+Junction dots for the stubs both tools draw follow KiCad's rule for drawn
+wiring: the candidates are each stub's ends and every wire end, pin or sheet
+pin on its span, and a dot goes where three or more exits meet. A stub leaving
+a pin that a wire already ends on now gets the dot KiCad would add there; a
+stub crossing another wire's span never does; and a missing dot at an
+unrelated T elsewhere on the sheet is no longer added as a side effect.
+
+Response fields are only added. `connect_to_net` adds `label_type`,
+`label_orientation`, `junctions_added` and, for a global or hierarchical label,
+`label.shape`. `batch_connect_to_net` keeps its keys exactly in the default
+placement (net labels on the pins, `direction` auto, no per-pin options); with
+a stub, a direction or any label option, each entry also carries `net`,
+`label.type`, `label.shape` when there is one and `label_orientation`, and the
+response `label_orientation`, `junctions_added_count` and `junctions_added`.
+`net` in the response is null when the call named no net of its own.
+
+## Unreleased: the design-wide net tools judge rails by KiCad's power rule
+
+`plan_sheet_removal`, `find_undriven_nets` and `get_net_members` share one
+drive model. It reached a rail through its pull-ups: with PT_A_VCCIO's only
+source removed, the rail was reported `driven_through_series` because a 10 kΩ
+pull-up led to a chip select that a buffer drives through a series resistor,
+and the six VCC pins it powers were not flagged.
+
+A net with a power-input pin is now a rail, and so is one with a power-output
+pin, a PWR_FLAG or a power symbol. As in KiCad's ERC, only a power-output pin
+or a PWR_FLAG on a rail drives it; a logic pin tied to it does not, and a
+rail's `sources` list only its power-output pins. A rail is also
+`driven_through_series` when a series path reaches another driven rail: through
+links (inductor, ferrite, fuse, jumper, net tie, or a resistor whose value
+reads zero ohms), or through a resistor, when the drive adds `resistive: true`
+and `through_resistors`. A path between rails passes only filter nodes (nets
+of passive pins of simple and series parts), and a ground feeds only a
+ground, so a pull-up that reaches a logic output, or a bleed resistor to
+ground, never supplies a rail. A rail with a connector or a part's passive pin
+on it, or with one or a logic output linked to it, is `indeterminate`: before,
+a connector made a rail `external`. Any other rail is `undriven`, a dead rail,
+and its `level_after` reads `no supply`.
+
+Other nets keep their rules, except that a path now ends at every rail,
+driven or not: before, a dead rail was walked through, so an input pulled up
+to it could be called driven by whatever another pull-up on the rail reached.
+A pull-up to a rail fed through series parts still reports the source behind
+it, with the rail's own feed appended to `via`.
+
+New fields, none renamed or removed: the drive object adds `rail` (on rails
+only) and, for a resistive feed, `resistive` and `through_resistors`.
+`plan_sheet_removal` adds `findings.dead_rails` (each rail that loses its
+supply, with its lost sources and every power-input pin it strands: reference,
+pin, pin name, sheet file and sheet path) and
+`findings.rails_fed_only_through_resistors`, and its remainder summaries add
+`rail`, `resistive` and `through_resistors`. `find_undriven_nets` adds
+`dead_rail_count`, `rails_fed_through_resistors` with its count, and `rail` and
+`power_in_pins` on each dead rail in `undriven_nets`.
+
+On DB2 as of 2026-11-08, the intact design changes only PT_A_LOAD_FEED and
+PT_B_LOAD_FEED (`external` to `indeterminate`, matching KiCad's
+`power_pin_not_driven` on U10401 and U10501 VBATT). Removing sheets 18, 19, 25,
+27, 28 and 29 now reports PT_A_VCCIO and PT_B_VCCIO as dead rails.
+
 ## Unreleased: junction dots follow KiCad's junction rule
 
 Deleting or moving wires, components and sheets re-judges the junction dots

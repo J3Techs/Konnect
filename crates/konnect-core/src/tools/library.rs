@@ -451,6 +451,13 @@ pub fn tools() -> Vec<ToolDef> {
     {
         tools.insert(after_create_footprint + offset, tool);
     }
+    // Beside the other symbol-library writers.
+    let after_delete_symbol = tools
+        .iter()
+        .position(|t| t.name == "delete_symbol")
+        .map(|i| i + 1)
+        .unwrap_or(tools.len());
+    tools.insert(after_delete_symbol, super::library_symbol_edit::tool());
     tools
 }
 

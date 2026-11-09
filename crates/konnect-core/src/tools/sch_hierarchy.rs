@@ -126,7 +126,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_sheet",
-            "Reposition a sheet on the parent canvas without touching any other field.",
+            "Reposition a sheet on the parent canvas without touching any other field. \
+             Junction dots at its pins' old and new ends are judged by KiCad's junction \
+             rule in the same write, reported as junctions_pruned_count and \
+             junctions_added_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -159,9 +162,13 @@ pub fn tools() -> Vec<ToolDef> {
             "duplicate_sheet",
             "Copy an existing sheet and its child .kicad_sch file under a new name/file, \
              offset slightly so the new sheet box doesn't overlap the source. The copy gets \
-             its own internal schematic UUID and its symbols' hierarchical instance paths \
-             are patched for the new sheet — it is a fully independent sub-circuit, not a \
-             live-linked reuse (for that, use add_hierarchical_sheet pointed at the existing file).",
+             its own internal schematic UUID, and each of its symbols one hierarchical \
+             instance, the new sheet's path, with the reference it has on the source sheet — \
+             it is a fully independent sub-circuit, not a live-linked reuse (for that, use \
+             add_hierarchical_sheet pointed at the existing file). 'renumber' moves the copy's \
+             references into another block (104 to 105 turns U10401 into U10501), refusing \
+             any the design already uses; 'label_substitutions' rewrites the copy's label \
+             texts (PT_A_ to PT_B_) and lists every label it changed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -169,7 +176,28 @@ pub fn tools() -> Vec<ToolDef> {
                     "source_sheet_name": { "type": "string" },
                     "new_sheet_name": { "type": "string" },
                     "new_file": { "type": "string", "description": "Filename for the copy, resolved relative to the parent's directory. Must not already exist." },
-                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC },
+                    "renumber": {
+                        "type": "object",
+                        "description": "Move the copy's references into a new block: each reference whose number starts with 'from' has that part replaced by 'to', so from '104' to '105' turns U10401 into U10501 and C10407 into C10507. Power and other '#' references stay as they are. A reference outside the block, or a new one the design already uses, refuses the whole duplicate before anything is written.",
+                        "properties": {
+                            "from": { "type": "string", "pattern": "^[0-9]+$", "description": "The block the source sheet's references are in, e.g. '104'" },
+                            "to": { "type": "string", "pattern": "^[0-9]+$", "description": "The block the copy's references move to, e.g. '105'" }
+                        },
+                        "required": ["from", "to"]
+                    },
+                    "label_substitutions": {
+                        "type": "array",
+                        "description": "Text substitutions applied in order to every label in the copy (local, global and hierarchical), each replacing every occurrence of 'from' with 'to', e.g. [{from: 'PT_A_', to: 'PT_B_'}]. Every label changed is listed in the response.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": { "type": "string", "minLength": 1 },
+                                "to": { "type": "string" }
+                            },
+                            "required": ["from", "to"]
+                        }
+                    }
                 },
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
@@ -249,7 +277,8 @@ pub fn tools() -> Vec<ToolDef> {
             "edit_sheet_pin",
             "Rename a sheet pin, change its electrical type, move it, or move it to a \
              different edge of the sheet box. Provide at least one of: new_name, pin_type, \
-             side, or both x+y.",
+             side, or both x+y. A pin that moves has the junction dots at its old and new \
+             ends judged by KiCad's junction rule in the same write.",
             json!({
                 "type": "object",
                 "properties": {
@@ -267,7 +296,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_sheet_pin",
-            "Remove a single pin from a sheet without touching the rest of the sheet.",
+            "Remove a single pin from a sheet without touching the rest of the sheet. \
+             A junction dot the pin justified goes in the same write when KiCad's junction \
+             rule no longer calls for it, reported as junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1128,6 +1159,118 @@ fn commit_edited_sheet_item(
     commit_verified_sheet_mutation(path, before, &command, &intent, label)
 }
 
+/// Junction dots a sheet edit re-judged in its own write: the UUIDs of the
+/// dots pruned and how many were added.
+struct SheetJunctions {
+    pruned: Vec<String>,
+    added: usize,
+}
+
+/// [`commit_edited_sheet_item`], with the junction dots at `points` judged by
+/// KiCad's junction rule in the same write: a dot a moved or removed sheet pin
+/// no longer justifies goes, and one a sheet pin landing on a wire's span
+/// needs is added. Points touching a bus are left alone, as everywhere else.
+fn commit_edited_sheet_item_with_junctions(
+    path: &Path,
+    before: &str,
+    edited: &cse::Schematic,
+    uuid: &str,
+    label: &str,
+    points: &[(f64, f64)],
+) -> anyhow::Result<(Option<CallToolResult>, SheetJunctions)> {
+    let edited_source = edited.to_source();
+    let (reconciled, added, pruned) =
+        super::sch_wiring::reconcile_junctions_at(edited_source, points);
+    if added == 0 && pruned == 0 {
+        let refused = commit_edited_sheet_item(path, before, edited, uuid, label)?;
+        return Ok((
+            refused,
+            SheetJunctions {
+                pruned: Vec::new(),
+                added: 0,
+            },
+        ));
+    }
+    // Top-level items by UUID, with their kind and block text.
+    let items = |source: &str| -> anyhow::Result<HashMap<String, (String, String)>> {
+        let mut out = HashMap::new();
+        for (start, end) in konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch") {
+            let block = &source[start..end];
+            let node = parse_sexp(block)?;
+            if let Some(id) = node.find_str("uuid") {
+                out.insert(
+                    id.to_owned(),
+                    (node.head().unwrap_or("").to_owned(), block.to_owned()),
+                );
+            }
+        }
+        Ok(out)
+    };
+    let (old, new) = (items(before)?, items(&reconciled)?);
+    let sheet_before = old
+        .get(uuid)
+        .ok_or_else(|| anyhow::anyhow!("{label}: the sheet {uuid} is not in the file"))?;
+    let sheet_after = new
+        .get(uuid)
+        .ok_or_else(|| anyhow::anyhow!("{label}: the edited sheet {uuid} went missing"))?;
+    let mut changes = vec![konnect_sexp::ItemChange {
+        id: ItemId::new(uuid)?,
+        before: Some(sheet_before.1.clone()),
+        after: Some(sheet_after.1.clone()),
+        anchor: ItemAnchor::EndOfDocument,
+    }];
+    let mut pruned_ids = Vec::new();
+    for (id, (kind, block)) in &old {
+        if kind == "junction" && !new.contains_key(id) {
+            pruned_ids.push(id.clone());
+            changes.push(konnect_sexp::ItemChange {
+                id: ItemId::new(id)?,
+                before: Some(block.clone()),
+                after: None,
+                anchor: ItemAnchor::EndOfDocument,
+            });
+        }
+    }
+    let mut added_count = 0;
+    for (id, (kind, block)) in &new {
+        if kind == "junction" && !old.contains_key(id) {
+            added_count += 1;
+            changes.push(konnect_sexp::ItemChange {
+                id: ItemId::new(id)?,
+                before: None,
+                after: Some(block.clone()),
+                anchor: ItemAnchor::BeforeFooter,
+            });
+        }
+    }
+    pruned_ids.sort();
+    let command = SchematicCommand::from_changes(before, label, changes)?;
+    let intended = edited
+        .sheets
+        .by_uuid(uuid)
+        .ok_or_else(|| anyhow::anyhow!("edited {label} result has no sheet UUID {uuid}"))?;
+    let intent = SheetMutationIntent::Present {
+        uuid: uuid.to_owned(),
+        expected: intended.to_sexp(),
+    };
+    let refused = commit_verified_sheet_mutation(path, before, &command, &intent, label)?;
+    Ok((
+        refused,
+        SheetJunctions {
+            pruned: pruned_ids,
+            added: added_count,
+        },
+    ))
+}
+
+/// Every pin position of the sheet `uuid`.
+fn sheet_pin_points(sch: &cse::Schematic, uuid: &str) -> Vec<(f64, f64)> {
+    sch.sheets
+        .by_uuid(uuid)
+        .map(|sheet| sheet.pins.iter().map(|pin| (pin.at.x, pin.at.y)).collect())
+        .unwrap_or_default()
+}
+
 /// Read one sheet pin back off the file a write has just committed, so a
 /// response can describe the pin that was *saved* rather than the request that
 /// produced it.
@@ -1415,17 +1558,39 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Some(sheet) => {
             let sheet_uuid = sheet.uuid.clone();
             let changed = sheet.at.x != x || sheet.at.y != y;
+            let mut junctions = SheetJunctions {
+                pruned: Vec::new(),
+                added: 0,
+            };
             if changed {
+                // The dots at the pins' old ends and new ones are judged in
+                // the same write.
+                let mut points: Vec<(f64, f64)> =
+                    sheet.pins.iter().map(|pin| (pin.at.x, pin.at.y)).collect();
                 sheet.move_to(x, y);
-                if let Some(error) =
-                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "move_sheet")?
-                {
+                points.extend(sheet_pin_points(&sch, &sheet_uuid));
+                let (refused, judged) = commit_edited_sheet_item_with_junctions(
+                    &sch_path,
+                    &before,
+                    &sch,
+                    &sheet_uuid,
+                    "move_sheet",
+                    &points,
+                )?;
+                if let Some(error) = refused {
                     return Ok(error);
                 }
+                junctions = judged;
             }
-            Ok(CallToolResult::json(
-                &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
-            ))
+            Ok(CallToolResult::json(&json!({
+                "moved": sheet_name,
+                "x": x,
+                "y": y,
+                "changed": changed,
+                "junctions_added_count": junctions.added,
+                "junctions_pruned_count": junctions.pruned.len(),
+                "junctions_pruned_uuids": junctions.pruned,
+            })))
         }
         None => Ok(CallToolResult::error(format!(
             "Sheet '{}' not found",
@@ -1551,6 +1716,14 @@ async fn handle_duplicate_sheet(
     let project_name = opt_str(args, "project_name")
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&sch_path));
+    let renumber = match renumber_arg(args) {
+        Ok(renumber) => renumber,
+        Err(refusal) => return Ok(refusal),
+    };
+    let substitutions = match label_substitutions_arg(args) {
+        Ok(substitutions) => substitutions,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let parent_before = read_consistent(&sch_path)?;
     let parent = cse::Schematic::load(&sch_path)?;
@@ -1562,10 +1735,18 @@ async fn handle_duplicate_sheet(
         )));
     }
 
-    let (src_x, src_y, src_w, src_h, src_file) = match parent.sheets.by_name(&source_name) {
+    let (src_x, src_y, src_w, src_h, src_file, src_uuid) = match parent.sheets.by_name(&source_name)
+    {
         Some(s) => {
             let (x, y) = s.position();
-            (x, y, s.width, s.height, s.file().to_string())
+            (
+                x,
+                y,
+                s.width,
+                s.height,
+                s.file().to_string(),
+                s.uuid.clone(),
+            )
         }
         None => {
             return Ok(CallToolResult::error(format!(
@@ -1644,11 +1825,21 @@ async fn handle_duplicate_sheet(
     let duplicated_uuid = uuid::Uuid::new_v4().to_string();
     let duplicated_base = replace_source_root_uuid(&refreshed_child, &duplicated_uuid)?;
     let hierarchy_path = format!("{root_path}/{sheet_uuid}");
+    // Each copied symbol keeps the reference it has on the source sheet, and
+    // the new sheet's path becomes its only instance: the source's own entry
+    // would otherwise ride along in the copy.
+    let source_path = format!("{root_path}/{src_uuid}");
+    let copied = copied_symbol_references(&duplicated_base, &project_name, &source_path)?;
+    let plan = match plan_copied_references(&sch_path, &copied, renumber.as_ref())? {
+        Ok(plan) => plan,
+        Err(refusal) => return Ok(refusal),
+    };
     let (duplicated_after, patched) = if let Some(command) =
-        SchematicCommand::ensure_symbol_instance_path(
+        SchematicCommand::set_sole_symbol_instances(
             &duplicated_base,
             &project_name,
             &hierarchy_path,
+            &plan.assignments,
             "Link duplicated child symbols",
         )? {
         let count = command.changes.len();
@@ -1657,6 +1848,8 @@ async fn handle_duplicate_sheet(
     } else {
         (duplicated_base, 0)
     };
+    let (duplicated_after, substituted) =
+        substitute_label_texts(&duplicated_after, &substitutions)?;
     commit_file_transaction(
         &dir,
         vec![
@@ -1670,12 +1863,330 @@ async fn handle_duplicate_sheet(
         .sheets
         .by_name(&new_name)
         .ok_or_else(|| anyhow::anyhow!("duplicated sheet was not readable"))?;
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "duplicated_from": source_name,
         "sheet": sheet_json(sheet_ref, &project_name),
         "child_file": new_child.display().to_string(),
-        "patched_symbol_instances": patched
-    })))
+        "patched_symbol_instances": patched,
+        "instance_path": hierarchy_path,
+    });
+    if renumber.is_some() {
+        response["renumbered_count"] = json!(plan.renumbered.len());
+        response["renumbered_references"] = json!(plan
+            .renumbered
+            .iter()
+            .map(|(from, to)| json!({ "from": from, "to": to }))
+            .collect::<Vec<_>>());
+    }
+    if !substitutions.is_empty() {
+        response["substituted_label_count"] = json!(substituted.len());
+        response["label_substitutions"] = json!(substituted);
+    }
+    Ok(CallToolResult::json(&response))
+}
+
+/// `renumber: {from, to}`: both runs of digits.
+fn renumber_arg(args: &Value) -> Result<Option<(String, String)>, CallToolResult> {
+    let Some(renumber) = args.get("renumber").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let digits = |name: &str| -> Result<String, CallToolResult> {
+        match renumber.get(name).and_then(Value::as_str) {
+            Some(text) if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) => {
+                Ok(text.to_owned())
+            }
+            _ => Err(invalid_arg(
+                &format!("renumber.{name}"),
+                "must be a run of digits, e.g. '104'",
+            )),
+        }
+    };
+    Ok(Some((digits("from")?, digits("to")?)))
+}
+
+/// `label_substitutions: [{from, to}]`, in order.
+fn label_substitutions_arg(args: &Value) -> Result<Vec<(String, String)>, CallToolResult> {
+    let Some(list) = args
+        .get("label_substitutions")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = list.as_array() else {
+        return Err(invalid_arg(
+            "label_substitutions",
+            "must be an array of {from, to}",
+        ));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let from = item
+                .get("from")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let to = item.get("to").and_then(Value::as_str);
+            match (from, to) {
+                (Some(from), Some(to)) => Ok((from.to_owned(), to.to_owned())),
+                _ => Err(invalid_arg(
+                    &format!("label_substitutions[{index}]"),
+                    "needs a non-empty 'from' and a 'to'",
+                )),
+            }
+        })
+        .collect()
+}
+
+/// One symbol of a sheet's copy: its UUID, unit and the reference it has on
+/// the source sheet.
+struct CopiedSymbol {
+    uuid: String,
+    unit: u32,
+    reference: String,
+}
+
+/// The copy's symbols with the references they have on the source sheet:
+/// the entry for `source_path` in this project, else the only entry, else
+/// the `Reference` property.
+fn copied_symbol_references(
+    content: &str,
+    project_name: &str,
+    source_path: &str,
+) -> anyhow::Result<Vec<CopiedSymbol>> {
+    let tree = parse_sexp(content)?;
+    let mut copied = Vec::new();
+    for node in tree.children().unwrap_or(&[]) {
+        if node.head() != Some("symbol") || node.find("lib_id").is_none() {
+            continue;
+        }
+        let Some(uuid) = node.find_str("uuid") else {
+            anyhow::bail!("a placed symbol in the copy has no UUID");
+        };
+        let unit = node
+            .find("unit")
+            .and_then(|unit| unit.get(1))
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .and_then(|unit| unit.parse::<u32>().ok())
+            .unwrap_or(1);
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+        if let Some(instances) = node.find("instances") {
+            for project in instances.find_all("project") {
+                let name = project
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .unwrap_or("");
+                for path in project.find_all("path") {
+                    let (Some(at), Some(reference)) = (
+                        path.get(1).and_then(konnect_sexp::SexpNode::as_str),
+                        path.find_str("reference"),
+                    ) else {
+                        continue;
+                    };
+                    entries.push((name.to_owned(), at.to_owned(), reference.to_owned()));
+                }
+            }
+        }
+        let property = node
+            .find_all("property")
+            .into_iter()
+            .find(|property| {
+                property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference")
+            })
+            .and_then(|property| property.get(2))
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .map(str::to_owned);
+        let reference = entries
+            .iter()
+            .find(|(project, path, _)| project == project_name && path == source_path)
+            .map(|(_, _, reference)| reference.clone())
+            .or_else(|| match entries.as_slice() {
+                [(_, _, only)] => Some(only.clone()),
+                _ => None,
+            })
+            .or(property)
+            .unwrap_or_default();
+        copied.push(CopiedSymbol {
+            uuid: uuid.to_owned(),
+            unit,
+            reference,
+        });
+    }
+    Ok(copied)
+}
+
+/// `reference` moved from block `from` to block `to`: `U10401` from `104` to
+/// `105` is `U10501`. `None` when its number does not start with `from`.
+fn renumber_reference(reference: &str, from: &str, to: &str) -> Option<String> {
+    let digits_at = reference.find(|c: char| c.is_ascii_digit())?;
+    let (letters, rest) = reference.split_at(digits_at);
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (digits, tail) = rest.split_at(digits_end);
+    let kept = digits.strip_prefix(from)?;
+    Some(format!("{letters}{to}{kept}{tail}"))
+}
+
+/// What the copy's symbols are written with.
+struct CopiedReferences {
+    /// Symbol UUID → (reference, unit).
+    assignments: HashMap<String, (String, u32)>,
+    /// Every reference renumbered, once, from → to.
+    renumbered: Vec<(String, String)>,
+}
+
+/// Assign the copy's references, renumbered into the new block when asked.
+/// A reference outside the block, or a new one the design already uses, is
+/// refused before anything is written: `Ok(Err(refusal))`.
+fn plan_copied_references(
+    sch_path: &Path,
+    copied: &[CopiedSymbol],
+    renumber: Option<&(String, String)>,
+) -> anyhow::Result<Result<CopiedReferences, CallToolResult>> {
+    let mut assignments = HashMap::new();
+    let mut renumbered: Vec<(String, String)> = Vec::new();
+    let mut outside: BTreeSet<String> = BTreeSet::new();
+    for symbol in copied {
+        let reference = match renumber {
+            Some((from, to)) if !symbol.reference.starts_with('#') => {
+                match renumber_reference(&symbol.reference, from, to) {
+                    Some(new) => {
+                        if !renumbered.iter().any(|(old, _)| *old == symbol.reference) {
+                            renumbered.push((symbol.reference.clone(), new.clone()));
+                        }
+                        new
+                    }
+                    None => {
+                        outside.insert(symbol.reference.clone());
+                        symbol.reference.clone()
+                    }
+                }
+            }
+            _ => symbol.reference.clone(),
+        };
+        assignments.insert(symbol.uuid.clone(), (reference, symbol.unit));
+    }
+    renumbered.sort_by(|a, b| crate::tools::design_nets::natural_cmp(&a.0, &b.0));
+    let Some((from, _)) = renumber else {
+        return Ok(Ok(CopiedReferences {
+            assignments,
+            renumbered,
+        }));
+    };
+    if !outside.is_empty() {
+        return Ok(Err(invalid_arg(
+            "renumber.from",
+            &format!(
+                "these references of the source sheet are not in block {from}, so they would \
+                 keep their names in the copy: {}",
+                outside.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )));
+    }
+    // Every reference the design already gives a placed symbol, from its
+    // root: the copy's new ones must be none of them.
+    let root = crate::tools::resolve_schematic_ownership(sch_path)
+        .ok()
+        .flatten()
+        .map(|ownership| ownership.root_schematic)
+        .unwrap_or_else(|| sch_path.to_path_buf());
+    let hierarchy = crate::tools::design_nets::Hierarchy::load(&root)?;
+    let used: HashMap<String, String> = hierarchy.placed_references().into_iter().collect();
+    let collisions: Vec<String> = renumbered
+        .iter()
+        .filter_map(|(_, new)| {
+            used.get(new)
+                .map(|sheet| format!("{new} (already on {sheet})"))
+        })
+        .collect();
+    if !collisions.is_empty() {
+        let reason = format!(
+            "the design already uses {} of the copy's new references: {}",
+            collisions.len(),
+            collisions.join(", ")
+        );
+        return Ok(Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "renumber.to".to_owned(),
+                reason: reason.clone(),
+            },
+            format!("Nothing was written: {reason}"),
+        )));
+    }
+    Ok(Ok(CopiedReferences {
+        assignments,
+        renumbered,
+    }))
+}
+
+/// The copy with `substitutions` applied, in order, to the text of every
+/// label, local, global and hierarchical, and each label changed: kind, UUID,
+/// position, text before and after. Only the text token changes.
+fn substitute_label_texts(
+    content: &str,
+    substitutions: &[(String, String)],
+) -> anyhow::Result<(String, Vec<Value>)> {
+    use konnect_sexp::writer::{apply_edits, find_direct_child_blocks, SexpEdit};
+    if substitutions.is_empty() {
+        return Ok((content.to_owned(), Vec::new()));
+    }
+    let mut edits = Vec::new();
+    let mut changed = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let block = &content[start..end];
+        let node = parse_sexp(block)?;
+        let Some(kind @ ("label" | "global_label" | "hierarchical_label")) = node.head() else {
+            continue;
+        };
+        let Some(text) = node.get(1).and_then(konnect_sexp::SexpNode::as_str) else {
+            continue;
+        };
+        let mut new_text = text.to_owned();
+        for (from, to) in substitutions {
+            new_text = new_text.replace(from.as_str(), to);
+        }
+        if new_text == text {
+            continue;
+        }
+        // The text is the block's first quoted string.
+        let open = block
+            .find('"')
+            .ok_or_else(|| anyhow::anyhow!("a {kind} has no quoted text"))?;
+        let mut close = None;
+        let mut escaped = false;
+        for (offset, character) in block[open + 1..].char_indices() {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => {
+                    close = Some(open + 1 + offset);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let close = close.ok_or_else(|| anyhow::anyhow!("a {kind}'s text is not closed"))?;
+        edits.push(SexpEdit::replace(
+            start + open + 1,
+            start + close,
+            new_text.replace('\\', "\\\\").replace('"', "\\\""),
+        ));
+        let at = konnect_sexp::schematic::parse_at(&node);
+        changed.push(json!({
+            "kind": kind,
+            "uuid": node.find_str("uuid"),
+            "x": at.map(|(x, _, _)| x),
+            "y": at.map(|(_, y, _)| y),
+            "from": text,
+            "to": new_text,
+        }));
+    }
+    let updated = apply_edits(content.to_owned(), edits);
+    parse_sexp(&updated).map_err(|error| {
+        anyhow::anyhow!("the copy no longer parses after its labels were renamed: {error}")
+    })?;
+    Ok((updated, changed))
 }
 
 async fn handle_get_sheet_hierarchy(
@@ -2271,6 +2782,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
             )))
         }
     };
+    let old_end = (pin.at.x, pin.at.y);
 
     // `requested` is what the caller asked to set, `changed` what actually
     // differs — the same split `edit_sheet` makes, and for the same reason: a
@@ -2314,6 +2826,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     // `new_name` may have just renamed it, so the read-back below has to look
     // for the name the pin carries now.
     let saved_name = pin.name.clone();
+    let new_end = (pin.at.x, pin.at.y);
 
     if requested.is_empty() {
         return Ok(CallToolResult::error(
@@ -2323,12 +2836,30 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
 
     // Nothing differs, so nothing is written: a commit here would reserialise
     // the sheet (#210) for a request that asked for the state already on disk.
+    let mut junctions = SheetJunctions {
+        pruned: Vec::new(),
+        added: 0,
+    };
     if !changed.is_empty() {
-        if let Some(error) =
-            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet_pin")?
-        {
+        // A pin that moved is judged at both ends: its old one may have lost
+        // the exit that justified a dot, and its new one may need one.
+        let points = if old_end == new_end {
+            Vec::new()
+        } else {
+            vec![old_end, new_end]
+        };
+        let (refused, judged) = commit_edited_sheet_item_with_junctions(
+            &sch_path,
+            &before,
+            &sch,
+            &sheet_uuid,
+            "edit_sheet_pin",
+            &points,
+        )?;
+        if let Some(error) = refused {
             return Ok(error);
         }
+        junctions = judged;
     }
 
     // Reported off the saved pin rather than the in-memory one, for the same
@@ -2348,7 +2879,10 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         "changed": !changed.is_empty(),
         "changed_fields": changed,
         "requested_fields": requested,
-        "pin": summary
+        "pin": summary,
+        "junctions_added_count": junctions.added,
+        "junctions_pruned_count": junctions.pruned.len(),
+        "junctions_pruned_uuids": junctions.pruned,
     })))
 }
 
@@ -2378,6 +2912,7 @@ async fn handle_delete_sheet_pin(
         }
     };
     let sheet_uuid = sheet.uuid.clone();
+    let end = sheet.pin_by_name(&pin_name).map(|pin| (pin.at.x, pin.at.y));
 
     if !sheet.remove_pin(&pin_name) {
         return Ok(CallToolResult::error(format!(
@@ -2385,15 +2920,26 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    if let Some(error) =
-        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "delete_sheet_pin")?
-    {
+    // The pin was an exit at its end; a dot there may now be unjustified.
+    let points: Vec<(f64, f64)> = end.into_iter().collect();
+    let (refused, junctions) = commit_edited_sheet_item_with_junctions(
+        &sch_path,
+        &before,
+        &sch,
+        &sheet_uuid,
+        "delete_sheet_pin",
+        &points,
+    )?;
+    if let Some(error) = refused {
         return Ok(error);
     }
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,
-        "sheet": sheet_name
+        "sheet": sheet_name,
+        "junctions_added_count": junctions.added,
+        "junctions_pruned_count": junctions.pruned.len(),
+        "junctions_pruned_uuids": junctions.pruned,
     })))
 }
 
@@ -5209,5 +5755,431 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_sheet_round3_tests {
+    //! R3-4: a duplicated sheet's symbols carry the new sheet's path alone,
+    //! references move into a new block on request (refused on any clash),
+    //! and label texts can be substituted, each change listed.
+    use super::*;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// A placed symbol with one instance entry.
+    fn symbol(uuid: &str, lib_id: &str, unit: u32, reference: &str, path: &str) -> String {
+        format!(
+            "\t(symbol\n\t\t(lib_id \"{lib_id}\")\n\t\t(at 50 50 0)\n\t\t(unit {unit})\n\t\t(uuid \"{uuid}\")\n\
+             \t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at 50 45 0)\n\t\t\t(effects (font (size 1.27 1.27)))\n\t\t)\n\
+             \t\t(instances\n\t\t\t(project \"demo\"\n\t\t\t\t(path \"{path}\"\n\t\t\t\t\t(reference \"{reference}\")\n\
+             \t\t\t\t\t(unit {unit})\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n"
+        )
+    }
+
+    fn sheet_file(uuid: &str, body: &str) -> String {
+        format!(
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"{uuid}\")\n\
+             \t(paper \"A4\")\n\t(lib_symbols)\n{body}\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n"
+        )
+    }
+
+    /// A root with two sheets: "Core A" (block 104: R10401, both units of
+    /// U10401, #PWR01, and three labels) and "Core B" holding R10501.
+    struct Design {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        root_uuid: String,
+        core_a_path: String,
+    }
+
+    async fn design(extra_a: impl Fn(&str) -> String) -> Design {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        create_blank_schematic(&root).unwrap();
+        for (name, file, x) in [
+            ("Core A", "core_a.kicad_sch", 10.0),
+            ("Core B", "core_b.kicad_sch", 80.0),
+        ] {
+            let result = handle_add_hierarchical_sheet(
+                &json!({ "schematic": root.display().to_string(), "sheet_file": file,
+                         "sheet_name": name, "x": x, "y": 10.0, "project_name": "demo" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+        }
+        let parent = cse::Schematic::load(&root).unwrap();
+        let root_uuid = parent.uuid.clone().unwrap();
+        let path_of =
+            |name: &str| format!("/{root_uuid}/{}", parent.sheets.by_name(name).unwrap().uuid);
+        let (a, b) = (path_of("Core A"), path_of("Core B"));
+        let labels = "\t(label \"PT_A_LOCAL\"\n\t\t(at 10 10 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left bottom))\n\t\t(uuid \"lab-1\")\n\t)\n\
+                      \t(global_label \"PT_A_CS\"\n\t\t(shape input)\n\t\t(at 20 10 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left))\n\t\t(uuid \"lab-2\")\n\t)\n\
+                      \t(global_label \"RAW_EVM_A_OA1\"\n\t\t(shape output)\n\t\t(at 30 10 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left))\n\t\t(uuid \"lab-3\")\n\t)\n\
+                      \t(label \"VCC1P5\"\n\t\t(at 40 10 0)\n\t\t(effects (font (size 1.27 1.27)) (justify left bottom))\n\t\t(uuid \"lab-4\")\n\t)\n";
+        let extra_a = extra_a(&a);
+        let body_a = format!(
+            "{labels}{}{}{}{}{extra_a}",
+            symbol("sym-r", "Device:R", 1, "R10401", &a),
+            symbol("sym-u1", "Chronos:PT", 1, "U10401", &a),
+            symbol("sym-u2", "Chronos:PT", 2, "U10401", &a),
+            symbol("sym-pwr", "power:GND", 1, "#PWR01", &a),
+        );
+        let core_a = dir.path().join("core_a.kicad_sch");
+        std::fs::write(&core_a, sheet_file("core-a", &body_a)).unwrap();
+        let body_b = symbol("sym-b", "Device:R", 1, "R10501", &b);
+        std::fs::write(
+            dir.path().join("core_b.kicad_sch"),
+            sheet_file("core-b", &body_b),
+        )
+        .unwrap();
+        Design {
+            _dir: dir,
+            root,
+            root_uuid,
+            core_a_path: a,
+        }
+    }
+
+    async fn duplicate(design: &Design, extra: Value) -> CallToolResult {
+        let mut args = json!({
+            "schematic": design.root.display().to_string(),
+            "source_sheet_name": "Core A",
+            "new_sheet_name": "Core C",
+            "new_file": "core_c.kicad_sch",
+            "project_name": "demo"
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        handle_duplicate_sheet(&args, &ctx()).await.unwrap()
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// One placed symbol: lib_id, Reference property, and each instance
+    /// entry as (path, reference, unit).
+    type PlacedInstances = (String, String, Vec<(String, String, u32)>);
+
+    /// Every placed symbol in `content` with its instance entries.
+    fn instances(content: &str) -> Vec<PlacedInstances> {
+        let sch =
+            cse::Schematic::from_source(Path::new("x.kicad_sch"), content.to_owned()).unwrap();
+        let mut out: Vec<_> = sch
+            .symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.lib_id.clone(),
+                    symbol.reference().unwrap_or("").to_owned(),
+                    symbol
+                        .instances()
+                        .into_iter()
+                        .map(|entry| {
+                            (
+                                entry.path.unwrap_or_default(),
+                                entry.reference.unwrap_or_default(),
+                                entry.unit.unwrap_or(0),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Without new options the copy keeps its references, as before, but
+    /// carries the new sheet's path alone: the source's entry is gone.
+    #[tokio::test]
+    async fn the_copy_carries_only_the_new_sheets_path() {
+        let design = design(|_| String::new()).await;
+        let result = duplicate(&design, json!({})).await;
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        let new_path = response["instance_path"].as_str().unwrap().to_owned();
+        assert!(new_path.starts_with(&format!("/{}/", design.root_uuid)));
+        assert_ne!(new_path, design.core_a_path);
+        assert_eq!(response["patched_symbol_instances"], 4);
+
+        let copy = std::fs::read_to_string(design.root.with_file_name("core_c.kicad_sch")).unwrap();
+        assert!(!copy.contains(&design.core_a_path), "{copy}");
+        for (_, reference, entries) in instances(&copy) {
+            assert_eq!(entries.len(), 1, "{reference}: {entries:?}");
+            assert_eq!(entries[0].0, new_path);
+            assert_eq!(entries[0].1, reference);
+        }
+        assert_eq!(copy.matches("(reference \"U10401\")").count(), 2);
+    }
+
+    /// Renumbering 104 to 106 moves every reference into the new block, both
+    /// units of U10401 together, the Reference property with it; #PWR01 stays.
+    /// Label substitutions rename the copy's labels and list each change.
+    #[tokio::test]
+    async fn references_move_into_the_new_block_and_labels_are_renamed() {
+        let design = design(|_| String::new()).await;
+        let result = duplicate(
+            &design,
+            json!({
+                "renumber": { "from": "104", "to": "106" },
+                "label_substitutions": [
+                    { "from": "PT_A_", "to": "PT_B_" },
+                    { "from": "RAW_EVM_A_", "to": "RAW_EVM_B_" }
+                ]
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(
+            response["renumbered_references"],
+            json!([{ "from": "R10401", "to": "R10601" }, { "from": "U10401", "to": "U10601" }])
+        );
+        let renamed: Vec<(String, String)> = response["label_substitutions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["from"].as_str().unwrap().to_owned(),
+                    entry["to"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            renamed,
+            [
+                ("PT_A_LOCAL".to_owned(), "PT_B_LOCAL".to_owned()),
+                ("PT_A_CS".to_owned(), "PT_B_CS".to_owned()),
+                ("RAW_EVM_A_OA1".to_owned(), "RAW_EVM_B_OA1".to_owned()),
+            ]
+        );
+
+        let copy = std::fs::read_to_string(design.root.with_file_name("core_c.kicad_sch")).unwrap();
+        let mut names: Vec<(String, u32)> = instances(&copy)
+            .into_iter()
+            .map(|(_, property, entries)| {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].1, property, "the property follows the instance");
+                (property, entries[0].2)
+            })
+            .collect();
+        names.sort();
+        let expected = [("#PWR01", 1), ("R10601", 1), ("U10601", 1), ("U10601", 2)];
+        assert_eq!(
+            names,
+            expected
+                .map(|(name, unit)| (name.to_owned(), unit))
+                .to_vec()
+        );
+        assert!(copy.contains("(label \"PT_B_LOCAL\""), "{copy}");
+        assert!(copy.contains("(global_label \"RAW_EVM_B_OA1\""), "{copy}");
+        assert!(copy.contains("(label \"VCC1P5\""), "untouched labels stay");
+        // The source is untouched.
+        let source =
+            std::fs::read_to_string(design.root.with_file_name("core_a.kicad_sch")).unwrap();
+        assert!(source.contains("(reference \"R10401\")") && source.contains("PT_A_CS"));
+    }
+
+    /// A new reference the design already uses refuses the whole duplicate,
+    /// naming the clash, before anything is written.
+    #[tokio::test]
+    async fn a_reference_the_design_already_uses_refuses_the_duplicate() {
+        let design = design(|_| String::new()).await;
+        let root_before = std::fs::read(&design.root).unwrap();
+        let result = duplicate(
+            &design,
+            json!({ "renumber": { "from": "104", "to": "105" } }),
+        )
+        .await;
+        assert!(result.is_error);
+        let response = body(&result);
+        assert_eq!(response["error"]["field"], "renumber.to");
+        let reason = response["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("R10501 (already on /Core B/)"), "{reason}");
+        assert_eq!(std::fs::read(&design.root).unwrap(), root_before);
+        assert!(!design.root.with_file_name("core_c.kicad_sch").exists());
+    }
+
+    /// A reference outside the block would keep its name in the copy, so it
+    /// refuses too.
+    #[tokio::test]
+    async fn a_reference_outside_the_block_refuses_the_duplicate() {
+        let design = design(|path| symbol("sym-x", "Device:R", 1, "R1", path)).await;
+        let result = duplicate(
+            &design,
+            json!({ "renumber": { "from": "104", "to": "106" } }),
+        )
+        .await;
+        assert!(result.is_error);
+        let response = body(&result);
+        assert_eq!(response["error"]["field"], "renumber.from");
+        assert!(response["error"]["reason"].as_str().unwrap().contains("R1"));
+        assert!(!design.root.with_file_name("core_c.kicad_sch").exists());
+    }
+
+    #[test]
+    fn a_reference_moves_by_its_leading_digits() {
+        assert_eq!(
+            renumber_reference("U10401", "104", "105").as_deref(),
+            Some("U10501")
+        );
+        assert_eq!(
+            renumber_reference("C10407", "104", "105").as_deref(),
+            Some("C10507")
+        );
+        assert_eq!(
+            renumber_reference("TP10401A", "104", "105").as_deref(),
+            Some("TP10501A")
+        );
+        assert_eq!(renumber_reference("R1", "104", "105"), None);
+        assert_eq!(renumber_reference("R21040", "104", "105"), None);
+    }
+}
+
+#[cfg(test)]
+mod sheet_junction_tests {
+    //! S5 leftovers: moving a sheet, and moving or deleting one of its pins,
+    //! re-judges the junction dots at the pins' old and new ends by KiCad's
+    //! rule in the same write.
+    use super::*;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// Sheet "Child" at (50, 50), 20 x 20, with pin A on its left edge at
+    /// (50, 60). A wire runs through the pin, so the pin is a third exit
+    /// there and the dot is needed. A second wire crosses (50, 90).
+    fn sheet() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        std::fs::write(dir.path().join("child.kicad_sch"), "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"child-uuid\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n").unwrap();
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"aaaaaaaa-0000-4000-8000-000000000001\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\
+             \t(wire\n\t\t(pts (xy 40 60) (xy 60 60))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000002\")\n\t)\n\
+             \t(wire\n\t\t(pts (xy 40 90) (xy 60 90))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000003\")\n\t)\n\
+             \t(junction\n\t\t(at 50 60)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000004\")\n\t)\n\
+             \t(sheet\n\t\t(at 50 50)\n\t\t(size 20 20)\n\t\t(stroke (width 0.1524) (type solid))\n\t\t(fill (color 0 0 0 0.0000))\n\
+             \t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000005\")\n\
+             \t\t(property \"Sheetname\" \"Child\" (at 50 49.2 0) (effects (font (size 1.27 1.27)) (justify left bottom)))\n\
+             \t\t(property \"Sheetfile\" \"child.kicad_sch\" (at 50 70.6 0) (effects (font (size 1.27 1.27)) (justify left top)))\n\
+             \t\t(pin \"A\" input (at 50 60 180) (uuid \"aaaaaaaa-0000-4000-8000-000000000006\") (effects (font (size 1.27 1.27)) (justify left)))\n\
+             \t\t(instances (project \"root\" (path \"/aaaaaaaa-0000-4000-8000-000000000001\" (page \"2\"))))\n\t)\n\
+             \t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn dots(path: &Path) -> Vec<(f64, f64)> {
+        let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut dots = konnect_sexp::schematic::extract_junctions(&tree);
+        dots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        dots
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Without its pin the point is a wire running through: two exits.
+    #[tokio::test]
+    async fn deleting_a_sheet_pin_prunes_the_dot_it_justified() {
+        let (_dir, path) = sheet();
+        let result = handle_delete_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child", "pin_name": "A" }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["junctions_pruned_count"], 1, "{response}");
+        assert_eq!(
+            response["junctions_pruned_uuids"],
+            json!(["aaaaaaaa-0000-4000-8000-000000000004"])
+        );
+        assert!(dots(&path).is_empty());
+    }
+
+    /// Moving the sheet down 30 takes pin A off the first wire, whose dot
+    /// goes, and onto the second wire's span, which then needs one.
+    #[tokio::test]
+    async fn moving_a_sheet_rejudges_the_dots_at_both_ends_of_its_pins() {
+        let (_dir, path) = sheet();
+        let result = handle_move_sheet(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child", "x": 50.0, "y": 80.0 }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["junctions_pruned_count"], 1, "{response}");
+        assert_eq!(response["junctions_added_count"], 1, "{response}");
+        assert_eq!(dots(&path), [(50.0, 90.0)]);
+        let saved = cse::Schematic::load(&path).unwrap();
+        let pin = saved
+            .sheets
+            .by_name("Child")
+            .unwrap()
+            .pin_by_name("A")
+            .unwrap();
+        assert_eq!((pin.at.x, pin.at.y), (50.0, 90.0));
+    }
+
+    /// Moving the pin along its edge leaves the old dot unjustified.
+    #[tokio::test]
+    async fn moving_a_sheet_pin_prunes_the_dot_at_its_old_end() {
+        let (_dir, path) = sheet();
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child",
+                     "pin_name": "A", "x": 50.0, "y": 65.0 }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["junctions_pruned_count"], 1);
+        assert!(dots(&path).is_empty());
+    }
+
+    /// Renaming a pin moves nothing and judges nothing.
+    #[tokio::test]
+    async fn renaming_a_sheet_pin_keeps_its_dot() {
+        let (_dir, path) = sheet();
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child",
+                     "pin_name": "A", "new_name": "B" }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["junctions_pruned_count"], 0);
+        assert_eq!(dots(&path), [(50.0, 60.0)]);
     }
 }

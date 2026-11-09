@@ -1,7 +1,9 @@
 //! `sch_wiring` toolset — wires, net labels, power symbols, junctions, no-connects.
 //!
 //! Key rule: Every wire add operation must auto-detect T-junctions and insert
-//! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
+//! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`; the
+//! stubs `connect_to_net` and `batch_connect_to_net` draw are judged by
+//! KiCad's rule for drawn wiring instead (`junctions_needed_by_new_wires`).
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -25,6 +27,22 @@ use konnect_sexp::{
     },
 };
 use serde_json::json;
+
+/// The `shape` argument of the tools that end a stub in a label.
+pub(crate) const SHAPE_DESC: &str =
+    "Shape of a global or hierarchical label. 'input' (default), 'output', \
+     'bidirectional', 'tri_state' or 'passive'; 'from_pin' takes it from the pin's electrical \
+     type: input and power input give input; output, power output, open collector and open \
+     emitter give output; bidirectional and tri_state their own; anything else passive. \
+     A net label has no shape, so giving one with label_type 'net_label' is refused.";
+
+/// The `label_orientation` argument of the tools that end a stub in a label.
+pub(crate) const LABEL_ORIENTATION_DESC: &str =
+    "'horizontal' (default) keeps the label text horizontal, reading away from the body on a \
+     left or right pin, as before. 'along_stub' turns it to run along the stub, away from the \
+     pin: 90 on a stub going up, 270 going down, as KiCad shows a label rotated on a vertical \
+     wire, so labels on neighbouring top or bottom pins 2.54 mm apart do not overlap. On a \
+     left or right stub the two are the same.";
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -106,9 +124,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "split_wire_at_point",
-            "Split a wire at a given point, creating two wire segments and a junction. \
-             Note: a pin landing mid-wire only needs a junction dot to connect \
-             (see add_junction) — splitting the wire is not required.",
+            "Split a wire at a given point into two wire segments. A junction dot goes \
+             at the split only where KiCad's junction rule calls for one: three or more \
+             exits, as when another wire ends there or a pin or sheet pin sits on it; two \
+             halves meeting are a straight join and get none. Note: a pin landing \
+             mid-wire only needs a junction dot to connect (see add_junction) — \
+             splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -190,7 +211,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_rotate_labels",
-            "Rotate multiple labels by net name in a single file read/write cycle.",
+            "Rotate multiple labels, each named by net and position as list_schematic_labels \
+             reports them. Each label is rewritten in turn; rotated counts the labels \
+             rotated, and a label not found is listed in errors and left as it was.",
             json!({
                 "type": "object",
                 "properties": {
@@ -338,7 +361,10 @@ pub fn tools() -> Vec<ToolDef> {
              Name the pin with reference + pin_number, or give its coordinates directly. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
-             which are one net across all sheets and instances.",
+             which are one net across all sheets and instances. label_orientation \
+             'along_stub' turns the label along a vertical stub; shape sets a global or \
+             hierarchical label's shape, or 'from_pin' takes it from the pin. Junction dots \
+             follow KiCad's rule: one goes where the stub makes three or more exits meet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -361,8 +387,20 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Length of the wire stub in mm" },
                     "label_type": {
                         "type": "string",
-                        "enum": ["net_label", "global_label"],
+                        "enum": ["net_label", "global_label", "hierarchical_label"],
                         "default": "net_label"
+                    },
+                    "shape": {
+                        "type": "string",
+                        "enum": ["input", "output", "bidirectional", "tri_state", "passive", "from_pin"],
+                        "default": "input",
+                        "description": SHAPE_DESC
+                    },
+                    "label_orientation": {
+                        "type": "string",
+                        "enum": ["horizontal", "along_stub"],
+                        "default": "horizontal",
+                        "description": LABEL_ORIENTATION_DESC
                     }
                 },
                 "required": ["schematic", "net"]
@@ -931,7 +969,7 @@ pub(crate) fn plan_no_connect_carry(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, true)
+    plan_no_connect_carry_with(before, after, true, None)
 }
 
 /// Follow a no-connect through a symbol replacement by the identity that the
@@ -945,13 +983,37 @@ pub(crate) fn plan_no_connect_carry_for_replacement(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, false)
+    plan_no_connect_carry_with(before, after, false, None)
+}
+
+/// A no-connect flag a replacement drops: the pin it protected is not in the
+/// new symbol.
+#[derive(Debug, Clone)]
+pub(crate) struct DroppedNoConnect {
+    pub(crate) uuid: String,
+    pub(crate) at: (f64, f64),
+    /// The pin it protected, as `reference unit pin`.
+    pub(crate) pin: String,
+}
+
+/// [`plan_no_connect_carry_for_replacement`], except that a flag on a pin the
+/// new symbol lacks (its number is gone) is dropped instead of refusing the
+/// replacement. A flag that still protects another pin follows that one; a
+/// duplicated pin still refuses.
+pub(crate) fn plan_no_connect_carry_for_replacement_dropping(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<(Vec<NoConnectCarry>, Vec<DroppedNoConnect>), NoConnectCarryError> {
+    let mut dropped = Vec::new();
+    let carries = plan_no_connect_carry_with(before, after, false, Some(&mut dropped))?;
+    Ok((carries, dropped))
 }
 
 fn plan_no_connect_carry_with(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
     require_same_local_geometry: bool,
+    mut dropped: Option<&mut Vec<DroppedNoConnect>>,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
     const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
     let coincident = |a: (f64, f64), b: (f64, f64)| {
@@ -981,9 +1043,11 @@ fn plan_no_connect_carry_with(
     let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
 
     let mut carries: Vec<NoConnectCarry> = Vec::new();
+    let mut gone: Vec<&str> = Vec::new();
     for (uuid, from) in &markers {
         let owners = before_pins.iter().filter(|p| coincident(p.at, *from));
         let mut arrivals: Vec<(&IdentifiedPin, (f64, f64))> = Vec::new();
+        let mut vanished: Vec<String> = Vec::new();
         for owner in owners {
             let landed: Vec<&IdentifiedPin> = after_pins
                 .iter()
@@ -995,6 +1059,12 @@ fn plan_no_connect_carry_with(
                             || p.identity.local_key == owner.identity.local_key)
                 })
                 .collect();
+            // Dropping is asked for: a pin the change removed takes its flag
+            // with it, unless the flag still protects another pin.
+            if landed.is_empty() && dropped.is_some() {
+                vanished.push(pin_label(owner));
+                continue;
+            }
             let [arrival] = landed[..] else {
                 return Err(NoConnectCarryError::Unmappable {
                     reason: format!(
@@ -1007,8 +1077,17 @@ fn plan_no_connect_carry_with(
             };
             arrivals.push((owner, arrival.at));
         }
-        // No pin under the marker: already dangling, and not this pass's to fix.
+        // No pin under the marker: already dangling, and not this pass's to
+        // fix — unless the pins it protected are gone, when it goes too.
         let Some(&(_, to)) = arrivals.first() else {
+            if let (Some(dropped), Some(pin)) = (dropped.as_deref_mut(), vanished.first()) {
+                dropped.push(DroppedNoConnect {
+                    uuid: uuid.clone(),
+                    at: *from,
+                    pin: pin.clone(),
+                });
+                gone.push(uuid.as_str());
+            }
             continue;
         };
         if arrivals.iter().any(|&(_, at)| !coincident(at, to)) {
@@ -1041,6 +1120,7 @@ fn plan_no_connect_carry_with(
     }
     let landings: Vec<Landing<'_>> = markers
         .iter()
+        .filter(|(uuid, _)| !gone.contains(&uuid.as_str()))
         .map(|(uuid, from)| Landing {
             uuid,
             from: *from,
@@ -1406,7 +1486,7 @@ pub(crate) fn reconcile_junctions_at(
         if here.is_empty() {
             if idx.wires_at(px, py) == 1
                 && idx.on_wire_interior(px, py)
-                && idx.has_pin(px, py)
+                && (idx.has_pin(px, py) || idx.has_sheet_pin(px, py))
                 && !idx.has_no_connect(px, py)
             {
                 to_add.push((px, py));
@@ -1655,15 +1735,28 @@ async fn handle_split_wire_at_point(
 
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
-    let junc = format_junction(px, py);
-    let insert = format!("{w1}{w2}{junc}");
-    let new_content = insert_before_close(&content, &insert);
+    let halves = insert_before_close(&content, &format!("{w1}{w2}"));
+    // KiCad's rule judges the split point: two halves meeting are a straight
+    // join and need no dot; a third exit there — another wire ending on it,
+    // a pin, a sheet pin — does. A dot already there stays.
+    let needs_dot = junctions_needed_by_new_wires(
+        &halves,
+        &[((w.x1, w.y1), (px, py)), ((px, py), (w.x2, w.y2))],
+    )
+    .iter()
+    .any(|&(x, y)| konnect_sexp::geometry::points_coincident(x, y, px, py, 0.01));
+    let new_content = if needs_dot {
+        insert_before_close(&halves, &format_junction(px, py))
+    } else {
+        halves
+    };
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": px, "y": py },
         "wire_a": { "x1": w.x1, "y1": w.y1, "x2": px, "y2": py },
-        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 }
+        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 },
+        "junction_added": needs_dot
     })))
 }
 
@@ -2481,8 +2574,11 @@ async fn handle_batch_rotate_labels(
         Ok(a) => a.clone(),
         Err(e) => return Ok(e),
     };
+    // `rotated` counts what was rotated, never what was asked for: a label
+    // that is not where the caller says is reported, not counted.
     let mut rotated = 0usize;
-    for label_arg in &labels {
+    let mut errors = Vec::new();
+    for (index, label_arg) in labels.iter().enumerate() {
         let full_args = json!({
             "schematic": sch_path.display().to_string(),
             "net": label_arg["net"],
@@ -2490,10 +2586,28 @@ async fn handle_batch_rotate_labels(
             "y": label_arg["y"],
             "rotation": label_arg["rotation"]
         });
-        handle_rotate_label(&full_args, ctx).await?;
-        rotated += 1;
+        let result = handle_rotate_label(&full_args, ctx).await?;
+        if result.is_error {
+            let message = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                _ => "not rotated".to_owned(),
+            };
+            errors.push(json!({
+                "index": index,
+                "net": label_arg["net"],
+                "x": label_arg["x"],
+                "y": label_arg["y"],
+                "message": message,
+            }));
+        } else {
+            rotated += 1;
+        }
     }
-    Ok(CallToolResult::json(&json!({ "rotated": rotated })))
+    Ok(CallToolResult::json(&json!({
+        "rotated": rotated,
+        "failed_count": errors.len(),
+        "errors": errors,
+    })))
 }
 
 /// The lowest `#PWR` number no symbol on the sheet is using.
@@ -2899,52 +3013,65 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
-    let label_type = opt_str(args, "label_type").unwrap_or("net_label");
+    let label = match StubLabel::from_args(args) {
+        Ok(label) => label,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let (_, tree) = read_schematic(&sch_path)?;
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
-    let (pin_x, pin_y, outward) = match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
-        (Some(reference), Some(pin_number)) => {
-            let instances = extract_symbol_instances(&tree);
-            let lib_syms = tree
-                .find("lib_symbols")
-                .map(|n| n.find_all("symbol"))
-                .unwrap_or_default();
-            match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
-                Ok((pin, t)) => {
-                    let (x, y) = pin_endpoint(&pin, t);
-                    (x, y, Some(pin_outward_direction(&pin, t)))
+    let (pin_x, pin_y, outward, pin_type) =
+        match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
+            (Some(reference), Some(pin_number)) => {
+                let instances = extract_symbol_instances(&tree);
+                let lib_syms = tree
+                    .find("lib_symbols")
+                    .map(|n| n.find_all("symbol"))
+                    .unwrap_or_default();
+                match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
+                    Ok((pin, t)) => {
+                        let (x, y) = pin_endpoint(&pin, t);
+                        (
+                            x,
+                            y,
+                            Some(pin_outward_direction(&pin, t)),
+                            Some(pin.electrical_type.clone()),
+                        )
+                    }
+                    Err(e) => return Ok(CallToolResult::error(e.to_string())),
                 }
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
             }
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Ok(CallToolResult::error(
-                "'reference' and 'pin_number' must be given together",
-            ))
-        }
-        (None, None) => match (require_f64(args, "pin_x"), require_f64(args, "pin_y")) {
-            (Ok(x), Ok(y)) => (x, y, None),
-            // Structured, not free text: a missing coordinate is an
-            // InvalidArgument like any other, and the reason names the way in
-            // that the caller did not take.
-            (x, _) => {
-                let field = if x.is_err() { "pin_x" } else { "pin_y" };
-                return Ok(CallToolResult::error_kind(
-                    crate::mcp::error::ToolErrorKind::InvalidArgument {
-                        field: field.to_string(),
-                        reason: "give either 'reference' + 'pin_number' or 'pin_x' + 'pin_y'"
-                            .into(),
-                    },
-                    format!(
-                        "Missing '{field}': give either 'reference' + 'pin_number' \
-                         or 'pin_x' + 'pin_y'"
-                    ),
-                ));
+            (Some(_), None) | (None, Some(_)) => {
+                return Ok(CallToolResult::error(
+                    "'reference' and 'pin_number' must be given together",
+                ))
             }
-        },
+            (None, None) => match (require_f64(args, "pin_x"), require_f64(args, "pin_y")) {
+                (Ok(x), Ok(y)) => (x, y, None, pin_type_at(&tree, x, y)),
+                // Structured, not free text: a missing coordinate is an
+                // InvalidArgument like any other, and the reason names the way in
+                // that the caller did not take.
+                (x, _) => {
+                    let field = if x.is_err() { "pin_x" } else { "pin_y" };
+                    return Ok(CallToolResult::error_kind(
+                        crate::mcp::error::ToolErrorKind::InvalidArgument {
+                            field: field.to_string(),
+                            reason: "give either 'reference' + 'pin_number' or 'pin_x' + 'pin_y'"
+                                .into(),
+                        },
+                        format!(
+                            "Missing '{field}': give either 'reference' + 'pin_number' \
+                             or 'pin_x' + 'pin_y'"
+                        ),
+                    ));
+                }
+            },
+        };
+    let shape = match label.shape_for(pin_type.as_deref()) {
+        Ok(shape) => shape,
+        Err(refusal) => return Ok(refusal),
     };
 
     // Where the stub goes, and how the label at its end must read: text
@@ -2953,75 +3080,159 @@ async fn handle_connect_to_net(
         Some(d) => crate::tools::stub_direction(direction, Some(d)),
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
+    let rotation = label.orientation.rotation(&dir);
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let pins = crate::tools::all_pin_endpoints(&tree);
-    let (label_x, label_y, label_rot) = add_net_stub(
-        &mut sch,
-        &pins,
-        (pin_x, pin_y),
-        &dir,
-        stub_length,
-        label_type,
-        &net,
-    );
+    let end = dir.end((pin_x, pin_y), stub_length);
+    add_stub_wire(&mut sch, (pin_x, pin_y), end);
+    add_stub_label(&mut sch, label.kind, shape, &net, end, rotation);
+    let junctions = add_junctions_for_new_wires(&mut sch, &[((pin_x, pin_y), end)]);
 
     sch.overwrite()?;
 
+    let mut label_json = json!({ "x": end.0, "y": end.1, "rotation": rotation });
+    if let Some(shape) = shape.filter(|_| label.kind != "net_label") {
+        label_json["shape"] = json!(shape);
+    }
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
-        "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+        "wire": { "x1": pin_x, "y1": pin_y, "x2": end.0, "y2": end.1 },
+        "label": label_json,
+        "label_type": label.kind,
+        "label_orientation": label.orientation.name(),
+        "junctions_added": junctions
+            .iter()
+            .map(|(x, y)| json!({ "x": x, "y": y }))
+            .collect::<Vec<_>>(),
     })))
 }
 
-/// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
-/// with the junctions it needs, and a net or global label at its end. Returns
-/// the label's position and rotation.
-pub(crate) fn add_net_stub(
-    sch: &mut cse::Schematic,
-    pins: &[(f64, f64)],
-    pin: (f64, f64),
-    dir: &crate::tools::StubDirection,
-    stub_length: f64,
-    label_type: &str,
-    net: &str,
-) -> (f64, f64, f64) {
-    let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, pins, pin, end);
-    add_stub_label(sch, label_type, net, end, dir.label_rotation);
-    (end.0, end.1, dir.label_rotation)
+/// The electrical type of the pin whose connection point is `(x, y)`, when
+/// the pins there agree on one.
+fn pin_type_at(tree: &konnect_sexp::SexpNode, x: f64, y: f64) -> Option<String> {
+    let mut found: Option<String> = None;
+    for (pin, t) in crate::tools::placed_pins(tree) {
+        let (px, py) = pin_endpoint(&pin, t);
+        if !konnect_sexp::geometry::points_coincident(px, py, x, y, 0.01) {
+            continue;
+        }
+        match &found {
+            Some(held) if *held != pin.electrical_type => return None,
+            _ => found = Some(pin.electrical_type.clone()),
+        }
+    }
+    found
 }
 
-/// The wire half of [`add_net_stub`]: the wire, plus junction dots where it
-/// makes a T or passes over a pin mid-segment.
-pub(crate) fn add_stub_wire(
-    sch: &mut cse::Schematic,
-    pins: &[(f64, f64)],
-    (x1, y1): (f64, f64),
-    (x2, y2): (f64, f64),
-) {
-    // T-junction detection for the wire stub
-    let mut existing_wires = cse_wires_to_sexp(sch);
-    existing_wires.push(konnect_sexp::schematic::Wire {
-        x1,
-        y1,
-        x2,
-        y2,
-        uuid: None,
-    });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+/// The label a stub ends in: its kind, the shape asked for, and how it turns.
+/// Read from the arguments of `connect_to_net`, or from one item of
+/// `batch_connect_to_net` over the call's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StubLabel {
+    /// `net_label`, `global_label` or `hierarchical_label`.
+    pub(crate) kind: &'static str,
+    /// The shape asked for, `from_pin` included; `None` when none was given.
+    pub(crate) shape: Option<&'static str>,
+    pub(crate) orientation: crate::tools::LabelOrientation,
+}
 
+pub(crate) const LABEL_KINDS: [&str; 3] = ["net_label", "global_label", "hierarchical_label"];
+
+impl StubLabel {
+    fn from_args(args: &serde_json::Value) -> Result<Self, CallToolResult> {
+        let label = Self::read(args, "", None)
+            .map_err(|(field, reason)| crate::tools::invalid_arg(&field, &reason))?;
+        if label.kind == "net_label" && label.shape.is_some() {
+            return Err(crate::tools::invalid_arg(
+                "shape",
+                "a net label has no shape; give label_type 'global_label' or \
+                 'hierarchical_label', or leave shape out",
+            ));
+        }
+        Ok(label)
+    }
+
+    /// Read `label_type`, `shape` and `label_orientation` from `args`, each
+    /// falling back to `inherited`'s when absent. A refusal is `(field,
+    /// reason)`, the field prefixed by `field`, as in `pins[3].`.
+    pub(crate) fn read(
+        args: &serde_json::Value,
+        field: &str,
+        inherited: Option<StubLabel>,
+    ) -> Result<Self, (String, String)> {
+        let word = |name: &str,
+                    allowed: &[&'static str]|
+         -> Result<Option<&'static str>, (String, String)> {
+            match args.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(value)) => allowed
+                    .iter()
+                    .find(|candidate| **candidate == value.as_str())
+                    .copied()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        (
+                            format!("{field}{name}"),
+                            format!("'{value}' is not one of {}", allowed.join(", ")),
+                        )
+                    }),
+                Some(_) => Err((format!("{field}{name}"), "must be a string".to_owned())),
+            }
+        };
+        let mut shapes: Vec<&'static str> = LABEL_SHAPES.to_vec();
+        shapes.push("from_pin");
+        let kind = word("label_type", &LABEL_KINDS)?;
+        let shape = word("shape", &shapes)?;
+        let orientation = word("label_orientation", &crate::tools::LabelOrientation::NAMES)?
+            .and_then(crate::tools::LabelOrientation::parse);
+        Ok(StubLabel {
+            kind: kind
+                .or(inherited.map(|label| label.kind))
+                .unwrap_or("net_label"),
+            shape: shape.or(inherited.and_then(|label| label.shape)),
+            orientation: orientation
+                .or(inherited.map(|label| label.orientation))
+                .unwrap_or(crate::tools::LabelOrientation::Horizontal),
+        })
+    }
+
+    /// The shape the label is written with: `None` for a net label, which has
+    /// none; the pin's own for `from_pin`; `input` when none was asked for,
+    /// as before shapes could be chosen.
+    pub(crate) fn shape_for(
+        &self,
+        pin_type: Option<&str>,
+    ) -> Result<Option<&'static str>, CallToolResult> {
+        if self.kind == "net_label" {
+            return Ok(None);
+        }
+        match self.shape {
+            Some("from_pin") => match pin_type {
+                Some(pin_type) => Ok(Some(crate::tools::label_shape_for_pin(pin_type))),
+                None => Err(crate::tools::invalid_arg(
+                    "shape",
+                    "'from_pin' needs a pin: name it with reference and pin_number, or give \
+                     coordinates where one pin type sits",
+                )),
+            },
+            Some(shape) => Ok(Some(shape)),
+            None => Ok(Some("input")),
+        }
+    }
+}
+
+/// The wire half of a stub: the wire alone. Its junction dots are judged
+/// once every new wire of the call is in, by [`add_junctions_for_new_wires`].
+pub(crate) fn add_stub_wire(sch: &mut cse::Schematic, (x1, y1): (f64, f64), (x2, y2): (f64, f64)) {
     sch.add_wire(x1, y1, x2, y2);
-    add_missing_junctions(sch, &junctions);
-    // Pins the stub passes over mid-segment also need junction dots.
-    add_missing_junctions(sch, &pins_mid_segment(pins, x1, y1, x2, y2));
 }
 
-/// The label half of [`add_net_stub`].
+/// The label half of a stub: a net, global or hierarchical label at its end.
+/// `shape` is a global or hierarchical label's; a net label has none.
 pub(crate) fn add_stub_label(
     sch: &mut cse::Schematic,
     label_type: &str,
+    shape: Option<&str>,
     net: &str,
     (x, y): (f64, f64),
     rotation: f64,
@@ -3030,16 +3241,105 @@ pub(crate) fn add_stub_label(
     // unset, and KiCad then centres the text on the anchor (#43).
     match label_type {
         "global_label" => {
-            sch.add_global_label(net, "input", x, y);
+            sch.add_global_label(net, shape.unwrap_or("input"), x, y);
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.set_rotation(rotation);
+            }
+        }
+        "hierarchical_label" => {
+            sch.add_hierarchical_label(net, shape.unwrap_or("input"), x, y);
+            let idx = sch.hierarchical_labels.len() - 1;
+            if let Some(hl) = sch.hierarchical_labels.get_mut(idx) {
+                hl.set_rotation(rotation);
             }
         }
         _ => {
             sch.add_label(net, x, y).set_rotation(rotation);
         }
     }
+}
+
+/// A wire as its two ends.
+pub(crate) type WireSpan = ((f64, f64), (f64, f64));
+
+/// Add the junction dots `new_wires` need to `sch`, by KiCad's rule, and
+/// return where they went. See [`junctions_needed_by_new_wires`].
+pub(crate) fn add_junctions_for_new_wires(
+    sch: &mut cse::Schematic,
+    new_wires: &[WireSpan],
+) -> Vec<(f64, f64)> {
+    if new_wires.is_empty() {
+        return Vec::new();
+    }
+    let needed = junctions_needed_by_new_wires(&sch.to_source(), new_wires);
+    for &(x, y) in &needed {
+        sch.add_junction(x, y);
+    }
+    needed
+}
+
+/// The junction dots a set of new wires needs, by KiCad's rule for drawn
+/// wiring (`SCH_SCREEN::GetNeededJunctions`): the candidates are each new
+/// wire's two ends and every connection point on the sheet — a wire end, a
+/// symbol pin or a sheet pin — that lies on a new wire's span, and a dot goes
+/// on each where three or more exits meet ([`JunctionSite`]) and none is yet.
+/// Two spans crossing are never a candidate: KiCad joins a crossing only when
+/// asked to. Points touching a bus are left alone, as everywhere else.
+///
+/// [`JunctionSite`]: crate::tools::sch_connectivity::JunctionSite
+pub(crate) fn junctions_needed_by_new_wires(
+    source: &str,
+    new_wires: &[WireSpan],
+) -> Vec<(f64, f64)> {
+    use crate::tools::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
+    use konnect_sexp::geometry::{point_on_segment, points_coincident};
+    let Ok(tree) = parse_sexp(source) else {
+        return Vec::new();
+    };
+    let wires = extract_wires(&tree);
+    let buses = konnect_sexp::schematic::extract_buses(&tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+    let mut connection_points: Vec<(f64, f64)> = wires
+        .iter()
+        .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)])
+        .collect();
+    connection_points.extend(index.placed_pins().iter().map(|pin| pin.at));
+    connection_points.extend(konnect_sexp::schematic::extract_sheet_pins(&tree));
+
+    let mut candidates: Vec<(f64, f64)> = Vec::new();
+    let mut consider = |point: (f64, f64)| {
+        if !candidates
+            .iter()
+            .any(|held| points_coincident(held.0, held.1, point.0, point.1, COINCIDENT_TOLERANCE))
+        {
+            candidates.push(point);
+        }
+    };
+    for &(start, end) in new_wires {
+        consider(start);
+        consider(end);
+        for &point in &connection_points {
+            if point_on_segment(
+                point.0,
+                point.1,
+                start.0,
+                start.1,
+                end.0,
+                end.1,
+                COINCIDENT_TOLERANCE,
+            ) {
+                consider(point);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|&(x, y)| {
+            !index.has_junction(x, y) && index.junction_site(x, y).needed() == Some(true)
+        })
+        .collect()
 }
 
 async fn handle_connect_pins(
@@ -4406,7 +4706,31 @@ mod wire_delete_tests {
 
         let mut juncs = junctions_in(&path);
         juncs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8), (68.58, 50.8)]);
+        // The split point itself is a straight join of the two halves: two
+        // exits, so KiCad's rule draws no dot there.
+        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8)]);
+    }
+
+    /// Where a third wire already ends on the split point, the three exits
+    /// call for a dot, and the split adds the one that was missing.
+    #[tokio::test]
+    async fn split_wire_adds_the_dot_three_exits_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-split-tee.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"w-rail\")\n\t)\n\t(wire\n\t\t(pts (xy 5 0) (xy 5 5))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"w-tap\")\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_split_wire_at_point(
+            &json!({ "schematic": path.display().to_string(), "x": 5.0, "y": 0.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(junctions_in(&path), vec![(5.0, 0.0)]);
     }
 
     #[tokio::test]
@@ -4435,7 +4759,8 @@ mod wire_delete_tests {
         let parsed = konnect_sexp::parse_sexp(&after).unwrap();
         let wires = extract_wires(&parsed);
         assert_eq!(wires.len(), 2);
-        assert!(after.contains("(junction"));
+        // Two halves of one wire meet end to end: no dot.
+        assert!(!after.contains("(junction"));
         assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
     }
 }
@@ -4947,6 +5272,38 @@ mod no_connect_carry_tests {
         };
         assert!(reason.contains(R2_MARKER), "{reason}");
         assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    /// Asked to, a replacement drops the flag on a pin the new symbol lacks
+    /// instead of refusing, and says which pin it protected.
+    #[test]
+    fn dropping_takes_the_flag_of_a_pin_the_new_symbol_lacks() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(number \"1\"", "(number \"3\"", 1);
+        let (carries, dropped) =
+            plan_no_connect_carry_for_replacement_dropping(&tree(&before), &tree(&after))
+                .expect("a pin the new symbol lacks is dropped, not refused");
+        assert!(carries.is_empty(), "{carries:?}");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].uuid, R2_MARKER);
+        assert_eq!(dropped[0].at, (158.75, 156.21));
+        assert!(dropped[0].pin.contains("R2"), "{:?}", dropped[0]);
+    }
+
+    /// Dropping does not make a duplicated pin any less ambiguous.
+    #[test]
+    fn dropping_still_refuses_a_duplicated_protected_pin() {
+        let before = with_only_marker(R2_MARKER);
+        let (start, end) = find_block_starts(&before, "pin")
+            .into_iter()
+            .find_map(|start| find_balanced_block(&before, start))
+            .expect("the fixture embeds a pin block");
+        let duplicate = before[start..end].to_owned();
+        let mut after = before.clone();
+        after.insert_str(end, &duplicate);
+        assert!(
+            plan_no_connect_carry_for_replacement_dropping(&tree(&before), &tree(&after)).is_err()
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
-                    "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "datasheet": { "type": "string", "description": "New datasheet URL (optional). Added, hidden as KiCad places it, to a placed unit that lacks the built-in Datasheet field." },
                     "in_bom": { "type": "boolean", "description": "Include this component in the BOM, consistently on every placed unit. Independent of on_board and DNP; no pins, wires, identity or other flags change." },
                     "fields": {
                         "type": "object",
@@ -342,14 +342,16 @@ pub fn tools() -> Vec<ToolDef> {
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
-             writing.",
+             writing, unless drop_orphaned_no_connects deletes the flags on removed pins.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
                     "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
-                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." }
+                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." },
+                    "drop_orphaned_no_connects": { "type": "boolean", "default": false,
+                        "description": "Delete, in the same write, each no-connect flag whose pin the new symbol lacks instead of refusing; each is listed in no_connects_dropped. A flag that still protects another pin follows that pin; a duplicated pin still refuses." }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -362,7 +364,11 @@ pub fn tools() -> Vec<ToolDef> {
              symbol, so editing one in its library leaves the sheet drawing the old \
              shape — this refreshes it. A symbol whose pins moved or disappeared in \
              the library is refused (reported in pins_moved) unless allow_pin_moves \
-             is set, because wires and labels attach at pin coordinates.",
+             is set, because wires and labels attach at pin coordinates. With \
+             allow_pin_moves, every pin end that moved on a placed instance is listed, \
+             with whatever it left behind (left_dangling); drag_connections carries \
+             those wires, labels and no-connect flags to the new pin ends, keeping wires \
+             orthogonal, and judges the junction dots it touched by KiCad's rule.",
             json!({
                 "type": "object",
                 "properties": {
@@ -375,7 +381,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "default": false,
                         "description": "Report what would change without writing." },
                     "allow_pin_moves": { "type": "boolean", "default": false,
-                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." }
+                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them unless drag_connections is set; what each moved pin leaves behind is listed in left_dangling." },
+                    "drag_connections": { "type": "boolean", "default": false,
+                        "description": "With allow_pin_moves: carry what sits on each moved pin's old end to its new one. A label or no-connect flag on the end moves with it; a wire whose far end holds only labels moves whole with them when its new place is clear; a wire lying along the move has its end slid; any other gets an orthogonal jog, as does an old end something else still holds. A pin the library removed cannot be followed and stays in left_dangling." }
                 },
                 "required": ["schematic"]
             }),
@@ -2402,34 +2410,43 @@ fn property_insert_edit(
         })
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
-    // Match the block's own indentation rather than assuming: eeschema saves
-    // with tabs, this crate's writer uses two spaces.
-    let indent = block
-        .find("(property ")
-        .map(|p| {
-            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
-            block[line_start..p].to_string()
-        })
-        .unwrap_or_else(|| "\t\t".to_string());
+    // Match the block's own layout rather than assuming one: eeschema saves a
+    // property per line indented with tabs, this crate's writer uses two
+    // spaces, and a compactly written sheet keeps a whole symbol on one line.
+    // There the text before the first property is the symbol's own head, not
+    // an indent, so the new property goes inline as well.
+    let lead = block.find("(property ").map(|p| {
+        let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
+        &block[line_start..p]
+    });
+    let inline = lead.is_some_and(|lead| !lead.chars().all(char::is_whitespace));
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
-    let newline = if content.contains("\r\n") {
-        "\r\n"
+    let prop = if inline {
+        format!(
+            " (property \"{escaped_name}\" \"{escaped_value}\" (at {x} {y} 0) (hide yes) \
+             (effects (font (size 1.27 1.27))))"
+        )
     } else {
-        "\n"
+        let indent = lead.unwrap_or("\t\t");
+        let newline = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        format!(
+            "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+             {indent}\t(at {x} {y} 0){newline}\
+             {indent}\t(hide yes){newline}\
+             {indent}\t(effects{newline}\
+             {indent}\t\t(font{newline}\
+             {indent}\t\t\t(size 1.27 1.27){newline}\
+             {indent}\t\t){newline}\
+             {indent}\t){newline}\
+             {indent})"
+        )
     };
-    let prop = format!(
-        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
-         {indent}\t(at {x} {y} 0){newline}\
-         {indent}\t(hide yes){newline}\
-         {indent}\t(effects{newline}\
-         {indent}\t\t(font{newline}\
-         {indent}\t\t\t(size 1.27 1.27){newline}\
-         {indent}\t\t){newline}\
-         {indent}\t){newline}\
-         {indent})"
-    );
 
     // Insert before the block's closing paren so the property stays inside it.
     let close = block
@@ -2924,7 +2941,19 @@ async fn handle_edit_schematic_component(
         apply!("Footprint", fp);
     }
     if let Some(ds) = opt_str(args, "datasheet") {
-        apply!("Datasheet", ds);
+        // A built-in field, but instances copied from older sheets may lack
+        // it, so a missing one is added — hidden, as KiCad places it.
+        match set_property_value(&content, edit_reference, "Datasheet", ds, true) {
+            Ok((updated, counts)) => {
+                content = updated;
+                expected_fields.insert("Datasheet".to_owned(), ds.to_owned());
+                changed.push(format!(
+                    "Datasheet → {ds} ({} updated, {} added)",
+                    counts.updated, counts.added
+                ));
+            }
+            Err(why) => errors.push(format!("Datasheet: {why}")),
+        }
     }
 
     if let Some(include) = requested_bom {
@@ -3976,6 +4005,13 @@ async fn handle_update_symbols_from_library(
     });
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let allow_pin_moves = args["allow_pin_moves"].as_bool().unwrap_or(false);
+    let drag = args["drag_connections"].as_bool().unwrap_or(false);
+    if drag && !allow_pin_moves {
+        return Ok(crate::tools::invalid_arg(
+            "drag_connections",
+            "drags what moved pins leave behind, so it needs allow_pin_moves too",
+        ));
+    }
 
     let (mut content, tree) = read_schematic(&sch_path)?;
     let expected = content.clone();
@@ -4033,6 +4069,41 @@ async fn handle_update_symbols_from_library(
         }
     }
 
+    // Pin ends the update moved on placed instances, and what each left
+    // behind, dragged along when asked.
+    let mut moved_report = None;
+    if allow_pin_moves && !updated.is_empty() {
+        let after_tree = konnect_sexp::parse_sexp(&content)?;
+        let moved = super::pin_drag::moved_pin_ends(&tree, &after_tree, &updated);
+        if !moved.is_empty() {
+            let ends: Vec<serde_json::Value> = moved
+                .iter()
+                .map(|end| {
+                    json!({
+                        "reference": end.reference,
+                        "unit": end.unit,
+                        "pin": end.number,
+                        "from": { "x": end.from.0, "y": end.from.1 },
+                        "to": end.to.map(|(x, y)| json!({ "x": x, "y": y })),
+                    })
+                })
+                .collect();
+            let mut report = json!({ "pins_moved_on_instances": ends });
+            if drag {
+                let dragged = super::pin_drag::drag_connections(&sch_path, &content, &moved)?;
+                content = dragged.content;
+                report["dragged"] = json!(dragged.dragged);
+                report["left_dangling"] = json!(dragged.left_dangling);
+                report["junctions_added_count"] = json!(dragged.junctions_added);
+                report["junctions_pruned_count"] = json!(dragged.junctions_pruned);
+            } else {
+                report["left_dangling"] =
+                    json!(super::pin_drag::left_dangling(&sch_path, &content, &moved)?);
+            }
+            moved_report = Some(report);
+        }
+    }
+
     if !updated.is_empty() && !dry_run {
         write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     }
@@ -4045,6 +4116,11 @@ async fn handle_update_symbols_from_library(
         "errors": errors,
         "dry_run": dry_run
     });
+    if let Some(serde_json::Value::Object(report)) = moved_report {
+        for (key, value) in report {
+            body[key] = value;
+        }
+    }
     if !pins_moved.is_empty() {
         body["hint"] = json!(
             "Symbols listed in pins_moved were left untouched: the library moved or \
@@ -4355,14 +4431,47 @@ async fn handle_replace_component(
     // one-to-one identity before the junction pass sees the new endpoints;
     // removed, renumbered or duplicated protected pins refuse before writing.
     let after_tree = parse_sexp(&content)?;
-    let carries = match plan_no_connect_carry_for_replacement(&parsed, &after_tree) {
-        Ok(carries) => carries,
+    let drop_orphans = args["drop_orphaned_no_connects"].as_bool().unwrap_or(false);
+    let planned = if drop_orphans {
+        super::sch_wiring::plan_no_connect_carry_for_replacement_dropping(&parsed, &after_tree)
+    } else {
+        plan_no_connect_carry_for_replacement(&parsed, &after_tree)
+            .map(|carries| (carries, Vec::new()))
+    };
+    let (carries, dropped) = match planned {
+        Ok(planned) => planned,
         Err(error) => return Ok(error.into_result(&sch_path)),
     };
     content = match apply_no_connect_carries(content, &carries) {
         Some(content) => content,
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
+    // Flags on pins the new symbol lacks go in the same write when asked.
+    if !dropped.is_empty() {
+        let mut ranges = Vec::new();
+        for start in konnect_sexp::writer::find_block_starts(&content, "no_connect") {
+            let Some((from, to)) =
+                konnect_sexp::writer::find_block_with_leading_whitespace(&content, start)
+            else {
+                continue;
+            };
+            let Some((block_start, block_end)) =
+                konnect_sexp::writer::find_balanced_block(&content, start)
+            else {
+                continue;
+            };
+            let uuid = parse_sexp(&content[block_start..block_end])
+                .ok()
+                .and_then(|node| node.find_str("uuid").map(str::to_owned));
+            if uuid.is_some_and(|uuid| dropped.iter().any(|flag| flag.uuid == uuid)) {
+                ranges.push(SexpEdit::delete(from, to));
+            }
+        }
+        if ranges.len() != dropped.len() {
+            return Ok(no_connect_carry_unwritable(&sch_path));
+        }
+        content = apply_edits(content, ranges);
+    }
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
@@ -4393,6 +4502,28 @@ async fn handle_replace_component(
             ));
         }
     };
+    // A dropped flag must be gone from the written file, not merely planned
+    // away.
+    if !dropped.is_empty() {
+        let written = read_consistent(&sch_path)?;
+        let still_there: Vec<&str> = parse_sexp(&written)
+            .map(|tree| {
+                tree.find_all("no_connect")
+                    .into_iter()
+                    .filter_map(|node| node.find_str("uuid"))
+                    .filter(|uuid| dropped.iter().any(|flag| flag.uuid == *uuid))
+                    .map(|_| "kept")
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !still_there.is_empty() {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                "a no-connect flag planned for removal is still in the written file",
+            ));
+        }
+    }
     let mut result = json!({
         "reference": observed["reference"],
         "old_lib_id": old_lib_id,
@@ -4404,6 +4535,15 @@ async fn handle_replace_component(
         "no_connects_moved_count": moved_markers.len(),
         "no_connects_moved": moved_markers
     });
+    if drop_orphans {
+        result["no_connects_dropped_count"] = json!(dropped.len());
+        result["no_connects_dropped"] = json!(dropped
+            .iter()
+            .map(
+                |flag| json!({ "uuid": flag.uuid, "x": flag.at.0, "y": flag.at.1, "pin": flag.pin })
+            )
+            .collect::<Vec<_>>());
+    }
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
 }
@@ -6044,6 +6184,319 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("(at 0 -5.08 90)"), "{after}");
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// R1 at (101.6, 101.6) on the stub library, pin 1's end at (101.6, 97.79)
+    /// and pin 2's at (101.6, 105.41). Below pin 2 a label stub ends in BOT;
+    /// from pin 1 a wire runs right to a corner another wire holds, up to TOP.
+    /// Then the library moves pin 1 up 1.27 and pin 2 down 5.08, past the far
+    /// end of its stub.
+    async fn sheet_with_moved_pins() -> (
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+        std::path::PathBuf,
+    ) {
+        let (symdir, env) = stub_symbol_dir();
+        let path = symdir.path().join("drag.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.add_wire(101.6, 105.41, 101.6, 107.95);
+        sch.add_label("BOT", 101.6, 107.95).set_rotation(0.0);
+        sch.add_wire(101.6, 97.79, 106.68, 97.79);
+        sch.add_wire(106.68, 97.79, 106.68, 91.44);
+        sch.add_label("TOP", 106.68, 91.44).set_rotation(0.0);
+        sch.overwrite().unwrap();
+
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib)
+            .unwrap()
+            .replace("(at 0 3.81 270)", "(at 0 5.08 270)")
+            .replace("(at 0 -3.81 90)", "(at 0 -8.89 90)");
+        std::fs::write(&lib, edited).unwrap();
+        (symdir, env, path)
+    }
+
+    fn wires_of(path: &std::path::Path) -> Vec<((f64, f64), (f64, f64))> {
+        let sch = cse::Schematic::load(path).unwrap();
+        let mut wires: Vec<_> = sch
+            .wires
+            .iter()
+            .map(|wire| {
+                let r =
+                    |(x, y): (f64, f64)| ((x * 100.0).round() / 100.0, (y * 100.0).round() / 100.0);
+                let (a, b) = (r(wire.start), r(wire.end));
+                if a <= b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect();
+        wires.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wires
+    }
+
+    /// R3-5: without drag_connections the update lists each moved pin end
+    /// and what it left behind there, and moves nothing.
+    #[tokio::test]
+    async fn moved_pins_list_what_they_leave_dangling() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let before_wires = wires_of(&path);
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(
+            body["pins_moved_on_instances"].as_array().unwrap().len(),
+            2,
+            "{body}"
+        );
+        let dangling = body["left_dangling"].as_array().unwrap();
+        assert_eq!(dangling.len(), 2, "{body}");
+        let pin2 = dangling.iter().find(|entry| entry["pin"] == "2").unwrap();
+        assert_eq!(pin2["from"], json!({ "x": 101.6, "y": 105.41 }));
+        assert_eq!(pin2["to"], json!({ "x": 101.6, "y": 110.49 }));
+        assert_eq!(
+            pin2["left_at_old_end"]["wires"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(wires_of(&path), before_wires, "nothing is dragged");
+    }
+
+    /// R3-5: drag_connections moves the label stub below pin 2 whole, and
+    /// joins pin 1's new end to its held wire with an orthogonal jog.
+    #[tokio::test]
+    async fn moved_pins_drag_their_connections_when_asked() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true,
+                     "drag_connections": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["left_dangling"], json!([]), "{body}");
+        let actions = |pin: &str| -> Vec<String> {
+            body["dragged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["pin"] == pin)
+                .unwrap()["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| action["action"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(actions("2"), ["moved_stub"], "{body}");
+        assert_eq!(actions("1"), ["jog"], "{body}");
+
+        assert_eq!(
+            wires_of(&path),
+            [
+                ((101.6, 96.52), (101.6, 97.79)),
+                ((101.6, 97.79), (106.68, 97.79)),
+                ((101.6, 110.49), (101.6, 113.03)),
+                ((106.68, 91.44), (106.68, 97.79)),
+            ]
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        let bot = sch.labels.iter().find(|label| label.text == "BOT").unwrap();
+        assert!((bot.at.x - 101.6).abs() < 1e-6 && (bot.at.y - 113.03).abs() < 1e-6);
+        // Every wire is horizontal or vertical.
+        for ((x1, y1), (x2, y2)) in wires_of(&path) {
+            assert!(x1 == x2 || y1 == y2, "({x1}, {y1}) to ({x2}, {y2})");
+        }
+    }
+
+    #[tokio::test]
+    async fn dragging_needs_allow_pin_moves() {
+        let (_symdir, _env, path) = sheet_with_moved_pins().await;
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "drag_connections": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Item 7: a placed unit without the built-in Datasheet field gets it,
+    /// hidden as KiCad places it, instead of the edit being refused.
+    #[tokio::test]
+    async fn a_missing_datasheet_field_is_added() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("datasheet.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        // Strip the instance's Datasheet, as DB1-derived sheets have none.
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        for symbol in sch.symbols.iter_mut() {
+            symbol.remove_property("Datasheet");
+        }
+        sch.overwrite().unwrap();
+        let stripped = cse::Schematic::load(&path).unwrap();
+        assert!(stripped.symbols.iter().all(|s| s.datasheet().is_none()));
+
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "datasheet": "https://example.com/r.pdf" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let sch = cse::Schematic::load(&path).unwrap();
+        let symbol = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .unwrap();
+        assert_eq!(symbol.datasheet(), Some("https://example.com/r.pdf"));
+        let property = symbol
+            .properties
+            .iter()
+            .find(|property| property.name == "Datasheet")
+            .unwrap();
+        let text = cse::sexp::writer::write(&property.to_sexp());
+        assert!(text.contains("(hide yes)"), "{text}");
+    }
+
+    /// A sheet written compactly keeps a whole symbol on one line. The text
+    /// before its first property is then the symbol's head, not an indent,
+    /// and a property added there must go inline instead of repeating it.
+    #[test]
+    fn a_property_added_to_a_one_line_symbol_stays_on_its_line() {
+        let symbol = concat!(
+            r#"(symbol (lib_id "Device:R") (at 101.6 50.8 0) (unit 1) (uuid "s1") "#,
+            r#"(property "Reference" "R1" (at 101.6 48.26 0) (effects (font (size 1.27 1.27)))) "#,
+            r#"(property "Value" "1k" (at 101.6 53.34 0) (effects (font (size 1.27 1.27)))) "#,
+            r#"(pin "1" (uuid "p1")) (pin "2" (uuid "p2")) "#,
+            r#"(instances (project "p" (path "/root" (reference "R1") (unit 1)))))"#,
+        );
+        let content = format!(
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"root\")\n{symbol}\n)\n"
+        );
+
+        let (updated, counts) = set_property_value(
+            &content,
+            "R1",
+            "Datasheet",
+            "https://example.com/r.pdf",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!((counts.updated, counts.added), (0, 1));
+        assert_eq!(
+            updated.lines().count(),
+            content.lines().count(),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(concat!(
+                r#"(unit 1)))) (property "Datasheet" "https://example.com/r.pdf" "#,
+                r#"(at 101.6 50.8 0) (hide yes) (effects (font (size 1.27 1.27)))))"#,
+            )),
+            "{updated}"
+        );
+        assert_eq!(updated.matches("(symbol ").count(), 1, "{updated}");
+        let tree = parse_sexp(&updated).unwrap();
+        let placed = tree.find_all("symbol");
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].find_all("property").len(), 3);
+    }
+
+    /// Item 7: replacing R1 (pins 1 and 2) with a one-pin symbol refuses
+    /// while a no-connect flag sits on pin 2, unless asked to drop it.
+    #[tokio::test]
+    async fn a_replacement_can_drop_the_flag_of_a_pin_it_removes() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("drop-nc.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        // Pin 2's end is at (101.6, 105.41).
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.add_no_connect(101.6, 105.41);
+        sch.overwrite().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let refused = handle_replace_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "new_lib_id": "Device:WITH_DEFAULTS" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error, "{refused:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let result = handle_replace_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "new_lib_id": "Device:WITH_DEFAULTS", "drop_orphaned_no_connects": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["no_connects_dropped_count"], 1, "{body}");
+        assert_eq!(body["no_connects_dropped"][0]["x"], 101.6, "{body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("(no_connect"), "{after}");
+        assert!(after.contains("Device:WITH_DEFAULTS"), "{after}");
     }
 
     /// #203: annotating the same key twice must update the one property in

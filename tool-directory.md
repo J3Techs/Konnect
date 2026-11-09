@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **281 registered tools** + **7 always-visible meta-tools** = **288 total**
+- **282 registered tools** + **7 always-visible meta-tools** = **289 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -94,7 +94,7 @@ and Windows servers do not.
 |------|-------------|
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator, with the junction dots its pins leave unjustified by KiCad's junction rule. |
-| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component, and move or hide any field's text. |
+| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component, and move or hide any field's text. `datasheet` adds the built-in Datasheet field, hidden, to a unit that lacks it. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
@@ -106,8 +106,8 @@ and Windows servers do not.
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
 | `group_components` | Add or update a group property across every placed unit of multiple components. |
-| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
-| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
+| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. `drop_orphaned_no_connects` deletes, in the same write, the no-connect flags on pins the new symbol lacks instead of refusing. |
+| `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set; then every moved pin end is listed with what it left behind (`left_dangling`), and `drag_connections` carries those wires, labels and no-connect flags to the new ends, keeping wires orthogonal. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
 
@@ -121,12 +121,12 @@ and Windows servers do not.
 | `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. |
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified by KiCad's junction rule (fewer than three exits: a corner, a straight join, a lone wire, a wire end on a pin). |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified by KiCad's junction rule. |
-| `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
+| `split_wire_at_point` | Split a wire at a given point into two segments. A junction dot goes at the split only where KiCad's junction rule calls for one (another wire ending there, a pin or a sheet pin); `junction_added` says which. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
-| `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
+| `batch_rotate_labels` | Rotate multiple labels, each named by net and position as `list_schematic_labels` reports them. `rotated` counts only the labels rotated; one not found is listed in `errors` (`failed_count`) and left as it was. |
 | `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Snaps to the 1.27mm grid like the other placers and reports the placed coordinates. Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
@@ -134,7 +134,7 @@ and Windows servers do not.
 | `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net, global or hierarchical label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. `label_orientation: along_stub` turns the label along a vertical stub (90 up, 270 down); `shape` sets a global or hierarchical label's shape, or `from_pin` takes it from the pin's type. Junction dots follow KiCad's rule. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
@@ -157,7 +157,7 @@ and Windows servers do not.
 |------|-------------|
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
-| `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
+| `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types, and each one's `uuid`, `kind` (its S-expression tag), rotation, `justify` and `shape`: the UUID names it to `batch_delete`, net and position to `edit_schematic_label`, `rotate_schematic_label` and `batch_rotate_labels`. |
 | `get_net_connections` | Get all pins and labels connected to a named net, in this file only; `coverage` says when the net continues beyond it. |
 | `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations in this file; `coverage` says when the net continues beyond it. |
 | `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |
@@ -170,9 +170,9 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified, and `coverage` says so for the response as a whole. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `get_net_members` | Everything on a net across the whole sheet hierarchy: every component pin (reference, pin number and name, electrical type, sheet file and path), every label (kind, sheet, position, rotation, shape), power symbols, PWR_FLAGs and sheet pins, and what drives the net. Connectivity is KiCad's own (kicad-cli netlist of the saved files); labels come from walking the sheet tree. Match by net name, label text or `net_glob`; nets KiCad does not export because they reach no pin are found through their labels. Summary inline, full result in `output`. |
-| `plan_sheet_removal` | Read-only dry run of deleting sheets: KiCad netlists a temporary copy of the hierarchy with the sheet blocks removed. Reports each net crossing the boundary, what remains, whether it keeps a source, inputs left without a driver, dead rails and orphaned pull-ups, open-drain nets losing their pull-up rail, nets reduced to one pin or label, nets that lose their drive one series part away, and the nets entirely inside. Nothing in the project is written. |
-| `find_undriven_nets` | Design-wide check for nets with no source, which ERC does not report: no driving pin, PWR_FLAG or connector, and no series path from a push-pull output or connector. Lists undriven nets with their pins and labels, nets that reach no pin, and global labels used once; nets held only by a pull resistor (`biased`) or by a pin that may be driven inside its part (`indeterminate`) are counted and named. |
+| `get_net_members` | Everything on a net across the whole sheet hierarchy: every component pin (reference, pin number and name, electrical type, sheet file and path), every label (kind, sheet, position, rotation, shape), power symbols, PWR_FLAGs and sheet pins, and what drives the net (for a rail, by KiCad's power rule, with any resistor on its supply path named). Connectivity is KiCad's own (kicad-cli netlist of the saved files); labels come from walking the sheet tree. Match by net name, label text or `net_glob`; nets KiCad does not export because they reach no pin are found through their labels. Summary inline, full result in `output`. |
+| `plan_sheet_removal` | Read-only dry run of deleting sheets: KiCad netlists a temporary copy of the hierarchy with the sheet blocks removed. Reports each net crossing the boundary, what remains, whether it keeps a source, inputs left without a driver, dead rails with the power-input pins they strand (`findings.dead_rails`), rails kept only through a resistor, orphaned pull-ups, open-drain nets losing their pull-up rail, nets reduced to one pin or label, nets that lose their drive one series part away, and the nets entirely inside. A net with a power-input pin is a rail, judged as KiCad's ERC judges one: only a power-output pin, a PWR_FLAG or a series feed from another driven rail supplies it, never a pull-up to a logic output. Nothing in the project is written. |
+| `find_undriven_nets` | Design-wide check for nets with no source, which ERC does not report: no driving pin, PWR_FLAG or connector, and no series path from a push-pull output or connector. Rails (nets with a power-input pin) follow KiCad's power rule: only a power-output pin, a PWR_FLAG or a series feed from another driven rail supplies one, and a dead rail lists the power-input pins it leaves unsupplied. Lists undriven nets with their pins and labels, nets that reach no pin, and global labels used once; nets held only by a pull resistor (`biased`), by a pin that may be driven inside its part (`indeterminate`), and rails fed only through a resistor are counted and named. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 15 tools
@@ -181,7 +181,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
+| `batch_connect_to_net` | Connect many pins to nets by adding labels at each endpoint, oriented away from the symbol body: one net for the call, or each pin its own `net`, `label_type`, `shape` and `label_orientation` (a pin-to-net map in one call). `stub_length`, `direction`, `label_type`, `shape` and `label_orientation` give `connect_to_net`'s stub and label for every pin. Every pin is checked first; an unknown pin, bad option or pin already on another net refuses the call with a result per pin and writes nothing. Junction dots follow KiCad's rule. Single read → all edits → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. Junction dots the deleted wires, components and sheets leave unjustified by KiCad's junction rule go in the same write (`junctions_pruned_uuids`). |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
@@ -224,15 +224,15 @@ and Windows servers do not.
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
 | `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
-| `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
+| `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. Junction dots at its pins' old and new ends are judged by KiCad's junction rule in the same write. |
 | `delete_sheet` | Remove a sheet reference from the parent schematic, with the junction dots on its pins that KiCad's junction rule no longer calls for. Does not delete the child file. |
-| `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
+| `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. Each copied symbol carries one instance entry, the new sheet's path, with the reference it has on the source. `renumber` moves the copy's references into another block (104 to 105 turns U10401 into U10501), refusing a reference outside the block or one the design already uses; `label_substitutions` rewrites the copy's label texts and lists every change. |
 | `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
 | `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. Optional `side` (`right`, `left`, `top`, `bottom`, default `right`) picks the edge and sets each pin's rotation, which is what KiCad reads the edge from; a `right`/`left` stack runs down the edge, a `top`/`bottom` one across it. Pins stack after the pin that reaches furthest along that edge, so an existing gap is left alone rather than filled — one pin on the last slot therefore fills the edge, and the refusal says so rather than suggesting a resize. An occupied slot is never written over, including one held by a pin whose rotation names no edge or one the sheet shrank away from. The whole import is planned and validated before anything is written, and refused entire — nothing written — if it would run past a corner, because KiCad clamps such a pin back onto the box. |
 | `add_sheet_pin` | Manually add a single pin to an existing sheet block. Optional `side` (`right`, `left`, `top`, `bottom`) selects the edge by writing the rotation KiCad reads it from, and makes the call validate `x`/`y` against that edge on both axes, corners included — an off-edge position is refused rather than written and then relocated by KiCad on load. Omitting `side` keeps the previous behavior: rotation `0` and no position check. `x`, `y`, and `side` in the response are read back off the saved pin. |
-| `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
-| `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. |
+| `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. A pin that moves has the junction dots at its old and new ends judged by KiCad's junction rule in the same write. |
+| `delete_sheet_pin` | Remove a single pin without touching the rest of the sheet. A junction dot the pin justified goes in the same write when KiCad's junction rule no longer calls for it. |
 | `validate_sheet_pins` | Read-only. Walk the sheet tree and report unmatched hierarchical labels/pins and stored pin positions inconsistent with their rotation-selected edge or its span. Geometry findings identify the pin, stored position, expected edge and recovery action; no pins are repaired. |
 | `edit_schematic_label` | Re-point one label in place: rename the label of `net` at (`x`, `y`) to `new_net`, keeping its position, rotation, justification, shape, fields and UUID; optionally change its shape (`new_shape`) or kind (`new_label_type`). Only the edited tokens change, and the result is read back before it is reported. |
 
@@ -409,7 +409,7 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 17 tools
+### `library` · 18 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -424,6 +424,7 @@ and Windows servers do not.
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
+| `edit_symbol` | Edit a symbol in a `.kicad_sym` library in place: per unit, move pins (position, orientation, length), rename their names and numbers, change their electrical types, and resize body rectangles, keeping every other property, field and graphic byte for byte. The whole request is checked before anything is written, and the file is read back. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |

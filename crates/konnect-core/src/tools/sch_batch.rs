@@ -32,7 +32,8 @@ use super::sch_components::{
     plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_junctions_for_new_wires, add_stub_label, add_stub_wire, resolve_pin_endpoint,
+    resolve_placed_pin, route_between, StubLabel, LABEL_ORIENTATION_DESC, SHAPE_DESC,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -41,10 +42,15 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "batch_connect_to_net",
-            "Connect multiple component pins to a named net. By default it adds a net label \
-             at each pin endpoint with no wire. Pass stub_length, direction and label_type \
-             for connect_to_net's placement, applied to every pin in the call. \
-             Single file read → all edits → single file write. \
+            "Connect multiple component pins to nets: one net for the whole call, or each pin \
+             its own (a pin-to-net map), each with its own label type, shape and orientation. \
+             By default it adds a net label at each pin endpoint with no wire. Pass \
+             stub_length, direction and label_type for connect_to_net's placement, applied to \
+             every pin in the call. Every pin is resolved and checked before anything is \
+             written: an unknown pin, a bad option, or a pin or label spot already on another \
+             net refuses the whole call, with a result for each pin. \
+             Single file read → all edits → single file write. Junction dots follow KiCad's \
+             rule: one goes where a stub makes three or more exits meet. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -53,7 +59,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "net_name": { "type": "string", "description": "Name of the net to connect pins to" },
+                    "net_name": { "type": "string", "description": "The net for every pin that does not name its own 'net'. May be left out when every pin names one." },
                     "net": { "type": "string",
                         "description": "Alias of net_name, as connect_to_net names it. Giving both with different values is an error." },
                     "direction": {
@@ -68,17 +74,42 @@ pub fn tools() -> Vec<ToolDef> {
                                         label on the pin endpoint with no wire; connect_to_net uses 2.54." },
                     "label_type": {
                         "type": "string",
-                        "enum": ["net_label", "global_label"],
+                        "enum": ["net_label", "global_label", "hierarchical_label"],
                         "default": "net_label"
+                    },
+                    "shape": {
+                        "type": "string",
+                        "enum": ["input", "output", "bidirectional", "tri_state", "passive", "from_pin"],
+                        "description": SHAPE_DESC
+                    },
+                    "label_orientation": {
+                        "type": "string",
+                        "enum": ["horizontal", "along_stub"],
+                        "default": "horizontal",
+                        "description": LABEL_ORIENTATION_DESC
                     },
                     "pins": {
                         "type": "array",
-                        "description": "List of {reference, pin_number} objects to connect",
+                        "description": "Pins to connect: {reference, pin_number}, and optionally the pin's own net, label_type, shape and label_orientation, which override the call's",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "reference": { "type": "string" },
-                                "pin_number": { "type": "string" }
+                                "pin_number": { "type": "string" },
+                                "net": { "type": "string", "minLength": 1,
+                                    "description": "This pin's net; the call's net_name when left out" },
+                                "label_type": {
+                                    "type": "string",
+                                    "enum": ["net_label", "global_label", "hierarchical_label"]
+                                },
+                                "shape": {
+                                    "type": "string",
+                                    "enum": ["input", "output", "bidirectional", "tri_state", "passive", "from_pin"]
+                                },
+                                "label_orientation": {
+                                    "type": "string",
+                                    "enum": ["horizontal", "along_stub"]
+                                }
                             },
                             "required": ["reference", "pin_number"]
                         }
@@ -454,19 +485,227 @@ fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-/// The net a `batch_connect_to_net` call names: `net_name`, or `net` as
-/// `connect_to_net` spells it. Both may be given only when they agree.
-fn batch_net_name(args: &serde_json::Value) -> Result<String, CallToolResult> {
+/// The net a `batch_connect_to_net` call names for every pin that does not
+/// name its own: `net_name`, or `net` as `connect_to_net` spells it. `None`
+/// when neither is given, which is fine when every pin names its net.
+fn batch_net_name(args: &serde_json::Value) -> Result<Option<String>, CallToolResult> {
     match (opt_string(args, "net_name")?, opt_string(args, "net")?) {
         (Some(a), Some(b)) if a != b => Err(invalid_arg(
             "net",
             "conflicts with 'net_name'; give one, or the same value in both",
         )),
-        (Some(name), _) | (None, Some(name)) => Ok(name),
-        (None, None) => Err(invalid_arg(
-            "net_name",
-            "missing; give 'net_name' or its alias 'net'",
-        )),
+        (Some(name), _) | (None, Some(name)) => Ok(Some(name)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// One pin of a `batch_connect_to_net` call, checked before anything is
+/// written.
+struct PlannedConnection {
+    index: usize,
+    reference: String,
+    pin_number: String,
+    net: String,
+    /// The item named its own net, label type, shape or orientation.
+    own_options: bool,
+    label: StubLabel,
+    shape: Option<&'static str>,
+    pin_at: (f64, f64),
+    dir: crate::tools::StubDirection,
+    label_at: (f64, f64),
+    rotation: f64,
+}
+
+/// A refusal of one item: the field at fault, prefixed `pins[i].`, and why.
+type ItemRefusal = (String, String);
+
+/// Read one item and resolve its pin, or say which field is wrong.
+#[allow(clippy::too_many_arguments)]
+fn plan_connection(
+    index: usize,
+    spec: &Value,
+    call_net: Option<&str>,
+    call_label: StubLabel,
+    direction: &str,
+    stub_length: f64,
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::SexpNode],
+) -> Result<PlannedConnection, ItemRefusal> {
+    let field = format!("pins[{index}].");
+    let text = |name: &str| -> Result<Option<String>, ItemRefusal> {
+        match spec.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+            Some(_) => Err((
+                format!("{field}{name}"),
+                "must be a non-empty string".to_owned(),
+            )),
+        }
+    };
+    let reference =
+        text("reference")?.ok_or_else(|| (format!("{field}reference"), "missing".to_owned()))?;
+    let pin_number =
+        text("pin_number")?.ok_or_else(|| (format!("{field}pin_number"), "missing".to_owned()))?;
+    let own_net = text("net")?;
+    let net = own_net
+        .clone()
+        .or_else(|| call_net.map(str::to_owned))
+        .ok_or_else(|| {
+            (
+                format!("{field}net"),
+                "missing: give 'net' on the item, or 'net_name' for the whole call".to_owned(),
+            )
+        })?;
+    let label = StubLabel::read(spec, &field, Some(call_label))?;
+    let own_label = ["label_type", "shape", "label_orientation"]
+        .iter()
+        .any(|name| spec.get(*name).is_some_and(|value| !value.is_null()));
+    if label.kind == "net_label" && spec.get("shape").is_some_and(|value| !value.is_null()) {
+        return Err((
+            format!("{field}shape"),
+            "a net label has no shape; give label_type 'global_label' or 'hierarchical_label', \
+             or leave shape out"
+                .to_owned(),
+        ));
+    }
+    let (pin, transform) = resolve_placed_pin(instances, lib_syms, &reference, &pin_number)
+        .map_err(|error| (format!("{field}pin_number"), error.to_string()))?;
+    let shape = label.shape_for(Some(&pin.electrical_type)).map_err(|_| {
+        (
+            format!("{field}shape"),
+            "cannot be read from the pin".to_owned(),
+        )
+    })?;
+    let pin_at = pin_endpoint(&pin, transform);
+    // `auto` is pin_label_rotation's direction, so the default rotation is
+    // unchanged.
+    let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, transform)));
+    let label_at = dir.end(pin_at, stub_length);
+    let rotation = label.orientation.rotation(&dir);
+    Ok(PlannedConnection {
+        index,
+        reference,
+        pin_number,
+        net,
+        own_options: own_net.is_some() || own_label,
+        label,
+        shape,
+        pin_at,
+        dir,
+        label_at,
+        rotation,
+    })
+}
+
+/// Pins that would join two nets: a label of another net already at the
+/// spot the new label goes, the pin already on another named net, or two
+/// items putting different nets on one spot. Each is refused, with the net
+/// it would have joined.
+fn connection_conflicts(
+    planned: &[PlannedConnection],
+    tree: &konnect_sexp::SexpNode,
+) -> Vec<(usize, ItemRefusal)> {
+    use crate::tools::sch_connectivity::{net_graph_for, COINCIDENT_TOLERANCE};
+    let wires = extract_wires(tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let mut graph = net_graph_for(tree, &wires, &labels);
+    let mut found = Vec::new();
+    let mut claimed: Vec<((f64, f64), &str)> = Vec::new();
+    for item in planned {
+        let field = format!("pins[{}].net", item.index);
+        let mut other_nets: Vec<String> = Vec::new();
+        for at in [item.pin_at, item.label_at] {
+            let root = graph.root_at(at.0, at.1);
+            let names = graph.aliases_of_root(root);
+            if !names.is_empty() && !names.contains(&item.net) {
+                other_nets.extend(names);
+            }
+        }
+        for (at, net) in &claimed {
+            if *net != item.net
+                && points_coincident(
+                    at.0,
+                    at.1,
+                    item.label_at.0,
+                    item.label_at.1,
+                    COINCIDENT_TOLERANCE,
+                )
+            {
+                other_nets.push((*net).to_owned());
+            }
+        }
+        other_nets.sort();
+        other_nets.dedup();
+        if other_nets.is_empty() {
+            claimed.push((item.label_at, item.net.as_str()));
+        } else {
+            found.push((
+                item.index,
+                (
+                    field,
+                    format!(
+                        "{}.{} would join '{}' to {}, already at ({}, {})",
+                        item.reference,
+                        item.pin_number,
+                        item.net,
+                        other_nets
+                            .iter()
+                            .map(|net| format!("'{net}'"))
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                        item.label_at.0,
+                        item.label_at.1
+                    ),
+                ),
+            ));
+        }
+    }
+    found
+}
+
+/// Refuse a whole call because some items are wrong: nothing is written, and
+/// every item is reported, refused or not.
+fn refuse_connections(
+    total: usize,
+    refusals: &[(usize, ItemRefusal)],
+    specs: &[Value],
+) -> CallToolResult {
+    let results: Vec<Value> = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut entry = json!({
+                "index": index,
+                "reference": spec.get("reference"),
+                "pin": spec.get("pin_number"),
+            });
+            match refusals.iter().find(|(at, _)| *at == index) {
+                Some((_, (field, reason))) => {
+                    entry["status"] = json!("refused");
+                    entry["field"] = json!(field);
+                    entry["reason"] = json!(reason);
+                }
+                None => entry["status"] = json!("valid"),
+            }
+            entry
+        })
+        .collect();
+    let (field, reason) = refusals[0].1.clone();
+    let message = format!(
+        "{} of {total} pins cannot be connected, so nothing was written. First: {field}: {reason}",
+        refusals.len()
+    );
+    let body = json!({
+        "message": message,
+        "error": crate::mcp::error::ToolErrorKind::InvalidArgument { field, reason },
+        "written": false,
+        "results": results,
+    });
+    CallToolResult {
+        content: vec![crate::mcp::protocol::ToolContent::Text {
+            text: body.to_string(),
+        }],
+        is_error: true,
     }
 }
 
@@ -475,7 +714,7 @@ async fn handle_batch_connect_to_net(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let net_name = match batch_net_name(args) {
+    let call_net = match batch_net_name(args) {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -487,11 +726,20 @@ async fn handle_batch_connect_to_net(
     // a local label on the pin endpoint and no wire (#701).
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(0.0);
-    let label_type = opt_str(args, "label_type").unwrap_or("net_label");
-    // Plain labels on the pin keep the string splice; anything else goes
-    // through the editor model connect_to_net uses.
-    let is_splice = stub_length == 0.0 && label_type == "net_label";
-    let is_legacy_placement = is_splice && direction == "auto";
+    let call_label = match StubLabel::read(args, "", None) {
+        Ok(label) => label,
+        Err((field, reason)) => return Ok(invalid_arg(&field, &reason)),
+    };
+    if call_net.is_none()
+        && !pins
+            .iter()
+            .all(|spec| spec.get("net").is_some_and(Value::is_string))
+    {
+        return Ok(invalid_arg(
+            "net_name",
+            "missing; give 'net_name' (or its alias 'net') for the call, or 'net' on every pin",
+        ));
+    }
 
     let (content, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
@@ -499,95 +747,119 @@ async fn handle_batch_connect_to_net(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+
+    // Every item is read, resolved and checked against the sheet before
+    // anything is written: one wrong pin refuses the call, not itself.
+    let mut planned = Vec::new();
+    let mut refusals: Vec<(usize, ItemRefusal)> = Vec::new();
+    for (index, spec) in pins.iter().enumerate() {
+        match plan_connection(
+            index,
+            spec,
+            call_net.as_deref(),
+            call_label,
+            direction,
+            stub_length,
+            &instances,
+            &lib_syms,
+        ) {
+            Ok(item) => planned.push(item),
+            Err(refusal) => refusals.push((index, refusal)),
+        }
+    }
+    refusals.extend(connection_conflicts(&planned, &tree));
+    refusals.sort_by_key(|(index, _)| *index);
+    if !refusals.is_empty() {
+        return Ok(refuse_connections(pins.len(), &refusals, &pins));
+    }
+    if call_label.shape.is_some()
+        && !planned.is_empty()
+        && planned.iter().all(|item| item.label.kind == "net_label")
+    {
+        return Ok(invalid_arg(
+            "shape",
+            "applies to global and hierarchical labels, and this call places only net labels",
+        ));
+    }
+
+    // Plain labels on the pin keep the string splice; anything else goes
+    // through the editor model connect_to_net uses.
+    let is_splice = stub_length == 0.0 && planned.iter().all(|item| item.label.kind == "net_label");
+    let is_legacy_placement = is_splice
+        && direction == "auto"
+        && planned.iter().all(|item| {
+            !item.own_options
+                && item.label.orientation == crate::tools::LabelOrientation::Horizontal
+        });
     let mut sch = if is_splice {
         None
     } else {
         Some(cse::Schematic::from_source(&sch_path, content.clone())?)
     };
-    // Only a stub wire can pass over a pin mid-segment.
-    let pin_points = if stub_length > 0.0 {
-        crate::tools::all_pin_endpoints(&tree)
-    } else {
-        Vec::new()
-    };
     let mut is_changed = false;
-
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    // Label positions already carrying this net, so a second never lands on
+    let mut new_wires: Vec<super::sch_wiring::WireSpan> = Vec::new();
+    // Label positions already carrying each net, so a second never lands on
     // the first. Seeded from the file, extended as we go.
-    let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
+    let mut labelled: Vec<(String, (f64, f64))> = extract_labels(&tree)
         .iter()
-        .filter(|l| l.net == net_name)
-        .map(|l| (l.x, l.y))
+        .map(|l| (l.net.clone(), (l.x, l.y)))
         .collect();
 
-    for pin_spec in &pins {
-        let reference = match pin_spec["reference"].as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Missing 'reference' in pin spec".into());
-                continue;
-            }
-        };
-        let pin_number = match pin_spec["pin_number"].as_str() {
-            Some(p) => p,
-            None => {
-                errors.push("Missing 'pin_number' in pin spec".into());
-                continue;
-            }
-        };
-
-        let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
-            Ok(p) => p,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-        let (px, py) = pin_endpoint(&pin, t);
-        // `auto` is pin_label_rotation's direction, so the default rotation
-        // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
-        let (lx, ly) = dir.end((px, py), stub_length);
-        let rotation = dir.label_rotation;
-
+    for item in &planned {
+        let (px, py) = item.pin_at;
+        let (lx, ly) = item.label_at;
         // Symbols stack several pins on one endpoint; a label each renders as
         // a smear. They stay connected by that endpoint. Two stubs can also
         // end on one spot, so the label is judged apart from this pin's wire.
         let needs_label = !labelled
             .iter()
-            .any(|(x, y)| points_coincident(*x, *y, lx, ly, 0.01));
+            .any(|(net, (x, y))| *net == item.net && points_coincident(*x, *y, lx, ly, 0.01));
         let needs_wire = match sch.as_ref() {
             Some(sch) if stub_length > 0.0 => !has_wire(sch, (px, py), (lx, ly)),
             _ => false,
         };
         if needs_wire {
             if let Some(sch) = sch.as_mut() {
-                add_stub_wire(sch, &pin_points, (px, py), (lx, ly));
+                add_stub_wire(sch, (px, py), (lx, ly));
+                new_wires.push(((px, py), (lx, ly)));
             }
         }
         if needs_label {
             if let Some(sch) = sch.as_mut() {
-                add_stub_label(sch, label_type, &net_name, (lx, ly), rotation);
+                add_stub_label(
+                    sch,
+                    item.label.kind,
+                    item.shape,
+                    &item.net,
+                    (lx, ly),
+                    item.rotation,
+                );
             } else {
-                inserts.push_str(&format_net_label(&net_name, lx, ly, rotation));
+                inserts.push_str(&format_net_label(&item.net, lx, ly, item.rotation));
             }
-            labelled.push((lx, ly));
+            labelled.push((item.net.clone(), (lx, ly)));
         }
         let duplicate = !needs_wire && !needs_label;
         is_changed |= !duplicate;
         let mut entry = json!({
-            "reference": reference,
-            "pin": pin_number,
+            "reference": item.reference,
+            "pin": item.pin_number,
             "x": px,
             "y": py,
-            "rotation": rotation
+            "rotation": item.rotation
         });
         if !is_legacy_placement {
-            entry["direction"] = json!(dir.name);
-            entry["label"] = json!({ "x": lx, "y": ly, "rotation": rotation });
+            entry["net"] = json!(item.net);
+            entry["direction"] = json!(item.dir.name);
+            let mut label =
+                json!({ "x": lx, "y": ly, "rotation": item.rotation, "type": item.label.kind });
+            if let Some(shape) = item.shape {
+                label["shape"] = json!(shape);
+            }
+            entry["label"] = label;
+            entry["label_orientation"] = json!(item.label.orientation.name());
             if needs_wire {
                 entry["wire"] = json!({ "x1": px, "y1": py, "x2": lx, "y2": ly });
             }
@@ -598,11 +870,15 @@ async fn handle_batch_connect_to_net(
         added.push(entry);
     }
 
+    let mut junctions = Vec::new();
     if is_changed {
         match sch {
             // Revision-checked against `content`: a concurrent edit refuses
             // the write rather than being overwritten.
-            Some(sch) => sch.overwrite()?,
+            Some(mut sch) => {
+                junctions = add_junctions_for_new_wires(&mut sch, &new_wires);
+                sch.overwrite()?;
+            }
             None => {
                 let expected = content.clone();
                 // Labels are element class 2; symbol instances MUST come last, so a
@@ -615,14 +891,20 @@ async fn handle_batch_connect_to_net(
     }
 
     let mut body = json!({
-        "net": net_name,
+        "net": call_net,
         "added": added,
         "added_count": added.len(),
-        "errors": errors
+        "errors": Vec::<String>::new()
     });
     if !is_legacy_placement {
         body["stub_length"] = json!(stub_length);
-        body["label_type"] = json!(label_type);
+        body["label_type"] = json!(call_label.kind);
+        body["label_orientation"] = json!(call_label.orientation.name());
+        body["junctions_added_count"] = json!(junctions.len());
+        body["junctions_added"] = json!(junctions
+            .iter()
+            .map(|(x, y)| json!({ "x": x, "y": y }))
+            .collect::<Vec<_>>());
     }
     Ok(CallToolResult::json(&body))
 }
@@ -4966,5 +5248,450 @@ mod sheet_text_tests {
             assert!(result.is_error);
             assert_eq!(after, SCH);
         }
+    }
+}
+
+#[cfg(test)]
+mod round3_connect_tests {
+    //! R3-2: labels that run along a vertical stub, label shapes, a pin-to-net
+    //! map checked whole before anything is written, and junction dots by
+    //! KiCad's rule for the stubs both connect tools draw.
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    /// U1 at (100, 100): two input/output pins on top 2.54 mm apart, tips at
+    /// (98.73, 89.84) and (101.27, 89.84); a bidirectional and a passive pin
+    /// below at (98.73, 110.16) and (101.27, 110.16); an input on the left
+    /// at (89.84, 100). `extra` goes in before the symbol.
+    fn sheet(extra: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin = |kind: &str, x: f64, y: f64, angle: f64, name: &str, number: &str| {
+            format!(
+                "        (pin {kind} line (at {x} {y} {angle}) (length 2.54)\n\
+                 \x20         (name \"{name}\") (number \"{number}\"))\n"
+            )
+        };
+        let body = [
+            pin("input", -1.27, 10.16, 270.0, "A", "1"),
+            pin("output", 1.27, 10.16, 270.0, "B", "2"),
+            pin("bidirectional", -1.27, -10.16, 90.0, "C", "3"),
+            pin("passive", 1.27, -10.16, 90.0, "D", "4"),
+            pin("input", -10.16, 0.0, 0.0, "E", "5"),
+        ]
+        .concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  \
+                 (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  \
+                 (lib_symbols\n    (symbol \"Test:TOP2\"\n      (symbol \"TOP2_1_1\"\n\
+                 {body}      )\n    )\n  )\n{extra}  (symbol\n    (lib_id \"Test:TOP2\")\n    \
+                 (at 100 100 0)\n    (unit 1)\n    (uuid \"11111111-2222-3333-4444-555555555555\")\n    \
+                 (property \"Reference\" \"U1\" (at 100 90 0))\n    \
+                 (property \"Value\" \"TOP2\" (at 100 110 0))\n  )\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn run(tool: &str, args: Value) -> CallToolResult {
+        let def = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .chain(tools())
+            .find(|def| def.name == tool)
+            .unwrap();
+        (def.handler)(&args, ctx()).await.unwrap()
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        serde_json::from_str(&error_text(result)).unwrap()
+    }
+
+    /// Every label: (kind, text, x, y, rotation, justify, shape).
+    fn labels(path: &std::path::Path) -> Vec<(String, String, f64, f64, f64, String, String)> {
+        let (_, tree) = read_schematic(path).unwrap();
+        let mut out = Vec::new();
+        for node in tree.children().unwrap() {
+            let Some(kind @ ("label" | "global_label" | "hierarchical_label")) = node.head() else {
+                continue;
+            };
+            let (x, y, rotation) = konnect_sexp::schematic::parse_at(node).unwrap();
+            let justify = node
+                .find("effects")
+                .and_then(|effects| effects.find("justify"))
+                .and_then(|justify| justify.children())
+                .map(|words| {
+                    words
+                        .iter()
+                        .skip(1)
+                        .filter_map(|word| word.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            out.push((
+                kind.to_owned(),
+                node.get(1)
+                    .and_then(|text| text.as_str())
+                    .unwrap()
+                    .to_owned(),
+                x,
+                y,
+                rotation,
+                justify,
+                node.find_str("shape").unwrap_or("").to_owned(),
+            ));
+        }
+        out
+    }
+
+    fn label<'a>(
+        all: &'a [(String, String, f64, f64, f64, String, String)],
+        text: &str,
+    ) -> &'a (String, String, f64, f64, f64, String, String) {
+        all.iter()
+            .find(|label| label.1 == text)
+            .unwrap_or_else(|| panic!("no label {text}: {all:?}"))
+    }
+
+    /// The box a local label's text covers as KiCad draws it, to within the
+    /// stroke font's proportions: 1.27 mm glyphs about 0.9 of that wide,
+    /// lifted 0.25 mm off the wire on the side their tops face. A label reads
+    /// left to right at 0 and 180 and bottom to top at 90 and 270.
+    fn text_box(x: f64, y: f64, rotation: f64, text: &str) -> (f64, f64, f64, f64) {
+        let (size, lift) = (1.27, 0.25);
+        let length = text.chars().count() as f64 * size * 0.9;
+        match rotation as i64 {
+            0 => (x, y - lift - size, x + length, y - lift),
+            180 => (x - length, y - lift - size, x, y - lift),
+            90 => (x - lift - size, y - length, x - lift, y),
+            270 => (x - lift - size, y, x - lift, y + length),
+            other => panic!("rotation {other}"),
+        }
+    }
+
+    fn overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+    }
+
+    /// `along_stub` turns a label on a stub going up to 90 and one going down
+    /// to 270, each reading away from its pin; `horizontal`, the default,
+    /// keeps both at 0 as before.
+    #[tokio::test]
+    async fn along_stub_turns_the_label_of_a_vertical_stub() {
+        for (pin, net, end_y, rotation, justify) in [
+            ("1", "UP", 87.3, 90.0, "left bottom"),
+            ("3", "DOWN", 112.7, 270.0, "right bottom"),
+        ] {
+            let (_d, path) = sheet("");
+            let result = run(
+                "connect_to_net",
+                json!({ "schematic": path.display().to_string(), "reference": "U1",
+                        "pin_number": pin, "net": net, "label_orientation": "along_stub" }),
+            )
+            .await;
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["label"]["rotation"], rotation);
+            let all = labels(&path);
+            let found = label(&all, net);
+            assert!((found.3 - end_y).abs() < 1e-6, "{found:?}");
+            assert_eq!(
+                (found.4, found.5.as_str()),
+                (rotation, justify),
+                "{found:?}"
+            );
+        }
+        let (_d, path) = sheet("");
+        let result = run(
+            "connect_to_net",
+            json!({ "schematic": path.display().to_string(), "reference": "U1",
+                    "pin_number": "1", "net": "UP" }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(label(&labels(&path), "UP").4, 0.0);
+    }
+
+    /// The overlap R3-2 reported: two top pins 2.54 mm apart. Horizontal
+    /// labels run across each other; labels along their stubs run side by
+    /// side.
+    #[tokio::test]
+    async fn labels_along_their_stubs_on_neighbouring_pins_do_not_overlap() {
+        for (orientation, overlapping) in [("horizontal", true), ("along_stub", false)] {
+            let (_d, path) = sheet("");
+            let result = run(
+                "batch_connect_to_net",
+                json!({
+                    "schematic": path.display().to_string(),
+                    "stub_length": 2.54,
+                    "label_orientation": orientation,
+                    "pins": [
+                        { "reference": "U1", "pin_number": "1", "net": "PT_A_CS_BUF" },
+                        { "reference": "U1", "pin_number": "2", "net": "PT_A_SCLK_BUF" }
+                    ]
+                }),
+            )
+            .await;
+            assert!(!result.is_error, "{result:?}");
+            let all = labels(&path);
+            let boxes: Vec<_> = ["PT_A_CS_BUF", "PT_A_SCLK_BUF"]
+                .iter()
+                .map(|text| {
+                    let found = label(&all, text);
+                    text_box(found.2, found.3, found.4, text)
+                })
+                .collect();
+            assert_eq!(
+                overlap(boxes[0], boxes[1]),
+                overlapping,
+                "{orientation}: {all:?}"
+            );
+        }
+    }
+
+    /// A pin-to-net map in one call: each pin names its own net, label type,
+    /// shape and orientation, and the call needs no net of its own.
+    #[tokio::test]
+    async fn each_pin_can_name_its_own_net_label_and_shape() {
+        let (_d, path) = sheet("");
+        let result = run(
+            "batch_connect_to_net",
+            json!({
+                "schematic": path.display().to_string(),
+                "stub_length": 2.54,
+                "label_type": "global_label",
+                "shape": "from_pin",
+                "label_orientation": "along_stub",
+                "pins": [
+                    { "reference": "U1", "pin_number": "1", "net": "SIG_A" },
+                    { "reference": "U1", "pin_number": "2", "net": "SIG_B" },
+                    { "reference": "U1", "pin_number": "3", "net": "SIG_C" },
+                    { "reference": "U1", "pin_number": "4", "net": "SIG_D",
+                      "label_type": "hierarchical_label", "shape": "tri_state" },
+                    { "reference": "U1", "pin_number": "5", "net": "SIG_E",
+                      "label_type": "net_label" }
+                ]
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["net"], Value::Null);
+        assert_eq!(response["added"][3]["net"], "SIG_D");
+        assert_eq!(response["added"][3]["label"]["shape"], "tri_state");
+
+        let all = labels(&path);
+        let summary: Vec<(&str, &str, &str, f64)> = all
+            .iter()
+            .map(|l| (l.0.as_str(), l.1.as_str(), l.6.as_str(), l.4))
+            .collect();
+        assert!(
+            summary.contains(&("global_label", "SIG_A", "input", 90.0)),
+            "{summary:?}"
+        );
+        assert!(
+            summary.contains(&("global_label", "SIG_B", "output", 90.0)),
+            "{summary:?}"
+        );
+        assert!(
+            summary.contains(&("global_label", "SIG_C", "bidirectional", 270.0)),
+            "{summary:?}"
+        );
+        assert!(
+            summary.contains(&("hierarchical_label", "SIG_D", "tri_state", 270.0)),
+            "{summary:?}"
+        );
+        assert!(
+            summary.contains(&("label", "SIG_E", "", 180.0)),
+            "{summary:?}"
+        );
+    }
+
+    /// Without a shape a global label keeps the old default, `input`.
+    #[tokio::test]
+    async fn a_global_label_without_a_shape_is_still_an_input() {
+        let (_d, path) = sheet("");
+        let result = run(
+            "connect_to_net",
+            json!({ "schematic": path.display().to_string(), "reference": "U1",
+                    "pin_number": "2", "net": "OUT", "label_type": "global_label" }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(label(&labels(&path), "OUT").6, "input");
+    }
+
+    /// One wrong pin refuses the whole call before anything is written, and
+    /// every pin gets a result.
+    #[tokio::test]
+    async fn one_wrong_pin_refuses_the_whole_list() {
+        let (_d, path) = sheet("");
+        let before = std::fs::read(&path).unwrap();
+        let result = run(
+            "batch_connect_to_net",
+            json!({
+                "schematic": path.display().to_string(),
+                "pins": [
+                    { "reference": "U1", "pin_number": "1", "net": "A" },
+                    { "reference": "U1", "pin_number": "99", "net": "B" },
+                    { "reference": "U1", "pin_number": "2", "net": "C" }
+                ]
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        let response = body(&result);
+        assert_eq!(response["error"]["kind"], "invalid_argument");
+        assert_eq!(response["error"]["field"], "pins[1].pin_number");
+        assert_eq!(response["written"], false);
+        let statuses: Vec<&str> = response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["valid", "refused", "valid"]);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing is written");
+    }
+
+    /// A pin already on one net is refused another: its label would join the
+    /// two. The file is left as it was.
+    #[tokio::test]
+    async fn a_pin_already_on_another_net_is_refused() {
+        let (_d, path) = sheet("");
+        let first = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(), "net_name": "A",
+                    "pins": [{ "reference": "U1", "pin_number": "1" }] }),
+        )
+        .await;
+        assert!(!first.is_error, "{first:?}");
+        let before = std::fs::read(&path).unwrap();
+        let result = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(),
+                    "pins": [{ "reference": "U1", "pin_number": "1", "net": "B" }] }),
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["error"]["field"], "pins[0].net");
+        assert!(
+            response["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("'A'"),
+            "{response}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Two items putting different nets on one spot are refused too.
+    #[tokio::test]
+    async fn two_nets_on_one_label_spot_are_refused() {
+        let (_d, path) = sheet("");
+        let result = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(),
+                    "pins": [
+                        { "reference": "U1", "pin_number": "1", "net": "A" },
+                        { "reference": "U1", "pin_number": "1", "net": "B" }
+                    ] }),
+        )
+        .await;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(body(&result)["error"]["field"], "pins[1].net");
+    }
+
+    /// A net label has no shape: asking for one is refused, not ignored.
+    #[tokio::test]
+    async fn a_shape_on_a_net_label_is_refused() {
+        let (_d, path) = sheet("");
+        let before = std::fs::read(&path).unwrap();
+        let single = run(
+            "connect_to_net",
+            json!({ "schematic": path.display().to_string(), "reference": "U1",
+                    "pin_number": "1", "net": "A", "shape": "output" }),
+        )
+        .await;
+        assert_eq!(body(&single)["error"]["field"], "shape");
+        let item = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(),
+                    "pins": [{ "reference": "U1", "pin_number": "1", "net": "A",
+                               "shape": "output" }] }),
+        )
+        .await;
+        assert_eq!(body(&item)["error"]["field"], "pins[0].shape");
+        let call = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(), "net": "A", "shape": "output",
+                    "pins": [{ "reference": "U1", "pin_number": "1" }] }),
+        )
+        .await;
+        assert_eq!(body(&call)["error"]["field"], "shape");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The S5 rule for new wiring. A stub leaving a pin that a wire already
+    /// ends on makes three exits there, so it gets a dot; a stub crossing
+    /// another wire's span does not, since KiCad joins a crossing only when
+    /// asked to.
+    #[tokio::test]
+    async fn stubs_get_junction_dots_by_kicads_rule() {
+        // A wire leaving U1.5's tip upward, and one crossing the stub's span.
+        let extra = "  (wire (pts (xy 89.84 100) (xy 89.84 95.25)) (uuid \"w-up\"))\n  \
+                     (wire (pts (xy 88.57 96.52) (xy 88.57 104.14)) (uuid \"w-cross\"))\n";
+        let (_d, path) = sheet(extra);
+        let result = run(
+            "connect_to_net",
+            json!({ "schematic": path.display().to_string(), "reference": "U1",
+                    "pin_number": "5", "net": "E" }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            body(&result)["junctions_added"],
+            json!([{ "x": 89.84, "y": 100.0 }])
+        );
+        let (_, tree) = read_schematic(&path).unwrap();
+        let dots = konnect_sexp::schematic::extract_junctions(&tree);
+        assert_eq!(
+            dots,
+            [(89.84, 100.0)],
+            "no dot at the crossing (88.57, 100)"
+        );
+    }
+
+    /// The batch draws the same dots, judged once for the whole call.
+    #[tokio::test]
+    async fn the_batch_judges_dots_by_the_same_rule() {
+        let extra = "  (wire (pts (xy 89.84 100) (xy 89.84 95.25)) (uuid \"w-up\"))\n  \
+                     (wire (pts (xy 88.57 96.52) (xy 88.57 104.14)) (uuid \"w-cross\"))\n";
+        let (_d, path) = sheet(extra);
+        let result = run(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(), "net": "E", "stub_length": 2.54,
+                    "pins": [{ "reference": "U1", "pin_number": "5" }] }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["junctions_added_count"], 1);
+        let (_, tree) = read_schematic(&path).unwrap();
+        assert_eq!(
+            konnect_sexp::schematic::extract_junctions(&tree),
+            [(89.84, 100.0)]
+        );
     }
 }

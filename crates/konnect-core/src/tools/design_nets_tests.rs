@@ -27,16 +27,41 @@ fn fixture(name: &str) -> PathBuf {
 struct Project {
     dir: tempfile::TempDir,
     cli: PathBuf,
+    /// Edited netlists the fake `kicad-cli` serves, kept for its lifetime.
+    _netlists: Option<tempfile::TempDir>,
 }
 
 impl Project {
     fn new(root: &str) -> Self {
+        Self::serving(
+            root,
+            fixture("design_nets.net"),
+            fixture("design_nets_child_removed.net"),
+        )
+    }
+
+    /// The fixture with KiCad's two netlists edited by `edit`, as if some
+    /// pins had other electrical types: the sheets stay KiCad's own.
+    fn with_edited_netlists(root: &str, edit: impl Fn(&str) -> String) -> Self {
+        let netlists = tempfile::tempdir().unwrap();
+        let full = netlists.path().join("full.net");
+        let removed = netlists.path().join("removed.net");
+        std::fs::write(&full, edit(NETLIST)).unwrap();
+        std::fs::write(
+            &removed,
+            edit(&std::fs::read_to_string(fixture("design_nets_child_removed.net")).unwrap()),
+        )
+        .unwrap();
+        let mut project = Self::serving(root, full, removed);
+        project._netlists = Some(netlists);
+        project
+    }
+
+    fn serving(root: &str, full: PathBuf, removed: PathBuf) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("design_nets.kicad_sch"), root).unwrap();
         std::fs::write(dir.path().join("design_nets_child.kicad_sch"), CHILD).unwrap();
         std::fs::write(dir.path().join("design_nets.kicad_pro"), "{}\n").unwrap();
-        let full = fixture("design_nets.net");
-        let removed = fixture("design_nets_child_removed.net");
         // `sch export netlist --output <5> --format kicadsexpr <8>`
         let cli = crate::tools::cli::test_support::write_script(
             dir.path(),
@@ -52,7 +77,11 @@ impl Project {
                 full.display()
             ),
         );
-        Project { dir, cli }
+        Project {
+            dir,
+            cli,
+            _netlists: None,
+        }
     }
 
     fn root(&self) -> PathBuf {
@@ -825,12 +854,36 @@ fn net_text(code: u32, name: &str, nodes: &[(&str, &str, &str)]) -> String {
 /// Drive of `name` on a netlist of `nets`, with a `PWR_FLAG` on each of
 /// `flagged`.
 fn drive_on(nets: &[String], flagged: &[&str], name: &str) -> Drive {
-    let netlist = Netlist::parse(&format!(
-        "(export (version \"E\") (components) (nets {}))",
+    drive_with_values(&[], nets, flagged, name)
+}
+
+/// [`drive_on`] with component values, `(reference, value)`, for the parts
+/// whose value matters: a zero-ohm resistor is a link.
+fn drive_with_values(
+    values: &[(&str, &str)],
+    nets: &[String],
+    flagged: &[&str],
+    name: &str,
+) -> Drive {
+    let netlist = netlist_of(values, nets);
+    let resolved = resolved_with_flags(&netlist, flagged);
+    DriveModel::new(&netlist, &resolved).drive(netlist.net_named(name))
+}
+
+fn netlist_of(values: &[(&str, &str)], nets: &[String]) -> Netlist {
+    let components: String = values
+        .iter()
+        .map(|(reference, value)| format!("(comp (ref \"{reference}\") (value \"{value}\"))"))
+        .collect();
+    Netlist::parse(&format!(
+        "(export (version \"E\") (components {components}) (nets {}))",
         nets.concat()
     ))
-    .unwrap();
-    let resolved = Resolved {
+    .unwrap()
+}
+
+fn resolved_with_flags(netlist: &Netlist, flagged: &[&str]) -> Resolved {
+    Resolved {
         nets: netlist
             .nets
             .iter()
@@ -850,8 +903,7 @@ fn drive_on(nets: &[String], flagged: &[&str], name: &str) -> Drive {
         disagreements: Vec::new(),
         attached_by_name: Vec::new(),
         unmatched_pins: Vec::new(),
-    };
-    DriveModel::new(&netlist, &resolved).drive(netlist.net_named(name))
+    }
 }
 
 /// A 10 kΩ pull-down holds an input low; it does not drive it.
@@ -926,9 +978,10 @@ fn a_series_resistor_from_an_output_drives() {
     assert!(drive.reaches.unwrap().starts_with("U2.3 (output)"));
 }
 
-/// A ferrite from a supply feeds a sub-rail; a resistor from it only pulls.
+/// A ferrite from a supply feeds a sub-rail. So does a resistor: a rail
+/// with a power input behind one is RC-filtered, driven but resistive.
 #[test]
-fn a_ferrite_feeds_a_supply_and_a_resistor_only_pulls() {
+fn a_ferrite_or_a_resistor_from_a_live_rail_feeds_a_rail() {
     let fed = [
         net_text(
             1,
@@ -958,7 +1011,9 @@ fn a_ferrite_feeds_a_supply_and_a_resistor_only_pulls() {
             &[("R5", "1", "passive"), ("U9", "1", "power_out")],
         ),
     ];
-    assert_eq!(drive_on(&pulled, &[], "AVDD").status, DriveStatus::Biased);
+    let drive = drive_on(&pulled, &[], "AVDD");
+    assert_eq!(drive.status, DriveStatus::DrivenThroughSeries);
+    assert!(drive.rail && drive.resistive);
 }
 
 /// An open drain drives its own net and nothing beyond its pull-up; a
@@ -1027,6 +1082,386 @@ fn a_connector_pin_drives_from_off_the_board() {
     assert_eq!(drive_on(&nets, &[], "CAN_H").status, DriveStatus::External);
 }
 
+// ─── The rail rule ────────────────────────────────────────────────────────────
+
+/// DB2's PT_A_VCCIO with its load switch removed: the rail keeps its
+/// decoupling and two pull-ups, one to a chip select that a buffer drives
+/// through a series resistor and one to an interrupt line on a bidirectional
+/// pin. Reaching those outputs through the pull-ups supplies nothing.
+fn vccio_without_its_switch() -> Vec<String> {
+    vec![
+        net_text(
+            1,
+            "PT_A_VCCIO",
+            &[
+                ("C1501", "1", "passive"),
+                ("R1712", "1", "passive"),
+                ("R1725", "1", "passive"),
+                ("U1501", "8", "power_in"),
+                ("U1701", "8", "power_in"),
+            ],
+        ),
+        net_text(
+            2,
+            "PT_A_CSB",
+            &[
+                ("R1712", "2", "passive"),
+                ("R1711", "2", "passive"),
+                ("U10401", "30", "input"),
+            ],
+        ),
+        net_text(
+            3,
+            "PT_A_CS_BUF",
+            &[("R1711", "1", "passive"), ("U1701", "6", "tri_state")],
+        ),
+        net_text(
+            4,
+            "PT_A_IRQB",
+            &[("R1725", "2", "passive"), ("U10401", "64", "bidirectional")],
+        ),
+        net_text(
+            5,
+            "GND",
+            &[
+                ("C1501", "2", "passive"),
+                ("U1501", "4", "power_in"),
+                ("U1701", "4", "power_in"),
+            ],
+        ),
+    ]
+}
+
+/// The R3-1 false negative: a rail fed only by pull-ups from a buffer
+/// output is dead, while the chip select the buffer drives through its
+/// series resistor stays driven.
+#[test]
+fn a_rail_fed_only_by_pull_ups_from_a_buffer_output_is_dead() {
+    let nets = vccio_without_its_switch();
+    let rail = drive_on(&nets, &["GND"], "PT_A_VCCIO");
+    assert_eq!(rail.status, DriveStatus::Undriven);
+    assert!(rail.rail);
+    assert!(rail.sources.is_empty() && rail.via.is_empty());
+
+    let select = drive_on(&nets, &["GND"], "PT_A_CSB");
+    assert_eq!(select.status, DriveStatus::DrivenThroughSeries);
+    assert_eq!(
+        select.reaches.as_deref(),
+        Some("U1701.6 (tri_state) on PT_A_CS_BUF")
+    );
+}
+
+/// A pull-up to a dead rail carries nothing on: the interrupt line's input
+/// is not driven by the buffer that another pull-up on the rail reaches.
+#[test]
+fn a_pull_up_to_a_dead_rail_carries_no_drive() {
+    let mut nets = vccio_without_its_switch();
+    nets[3] = net_text(
+        4,
+        "PT_A_IRQB",
+        &[("R1725", "2", "passive"), ("U1801", "2", "input")],
+    );
+    assert_eq!(
+        drive_on(&nets, &["GND"], "PT_A_IRQB").status,
+        DriveStatus::Undriven
+    );
+}
+
+/// A rail through a ferrite from a live rail is driven, and not resistive.
+#[test]
+fn a_rail_through_a_ferrite_from_a_live_rail_is_driven() {
+    let nets = [
+        net_text(
+            1,
+            "VPHY",
+            &[("FB1", "2", "passive"), ("U4", "7", "power_in")],
+        ),
+        net_text(
+            2,
+            "+3V3",
+            &[("FB1", "1", "passive"), ("U9", "1", "power_out")],
+        ),
+    ];
+    let drive = drive_on(&nets, &[], "VPHY");
+
+    assert_eq!(drive.status, DriveStatus::DrivenThroughSeries);
+    assert!(drive.rail && !drive.resistive);
+    assert_eq!(drive.via[0].reference, "FB1");
+    assert_eq!(drive.reaches.as_deref(), Some("U9.1 (power_out) on +3V3"));
+}
+
+/// A rail through 10 Ω from a live rail, an RC-filtered supply, is driven
+/// and reported as resistive, with the resistor named.
+#[test]
+fn a_rail_through_ten_ohms_from_a_live_rail_is_driven_and_resistive() {
+    let values = [("R5", "10"), ("C5", "1u")];
+    let nets = [
+        net_text(
+            1,
+            "AVDD_F",
+            &[
+                ("R5", "2", "passive"),
+                ("C5", "1", "passive"),
+                ("U4", "7", "power_in"),
+            ],
+        ),
+        net_text(
+            2,
+            "+3V3",
+            &[("R5", "1", "passive"), ("U9", "1", "power_out")],
+        ),
+        net_text(3, "GND", &[("C5", "2", "passive")]),
+    ];
+    let netlist = netlist_of(&values, &nets);
+    let resolved = resolved_with_flags(&netlist, &["GND"]);
+    let model = DriveModel::new(&netlist, &resolved);
+    let drive = model.drive(netlist.net_named("AVDD_F"));
+
+    assert_eq!(drive.status, DriveStatus::DrivenThroughSeries);
+    assert!(drive.rail && drive.resistive);
+    assert_eq!(model.resistors_on(&drive.via), ["R5"]);
+    assert_eq!(drive.reaches.as_deref(), Some("U9.1 (power_out) on +3V3"));
+}
+
+/// A zero-ohm resistor is a link, not a resistive feed.
+#[test]
+fn a_zero_ohm_resistor_links_a_rail() {
+    let nets = [
+        net_text(
+            1,
+            "ETH_AVDD",
+            &[("R5923", "2", "passive"), ("U5901", "1", "power_in")],
+        ),
+        net_text(
+            2,
+            "MCU_3V3",
+            &[("R5923", "1", "passive"), ("U5011", "6", "power_out")],
+        ),
+    ];
+    let drive = drive_with_values(&[("R5923", "0R")], &nets, &[], "ETH_AVDD");
+
+    assert_eq!(drive.status, DriveStatus::DrivenThroughSeries);
+    assert!(!drive.resistive);
+}
+
+/// A bleed resistor to ground holds a dead rail at 0 V; it supplies nothing.
+#[test]
+fn a_bleed_resistor_to_ground_does_not_supply_a_rail() {
+    let nets = [
+        net_text(
+            1,
+            "VOUT",
+            &[
+                ("R1", "1", "passive"),
+                ("C1", "1", "passive"),
+                ("U1", "1", "power_in"),
+            ],
+        ),
+        net_text(
+            2,
+            "GND",
+            &[
+                ("R1", "2", "passive"),
+                ("C1", "2", "passive"),
+                ("U1", "2", "power_in"),
+            ],
+        ),
+    ];
+    assert_eq!(
+        drive_on(&nets, &["GND"], "VOUT").status,
+        DriveStatus::Undriven
+    );
+}
+
+/// A logic pin tied to a rail straps it; it does not supply it, as KiCad's
+/// ERC agrees: only a power output drives a net with a power input.
+#[test]
+fn a_logic_pin_tied_to_a_rail_does_not_supply_it() {
+    let nets = [net_text(
+        1,
+        "VCC_IO",
+        &[("U1", "1", "power_in"), ("U2", "5", "bidirectional")],
+    )];
+    let drive = drive_on(&nets, &[], "VCC_IO");
+
+    assert_eq!(drive.status, DriveStatus::Undriven);
+    assert!(drive.sources.is_empty());
+}
+
+/// A rail behind a load switch's pass element may be supplied by it: not
+/// driven by the rule, not dead either.
+#[test]
+fn a_rail_behind_a_pass_transistor_is_indeterminate() {
+    let nets = [
+        net_text(
+            1,
+            "VOUT",
+            &[("Q1", "3", "passive"), ("U1", "1", "power_in")],
+        ),
+        net_text(2, "VIN", &[("Q1", "2", "passive")]),
+        net_text(3, "GATE", &[("Q1", "1", "passive")]),
+    ];
+    let drive = drive_on(&nets, &[], "VOUT");
+
+    assert_eq!(drive.status, DriveStatus::Indeterminate);
+    assert!(drive.reaches.unwrap().starts_with("Q1.3"));
+}
+
+/// A chain of rails names every hop to the source and stays resistive when
+/// any hop is a resistor.
+#[test]
+fn a_rail_fed_from_a_fed_rail_names_the_whole_supply_path() {
+    let nets = [
+        net_text(
+            1,
+            "VDDA",
+            &[("FB2", "2", "passive"), ("U3", "4", "power_in")],
+        ),
+        net_text(
+            2,
+            "VDD_F",
+            &[
+                ("FB2", "1", "passive"),
+                ("R7", "2", "passive"),
+                ("U2", "3", "power_in"),
+            ],
+        ),
+        net_text(
+            3,
+            "+5V",
+            &[("R7", "1", "passive"), ("U9", "1", "power_out")],
+        ),
+    ];
+    let drive = drive_with_values(&[("R7", "4.7")], &nets, &[], "VDDA");
+
+    assert_eq!(drive.status, DriveStatus::DrivenThroughSeries);
+    assert!(drive.resistive);
+    let hops: Vec<&str> = drive.via.iter().map(|hop| hop.reference.as_str()).collect();
+    assert_eq!(hops, ["FB2", "R7"]);
+    assert_eq!(drive.reaches.as_deref(), Some("U9.1 (power_out) on +5V"));
+}
+
+/// A pull-up to a ferrite-fed rail still biases a signal, and names the
+/// supply behind the rail, as before the rail rule.
+#[test]
+fn a_pull_up_to_a_fed_rail_names_the_source_behind_it() {
+    let nets = [
+        net_text(1, "SIG", &[("R1", "1", "passive"), ("U1", "1", "input")]),
+        net_text(
+            2,
+            "SUB",
+            &[
+                ("R1", "2", "passive"),
+                ("FB1", "1", "passive"),
+                ("U2", "1", "power_in"),
+            ],
+        ),
+        net_text(
+            3,
+            "+3V3",
+            &[("FB1", "2", "passive"), ("U9", "1", "power_out")],
+        ),
+    ];
+    let drive = drive_on(&nets, &[], "SIG");
+
+    assert_eq!(drive.status, DriveStatus::Biased);
+    let hops: Vec<&str> = drive.via.iter().map(|hop| hop.reference.as_str()).collect();
+    assert_eq!(hops, ["R1", "FB1"]);
+    assert_eq!(drive.reaches.as_deref(), Some("U9.1 (power_out) on +3V3"));
+}
+
+#[test]
+fn zero_ohms_is_read_from_the_value_field() {
+    for zero in [
+        "0", "0R", "0Ω", "0 Ω", "0R0", "0E", "0 ohm", "0.0", "0R 1%", "0r",
+    ] {
+        assert!(is_zero_ohm(zero), "{zero}");
+    }
+    for not_zero in [
+        "10",
+        "0R5",
+        "0.5m 1% 6W 2512",
+        "100k",
+        "DNP",
+        "",
+        "0402",
+        "R",
+    ] {
+        assert!(!is_zero_ohm(not_zero), "{not_zero}");
+    }
+}
+
+#[test]
+fn grounds_are_known_by_name() {
+    for ground in ["GND", "AGND", "GNDA", "/Sheet/PGND", "VSS", "0V", "Earth"] {
+        assert!(is_ground_name(ground), "{ground}");
+    }
+    for rail in ["+3V3", "VCCIO", "MCU_3V3", "VBAT"] {
+        assert!(!is_ground_name(rail), "{rail}");
+    }
+}
+
+/// Retype one pin in KiCad's netlist text: the `(node …)` block naming
+/// `reference` and `pin` has its `(pintype "<from>")` made `<to>`.
+fn retype_pin(netlist: &str, reference: &str, pin: &str, from: &str, to: &str) -> String {
+    use konnect_sexp::writer::{find_balanced_block, find_block_starts};
+    let (ref_clause, pin_clause) = (format!("(ref \"{reference}\")"), format!("(pin \"{pin}\")"));
+    let type_clause = format!("(pintype \"{from}\")");
+    let hits: Vec<(usize, usize)> = find_block_starts(netlist, "node")
+        .into_iter()
+        .filter_map(|start| find_balanced_block(netlist, start))
+        .filter(|&(start, end)| {
+            let node = &netlist[start..end];
+            node.contains(&ref_clause) && node.contains(&pin_clause) && node.contains(&type_clause)
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{reference}.{pin} as a {from} pin");
+    let (start, end) = hits[0];
+    let node = netlist[start..end].replacen(&type_clause, &format!("(pintype \"{to}\")"), 1);
+    format!("{}{node}{}", &netlist[..start], &netlist[end..])
+}
+
+/// The R3-1 shape through the served tool: with U3's input a power input,
+/// RAIL_A is a rail, and with U4 a tri-state buffer its pull-up R2 reaches
+/// a push-pull output. Removing the regulator's sheet leaves a dead rail,
+/// reported with the power input it strands, not a rail driven through R2.
+#[tokio::test]
+async fn removing_a_rails_only_source_reports_a_dead_rail() {
+    let edit = |netlist: &str| -> String {
+        let edited = retype_pin(netlist, "U3", "2", "input", "power_in");
+        retype_pin(&edited, "U4", "4", "open_collector", "tri_state")
+    };
+    let project = Project::with_edited_netlists(ROOT, edit);
+    let response = project
+        .call(
+            "plan_sheet_removal",
+            json!({ "sheet_names": ["Rail A regulator"] }),
+        )
+        .await;
+
+    let rail = response["crossing_nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|net| net["net"] == "RAIL_A")
+        .unwrap_or_else(|| panic!("RAIL_A not crossing: {response}"));
+    assert_eq!(rail["verdict"], "loses_drive");
+    assert_eq!(rail["remainders"][0]["drive_after"], "undriven");
+    assert_eq!(rail["remainders"][0]["rail"], true);
+    assert_eq!(rail["remainders"][0]["level_after"], "no supply");
+
+    let dead = &response["findings"]["dead_rails"];
+    assert_eq!(dead.as_array().unwrap().len(), 1, "{dead}");
+    assert_eq!(dead[0]["net"], "RAIL_A");
+    assert_eq!(dead[0]["lost_sources"], json!(["U10.5 VOUT power_out"]));
+    let pins = &dead[0]["power_in_pins"];
+    assert_eq!(pins.as_array().unwrap().len(), 1, "{pins}");
+    assert_eq!(pins[0]["reference"], "U3");
+    assert_eq!(pins[0]["pin"], "2");
+    assert_eq!(pins[0]["sheet_path"], "/");
+    assert_eq!(pins[0]["sheet_file"], "design_nets.kicad_sch");
+}
+
 /// The removal verdicts, from the drive before and after.
 #[test]
 fn removal_verdicts_separate_drive_from_bias() {
@@ -1039,6 +1474,8 @@ fn removal_verdicts_separate_drive_from_bias() {
         has_inputs: true,
         passive_only: false,
         open_drain_only: false,
+        rail: false,
+        resistive: false,
     };
     let open_drain = Drive {
         open_drain_only: true,
