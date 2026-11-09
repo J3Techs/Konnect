@@ -126,7 +126,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_sheet",
-            "Reposition a sheet on the parent canvas without touching any other field.",
+            "Reposition a sheet on the parent canvas without touching any other field. \
+             Junction dots at its pins' old and new ends are judged by KiCad's junction \
+             rule in the same write, reported as junctions_pruned_count and \
+             junctions_added_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -274,7 +277,8 @@ pub fn tools() -> Vec<ToolDef> {
             "edit_sheet_pin",
             "Rename a sheet pin, change its electrical type, move it, or move it to a \
              different edge of the sheet box. Provide at least one of: new_name, pin_type, \
-             side, or both x+y.",
+             side, or both x+y. A pin that moves has the junction dots at its old and new \
+             ends judged by KiCad's junction rule in the same write.",
             json!({
                 "type": "object",
                 "properties": {
@@ -292,7 +296,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_sheet_pin",
-            "Remove a single pin from a sheet without touching the rest of the sheet.",
+            "Remove a single pin from a sheet without touching the rest of the sheet. \
+             A junction dot the pin justified goes in the same write when KiCad's junction \
+             rule no longer calls for it, reported as junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1153,6 +1159,118 @@ fn commit_edited_sheet_item(
     commit_verified_sheet_mutation(path, before, &command, &intent, label)
 }
 
+/// Junction dots a sheet edit re-judged in its own write: the UUIDs of the
+/// dots pruned and how many were added.
+struct SheetJunctions {
+    pruned: Vec<String>,
+    added: usize,
+}
+
+/// [`commit_edited_sheet_item`], with the junction dots at `points` judged by
+/// KiCad's junction rule in the same write: a dot a moved or removed sheet pin
+/// no longer justifies goes, and one a sheet pin landing on a wire's span
+/// needs is added. Points touching a bus are left alone, as everywhere else.
+fn commit_edited_sheet_item_with_junctions(
+    path: &Path,
+    before: &str,
+    edited: &cse::Schematic,
+    uuid: &str,
+    label: &str,
+    points: &[(f64, f64)],
+) -> anyhow::Result<(Option<CallToolResult>, SheetJunctions)> {
+    let edited_source = edited.to_source();
+    let (reconciled, added, pruned) =
+        super::sch_wiring::reconcile_junctions_at(edited_source, points);
+    if added == 0 && pruned == 0 {
+        let refused = commit_edited_sheet_item(path, before, edited, uuid, label)?;
+        return Ok((
+            refused,
+            SheetJunctions {
+                pruned: Vec::new(),
+                added: 0,
+            },
+        ));
+    }
+    // Top-level items by UUID, with their kind and block text.
+    let items = |source: &str| -> anyhow::Result<HashMap<String, (String, String)>> {
+        let mut out = HashMap::new();
+        for (start, end) in konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch") {
+            let block = &source[start..end];
+            let node = parse_sexp(block)?;
+            if let Some(id) = node.find_str("uuid") {
+                out.insert(
+                    id.to_owned(),
+                    (node.head().unwrap_or("").to_owned(), block.to_owned()),
+                );
+            }
+        }
+        Ok(out)
+    };
+    let (old, new) = (items(before)?, items(&reconciled)?);
+    let sheet_before = old
+        .get(uuid)
+        .ok_or_else(|| anyhow::anyhow!("{label}: the sheet {uuid} is not in the file"))?;
+    let sheet_after = new
+        .get(uuid)
+        .ok_or_else(|| anyhow::anyhow!("{label}: the edited sheet {uuid} went missing"))?;
+    let mut changes = vec![konnect_sexp::ItemChange {
+        id: ItemId::new(uuid)?,
+        before: Some(sheet_before.1.clone()),
+        after: Some(sheet_after.1.clone()),
+        anchor: ItemAnchor::EndOfDocument,
+    }];
+    let mut pruned_ids = Vec::new();
+    for (id, (kind, block)) in &old {
+        if kind == "junction" && !new.contains_key(id) {
+            pruned_ids.push(id.clone());
+            changes.push(konnect_sexp::ItemChange {
+                id: ItemId::new(id)?,
+                before: Some(block.clone()),
+                after: None,
+                anchor: ItemAnchor::EndOfDocument,
+            });
+        }
+    }
+    let mut added_count = 0;
+    for (id, (kind, block)) in &new {
+        if kind == "junction" && !old.contains_key(id) {
+            added_count += 1;
+            changes.push(konnect_sexp::ItemChange {
+                id: ItemId::new(id)?,
+                before: None,
+                after: Some(block.clone()),
+                anchor: ItemAnchor::BeforeFooter,
+            });
+        }
+    }
+    pruned_ids.sort();
+    let command = SchematicCommand::from_changes(before, label, changes)?;
+    let intended = edited
+        .sheets
+        .by_uuid(uuid)
+        .ok_or_else(|| anyhow::anyhow!("edited {label} result has no sheet UUID {uuid}"))?;
+    let intent = SheetMutationIntent::Present {
+        uuid: uuid.to_owned(),
+        expected: intended.to_sexp(),
+    };
+    let refused = commit_verified_sheet_mutation(path, before, &command, &intent, label)?;
+    Ok((
+        refused,
+        SheetJunctions {
+            pruned: pruned_ids,
+            added: added_count,
+        },
+    ))
+}
+
+/// Every pin position of the sheet `uuid`.
+fn sheet_pin_points(sch: &cse::Schematic, uuid: &str) -> Vec<(f64, f64)> {
+    sch.sheets
+        .by_uuid(uuid)
+        .map(|sheet| sheet.pins.iter().map(|pin| (pin.at.x, pin.at.y)).collect())
+        .unwrap_or_default()
+}
+
 /// Read one sheet pin back off the file a write has just committed, so a
 /// response can describe the pin that was *saved* rather than the request that
 /// produced it.
@@ -1440,17 +1558,39 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Some(sheet) => {
             let sheet_uuid = sheet.uuid.clone();
             let changed = sheet.at.x != x || sheet.at.y != y;
+            let mut junctions = SheetJunctions {
+                pruned: Vec::new(),
+                added: 0,
+            };
             if changed {
+                // The dots at the pins' old ends and new ones are judged in
+                // the same write.
+                let mut points: Vec<(f64, f64)> =
+                    sheet.pins.iter().map(|pin| (pin.at.x, pin.at.y)).collect();
                 sheet.move_to(x, y);
-                if let Some(error) =
-                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "move_sheet")?
-                {
+                points.extend(sheet_pin_points(&sch, &sheet_uuid));
+                let (refused, judged) = commit_edited_sheet_item_with_junctions(
+                    &sch_path,
+                    &before,
+                    &sch,
+                    &sheet_uuid,
+                    "move_sheet",
+                    &points,
+                )?;
+                if let Some(error) = refused {
                     return Ok(error);
                 }
+                junctions = judged;
             }
-            Ok(CallToolResult::json(
-                &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
-            ))
+            Ok(CallToolResult::json(&json!({
+                "moved": sheet_name,
+                "x": x,
+                "y": y,
+                "changed": changed,
+                "junctions_added_count": junctions.added,
+                "junctions_pruned_count": junctions.pruned.len(),
+                "junctions_pruned_uuids": junctions.pruned,
+            })))
         }
         None => Ok(CallToolResult::error(format!(
             "Sheet '{}' not found",
@@ -2642,6 +2782,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
             )))
         }
     };
+    let old_end = (pin.at.x, pin.at.y);
 
     // `requested` is what the caller asked to set, `changed` what actually
     // differs — the same split `edit_sheet` makes, and for the same reason: a
@@ -2685,6 +2826,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     // `new_name` may have just renamed it, so the read-back below has to look
     // for the name the pin carries now.
     let saved_name = pin.name.clone();
+    let new_end = (pin.at.x, pin.at.y);
 
     if requested.is_empty() {
         return Ok(CallToolResult::error(
@@ -2694,12 +2836,30 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
 
     // Nothing differs, so nothing is written: a commit here would reserialise
     // the sheet (#210) for a request that asked for the state already on disk.
+    let mut junctions = SheetJunctions {
+        pruned: Vec::new(),
+        added: 0,
+    };
     if !changed.is_empty() {
-        if let Some(error) =
-            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet_pin")?
-        {
+        // A pin that moved is judged at both ends: its old one may have lost
+        // the exit that justified a dot, and its new one may need one.
+        let points = if old_end == new_end {
+            Vec::new()
+        } else {
+            vec![old_end, new_end]
+        };
+        let (refused, judged) = commit_edited_sheet_item_with_junctions(
+            &sch_path,
+            &before,
+            &sch,
+            &sheet_uuid,
+            "edit_sheet_pin",
+            &points,
+        )?;
+        if let Some(error) = refused {
             return Ok(error);
         }
+        junctions = judged;
     }
 
     // Reported off the saved pin rather than the in-memory one, for the same
@@ -2719,7 +2879,10 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         "changed": !changed.is_empty(),
         "changed_fields": changed,
         "requested_fields": requested,
-        "pin": summary
+        "pin": summary,
+        "junctions_added_count": junctions.added,
+        "junctions_pruned_count": junctions.pruned.len(),
+        "junctions_pruned_uuids": junctions.pruned,
     })))
 }
 
@@ -2749,6 +2912,7 @@ async fn handle_delete_sheet_pin(
         }
     };
     let sheet_uuid = sheet.uuid.clone();
+    let end = sheet.pin_by_name(&pin_name).map(|pin| (pin.at.x, pin.at.y));
 
     if !sheet.remove_pin(&pin_name) {
         return Ok(CallToolResult::error(format!(
@@ -2756,15 +2920,26 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    if let Some(error) =
-        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "delete_sheet_pin")?
-    {
+    // The pin was an exit at its end; a dot there may now be unjustified.
+    let points: Vec<(f64, f64)> = end.into_iter().collect();
+    let (refused, junctions) = commit_edited_sheet_item_with_junctions(
+        &sch_path,
+        &before,
+        &sch,
+        &sheet_uuid,
+        "delete_sheet_pin",
+        &points,
+    )?;
+    if let Some(error) = refused {
         return Ok(error);
     }
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,
-        "sheet": sheet_name
+        "sheet": sheet_name,
+        "junctions_added_count": junctions.added,
+        "junctions_pruned_count": junctions.pruned.len(),
+        "junctions_pruned_uuids": junctions.pruned,
     })))
 }
 
@@ -5873,5 +6048,138 @@ mod duplicate_sheet_round3_tests {
         );
         assert_eq!(renumber_reference("R1", "104", "105"), None);
         assert_eq!(renumber_reference("R21040", "104", "105"), None);
+    }
+}
+
+#[cfg(test)]
+mod sheet_junction_tests {
+    //! S5 leftovers: moving a sheet, and moving or deleting one of its pins,
+    //! re-judges the junction dots at the pins' old and new ends by KiCad's
+    //! rule in the same write.
+    use super::*;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// Sheet "Child" at (50, 50), 20 x 20, with pin A on its left edge at
+    /// (50, 60). A wire runs through the pin, so the pin is a third exit
+    /// there and the dot is needed. A second wire crosses (50, 90).
+    fn sheet() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        std::fs::write(dir.path().join("child.kicad_sch"), "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"child-uuid\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))\n").unwrap();
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"aaaaaaaa-0000-4000-8000-000000000001\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\
+             \t(wire\n\t\t(pts (xy 40 60) (xy 60 60))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000002\")\n\t)\n\
+             \t(wire\n\t\t(pts (xy 40 90) (xy 60 90))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000003\")\n\t)\n\
+             \t(junction\n\t\t(at 50 60)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000004\")\n\t)\n\
+             \t(sheet\n\t\t(at 50 50)\n\t\t(size 20 20)\n\t\t(stroke (width 0.1524) (type solid))\n\t\t(fill (color 0 0 0 0.0000))\n\
+             \t\t(uuid \"aaaaaaaa-0000-4000-8000-000000000005\")\n\
+             \t\t(property \"Sheetname\" \"Child\" (at 50 49.2 0) (effects (font (size 1.27 1.27)) (justify left bottom)))\n\
+             \t\t(property \"Sheetfile\" \"child.kicad_sch\" (at 50 70.6 0) (effects (font (size 1.27 1.27)) (justify left top)))\n\
+             \t\t(pin \"A\" input (at 50 60 180) (uuid \"aaaaaaaa-0000-4000-8000-000000000006\") (effects (font (size 1.27 1.27)) (justify left)))\n\
+             \t\t(instances (project \"root\" (path \"/aaaaaaaa-0000-4000-8000-000000000001\" (page \"2\"))))\n\t)\n\
+             \t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn dots(path: &Path) -> Vec<(f64, f64)> {
+        let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut dots = konnect_sexp::schematic::extract_junctions(&tree);
+        dots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        dots
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Without its pin the point is a wire running through: two exits.
+    #[tokio::test]
+    async fn deleting_a_sheet_pin_prunes_the_dot_it_justified() {
+        let (_dir, path) = sheet();
+        let result = handle_delete_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child", "pin_name": "A" }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["junctions_pruned_count"], 1, "{response}");
+        assert_eq!(
+            response["junctions_pruned_uuids"],
+            json!(["aaaaaaaa-0000-4000-8000-000000000004"])
+        );
+        assert!(dots(&path).is_empty());
+    }
+
+    /// Moving the sheet down 30 takes pin A off the first wire, whose dot
+    /// goes, and onto the second wire's span, which then needs one.
+    #[tokio::test]
+    async fn moving_a_sheet_rejudges_the_dots_at_both_ends_of_its_pins() {
+        let (_dir, path) = sheet();
+        let result = handle_move_sheet(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child", "x": 50.0, "y": 80.0 }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["junctions_pruned_count"], 1, "{response}");
+        assert_eq!(response["junctions_added_count"], 1, "{response}");
+        assert_eq!(dots(&path), [(50.0, 90.0)]);
+        let saved = cse::Schematic::load(&path).unwrap();
+        let pin = saved
+            .sheets
+            .by_name("Child")
+            .unwrap()
+            .pin_by_name("A")
+            .unwrap();
+        assert_eq!((pin.at.x, pin.at.y), (50.0, 90.0));
+    }
+
+    /// Moving the pin along its edge leaves the old dot unjustified.
+    #[tokio::test]
+    async fn moving_a_sheet_pin_prunes_the_dot_at_its_old_end() {
+        let (_dir, path) = sheet();
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child",
+                     "pin_name": "A", "x": 50.0, "y": 65.0 }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["junctions_pruned_count"], 1);
+        assert!(dots(&path).is_empty());
+    }
+
+    /// Renaming a pin moves nothing and judges nothing.
+    #[tokio::test]
+    async fn renaming_a_sheet_pin_keeps_its_dot() {
+        let (_dir, path) = sheet();
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": path.display().to_string(), "sheet_name": "Child",
+                     "pin_name": "A", "new_name": "B" }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["junctions_pruned_count"], 0);
+        assert_eq!(dots(&path), [(50.0, 60.0)]);
     }
 }

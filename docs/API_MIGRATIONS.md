@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: sheet moves and sheet-pin edits judge junction dots; a split adds only a needed dot
+
+`move_sheet`, `edit_sheet_pin` and `delete_sheet_pin` left junction dots as
+they were, so a dot a sheet pin had justified stayed after the pin moved away
+or was deleted, and the prune pass had to follow. Each now judges the dots at
+the pins' old and new ends by KiCad's junction rule in the same write: a dot
+the rule no longer calls for goes, and a sheet pin landing on one wire's span
+gets the dot it needs to connect. Each response adds
+`junctions_added_count`, `junctions_pruned_count` and
+`junctions_pruned_uuids`; renaming or retyping a pin judges nothing. The
+dot a component move adds where a pin lands mid-span is now added for a sheet
+pin too.
+
+`split_wire_at_point` always added a dot at the split. Two halves of one wire
+meeting there are a straight join, two exits, and KiCad draws no dot, so the
+dot now goes only where the rule calls for one: another wire ending there, or
+a pin or sheet pin on the point. The response adds `junction_added`.
+
 ## Unreleased: edit a library symbol in place, and drag what moved pins leave
 
 New: `edit_symbol` (`library`) edits a symbol in a `.kicad_sym` library

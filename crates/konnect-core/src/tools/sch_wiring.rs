@@ -124,9 +124,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "split_wire_at_point",
-            "Split a wire at a given point, creating two wire segments and a junction. \
-             Note: a pin landing mid-wire only needs a junction dot to connect \
-             (see add_junction) — splitting the wire is not required.",
+            "Split a wire at a given point into two wire segments. A junction dot goes \
+             at the split only where KiCad's junction rule calls for one: three or more \
+             exits, as when another wire ends there or a pin or sheet pin sits on it; two \
+             halves meeting are a straight join and get none. Note: a pin landing \
+             mid-wire only needs a junction dot to connect (see add_junction) — \
+             splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1441,7 +1444,7 @@ pub(crate) fn reconcile_junctions_at(
         if here.is_empty() {
             if idx.wires_at(px, py) == 1
                 && idx.on_wire_interior(px, py)
-                && idx.has_pin(px, py)
+                && (idx.has_pin(px, py) || idx.has_sheet_pin(px, py))
                 && !idx.has_no_connect(px, py)
             {
                 to_add.push((px, py));
@@ -1690,15 +1693,28 @@ async fn handle_split_wire_at_point(
 
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
-    let junc = format_junction(px, py);
-    let insert = format!("{w1}{w2}{junc}");
-    let new_content = insert_before_close(&content, &insert);
+    let halves = insert_before_close(&content, &format!("{w1}{w2}"));
+    // KiCad's rule judges the split point: two halves meeting are a straight
+    // join and need no dot; a third exit there — another wire ending on it,
+    // a pin, a sheet pin — does. A dot already there stays.
+    let needs_dot = junctions_needed_by_new_wires(
+        &halves,
+        &[((w.x1, w.y1), (px, py)), ((px, py), (w.x2, w.y2))],
+    )
+    .iter()
+    .any(|&(x, y)| konnect_sexp::geometry::points_coincident(x, y, px, py, 0.01));
+    let new_content = if needs_dot {
+        insert_before_close(&halves, &format_junction(px, py))
+    } else {
+        halves
+    };
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": px, "y": py },
         "wire_a": { "x1": w.x1, "y1": w.y1, "x2": px, "y2": py },
-        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 }
+        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 },
+        "junction_added": needs_dot
     })))
 }
 
@@ -4648,7 +4664,31 @@ mod wire_delete_tests {
 
         let mut juncs = junctions_in(&path);
         juncs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8), (68.58, 50.8)]);
+        // The split point itself is a straight join of the two halves: two
+        // exits, so KiCad's rule draws no dot there.
+        assert_eq!(juncs, vec![(25.4, 25.4), (63.5, 50.8)]);
+    }
+
+    /// Where a third wire already ends on the split point, the three exits
+    /// call for a dot, and the split adds the one that was missing.
+    #[tokio::test]
+    async fn split_wire_adds_the_dot_three_exits_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-split-tee.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"w-rail\")\n\t)\n\t(wire\n\t\t(pts (xy 5 0) (xy 5 5))\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"w-tap\")\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_split_wire_at_point(
+            &json!({ "schematic": path.display().to_string(), "x": 5.0, "y": 0.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(junctions_in(&path), vec![(5.0, 0.0)]);
     }
 
     #[tokio::test]
@@ -4677,7 +4717,8 @@ mod wire_delete_tests {
         let parsed = konnect_sexp::parse_sexp(&after).unwrap();
         let wires = extract_wires(&parsed);
         assert_eq!(wires.len(), 2);
-        assert!(after.contains("(junction"));
+        // Two halves of one wire meet end to end: no dot.
+        assert!(!after.contains("(junction"));
         assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
     }
 }
