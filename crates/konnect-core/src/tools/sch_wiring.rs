@@ -71,7 +71,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Delete a wire segment by its UUID, or by matching BOTH endpoints \
              (all four of x1/y1/x2/y2, either direction). Fails without deleting \
              anything when no wire matches. Junction dots the wire leaves \
-             unjustified are removed with it.",
+             unjustified by KiCad's junction rule (fewer than three exits: a \
+             corner, a straight join, a lone wire, a wire end on a pin) are \
+             removed with it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -88,8 +90,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete_schematic_wire",
             "Delete multiple wire segments in a single file read/write cycle. \
-             Junction dots the wires leave unjustified are removed with them, \
-             reported as junctions_pruned_count.",
+             Junction dots the wires leave unjustified by KiCad's junction rule \
+             (fewer than three exits: a corner, a straight join, a lone wire, a \
+             wire end on a pin) are removed with them, reported as \
+             junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -787,8 +791,8 @@ struct IdentifiedPin {
 ///
 /// Fails rather than answering short: a `lib_symbols` lookup that failed, or an
 /// instance with no UUID, is stale state and not evidence that no pin is there.
-/// [`reconcile_junctions_at`] draws the same distinction with `pins_known`,
-/// more coarsely — it cannot see one symbol of ten failing to resolve.
+/// [`reconcile_junctions_at`] draws the same distinction before it drops a
+/// dot, through `resolved_placed_pins_by_reference`.
 fn identified_pins(
     tree: &konnect_sexp::SexpNode,
 ) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
@@ -1314,13 +1318,17 @@ pub(crate) fn reconcile_junctions_for_placement(
 ///
 /// All connectivity answers come from the shared [`ConnectivityIndex`] — this
 /// must not become a fifth private definition of "what is attached here"
-/// (#323). A dot is kept when anything still justifies it:
+/// (#323). A dot is kept when KiCad's junction rule still calls for it
+/// ([`JunctionSite`]): three or more distinct exits meet there, such as a T, a
+/// pin on a wire's span, or a crossing joined on purpose. A corner, a straight
+/// join or a wire ending on a pin has two, so its dot goes. Two exceptions
+/// keep a dot the rule would drop:
 ///
-/// * two or more wires under the point — a T, a crossing joined on purpose, or
-///   wire ends meeting: never touched;
-/// * a pin or a hierarchical sheet pin still at the point;
+/// * a bus or bus entry touches the point — bus junctions are not judged here;
 /// * pins unresolvable (`lib_symbols` lookup failed) — that is not the same as
 ///   "no pin here", so only the unambiguous zero-wire case prunes then.
+///
+/// [`JunctionSite`]: crate::tools::sch_connectivity::JunctionSite
 ///
 /// A dot is added only where a pin has landed mid-span on **exactly one** wire
 /// and no no-connect flag sits there. One wire is the unambiguous case: with
@@ -1353,7 +1361,12 @@ pub(crate) fn reconcile_junctions_at(
     // A bus junction remains outside ordinary wire-junction mutation. The
     // shared index owns this geometric answer so validators and mutation do
     // not drift apart again (#328).
-    let pins_known = !idx.placed_pins().is_empty() || extract_symbol_instances(&tree).is_empty();
+    //
+    // Whether every placed symbol's pins resolved. Only asked when the rule
+    // would drop a dot: then a pin the lookup could not place may be the
+    // missing third exit. Resolving walks every symbol, so it waits until a
+    // verdict depends on it.
+    let mut pins_resolved: Option<bool> = None;
 
     // Existing dots at the candidate points, with the byte range to delete —
     // the one thing the index does not hold.
@@ -1390,7 +1403,6 @@ pub(crate) fn reconcile_junctions_at(
             .iter()
             .filter(|d| konnect_sexp::geometry::points_coincident(px, py, d.at.0, d.at.1, TOL))
             .collect();
-        let attached = idx.has_pin(px, py) || idx.has_sheet_pin(px, py);
         if here.is_empty() {
             if idx.wires_at(px, py) == 1
                 && idx.on_wire_interior(px, py)
@@ -1400,10 +1412,14 @@ pub(crate) fn reconcile_junctions_at(
                 to_add.push((px, py));
             }
         } else {
-            let keep = match idx.wires_at(px, py) {
-                0 => false,
-                1 => !pins_known || attached,
-                _ => true,
+            let keep = match idx.junction_site(px, py).needed() {
+                None | Some(true) => true,
+                Some(false) => {
+                    let resolved = *pins_resolved.get_or_insert_with(|| {
+                        crate::tools::resolved_placed_pins_by_reference(&tree).is_some()
+                    });
+                    !resolved && idx.wires_at(px, py) > 0
+                }
             };
             if !keep {
                 ranges.extend(here.iter().map(|d| d.range));
@@ -1440,34 +1456,37 @@ pub(crate) fn reconcile_junctions_at(
     (out, added, pruned)
 }
 
-/// Drop the junction dots the removed wires left with nothing to justify them.
+/// Drop the junction dots the removed wires left unjustified.
 ///
 /// Deleting a wire used to leave its dots behind, so relocating a block — delete
 /// its wires, re-add them elsewhere — stranded junctions at the old coordinates.
-/// A dot needs two wires to mean anything, with one exception: one wire plus a
-/// pin landing mid-segment, which is exactly what `pins_mid_segment` creates.
-/// So a junction is pruned when no wire is left through it, or one is and no pin
-/// sits there. Junctions no removed wire touched are left alone, and moves that
-/// strand a dot without deleting a wire are #120's half of the problem.
+/// Only the dots a removed wire ended on or ran through can have lost an exit,
+/// so those are the candidates, and [`reconcile_junctions_at`] judges each by
+/// KiCad's junction rule: a dot left on a corner or a straight join goes, as
+/// does one left on a single wire or a wire end on a pin. Junctions no removed
+/// wire touched are left alone; [`prune_schematic_junctions`] sweeps a whole
+/// sheet.
+///
+/// [`prune_schematic_junctions`]: crate::tools::sch_junctions
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
-    const TOL: f64 = 0.01;
-    // Two is as high as this needs to count, so it stops there.
-    let wires_through = |wires: &[Wire], jx: f64, jy: f64| {
-        wires
-            .iter()
-            .filter(|w| {
-                konnect_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
-            })
-            .take(2)
-            .count()
-    };
+    let dots = dots_on_wires(&content, removed);
+    if dots.is_empty() {
+        return (content, 0);
+    }
+    let (content, _, pruned) = reconcile_junctions_at(content, &dots);
+    (content, pruned)
+}
 
-    // The dots the removed wires ran through, with the block to delete. Most
-    // deletions find none, and the document parse below is only for those.
-    let mut candidates: Vec<((usize, usize), (f64, f64))> = Vec::new();
-    for start in find_block_starts(&content, "junction") {
-        let Some((ws_start, block_end)) = find_block_with_leading_whitespace(&content, start)
-        else {
+/// The junction dots that lie on any of `wires`, at an end or inside the span —
+/// the dots whose justification a change to those wires can alter.
+pub(crate) fn dots_on_wires(content: &str, wires: &[Wire]) -> Vec<(f64, f64)> {
+    const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
+    if wires.is_empty() {
+        return Vec::new();
+    }
+    let mut dots = Vec::new();
+    for start in find_block_starts(content, "junction") {
+        let Some((_, block_end)) = find_block_with_leading_whitespace(content, start) else {
             continue;
         };
         let Ok(node) = parse_sexp(&content[start..block_end]) else {
@@ -1476,54 +1495,16 @@ fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize
         let Some((jx, jy, _)) = parse_at(&node) else {
             continue;
         };
-        if wires_through(removed, jx, jy) > 0 {
-            candidates.push(((ws_start, block_end), (jx, jy)));
+        let touched = wires.iter().any(|w| {
+            konnect_sexp::geometry::points_coincident(jx, jy, w.x1, w.y1, TOL)
+                || konnect_sexp::geometry::points_coincident(jx, jy, w.x2, w.y2, TOL)
+                || konnect_sexp::geometry::point_on_segment(jx, jy, w.x1, w.y1, w.x2, w.y2, TOL)
+        });
+        if touched {
+            dots.push((jx, jy));
         }
     }
-    if candidates.is_empty() {
-        return (content, 0);
-    }
-
-    let Ok(tree) = parse_sexp(&content) else {
-        return (content, 0);
-    };
-    let remaining = extract_wires(&tree);
-    // Resolving pins walks every symbol against `lib_symbols`, so it waits
-    // until a dot is down to its last wire and the answer decides the case.
-    let mut pins: Option<(Vec<(f64, f64)>, bool)> = None;
-
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (range, (jx, jy)) in candidates {
-        let orphaned = match wires_through(&remaining, jx, jy) {
-            0 => true,
-            1 => {
-                let (pins, pins_known) = pins.get_or_insert_with(|| {
-                    let pins = crate::tools::all_pin_endpoints(&tree);
-                    // A sheet with symbols but no resolvable pin means the
-                    // `lib_symbols` lookup failed, not that nothing is
-                    // connected. Only the unambiguous zero-wire case prunes
-                    // then, rather than guess a pin isn't there.
-                    let known = !pins.is_empty() || extract_symbol_instances(&tree).is_empty();
-                    (pins, known)
-                });
-                *pins_known
-                    && !pins.iter().any(|&(px, py)| {
-                        konnect_sexp::geometry::points_coincident(px, py, jx, jy, TOL)
-                    })
-            }
-            _ => false,
-        };
-        if orphaned {
-            ranges.push(range);
-        }
-    }
-
-    let pruned = ranges.len();
-    let edits = ranges
-        .into_iter()
-        .map(|(s, e)| SexpEdit::delete(s, e))
-        .collect();
-    (apply_edits(content, edits), pruned)
+    dots
 }
 
 async fn handle_batch_delete_wire(
@@ -2002,6 +1983,428 @@ async fn handle_rotate_label(
         "type": label.kind,
         "rotation": rotation,
         "justify": justify
+    })))
+}
+
+/// The shapes KiCad gives a global or hierarchical label.
+pub(crate) const LABEL_SHAPES: [&str; 5] =
+    ["input", "output", "bidirectional", "tri_state", "passive"];
+
+/// A label as the file states it, for the before/after of an edit.
+#[derive(Debug, Clone, PartialEq)]
+struct LabelState {
+    kind: String,
+    text: String,
+    at: Vec<String>,
+    shape: Option<String>,
+    effects: Option<konnect_sexp::SexpNode>,
+    uuid: Option<String>,
+    /// Every other child — fields, `fields_autoplaced` — in file order.
+    rest: Vec<konnect_sexp::SexpNode>,
+}
+
+impl LabelState {
+    fn read(block: &str) -> Option<Self> {
+        let node = parse_sexp(block).ok()?;
+        let children = node.children()?;
+        let kind = children.first()?.as_str()?.to_owned();
+        let text = children.get(1)?.as_str()?.to_owned();
+        let at = node
+            .find("at")?
+            .children()?
+            .iter()
+            .skip(1)
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
+        let rest = children
+            .iter()
+            .skip(2)
+            .filter(|child| !matches!(child.head(), Some("at" | "shape" | "effects" | "uuid")))
+            .cloned()
+            .collect();
+        Some(LabelState {
+            kind,
+            text,
+            at,
+            shape: node.find_str("shape").map(str::to_owned),
+            effects: node.find("effects").cloned(),
+            uuid: node.find_str("uuid").map(str::to_owned),
+            rest,
+        })
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let justify = self
+            .effects
+            .as_ref()
+            .and_then(|effects| effects.find("justify"))
+            .and_then(konnect_sexp::SexpNode::children)
+            .map(|children| {
+                children
+                    .iter()
+                    .skip(1)
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+        let number = |index: usize| {
+            self.at
+                .get(index)
+                .and_then(|value| value.parse::<f64>().ok())
+        };
+        json!({
+            "label_type": label_type_name(&self.kind),
+            "text": self.text,
+            "x": number(0),
+            "y": number(1),
+            "rotation": number(2).unwrap_or(0.0),
+            "shape": self.shape,
+            "justify": justify,
+            "uuid": self.uuid,
+            "fields": self.rest.iter().filter(|child| child.head() == Some("property")).filter_map(|field| field.get(1).and_then(|name| name.as_str())).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The tool's name for a label tag.
+fn label_type_name(tag: &str) -> &'static str {
+    match tag {
+        "global_label" => "global_label",
+        "hierarchical_label" => "hierarchical_label",
+        _ => "net_label",
+    }
+}
+
+/// The label tag for the tool's name.
+fn label_tag(label_type: &str) -> Option<&'static str> {
+    match label_type {
+        "net_label" => Some("label"),
+        "global_label" => Some("global_label"),
+        "hierarchical_label" => Some("hierarchical_label"),
+        _ => None,
+    }
+}
+
+/// Byte range of the quoted text right after a block's tag, quotes included.
+fn label_text_range(block: &str) -> Option<(usize, usize)> {
+    let bytes = block.as_bytes();
+    let mut index = 1;
+    while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    let start = index;
+    index += 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some((start, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Escape label text for a quoted S-expression string.
+fn quote_label_text(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Re-point a label in place. Only the tokens being changed are rewritten —
+/// the text, and the shape or tag when asked — so position, rotation,
+/// justification, fields and UUID are the file's own bytes afterwards. That is
+/// the difference from deleting and re-adding a label, which lost the shape to
+/// `add_schematic_net_label`'s `input` default.
+pub(crate) async fn handle_edit_label(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use crate::mcp::error::ToolErrorKind;
+    use crate::tools::invalid_arg;
+
+    let sch_path = get_path(args, "schematic")?;
+    let net = match require_str(args, "net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let new_net = match require_str(args, "new_net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    if new_net.is_empty() || new_net.chars().any(char::is_control) {
+        return Ok(invalid_arg(
+            "new_net",
+            "must be non-empty and free of control characters",
+        ));
+    }
+    let new_tag = match args.get("new_label_type") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str().and_then(label_tag) {
+            Some(tag) => Some(tag),
+            None => {
+                return Ok(invalid_arg(
+                    "new_label_type",
+                    "must be net_label, global_label or hierarchical_label",
+                ))
+            }
+        },
+    };
+    let new_shape = match args.get("new_shape") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str().filter(|shape| LABEL_SHAPES.contains(shape)) {
+            Some(shape) => Some(shape.to_string()),
+            None => {
+                return Ok(invalid_arg(
+                    "new_shape",
+                    "must be input, output, bidirectional, tri_state or passive",
+                ))
+            }
+        },
+    };
+
+    let content = read_consistent(&sch_path)?;
+    let labels = find_label_blocks(&content);
+    let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
+    let matched: Vec<&&LabelBlock> = named
+        .iter()
+        .filter(|l| same_point(l.x, x) && same_point(l.y, y))
+        .collect();
+    let label = match matched.as_slice() {
+        [one] => **one,
+        [] => {
+            let positions: Vec<String> = named
+                .iter()
+                .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
+                .collect();
+            let reason = if positions.is_empty() {
+                format!("no label named '{net}' in this schematic")
+            } else {
+                format!(
+                    "no label '{net}' at ({x}, {y}); labels of that name are at: {}",
+                    positions.join("; ")
+                )
+            };
+            return Ok(invalid_arg("net", &reason));
+        }
+        several => {
+            let candidates: Vec<String> = several
+                .iter()
+                .filter_map(|l| {
+                    let (start, end) = find_balanced_block(&content, l.start)?;
+                    LabelState::read(&content[start..end]).map(|state| {
+                        state
+                            .uuid
+                            .unwrap_or_else(|| format!("{} at byte {start}", l.kind))
+                    })
+                })
+                .collect();
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousTarget {
+                    target: format!("{net} at ({x}, {y})"),
+                    candidates: candidates.clone(),
+                },
+                format!(
+                    "{} labels named '{net}' share ({x}, {y}): {}. Remove the duplicates in \
+                     Eeschema before editing either.",
+                    several.len(),
+                    candidates.join(", ")
+                ),
+            ));
+        }
+    };
+
+    let (block_start, block_end) = find_balanced_block(&content, label.start)
+        .ok_or_else(|| anyhow::anyhow!("the label block is not balanced"))?;
+    let block = &content[block_start..block_end];
+    let before = LabelState::read(block)
+        .ok_or_else(|| anyhow::anyhow!("the label block could not be read"))?;
+    let old_tag = label.kind;
+    let tag = new_tag.unwrap_or(old_tag);
+    let shaped = tag != "label";
+    if !shaped && new_shape.is_some() {
+        return Ok(invalid_arg(
+            "new_shape",
+            "a local label (net_label) has no shape",
+        ));
+    }
+    if shaped && before.shape.is_none() && new_shape.is_none() {
+        return Ok(invalid_arg(
+            "new_shape",
+            &format!(
+                "a {} needs a shape and this label has none to keep; give new_shape",
+                label_type_name(tag)
+            ),
+        ));
+    }
+
+    // Every edit is relative to the label block, so nothing outside it moves.
+    let mut edits = Vec::new();
+    if tag != old_tag {
+        edits.push(SexpEdit::replace(
+            block_start + 1,
+            block_start + 1 + old_tag.len(),
+            tag,
+        ));
+    }
+    let (text_start, text_end) = label_text_range(block)
+        .ok_or_else(|| anyhow::anyhow!("the label's text is not a quoted string"))?;
+    edits.push(SexpEdit::replace(
+        block_start + text_start,
+        block_start + text_end,
+        quote_label_text(&new_net),
+    ));
+    let children = find_direct_child_blocks(block, old_tag);
+    let child_tag = |&(start, end): &(usize, usize)| -> Option<String> {
+        parse_sexp(&block[start..end])
+            .ok()
+            .and_then(|node| node.head().map(str::to_owned))
+    };
+    let shape_child = children
+        .iter()
+        .find(|range| child_tag(range).as_deref() == Some("shape"))
+        .copied();
+    match (shaped, shape_child, &new_shape) {
+        // Dropped: a local label has no shape.
+        (false, Some((start, _)), _) => {
+            let (from, to) = find_block_with_leading_whitespace(block, start)
+                .ok_or_else(|| anyhow::anyhow!("the shape is not balanced"))?;
+            edits.push(SexpEdit::delete(block_start + from, block_start + to));
+        }
+        (true, Some((start, end)), Some(shape)) => {
+            edits.push(SexpEdit::replace(
+                block_start + start,
+                block_start + end,
+                format!("(shape {shape})"),
+            ));
+        }
+        // Added where KiCad writes it: straight after the text, on the line
+        // the `(at …)` sits on.
+        (true, None, Some(shape)) => {
+            let at = children
+                .iter()
+                .find(|range| child_tag(range).as_deref() == Some("at"))
+                .map(|&(start, _)| start)
+                .ok_or_else(|| anyhow::anyhow!("the label has no (at …)"))?;
+            let line_start = block[..at].rfind('\n').map_or(at, |index| index + 1);
+            let separator = &block[text_end..at];
+            let indent: String = block[line_start..at]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let lead = if separator.contains('\n') {
+                let newline = if separator.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                format!("{newline}{indent}")
+            } else {
+                " ".to_string()
+            };
+            edits.push(SexpEdit::insert(
+                block_start + text_end,
+                format!("{lead}(shape {shape})"),
+            ));
+        }
+        _ => {}
+    }
+    if old_tag == "global_label" && tag != "global_label" {
+        // `Intersheetrefs` belongs to global labels only.
+        for &(start, end) in &children {
+            let is_refs = parse_sexp(&block[start..end]).ok().is_some_and(|node| {
+                node.head() == Some("property")
+                    && node.get(1).and_then(|name| name.as_str()) == Some("Intersheetrefs")
+            });
+            if is_refs {
+                let (from, to) = find_block_with_leading_whitespace(block, start)
+                    .ok_or_else(|| anyhow::anyhow!("a field is not balanced"))?;
+                edits.push(SexpEdit::delete(block_start + from, block_start + to));
+            }
+        }
+    }
+
+    let expected = content.clone();
+    let new_content = apply_edits(content, edits);
+    if let Err(error) = write_atomic_if_unchanged(&sch_path, &expected, &new_content) {
+        if let konnect_sexp::SexpError::Conflict { path } = &error {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![path.display().to_string()],
+                },
+                format!(
+                    "Schematic '{}' changed while the label was being edited; nothing was \
+                     written. Reload and retry.",
+                    path.display()
+                ),
+            ));
+        }
+        return Err(error.into());
+    }
+
+    // The write is not its own witness: read the label back from disk.
+    // Every edit was inside the block, so it still opens at `block_start`.
+    let written = read_consistent(&sch_path)?;
+    let after = find_balanced_block(&written, block_start)
+        .and_then(|(start, end)| LabelState::read(&written[start..end]));
+    let expected_shape = if shaped {
+        new_shape.clone().or_else(|| before.shape.clone())
+    } else {
+        None
+    };
+    let mut expected_rest = before.rest.clone();
+    if old_tag == "global_label" && tag != "global_label" {
+        expected_rest.retain(|child| {
+            !(child.head() == Some("property")
+                && child.get(1).and_then(|name| name.as_str()) == Some("Intersheetrefs"))
+        });
+    }
+    let proven = after.as_ref().is_some_and(|after| {
+        after.kind == tag
+            && after.text == new_net
+            && after.at == before.at
+            && after.effects == before.effects
+            && after.uuid == before.uuid
+            && after.shape == expected_shape
+            && after.rest == expected_rest
+    }) && written == new_content;
+    let Some(after) = after.filter(|_| proven) else {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "edit_schematic_label",
+            "the label read back from the file is not the one requested",
+        ));
+    };
+
+    // Read off the two states, not restated from the request.
+    let mut unchanged = vec!["position", "rotation", "justify", "uuid"];
+    if after.shape == before.shape {
+        unchanged.push("shape");
+    }
+    if after.rest == before.rest {
+        unchanged.push("fields");
+    }
+    if after.kind == before.kind {
+        unchanged.push("label_type");
+    }
+    Ok(CallToolResult::json(&json!({
+        "edited_label": {
+            "before": before.json(),
+            "after": after.json(),
+        },
+        "unchanged": unchanged,
     })))
 }
 
@@ -4800,5 +5203,267 @@ mod batch_no_connect_tests {
         let (out, body) = run(json!([])).await;
         assert_eq!(body["added_count"], 0);
         assert_eq!(out.matches("(no_connect").count(), 0);
+    }
+}
+
+/// `edit_schematic_label` on a KiCad 10.0.7-saved sheet (CRLF line endings,
+/// `Intersheetrefs` fields on its global labels). Each success compares the
+/// whole file with the original plus exactly the intended token changes, so
+/// a stray byte anywhere else fails the test.
+#[cfg(test)]
+mod edit_label_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+
+    const ROOT: &str = include_str!("../../tests/fixtures/design_nets.kicad_sch");
+    const RAIL_A_AT_U3: &str =
+        "(global_label \"RAIL_A\"\r\n\t\t(shape input)\r\n\t\t(at 45.72 114.3 180)";
+
+    fn sheet(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design_nets.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    async fn edit(path: &std::path::Path, mut args: serde_json::Value) -> CallToolResult {
+        args["schematic"] = json!(path.display().to_string());
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        handle_edit_label(&args, &ctx).await.unwrap()
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The acceptance case's shape: a global label keeps its shape, rotation,
+    /// justification and Intersheetrefs field, and the other label of the
+    /// same name is left alone.
+    #[tokio::test]
+    async fn re_pointing_a_global_label_changes_only_its_text() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "RAIL_A", "x": 45.72, "y": 114.3, "new_net": "MCU_3V3" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let expected = ROOT.replacen(
+            RAIL_A_AT_U3,
+            "(global_label \"MCU_3V3\"\r\n\t\t(shape input)\r\n\t\t(at 45.72 114.3 180)",
+            1,
+        );
+        assert_ne!(expected, ROOT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+        let response = body(&result);
+        let (before, after) = (
+            &response["edited_label"]["before"],
+            &response["edited_label"]["after"],
+        );
+        assert_eq!(before["text"], "RAIL_A");
+        assert_eq!(after["text"], "MCU_3V3");
+        for field in [
+            "label_type",
+            "shape",
+            "rotation",
+            "justify",
+            "uuid",
+            "fields",
+            "x",
+            "y",
+        ] {
+            assert_eq!(before[field], after[field], "{field}");
+        }
+        assert_eq!(after["shape"], "input");
+        assert_eq!(after["justify"], "right");
+        assert_eq!(after["fields"], json!(["Intersheetrefs"]));
+        assert_eq!(
+            response["unchanged"],
+            json!([
+                "position",
+                "rotation",
+                "justify",
+                "uuid",
+                "shape",
+                "fields",
+                "label_type"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_not_at_the_position_is_refused_and_nothing_is_written() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "RAIL_A", "x": 45.0, "y": 114.3, "new_net": "MCU_3V3" }),
+        )
+        .await;
+
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("45.72"),
+            "the positions found are listed: {text}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ROOT);
+    }
+
+    #[tokio::test]
+    async fn two_labels_on_one_point_are_ambiguous_and_nothing_is_written() {
+        let start = ROOT.find(RAIL_A_AT_U3).unwrap();
+        let (block_start, block_end) = find_balanced_block(ROOT, start).unwrap();
+        let duplicate = ROOT[block_start..block_end].replace(
+            "5eed0000-0000-4000-8000-000000000022",
+            "5eed0000-0000-4000-8000-0000000000ff",
+        );
+        let content = format!(
+            "{}\r\n\t{duplicate}{}",
+            &ROOT[..block_end],
+            &ROOT[block_end..]
+        );
+        let (_dir, path) = sheet(&content);
+        let result = edit(
+            &path,
+            json!({ "net": "RAIL_A", "x": 45.72, "y": 114.3, "new_net": "MCU_3V3" }),
+        )
+        .await;
+
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn a_new_shape_changes_only_the_shape() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "FAULT_N", "x": 154.94, "y": 101.6, "new_net": "FAULT_N", "new_shape": "bidirectional" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let expected = ROOT.replacen(
+            "(global_label \"FAULT_N\"\r\n\t\t(shape output)\r\n\t\t(at 154.94 101.6 0)",
+            "(global_label \"FAULT_N\"\r\n\t\t(shape bidirectional)\r\n\t\t(at 154.94 101.6 0)",
+            1,
+        );
+        assert_ne!(expected, ROOT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert!(!body(&result)["unchanged"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("shape")));
+    }
+
+    /// A local label has no shape, and Intersheetrefs belongs to global
+    /// labels; the rest of the block is the file's own.
+    #[tokio::test]
+    async fn a_global_label_made_local_drops_its_shape_and_intersheetrefs() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "RAIL_A", "x": 101.6, "y": 95.25, "new_net": "RAIL_A", "new_label_type": "net_label" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let start = written
+            .find("(label \"RAIL_A\"")
+            .expect("now a local label");
+        let (block_start, block_end) = find_balanced_block(&written, start).unwrap();
+        let block = &written[block_start..block_end];
+        assert!(!block.contains("(shape"), "{block}");
+        assert!(!block.contains("Intersheetrefs"), "{block}");
+        assert!(block.contains("(at 101.6 95.25 90)"));
+        assert!(block.contains("(justify left)"));
+        assert!(block.contains("5eed0000-0000-4000-8000-00000000002f"));
+        let reparsed = cse::Schematic::from_source(&path, written.clone()).unwrap();
+        assert!(reparsed.labels.iter().any(|label| label.text == "RAIL_A"));
+
+        let response = body(&result);
+        assert_eq!(response["edited_label"]["after"]["label_type"], "net_label");
+        assert_eq!(
+            response["edited_label"]["after"]["shape"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_label_made_global_needs_a_shape() {
+        let (_dir, path) = sheet(ROOT);
+        let refused = edit(
+            &path,
+            json!({ "net": "REG_EN", "x": 78.74, "y": 63.5, "new_net": "REG_EN", "new_label_type": "global_label" }),
+        )
+        .await;
+        assert_eq!(
+            extract_error_kind(&refused).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ROOT);
+
+        let result = edit(
+            &path,
+            json!({ "net": "REG_EN", "x": 78.74, "y": 63.5, "new_net": "REG_EN",
+                    "new_label_type": "global_label", "new_shape": "output" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+        let expected = ROOT.replacen(
+            "(label \"REG_EN\"\r\n\t\t(at 78.74 63.5 0)",
+            "(global_label \"REG_EN\"\r\n\t\t(shape output)\r\n\t\t(at 78.74 63.5 0)",
+            1,
+        );
+        assert_ne!(expected, ROOT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_shape_on_a_local_label_is_refused() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "REG_EN", "x": 78.74, "y": 63.5, "new_net": "X", "new_shape": "input" }),
+        )
+        .await;
+
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ROOT);
+    }
+
+    /// The new text is quoted the way KiCad reads it back.
+    #[tokio::test]
+    async fn a_quote_in_the_new_text_is_escaped() {
+        let (_dir, path) = sheet(ROOT);
+        let result = edit(
+            &path,
+            json!({ "net": "ORPHAN", "x": 152.4, "y": 139.7, "new_net": "A\"B" }),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.content);
+
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("(global_label \"A\\\"B\""));
+        assert_eq!(body(&result)["edited_label"]["after"]["text"], "A\"B");
     }
 }

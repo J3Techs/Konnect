@@ -19,6 +19,7 @@ pub(crate) mod closed_board;
 pub mod config;
 pub(crate) mod cross_probe;
 mod custom_rules;
+pub(crate) mod design_nets;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;
@@ -63,6 +64,7 @@ pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
+pub(crate) mod sch_junctions;
 pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]

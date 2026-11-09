@@ -132,7 +132,8 @@ pub fn tools() -> Vec<ToolDef> {
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
              components, their nets, pin counts. Nets come from labels and from \
-             power symbols. Does not require kicad-cli.",
+             power symbols. Reads this file only, and 'coverage' says when its nets \
+             continue on other sheets. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
@@ -636,12 +637,18 @@ async fn handle_export_netlist_summary(
         })
         .collect();
 
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "component_count": components.len(),
         "net_count": net_names.len(),
         "nets": net_names,
         "components": components
-    })))
+    });
+    if let Some(coverage) =
+        super::sch_analysis::single_file_coverage(&sch_path, &tree, &labels, None)
+    {
+        response["coverage"] = coverage;
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 /// ERC positions ride on the entry itself as a pair of keys, not as a nested
@@ -1632,7 +1639,9 @@ mod connectivity_edit_tests {
 ///
 /// Returns `None` for a proven root or a loose schematic with no project
 /// candidate. Unproven or ambiguous ownership is a structured conflict.
-fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+pub(crate) fn owning_project_root(
+    file: &Path,
+) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
     Ok(
         crate::tools::resolve_schematic_ownership(file)?.and_then(|ownership| {
             (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)

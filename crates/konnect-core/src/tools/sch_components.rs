@@ -65,7 +65,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_component",
-            "Remove a component by reference designator, including every placed unit of a multi-unit symbol.",
+            "Remove a component by reference designator, including every placed unit of a \
+             multi-unit symbol. Junction dots its pins leave unjustified by KiCad's junction \
+             rule go in the same write, reported as junctions_pruned_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1914,6 +1916,53 @@ fn dedup_points(points: impl IntoIterator<Item = (f64, f64)>) -> Vec<(f64, f64)>
     unique
 }
 
+/// The junction dots that deleting `item_uuids` can leave unjustified: the dots
+/// on a deleted wire's ends or span, and the dots on a deleted sheet's pins.
+/// Labels, no-connects and texts are not exits, and bus items keep their own
+/// junction rule, so nothing else is a candidate.
+fn dots_touched_by_deleted_items(
+    content: &str,
+    tree: &konnect_sexp::SexpNode,
+    item_uuids: &[String],
+) -> Vec<(f64, f64)> {
+    if item_uuids.is_empty() {
+        return Vec::new();
+    }
+    let deleted = |node: &konnect_sexp::SexpNode| {
+        node.find_str("uuid")
+            .is_some_and(|uuid| item_uuids.iter().any(|selected| selected == uuid))
+    };
+    let wires: Vec<konnect_sexp::schematic::Wire> = konnect_sexp::schematic::extract_wires(tree)
+        .into_iter()
+        .filter(|wire| {
+            wire.uuid
+                .as_ref()
+                .is_some_and(|uuid| item_uuids.contains(uuid))
+        })
+        .collect();
+    let mut points = crate::tools::sch_wiring::dots_on_wires(content, &wires);
+
+    let dots = konnect_sexp::schematic::extract_junctions(tree);
+    for sheet in tree
+        .find_all("sheet")
+        .into_iter()
+        .filter(|sheet| deleted(sheet))
+    {
+        for pin in sheet.find_all("pin") {
+            let Some((x, y, _)) = konnect_sexp::schematic::parse_at(pin) else {
+                continue;
+            };
+            if dots
+                .iter()
+                .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+            {
+                points.push((x, y));
+            }
+        }
+    }
+    dedup_points(points)
+}
+
 fn plan_component_deletion(
     path: &std::path::Path,
     content: &str,
@@ -2104,7 +2153,13 @@ pub(crate) fn plan_component_and_item_deletions(
     let candidate = prepare_command(path, content, &initial)
         .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
         .0;
-    let (reconciled, _, _) = crate::tools::sch_wiring::reconcile_junctions_at(candidate, &affected);
+    // Every dot a deleted item met can have lost an exit: the pins of deleted
+    // components, the dots on deleted wires, and the dots on deleted sheets'
+    // pins. Each is re-judged by KiCad's junction rule.
+    let mut junction_points = affected;
+    junction_points.extend(dots_touched_by_deleted_items(content, &tree, &item_uuids));
+    let (reconciled, _, _) =
+        crate::tools::sch_wiring::reconcile_junctions_at(candidate, &junction_points);
 
     let after_items = indexed_uuid_items(path, &reconciled)?;
     let before_ids = before_items.keys().cloned().collect::<BTreeSet<_>>();
@@ -2246,8 +2301,10 @@ pub(crate) fn commit_component_deletion(
         .iter()
         .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
         .collect::<BTreeSet<_>>();
+    // A junction the caller named is a deleted item, not one the rule pruned.
     let pruned_junctions = before_junctions
         .difference(&after_junctions)
+        .filter(|uuid| !plan.item_uuids.contains(uuid))
         .cloned()
         .collect::<Vec<_>>();
     let added_junctions = after_junctions

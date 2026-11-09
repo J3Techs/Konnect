@@ -52,15 +52,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_analysis",
-        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection",
+        description: "Net connectivity, pin queries, trace paths, overlap/orphan detection, junction dots and what meets at each, and design-wide net members, undriven nets and sheet-removal dry runs from KiCad's netlist",
         category: "schematic",
-        tool_count: 15,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "sch_batch",
-        description: "Bulk add, edit, delete, and move schematic elements in one call",
+        description: "Bulk add, edit, delete, and move schematic elements in one call, and prune the junction dots KiCad's rule does not call for",
         category: "schematic",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "sch_export",
@@ -70,9 +70,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
+        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation, re-pointing a label in place",
         category: "schematic",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "pcb_board",
