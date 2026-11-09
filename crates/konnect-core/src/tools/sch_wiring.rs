@@ -969,7 +969,7 @@ pub(crate) fn plan_no_connect_carry(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, true)
+    plan_no_connect_carry_with(before, after, true, None)
 }
 
 /// Follow a no-connect through a symbol replacement by the identity that the
@@ -983,13 +983,37 @@ pub(crate) fn plan_no_connect_carry_for_replacement(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
-    plan_no_connect_carry_with(before, after, false)
+    plan_no_connect_carry_with(before, after, false, None)
+}
+
+/// A no-connect flag a replacement drops: the pin it protected is not in the
+/// new symbol.
+#[derive(Debug, Clone)]
+pub(crate) struct DroppedNoConnect {
+    pub(crate) uuid: String,
+    pub(crate) at: (f64, f64),
+    /// The pin it protected, as `reference unit pin`.
+    pub(crate) pin: String,
+}
+
+/// [`plan_no_connect_carry_for_replacement`], except that a flag on a pin the
+/// new symbol lacks (its number is gone) is dropped instead of refusing the
+/// replacement. A flag that still protects another pin follows that one; a
+/// duplicated pin still refuses.
+pub(crate) fn plan_no_connect_carry_for_replacement_dropping(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<(Vec<NoConnectCarry>, Vec<DroppedNoConnect>), NoConnectCarryError> {
+    let mut dropped = Vec::new();
+    let carries = plan_no_connect_carry_with(before, after, false, Some(&mut dropped))?;
+    Ok((carries, dropped))
 }
 
 fn plan_no_connect_carry_with(
     before: &konnect_sexp::SexpNode,
     after: &konnect_sexp::SexpNode,
     require_same_local_geometry: bool,
+    mut dropped: Option<&mut Vec<DroppedNoConnect>>,
 ) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
     const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
     let coincident = |a: (f64, f64), b: (f64, f64)| {
@@ -1019,9 +1043,11 @@ fn plan_no_connect_carry_with(
     let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
 
     let mut carries: Vec<NoConnectCarry> = Vec::new();
+    let mut gone: Vec<&str> = Vec::new();
     for (uuid, from) in &markers {
         let owners = before_pins.iter().filter(|p| coincident(p.at, *from));
         let mut arrivals: Vec<(&IdentifiedPin, (f64, f64))> = Vec::new();
+        let mut vanished: Vec<String> = Vec::new();
         for owner in owners {
             let landed: Vec<&IdentifiedPin> = after_pins
                 .iter()
@@ -1033,6 +1059,12 @@ fn plan_no_connect_carry_with(
                             || p.identity.local_key == owner.identity.local_key)
                 })
                 .collect();
+            // Dropping is asked for: a pin the change removed takes its flag
+            // with it, unless the flag still protects another pin.
+            if landed.is_empty() && dropped.is_some() {
+                vanished.push(pin_label(owner));
+                continue;
+            }
             let [arrival] = landed[..] else {
                 return Err(NoConnectCarryError::Unmappable {
                     reason: format!(
@@ -1045,8 +1077,17 @@ fn plan_no_connect_carry_with(
             };
             arrivals.push((owner, arrival.at));
         }
-        // No pin under the marker: already dangling, and not this pass's to fix.
+        // No pin under the marker: already dangling, and not this pass's to
+        // fix — unless the pins it protected are gone, when it goes too.
         let Some(&(_, to)) = arrivals.first() else {
+            if let (Some(dropped), Some(pin)) = (dropped.as_deref_mut(), vanished.first()) {
+                dropped.push(DroppedNoConnect {
+                    uuid: uuid.clone(),
+                    at: *from,
+                    pin: pin.clone(),
+                });
+                gone.push(uuid.as_str());
+            }
             continue;
         };
         if arrivals.iter().any(|&(_, at)| !coincident(at, to)) {
@@ -1079,6 +1120,7 @@ fn plan_no_connect_carry_with(
     }
     let landings: Vec<Landing<'_>> = markers
         .iter()
+        .filter(|(uuid, _)| !gone.contains(&uuid.as_str()))
         .map(|(uuid, from)| Landing {
             uuid,
             from: *from,
@@ -5230,6 +5272,38 @@ mod no_connect_carry_tests {
         };
         assert!(reason.contains(R2_MARKER), "{reason}");
         assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    /// Asked to, a replacement drops the flag on a pin the new symbol lacks
+    /// instead of refusing, and says which pin it protected.
+    #[test]
+    fn dropping_takes_the_flag_of_a_pin_the_new_symbol_lacks() {
+        let before = with_only_marker(R2_MARKER);
+        let after = before.replacen("(number \"1\"", "(number \"3\"", 1);
+        let (carries, dropped) =
+            plan_no_connect_carry_for_replacement_dropping(&tree(&before), &tree(&after))
+                .expect("a pin the new symbol lacks is dropped, not refused");
+        assert!(carries.is_empty(), "{carries:?}");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].uuid, R2_MARKER);
+        assert_eq!(dropped[0].at, (158.75, 156.21));
+        assert!(dropped[0].pin.contains("R2"), "{:?}", dropped[0]);
+    }
+
+    /// Dropping does not make a duplicated pin any less ambiguous.
+    #[test]
+    fn dropping_still_refuses_a_duplicated_protected_pin() {
+        let before = with_only_marker(R2_MARKER);
+        let (start, end) = find_block_starts(&before, "pin")
+            .into_iter()
+            .find_map(|start| find_balanced_block(&before, start))
+            .expect("the fixture embeds a pin block");
+        let duplicate = before[start..end].to_owned();
+        let mut after = before.clone();
+        after.insert_str(end, &duplicate);
+        assert!(
+            plan_no_connect_carry_for_replacement_dropping(&tree(&before), &tree(&after)).is_err()
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
-                    "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "datasheet": { "type": "string", "description": "New datasheet URL (optional). Added, hidden as KiCad places it, to a placed unit that lacks the built-in Datasheet field." },
                     "in_bom": { "type": "boolean", "description": "Include this component in the BOM, consistently on every placed unit. Independent of on_board and DNP; no pins, wires, identity or other flags change." },
                     "fields": {
                         "type": "object",
@@ -342,14 +342,16 @@ pub fn tools() -> Vec<ToolDef> {
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
-             writing.",
+             writing, unless drop_orphaned_no_connects deletes the flags on removed pins.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
                     "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
-                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." }
+                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." },
+                    "drop_orphaned_no_connects": { "type": "boolean", "default": false,
+                        "description": "Delete, in the same write, each no-connect flag whose pin the new symbol lacks instead of refusing; each is listed in no_connects_dropped. A flag that still protects another pin follows that pin; a duplicated pin still refuses." }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -2930,7 +2932,19 @@ async fn handle_edit_schematic_component(
         apply!("Footprint", fp);
     }
     if let Some(ds) = opt_str(args, "datasheet") {
-        apply!("Datasheet", ds);
+        // A built-in field, but instances copied from older sheets may lack
+        // it, so a missing one is added — hidden, as KiCad places it.
+        match set_property_value(&content, edit_reference, "Datasheet", ds, true) {
+            Ok((updated, counts)) => {
+                content = updated;
+                expected_fields.insert("Datasheet".to_owned(), ds.to_owned());
+                changed.push(format!(
+                    "Datasheet → {ds} ({} updated, {} added)",
+                    counts.updated, counts.added
+                ));
+            }
+            Err(why) => errors.push(format!("Datasheet: {why}")),
+        }
     }
 
     if let Some(include) = requested_bom {
@@ -4408,14 +4422,47 @@ async fn handle_replace_component(
     // one-to-one identity before the junction pass sees the new endpoints;
     // removed, renumbered or duplicated protected pins refuse before writing.
     let after_tree = parse_sexp(&content)?;
-    let carries = match plan_no_connect_carry_for_replacement(&parsed, &after_tree) {
-        Ok(carries) => carries,
+    let drop_orphans = args["drop_orphaned_no_connects"].as_bool().unwrap_or(false);
+    let planned = if drop_orphans {
+        super::sch_wiring::plan_no_connect_carry_for_replacement_dropping(&parsed, &after_tree)
+    } else {
+        plan_no_connect_carry_for_replacement(&parsed, &after_tree)
+            .map(|carries| (carries, Vec::new()))
+    };
+    let (carries, dropped) = match planned {
+        Ok(planned) => planned,
         Err(error) => return Ok(error.into_result(&sch_path)),
     };
     content = match apply_no_connect_carries(content, &carries) {
         Some(content) => content,
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
+    // Flags on pins the new symbol lacks go in the same write when asked.
+    if !dropped.is_empty() {
+        let mut ranges = Vec::new();
+        for start in konnect_sexp::writer::find_block_starts(&content, "no_connect") {
+            let Some((from, to)) =
+                konnect_sexp::writer::find_block_with_leading_whitespace(&content, start)
+            else {
+                continue;
+            };
+            let Some((block_start, block_end)) =
+                konnect_sexp::writer::find_balanced_block(&content, start)
+            else {
+                continue;
+            };
+            let uuid = parse_sexp(&content[block_start..block_end])
+                .ok()
+                .and_then(|node| node.find_str("uuid").map(str::to_owned));
+            if uuid.is_some_and(|uuid| dropped.iter().any(|flag| flag.uuid == uuid)) {
+                ranges.push(SexpEdit::delete(from, to));
+            }
+        }
+        if ranges.len() != dropped.len() {
+            return Ok(no_connect_carry_unwritable(&sch_path));
+        }
+        content = apply_edits(content, ranges);
+    }
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
@@ -4446,6 +4493,28 @@ async fn handle_replace_component(
             ));
         }
     };
+    // A dropped flag must be gone from the written file, not merely planned
+    // away.
+    if !dropped.is_empty() {
+        let written = read_consistent(&sch_path)?;
+        let still_there: Vec<&str> = parse_sexp(&written)
+            .map(|tree| {
+                tree.find_all("no_connect")
+                    .into_iter()
+                    .filter_map(|node| node.find_str("uuid"))
+                    .filter(|uuid| dropped.iter().any(|flag| flag.uuid == *uuid))
+                    .map(|_| "kept")
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !still_there.is_empty() {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "replace_component",
+                "a no-connect flag planned for removal is still in the written file",
+            ));
+        }
+    }
     let mut result = json!({
         "reference": observed["reference"],
         "old_lib_id": old_lib_id,
@@ -4457,6 +4526,15 @@ async fn handle_replace_component(
         "no_connects_moved_count": moved_markers.len(),
         "no_connects_moved": moved_markers
     });
+    if drop_orphans {
+        result["no_connects_dropped_count"] = json!(dropped.len());
+        result["no_connects_dropped"] = json!(dropped
+            .iter()
+            .map(
+                |flag| json!({ "uuid": flag.uuid, "x": flag.at.0, "y": flag.at.1, "pin": flag.pin })
+            )
+            .collect::<Vec<_>>());
+    }
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
 }
@@ -6261,6 +6339,110 @@ mod tests {
         .unwrap();
         assert!(result.is_error);
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Item 7: a placed unit without the built-in Datasheet field gets it,
+    /// hidden as KiCad places it, instead of the edit being refused.
+    #[tokio::test]
+    async fn a_missing_datasheet_field_is_added() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("datasheet.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        // Strip the instance's Datasheet, as DB1-derived sheets have none.
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        for symbol in sch.symbols.iter_mut() {
+            symbol.remove_property("Datasheet");
+        }
+        sch.overwrite().unwrap();
+        let stripped = cse::Schematic::load(&path).unwrap();
+        assert!(stripped.symbols.iter().all(|s| s.datasheet().is_none()));
+
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "datasheet": "https://example.com/r.pdf" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let sch = cse::Schematic::load(&path).unwrap();
+        let symbol = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .unwrap();
+        assert_eq!(symbol.datasheet(), Some("https://example.com/r.pdf"));
+        let property = symbol
+            .properties
+            .iter()
+            .find(|property| property.name == "Datasheet")
+            .unwrap();
+        let text = cse::sexp::writer::write(&property.to_sexp());
+        assert!(text.contains("(hide yes)"), "{text}");
+    }
+
+    /// Item 7: replacing R1 (pins 1 and 2) with a one-pin symbol refuses
+    /// while a no-connect flag sits on pin 2, unless asked to drop it.
+    #[tokio::test]
+    async fn a_replacement_can_drop_the_flag_of_a_pin_it_removes() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("drop-nc.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 101.6, "y": 101.6 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        // Pin 2's end is at (101.6, 105.41).
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.add_no_connect(101.6, 105.41);
+        sch.overwrite().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let refused = handle_replace_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "new_lib_id": "Device:WITH_DEFAULTS" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error, "{refused:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let result = handle_replace_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "new_lib_id": "Device:WITH_DEFAULTS", "drop_orphaned_no_connects": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["no_connects_dropped_count"], 1, "{body}");
+        assert_eq!(body["no_connects_dropped"][0]["x"], 101.6, "{body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("(no_connect"), "{after}");
+        assert!(after.contains("Device:WITH_DEFAULTS"), "{after}");
     }
 
     /// #203: annotating the same key twice must update the one property in

@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a missing Datasheet field is added; a replacement can drop orphaned no-connect flags
+
+`edit_schematic_component` refused `datasheet` on a placed unit with no
+Datasheet property, which instances copied from older sheets lack, so the link
+stayed only on the library symbol. A missing Datasheet is now added, hidden as
+KiCad places it, in the same write that updates the units that have one; the
+change line reads `Datasheet → … (n updated, m added)`.
+
+`replace_component` refuses while a no-connect flag sits on a pin the new
+symbol lacks. New `drop_orphaned_no_connects` (default false) deletes such
+flags in the same write instead, listing each in `no_connects_dropped` (UUID,
+position, the pin it protected) with `no_connects_dropped_count`, and checks
+the written file no longer has them. A flag that still protects another pin
+follows that pin, and a duplicated pin still refuses. Without the option the
+refusal is unchanged.
+
 ## Unreleased: sheet moves and sheet-pin edits judge junction dots; a split adds only a needed dot
 
 `move_sheet`, `edit_sheet_pin` and `delete_sheet_pin` left junction dots as
