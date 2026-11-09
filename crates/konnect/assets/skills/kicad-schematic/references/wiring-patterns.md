@@ -1,5 +1,8 @@
 # Common Wiring Patterns
 
+Each pattern is drawn with wires between its own parts. A net label appears
+only where the signal leaves the pattern.
+
 ## Pattern 1: Decoupling Capacitor
 ```
         +3V3 (power symbol)

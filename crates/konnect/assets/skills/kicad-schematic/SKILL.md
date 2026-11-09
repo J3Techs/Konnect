@@ -106,6 +106,51 @@ Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow poi
 
 ---
 
+## Draw the circuit, not a netlist
+
+A schematic is read by people. Draw each functional block the way a datasheet
+or a hand-drawn schematic shows it: parts placed in signal-flow order and
+joined by wires, so a reader can follow the circuit without matching net names.
+
+**Wire by default.** Connections inside a functional block get wires
+(`connect_pins`, `add_wire`, `batch_add_wire`, `add_schematic_connection`):
+
+- a pin to the passive beside it: gate resistor to gate, sense resistor to its
+  amplifier input, decoupling capacitor to its supply pin;
+- the nodes of a divider, filter, snubber, clamp or bridge;
+- a switch, its diode and its load path;
+- anything a reader would trace with a finger.
+
+**Labels are for boundaries.** Use a net label only where a wire would hurt:
+
+- a net that leaves the sheet (global or hierarchical label);
+- a net that runs to a distant block on the same sheet, where a wire would
+  cross many others: name it once at each end;
+- buses and the fan-out of a large IC or connector, whose pins go to many
+  other blocks or sheets.
+
+**Rails take power symbols**, drawn at the part that uses them.
+
+**Do not** build a sheet as rows of parts with a label on every pin and no
+wires between them. It nets up correctly and passes ERC, but it is a netlist
+laid out on a page: the reader has to search for matching names to learn what
+each part connects to. `batch_connect_to_net` makes that style quick to
+produce; speed of capture is not a reason to use it. If a block has been built
+that way, redraw it with wires.
+
+**Layout that reads:**
+
+- signal flow left to right; supplies toward the top, ground toward the bottom;
+- one functional block per area, with a short title;
+- repeated cells (channels, phases, banks) drawn the same way each time;
+- room between blocks for the wires that join them.
+
+**Acceptance:** in the rendered image, each block's function can be followed
+along its wires without reading a net name. Check this in the visual feedback
+loop below, alongside overlaps and page bounds.
+
+---
+
 ## Wiring
 
 Read [`references/wiring-patterns.md`](references/wiring-patterns.md) when
@@ -117,12 +162,13 @@ pattern.
 
 | Scenario                                | Method                  | Why                                      |
 |-----------------------------------------|-------------------------|------------------------------------------|
+| Parts within one functional block       | `connect_pins`, `add_wire` | Drawn circuit: the default            |
 | Two pins physically close (<30mm)       | `connect_pins`          | Direct wire, auto-routed                 |
-| Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
+| Named signal leaving the block or sheet | `connect_to_net`        | Stub wire + net label at the boundary    |
 | Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
 | Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
-| Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
+| Many IC or connector pins leaving the sheet | `batch_connect_to_net` | Efficient bulk operation; not for wiring a block |
 
 ### connect_pins
 
@@ -144,9 +190,9 @@ Use for named nets. Creates a short stub wire and attaches a net label.
 connect_to_net(schematic, reference, pin_number, net)
 ```
 
-- Preferred for signals that connect to 3+ pins
-- Preferred for named buses and control signals
-- Keeps schematic clean and readable
+- For a signal whose other pins are in another block or on another sheet
+- For named buses and control signals at a block's boundary
+- Not for joining neighbouring parts: wire those (see Draw the circuit)
 - Net name must be consistent across all connections
 - Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
   from the symbol body on its own, instead of the label text running back
@@ -211,7 +257,8 @@ junction was added.
 
 ### batch_connect_to_net
 
-Connect multiple pins to the same net in one call. Ideal for:
+Connect multiple pins to the same net in one call. It is not a way to wire a
+whole sheet (see Draw the circuit, not a netlist). Ideal for:
 - Connecting all VCC pins on an IC
 - Connecting all GND pins
 - Bus signals across multiple ICs
@@ -305,7 +352,7 @@ The agent can see its own schematic. After meaningful edits:
    than silently trusted.
 
 Use the loop to catch what connectivity checks cannot. Completion requires
-coherent functional grouping, label-inclusive overlap inspection, clear signal
+blocks drawn with wires and readable without net names, coherent functional grouping, label-inclusive overlap inspection, clear signal
 flow, and page-boundary acceptance for every symbol, label, and note. Inspect
 the image itself; a successful render command is not visual acceptance.
 
@@ -333,7 +380,7 @@ production-ready claim.
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
 6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels; the exception is a rail that must stay separate per instance of a repeated sheet, which takes a local label because power symbols are global
-7. **Net labels for named signals** — keeps schematics readable
+7. **Wires inside a block, labels at its boundary** — a label on every pin makes a netlist, not a schematic
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
 10. **Batch for bulk** — use batch toolset for 3+ repetitive operations

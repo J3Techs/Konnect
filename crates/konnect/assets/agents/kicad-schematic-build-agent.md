@@ -52,9 +52,11 @@ load_toolset("templates")
 - Place decoupling caps immediately when placing each IC
 
 **Step 4: Wire the Circuit**
-- Use `connect_to_net` for power connections (cleaner than explicit wires)
-- Use `connect_pins` for direct point-to-point signals
-- Use net labels for signals that span groups or sheets
+- Draw each functional block with wires (`connect_pins`, `add_wire`), parts in
+  signal-flow order, as a datasheet would draw it
+- Use power symbols for rails, at the part that uses them
+- Use net labels only where a signal leaves its block or sheet; never a label
+  on every pin in place of wires
 - Wire power first, then signals, then low-priority connections
 
 **Step 5: Annotate and save**
