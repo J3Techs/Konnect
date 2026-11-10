@@ -1100,10 +1100,23 @@ needs the new field.
   (`Own`: this run's copper; `Unlocked`: also `Ownership::Fixed` tracks,
   arcs and vias with a UUID, of nets inside the scope, not of an excluded
   class and without a zone). The S7 checker then checks the probe paths
-  against the real copper: the nets they collide with are the blockers. A
-  connection with no probe path is probed again with every nearby track,
-  arc and via out, then with every zone fill out as well, only to report
-  its blockers (`StillOpen::blocked_by`, a zone fill as `zone_fill`).
+  against the real copper: the nets they collide with are the blockers.
+  Zone fills that are walls to negotiation (filled, on a routable layer,
+  not `ZonePiece::crossable`) are crossable on the probe board and checked
+  as copper on the real one: a path that crosses one has the fill as a
+  blocker (`zone_fill`), and its connection gets no attempt. The probe
+  therefore never paints a fill polygon into a raster, which is what a
+  negotiation on a board poured around its tracks spends its time on. A
+  connection with no probe path is probed once more with every nearby
+  track, arc and via out, only to report its blockers
+  (`StillOpen::blocked_by`). A blocker that may be ripped but was not
+  ripped for that connection in any attempt reads `not_tried`.
+- **Paths nothing blocks.** A probe path with no blocker is not searched
+  for again: the round first keeps all such paths as they are
+  (`RipUpAttempt::order` `probe_path`, no nets ripped), through
+  `clear_findings` against the rest, and the round ends there when the
+  board then has fewer open connections. Earlier such a connection was
+  routed again on the real board (a "plain retry").
 - **Attempt.** The blockers are ripped whole (a net, not single tracks).
   The stuck connections are routed first around what is left, then the
   ripped nets around those (`route_around`, pin access recomputed on that
@@ -1132,13 +1145,29 @@ needs the new field.
   own tail (S6, clear, repair) leaves `connections_after` above the
   stage's `open_before` (`RipUpReport::restored`); the job runner does the
   same after its clear stage.
+- **Watching and stopping.** `route_board_hooked` takes a `RunHooks`:
+  `rip_up` is told each `RipUpEvent` (`Start`, then per round `Probe`
+  (`stuck`, `rippable`, `unblocked`, `behind_zone_fill`, `no_path`) and
+  per attempt `Attempt` and `AttemptDone`, and `Stopped` last; `name()`
+  gives `start`, `probe`, `attempt`, `attempt_done`, `stopped`, and the
+  event serialises as its fields), and `stop` is asked before each probe
+  and attempt: `true` ends the stage with what it has kept
+  (`RipUpReport::stopped` `stop_requested`). `route_board` and
+  `route_board_with` run without hooks. No other stage reports or asks.
 - Counters `pipeline_rip_up_{rounds, attempts, accepted, ripped_items,
-  joined, us, restored}`; time charged to `Stage::Detail`.
+  joined, us, restored, routes}` (`routes`: negotiations the stage ran,
+  probes included); time charged to `Stage::Detail`.
 - The job: `NativeJobSpec::rip_up` (serialised only when not `Own`),
   `PipelineReport::{rip_up, replaces_path}`, `Checkpoint::rip_up`,
   `replaces_path_for(output_plan)`, a `rip_up` stage record after the
   clear stage (`done` or `restored`). `unrouted::OpenConnection::blocked_by`
-  is the `StillOpen::blocked_by` of the same pad pair.
+  is the `StillOpen::blocked_by` of the same pad pair. The runner routes on
+  a thread of its own and passes each `RipUpEvent` to
+  `PipelineObserver::event` under stage `rip_up` (so `progress.jsonl` and
+  the status's `stage` show it); while the route stage runs it asks
+  `should_stop` and the time limit four times a second and sets the
+  stage's `stop`. `NativeRoute::rip_up` is also set for a stage stopped
+  before its first round.
 
 ### Workspace
 

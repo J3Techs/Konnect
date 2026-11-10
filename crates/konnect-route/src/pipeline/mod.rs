@@ -55,7 +55,7 @@ pub use planes::{
     crossed_zones, open_connection_count, split_left_to_planes, PlaneNetReport, PlaneOpenReason,
     PlaneTracks, ZoneCrossing,
 };
-pub use rip_up::{without_ripped, RipUp, RipUpReport, RipUpSettings, RippedItem};
+pub use rip_up::{without_ripped, RipUp, RipUpEvent, RipUpReport, RipUpSettings, RippedItem};
 
 use crate::access::{compute_pin_access_with, AccessSettings, AccessStats, PadAccess};
 use crate::api::{
@@ -397,12 +397,36 @@ pub enum PipelineError {
     Plan(#[from] PlanError),
 }
 
+/// What a caller may watch and stop while the pipeline runs
+/// ([`route_board_hooked`]). Only the rip-up stage reports and asks so far:
+/// it is the one stage whose work is optional, so stopping it loses nothing
+/// the run already has.
+#[derive(Clone, Copy, Default)]
+pub struct RunHooks<'a> {
+    /// Told what the rip-up stage is doing, as it does it.
+    pub rip_up: Option<&'a (dyn Fn(&RipUpEvent) + Sync)>,
+    /// Asked before each probe and attempt of the rip-up stage; `true`
+    /// ends the stage with what it has kept (`stopped: stop_requested`).
+    pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
 /// Route `board` with WS-D1's kernel as the detailed search backend.
 pub fn route_board(
     board: &RouteBoard,
     rules: &dyn RuleTable,
     scope: &PipelineScope,
     settings: &PipelineSettings,
+) -> Result<PipelineResult, PipelineError> {
+    route_board_hooked(board, rules, scope, settings, &RunHooks::default())
+}
+
+/// [`route_board`], watched and stoppable through `hooks`.
+pub fn route_board_hooked(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    scope: &PipelineScope,
+    settings: &PipelineSettings,
+    hooks: &RunHooks<'_>,
 ) -> Result<PipelineResult, PipelineError> {
     let mut backend = KernelBackend::new(settings.search.clone());
     if settings.search_min_run {
@@ -412,7 +436,7 @@ pub fn route_board(
             backend.config.min_run_nm = min;
         }
     }
-    route_board_with(board, rules, scope, settings, &mut backend)
+    route_on(board, rules, scope, settings, hooks, &mut backend)
 }
 
 /// [`route_board`] on any detailed search backend.
@@ -423,15 +447,26 @@ pub fn route_board_with(
     settings: &PipelineSettings,
     backend: &mut (dyn RouteCompute + Send),
 ) -> Result<PipelineResult, PipelineError> {
+    route_on(board, rules, scope, settings, &RunHooks::default(), backend)
+}
+
+fn route_on(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    scope: &PipelineScope,
+    settings: &PipelineSettings,
+    hooks: &RunHooks<'_>,
+    backend: &mut (dyn RouteCompute + Send),
+) -> Result<PipelineResult, PipelineError> {
     if settings.threads == 0 {
-        return run(board, rules, scope, settings, backend);
+        return run(board, rules, scope, settings, hooks, backend);
     }
     match rayon::ThreadPoolBuilder::new()
         .num_threads(settings.threads)
         .build()
     {
-        Ok(pool) => pool.install(|| run(board, rules, scope, settings, backend)),
-        Err(_) => run(board, rules, scope, settings, backend),
+        Ok(pool) => pool.install(|| run(board, rules, scope, settings, hooks, backend)),
+        Err(_) => run(board, rules, scope, settings, hooks, backend),
     }
 }
 
@@ -440,6 +475,7 @@ fn run(
     rules: &dyn RuleTable,
     scope: &PipelineScope,
     settings: &PipelineSettings,
+    hooks: &RunHooks<'_>,
     backend: &mut (dyn RouteCompute + Send),
 ) -> Result<PipelineResult, PipelineError> {
     let mut out = PipelineResult::default();
@@ -686,6 +722,7 @@ fn run(
             &negotiation,
             &inputs,
             &routed,
+            hooks,
             backend,
             tel,
         );
@@ -816,7 +853,7 @@ fn run(
     if out.rip_up.changed() && open_after > out.rip_up.open_before {
         let mut plain = settings.clone();
         plain.rip_up.mode = RipUp::None;
-        let mut again = run(loaded, rules, scope, &plain, backend)?;
+        let mut again = run(loaded, rules, scope, &plain, hooks, backend)?;
         again.rip_up = out.rip_up.restored();
         again.telemetry.count("pipeline_rip_up_restored", 1);
         return Ok(again);

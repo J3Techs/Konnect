@@ -30,7 +30,7 @@ use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
 use konnect_route::optimize::{OptimizeOptions, OptimizeReport};
 use konnect_route::pipeline::{
     without_ripped, AllowanceError, AllowanceReport, ClassFallback, PipelineSettings,
-    ReferenceReport, RipUp, RipUpReport, RoutingAllowances,
+    ReferenceReport, RipUp, RipUpEvent, RipUpReport, RoutingAllowances, RunHooks,
 };
 use konnect_route::plan::{RoutedCopper, ADD_ROUTING_MAX_ITEMS};
 use konnect_route::telemetry::Telemetry;
@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,6 +63,9 @@ const STOP_FILE: &str = "stop";
 const RUNNER_LOG: &str = "runner.log";
 /// The runner rewrites its heartbeat this often while a stage runs.
 const HEARTBEAT: Duration = Duration::from_secs(2);
+/// How often the route stage is checked for a stop request or the time
+/// limit while its rip-up stage may be running.
+const RIP_UP_POLL: Duration = Duration::from_millis(250);
 /// A runner silent for this long is gone.
 const STALE_HEARTBEAT_SECONDS: u64 = 30;
 /// How long the starter waits for the runner to report it is running.
@@ -938,14 +942,17 @@ fn route_native(
     nets: Option<&BTreeSet<NetId>>,
     region: Option<konnect_geom::BBox>,
     settings: &PipelineSettings,
+    hooks: &RunHooks<'_>,
 ) -> Result<NativeRoute> {
-    use konnect_route::pipeline::{route_board, PipelineScope};
+    use konnect_route::pipeline::{route_board_hooked, PipelineScope};
     let scope = PipelineScope {
         nets: nets.cloned(),
         region,
     };
-    let r = guarded("route", || route_board(board, rules, &scope, settings))?
-        .map_err(|e| anyhow::anyhow!("route: {e}"))?;
+    let r = guarded("route", || {
+        route_board_hooked(board, rules, &scope, settings, hooks)
+    })?
+    .map_err(|e| anyhow::anyhow!("route: {e}"))?;
     let mut failed: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, d) in &r.detail.failure_details {
         *failed.entry(d.name()).or_default() += 1;
@@ -996,7 +1003,8 @@ fn route_native(
         detail,
         connections: r.connections,
         connection_widths: r.connection_widths,
-        rip_up: (r.rip_up.rounds > 0).then_some(r.rip_up),
+        // Also when it was told to stop before its first round.
+        rip_up: (r.rip_up.rounds > 0 || r.rip_up.stopped == "stop_requested").then_some(r.rip_up),
         telemetry: r.telemetry,
     })
 }
@@ -1225,7 +1233,47 @@ pub fn run_pipeline(
                     .map_err(|e| anyhow::anyhow!("source plan: {e}"))
             }
             CopperSource::Native => {
-                pool.install(|| route_native(&board, &rules, nets.as_ref(), region, &settings))
+                // The route stage runs on its own thread so this one can
+                // pass on what the rip-up stage says while it works, and
+                // tell it to stop when the job is told to or its time
+                // limit runs out: the stage ends with what it has, and the
+                // job stops at the stage boundary as for any other stage.
+                let (tx, rx) = std::sync::mpsc::channel::<RipUpEvent>();
+                let stop = AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    let (board, rules, settings, pool, stop) =
+                        (&board, &rules, &settings, &pool, &stop);
+                    let nets = nets.as_ref();
+                    let route = s.spawn(move || {
+                        let tell = move |e: &RipUpEvent| {
+                            let _ = tx.send(e.clone());
+                        };
+                        let stopped = || stop.load(Ordering::Relaxed);
+                        let hooks = RunHooks {
+                            rip_up: Some(&tell),
+                            stop: Some(&stopped),
+                        };
+                        pool.install(|| route_native(board, rules, nets, region, settings, &hooks))
+                    });
+                    loop {
+                        if stop_check(observer).is_some() {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        match rx.recv_timeout(RIP_UP_POLL) {
+                            Ok(e) => observer.event(
+                                "rip_up",
+                                e.name(),
+                                &serde_json::to_value(&e).unwrap_or_default(),
+                            ),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            // The route stage is over (its sender is gone).
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    route
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
             }
         };
         match routed {

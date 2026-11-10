@@ -109,7 +109,7 @@ fn job_props() -> Value {
         "net_classes": { "type": "string", "enum": ["auto", "kicad", "project"], "default": "auto",
                          "description": "Where net classes come from: kicad (KiCad's effective class per net over IPC; the board must be open), project (the .kicad_pro patterns, resolved as KiCad does), auto (kicad when KiCad has the board open, else project)" },
         "rip_up": { "type": "string", "enum": ["none", "own", "unlocked"], "default": "own",
-                    "description": "Native routing: rip-up and retry for connections still open after negotiation because other copper fences them in. The nets whose copper blocks such a connection are ripped whole, the connection is routed first and those nets again; a try is kept only when fewer connections are open after it, so the result is never worse than without. own: only copper this run routed may be ripped. unlocked: also the saved board's unlocked tracks, arcs and vias (never locked copper, pads, zones, nets with a zone, or nets outside nets/region); what was taken out is listed in the report's rip_up.ripped (UUID, net, layer, reason) and written beside the plan as <output_plan stem>.replaces.json for apply_route_plan's replaces_file. none: skip the stage" },
+                    "description": "Native routing: rip-up and retry for connections still open after negotiation because other copper fences them in. The nets whose copper blocks such a connection are ripped whole, the connection is routed first and those nets again; a try is kept only when fewer connections are open after it, so the result is never worse than without. A connection whose way is across another net's saved zone fill gets no try: zones are never ripped, so it is reported with the fill as its blocker (zone_fill) and the stage moves on; declare the zone crossable (carve_zones, carve_zone_nets) when it will be refilled. own: only copper this run routed may be ripped. unlocked: also the saved board's unlocked tracks, arcs and vias (never locked copper, pads, zones, nets with a zone, or nets outside nets/region); what was taken out is listed in the report's rip_up.ripped (UUID, net, layer, reason) and written beside the plan as <output_plan stem>.replaces.json for apply_route_plan's replaces_file. none: skip the stage" },
         "fanout_plan": { "type": "string", "description": "Native routing: write the plane fanout (S2) to this new routing_file, to apply with locked: true, and leave it out of output_plan" },
         "fanout_share_within_mm": { "type": "number", "minimum": 0, "description": "Native routing: a plane pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" }
     })
@@ -395,7 +395,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. Returns once the runner is running. State lives in '<output_plan>.konnect-native-job/' (status.json, progress.jsonl, checkpoint.json, report.json). report.json's unrouted.connections lists every connection the finished run leaves open, by pad and reason (get_native_route_job lists them). Follow with get_native_route_job; end early with stop_native_route_job; resume: true continues a stopped or lost job from its checkpoint. Plane nets and crossable zones (carve_zones, carve_zone_nets, plane_nets_as_tracks) work as in route_native_region; the finished job's report carries plane_nets, refill and warnings. track_widths draws named nets, or single connections named by two pads, at a width of their own instead of the net class width; the report lists each as an override of its class.",
             {
                 let mut p = job_props();
-                p["time_limit_seconds"] = json!({ "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop at the next stage boundary after this long, keeping the checkpoint" });
+                p["time_limit_seconds"] = json!({ "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop at the next stage boundary after this long, keeping the checkpoint. The route stage's rip-up and retry also ends at its next probe or try once the limit has passed, with what it has kept" });
                 p["resume"] = json!({ "type": "boolean", "default": false, "description": "Continue the job already in the job directory (same arguments)" });
                 with_props(p, &["board", "output_plan"])
             },
@@ -452,7 +452,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "stop_native_route_job",
-            "Ask a job started by start_native_route_job to stop at its next stage boundary; its checkpoint is kept for resume. Waits up to wait_seconds and reports the job.",
+            "Ask a job started by start_native_route_job to stop at its next stage boundary; its checkpoint is kept for resume. A route stage in its rip-up and retry ends that at its next probe or try, with what it has kept. Waits up to wait_seconds and reports the job.",
             json!({
                 "type": "object",
                 "properties": {

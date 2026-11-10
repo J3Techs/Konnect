@@ -1573,3 +1573,65 @@ fn a_run_without_a_kept_rip_carries_the_blocker_on_the_connection_it_leaves_open
         ("B", "board_copper_not_requested")
     );
 }
+
+#[test]
+fn a_job_passes_on_what_its_rip_up_stage_does_as_progress_events_of_their_own() {
+    let f = sealed_fixture(false);
+    let mut s = spec(&f.root, "watched.json", CopperSource::Native);
+    s.rip_up = RipUp::Unlocked;
+    let dir = prepare(&s, false).unwrap();
+    assert_eq!(run_job_dir(&dir).unwrap().state, "COMPLETED");
+    let events = progress(&dir);
+    let at = |stage: &str, event: &str| {
+        events
+            .iter()
+            .position(|e| e["stage"] == stage && e["event"] == event)
+            .unwrap_or_else(|| panic!("no {stage} {event} in {events:?}"))
+    };
+    // The stage's own events lie between the route stage's start and done.
+    let (start, done) = (at("route", "start"), at("route", "done"));
+    let inside: Vec<&str> = events[start + 1..done]
+        .iter()
+        .map(|e| {
+            assert_eq!(e["stage"], "rip_up", "{e}");
+            e["event"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        inside,
+        ["start", "probe", "attempt", "attempt_done", "stopped"]
+    );
+    let probe = &events[at("rip_up", "probe")]["detail"];
+    assert_eq!(
+        *probe,
+        json!({ "round": 1, "stuck": 1, "rippable": 1, "unblocked": 0, "behind_zone_fill": 0, "no_path": 0 })
+    );
+    let attempt = &events[at("rip_up", "attempt")]["detail"];
+    assert_eq!(attempt["stuck_nets"], json!(["A"]));
+    assert_eq!(attempt["ripped_nets"], json!(["B"]));
+    let stopped = &events[at("rip_up", "stopped")]["detail"];
+    assert_eq!(
+        *stopped,
+        json!({ "rounds": 1, "open_before": 1, "open_after": 0, "stopped": "complete" })
+    );
+}
+
+#[test]
+fn a_job_told_to_stop_ends_its_rip_up_stage_before_any_try_and_keeps_the_checkpoint() {
+    let f = sealed_fixture(false);
+    let mut s = spec(&f.root, "stopped.json", CopperSource::Native);
+    s.rip_up = RipUp::Unlocked;
+    let dir = prepare(&s, false).unwrap();
+    // The request is there before the route stage starts.
+    std::fs::write(dir.join(STOP_FILE), b"").unwrap();
+    let status = run_job_dir(&dir).unwrap();
+    assert_eq!(status.state, "STOPPED_ON_REQUEST", "{status:?}");
+    let cp: Checkpoint = read_json(&dir.join(CHECKPOINT_FILE)).unwrap();
+    assert_eq!(cp.completed, ["route"]);
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let rip = report.rip_up.expect("the rip-up stage was reached");
+    assert_eq!(rip.stopped, "stop_requested");
+    assert!(rip.attempts.is_empty() && rip.ripped.is_empty());
+    assert_eq!((rip.open_before, rip.open_after), (1, 1));
+    assert!(!replaces_path_for(&s.output_plan).exists());
+}

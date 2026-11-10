@@ -14,11 +14,21 @@
 //!    within [`RipUpSettings::probe_radius`] of their pads. The exact
 //!    checker then names the copper each probe path collides with on the
 //!    real board: those nets block that connection. Blockers are what the
-//!    path found actually crosses, never what merely lies near. When the
-//!    stage ends, a connection with no probe path is probed again with
-//!    every nearby track, arc and via taken out, and if that leaves no path
-//!    either with every zone fill out as well, only to report what blocks
-//!    it (locked copper, a plane net, a net outside the scope, a zone fill).
+//!    path found actually crosses, never what merely lies near. Another
+//!    net's zone fill that is a wall to the router ([`is_wall`]) is open to
+//!    the probe, as if declared crossable: a path that crosses one has the
+//!    fill as a blocker, which nothing here can rip, so its connection is
+//!    reported with it and gets no attempt. (A probe that kept the fills
+//!    as walls would say the same less often and cost a negotiation over
+//!    every fill polygon: minutes on a board poured around its tracks,
+//!    where the fill is what walls the open pads in.) When the stage ends,
+//!    a connection with no probe path is probed again with every nearby
+//!    track, arc and via taken out, only to report what blocks it (locked
+//!    copper, a plane net, a net outside the scope, a zone fill).
+//!    A probe path nothing blocks is kept as it is, with those of the
+//!    round's other such connections, when it passes [`clear_findings`]
+//!    against the rest and the board then has fewer open connections:
+//!    there is nothing to rip for it and no reason to search again.
 //! 2. **Attempt.** The blocking nets are ripped whole: every unlocked
 //!    track, arc and via of the net on the board ([`RipUp::Unlocked`]) and
 //!    all copper this run routed for it. The stuck connections are routed
@@ -33,6 +43,10 @@
 //!    together; when that does not pay, each is tried alone. A rip set
 //!    already tried for the same stuck connections is never tried again, so
 //!    two nets cannot keep evicting each other.
+//!
+//! The stage says what it is doing ([`RipUpEvent`]) and asks before each
+//! probe and attempt whether to go on ([`RunHooks`]); told to stop, it ends
+//! with what it has kept so far.
 //!
 //! The state after the stage is therefore the best seen, and never has
 //! more open connections than the state before it. Locked copper, pads,
@@ -55,14 +69,14 @@
 use super::{
     add_locked, clear_findings, concat, match_connection_widths, open_connection_count,
     route_around, select_connections, split_excluded, split_left_to_planes, PipelineScope,
-    PipelineSettings,
+    PipelineSettings, RunHooks,
 };
 use crate::access::compute_pin_access_with;
 use crate::api::{
     ArcId, ClassId, Connection, ConnectionId, ItemKind, ItemRef, NetId, Ownership, PadId,
-    ProfileId, TrackId, ViaId, ZoneId,
+    ProfileId, TrackId, ViaId,
 };
-use crate::board::RouteBoard;
+use crate::board::{RouteBoard, ZonePiece};
 use crate::check::{BoardChecker, CheckOptions, CheckedItem};
 use crate::compute::RouteCompute;
 use crate::connectivity::ConnectivityReport;
@@ -141,7 +155,7 @@ pub struct RipUpAttempt {
     pub round: u32,
     /// Nets of the stuck connections routed first.
     pub stuck_nets: Vec<String>,
-    /// Nets ripped whole (empty: a plain retry).
+    /// Nets ripped whole (empty: order `probe_path`).
     pub ripped_nets: Vec<String>,
     /// Open connections on the whole board before and after the attempt.
     pub open_before: usize,
@@ -155,6 +169,8 @@ pub struct RipUpAttempt {
     /// `stuck_first`: the stuck connections were routed first, then the
     /// ripped nets around them. `together`: tried when that did not pay,
     /// the stuck connections and the ripped nets negotiated as one batch.
+    /// `probe_path`: nothing blocked the probe paths of these connections,
+    /// so the paths themselves were kept; nothing was ripped or routed.
     #[serde(default)]
     pub order: String,
     /// Nets within the scope with a connection open after the attempt.
@@ -166,12 +182,16 @@ pub struct RipUpAttempt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocker {
     pub net: String,
-    /// Why the stage did not rip it, or `ripping_did_not_help`:
+    /// Why the stage did not rip it, or `ripping_did_not_help`, or
+    /// `not_tried` (it may be ripped, but no attempt ripped it for this
+    /// connection: another of its blockers may not be, more nets block it
+    /// than one attempt rips, or the stage ended first):
     /// `locked`, `board_copper_not_requested` (the mode is [`RipUp::Own`]),
     /// `plane_net`, `out_of_scope`, `excluded_class`, `no_uuid`, or
     /// `zone_fill` (another net's filled zone: zones are never ripped; a
     /// pour refilled around the board's tracks walls in what was not
-    /// routed before the refill).
+    /// routed before the refill). A connection with a `zone_fill` blocker
+    /// got no attempt.
     pub reason: String,
     /// The blocking board items' UUIDs (none for this run's own copper).
     pub uuids: Vec<String>,
@@ -184,7 +204,10 @@ pub struct StillOpen {
     pub from: String,
     pub to: String,
     /// What its probe path collided with. Empty: no path was found even
-    /// with every nearby track, arc and via and every zone fill taken out.
+    /// with every nearby track, arc and via taken out and every zone fill
+    /// open; or nothing blocked its path and the path still did not join
+    /// it (order `probe_path`); or the stage was told to stop before it
+    /// probed.
     pub blocked_by: Vec<Blocker>,
 }
 
@@ -207,7 +230,8 @@ pub struct RipUpReport {
     /// Connections within the scope still open, and what blocks each.
     pub still_open: Vec<StillOpen>,
     /// Why the stage ended: `complete`, `nothing_to_rip`, `no_improvement`,
-    /// `repeat` (every remaining rip set was already tried) or `max_rounds`.
+    /// `repeat` (every remaining rip set was already tried), `max_rounds`
+    /// or `stop_requested` ([`RunHooks::stop`]).
     pub stopped: String,
     /// The run was put back to the state before the stage because the
     /// later stages left more connections open than it started with.
@@ -246,6 +270,68 @@ impl RipUpReport {
             "pipeline_rip_up_joined",
             self.open_before.saturating_sub(self.open_after) as u64,
         );
+    }
+}
+
+/// What the stage tells [`RunHooks::rip_up`] while it runs, in order:
+/// [`RipUpEvent::Start`], then per round a [`RipUpEvent::Probe`] and an
+/// [`RipUpEvent::Attempt`] and [`RipUpEvent::AttemptDone`] per attempt, and
+/// [`RipUpEvent::Stopped`] last. Serialised as its fields alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum RipUpEvent {
+    Start {
+        mode: RipUp,
+        /// Open connections on the whole board, and those within the scope.
+        open: usize,
+        stuck: usize,
+    },
+    /// A round's probe is done.
+    Probe {
+        round: u32,
+        stuck: usize,
+        /// Stuck connections with nets an attempt may rip for them.
+        rippable: usize,
+        /// Stuck connections whose probe path nothing blocks.
+        unblocked: usize,
+        /// Stuck connections whose probe path crosses a zone fill.
+        behind_zone_fill: usize,
+        /// Stuck connections the probe found no path for.
+        no_path: usize,
+    },
+    /// An attempt starts.
+    Attempt {
+        round: u32,
+        order: String,
+        stuck_nets: Vec<String>,
+        ripped_nets: Vec<String>,
+        open_before: usize,
+    },
+    AttemptDone {
+        round: u32,
+        order: String,
+        open_after: usize,
+        accepted: bool,
+    },
+    Stopped {
+        rounds: u32,
+        open_before: usize,
+        open_after: usize,
+        /// [`RipUpReport::stopped`].
+        stopped: String,
+    },
+}
+
+impl RipUpEvent {
+    /// `start`, `probe`, `attempt`, `attempt_done` or `stopped`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RipUpEvent::Start { .. } => "start",
+            RipUpEvent::Probe { .. } => "probe",
+            RipUpEvent::Attempt { .. } => "attempt",
+            RipUpEvent::AttemptDone { .. } => "attempt_done",
+            RipUpEvent::Stopped { .. } => "stopped",
+        }
     }
 }
 
@@ -304,6 +390,26 @@ struct Ctx<'a> {
     settings: &'a PipelineSettings,
     negotiation: &'a NegotiationSettings,
     inputs: &'a NegotiationInputs,
+    hooks: &'a RunHooks<'a>,
+}
+
+impl Ctx<'_> {
+    fn tell(&self, event: RipUpEvent) {
+        if let Some(f) = self.hooks.rip_up {
+            f(&event);
+        }
+    }
+
+    fn stop(&self) -> bool {
+        self.hooks.stop.is_some_and(|f| f())
+    }
+}
+
+/// Whether the router takes this zone piece's fill for a wall to other
+/// nets' new copper: a saved fill on a routing layer that nobody declared
+/// crossable (as negotiation's obstacle list reads it).
+pub(super) fn is_wall(board: &RouteBoard, z: &ZonePiece) -> bool {
+    z.filled && !z.crossable && board.routable.contains(z.layer)
 }
 
 fn frozen(board: &RouteBoard, routed: &RoutedCopper) -> RouteBoard {
@@ -374,6 +480,7 @@ fn route(
     if tasks.is_empty() {
         return DetailResult::default();
     }
+    tel.count("pipeline_rip_up_routes", 1);
     let tasks: Vec<Connection> = tasks
         .iter()
         .enumerate()
@@ -507,12 +614,17 @@ struct Probe {
     /// A probe path was found.
     routed: bool,
     hits: BTreeSet<Hit>,
+    /// The path crosses a fill that is a wall (of a net or of none).
+    walled: bool,
+    /// The path's copper.
+    path: RoutedCopper,
 }
 
 impl Probe {
     /// The nets to rip for this connection, when every blocker may be.
+    /// Empty: nothing blocks the path.
     fn rip_set(&self) -> Option<BTreeSet<NetId>> {
-        (self.routed && self.hits.iter().all(|h| h.refusal.is_none()))
+        (self.routed && !self.walled && self.hits.iter().all(|h| h.refusal.is_none()))
             .then(|| self.hits.iter().map(|h| h.net).collect())
     }
 }
@@ -524,9 +636,7 @@ enum Take {
     Rippable,
     /// Every nearby track, arc and via, rippable or not: only to name what
     /// blocks a connection the first probe found no path for.
-    Copper,
-    /// That, and every zone fill, when even [`Take::Copper`] leaves no path.
-    CopperAndFills,
+    Everything,
 }
 
 /// Probe `stuck` (see the module docs).
@@ -566,13 +676,13 @@ fn probe(
     pb.arcs.retain(|a| !out(a.net, a.ownership, arc_bbox(a)));
     pb.vias
         .retain(|v| !out(v.net, v.ownership, v.shape().bbox()));
-    if take == Take::CopperAndFills {
-        // Zone fills too: a pour refilled around the board's tracks walls
-        // in whatever was not routed before the refill.
-        pb.zones.retain(|z| !(z.filled && z.net.is_some()));
-        for (n, z) in pb.zones.iter_mut().enumerate() {
-            z.id = ZoneId(n as u32);
-        }
+    // The fills that are walls are open to the probe: what a path through
+    // one says (its connection is behind a pour, which is never ripped)
+    // costs no search over the fill polygons. Connectivity still reads
+    // them as saved.
+    let walls = board.zones.iter().any(|z| is_wall(board, z));
+    for z in &mut pb.zones {
+        z.crossable |= is_wall(board, z);
     }
     renumber(&mut pb);
     let mut pr = state.routed.clone();
@@ -585,8 +695,8 @@ fn probe(
     let full = frozen(board, &state.routed);
     let (nt, nv) = (board.tracks.len(), board.vias.len());
     // The routed-copper check leaves zone fills to KiCad's refill; the
-    // widest probe wants them named, so it checks them as copper.
-    let options = if take == Take::CopperAndFills {
+    // probe wants the walls among them named, so it checks them as copper.
+    let options = if walls {
         CheckOptions::default()
     } else {
         CheckOptions::for_routed()
@@ -596,6 +706,14 @@ fn probe(
     let mut probes = vec![Probe::default(); stuck.len()];
     for id in &found.routed {
         probes[id.index()].routed = true;
+    }
+    for (t, owner) in found.copper.tracks.iter().zip(&found.track_owner) {
+        probes[owner.index()].path.tracks.push(*t);
+    }
+    for (v, users) in found.copper.vias.iter().zip(&found.via_users) {
+        for user in users {
+            probes[user.index()].path.vias.push(*v);
+        }
     }
     let owners = |item: CheckedItem| -> Vec<ConnectionId> {
         match item {
@@ -633,12 +751,15 @@ fn probe(
                 let a = &full.arcs[id.index()];
                 (a.net?, Some(a.ownership), a.uuid.clone())
             }
+            // A fill that is no wall to the router (a plane on a layer
+            // it does not use, a pour declared crossable) blocks nothing.
             ItemRef::Zone(id) => {
-                return Some(Hit {
-                    net: full.zones[id.index()].net?,
+                let z = &full.zones[id.index()];
+                return is_wall(&full, z).then_some(Hit {
+                    net: z.net?,
                     refusal: Some("zone_fill"),
                     uuid: None,
-                })
+                });
             }
             ItemRef::Pad(_) => return None,
         };
@@ -656,6 +777,16 @@ fn probe(
             if who.is_empty() {
                 continue;
             }
+            if let CheckedItem::Board {
+                item: ItemRef::Zone(id),
+            } = other
+            {
+                if is_wall(&full, &full.zones[id.index()]) {
+                    for c in &who {
+                        probes[c.index()].walled = true;
+                    }
+                }
+            }
             let Some(h) = hit(other) else { continue };
             for c in who {
                 probes[c.index()].hits.insert(h.clone());
@@ -667,6 +798,28 @@ fn probe(
         p.hits.retain(|h| h.net != c.net);
     }
     probes
+}
+
+/// Keep the probe paths `paths` as they are: nothing blocks them, so there
+/// is nothing to rip and no reason to search for them again. They go
+/// through [`clear_findings`] against the rest like an attempt's copper.
+/// Returns the state that results (not judged).
+fn keep_paths(ctx: &Ctx<'_>, state: &State, paths: &[&RoutedCopper]) -> State {
+    let mut fresh = RoutedCopper::default();
+    for path in paths {
+        fresh.tracks.extend(path.tracks.iter().copied());
+        // Two connections of a net may share a via.
+        for v in &path.vias {
+            if !fresh.vias.contains(v) {
+                fresh.vias.push(*v);
+            }
+        }
+    }
+    clear_findings(&frozen(&state.board, &state.routed), ctx.rules, &mut fresh);
+    let mut next = state.clone();
+    next.routed = concat(&state.routed, &fresh);
+    (next.open, next.stuck) = open_connections(ctx, &next.board, &next.routed);
+    next
 }
 
 /// A rip set tried for a set of stuck connections.
@@ -795,6 +948,7 @@ pub(super) fn rip_up(
     negotiation: &NegotiationSettings,
     inputs: &NegotiationInputs,
     routed: &RoutedCopper,
+    hooks: &RunHooks<'_>,
     backend: &mut (dyn RouteCompute + Send),
     tel: &mut Telemetry,
 ) -> Outcome {
@@ -804,6 +958,7 @@ pub(super) fn rip_up(
         settings,
         negotiation,
         inputs,
+        hooks,
     };
     let rs = settings.rip_up;
     let mut state = State {
@@ -824,20 +979,39 @@ pub(super) fn rip_up(
         ..RipUpReport::default()
     };
     let mut tried: BTreeSet<Tried> = BTreeSet::new();
+    // (ripped net, stuck connection) of every attempt that ran.
+    let mut ripped_for: BTreeSet<(NetId, (NetId, ItemRef, ItemRef))> = BTreeSet::new();
     let name = |board: &RouteBoard, n: NetId| board.net(n).name.clone();
+    ctx.tell(RipUpEvent::Start {
+        mode: rs.mode,
+        open,
+        stuck: stuck.len(),
+    });
     loop {
         if stuck.is_empty() {
             report.stopped = "complete".to_string();
             break;
         }
+        let mut probes = vec![Probe::default(); stuck.len()];
+        // Told to stop: what is kept so far stays, the rest is listed.
+        let mut stopped = ctx.stop();
         let round = report.rounds + 1;
-        let mut probes = probe(&ctx, &state, &stuck, Take::Rippable, backend, tel);
+        if !stopped {
+            probes = probe(&ctx, &state, &stuck, Take::Rippable, backend, tel);
+        }
         // Stuck connections whose nets are within what one attempt may rip.
         let sets: Vec<Option<BTreeSet<NetId>>> = probes
             .iter()
             .map(|p| p.rip_set().filter(|s| s.len() <= rs.max_nets))
             .collect();
-        let able: Vec<usize> = (0..stuck.len()).filter(|&i| sets[i].is_some()).collect();
+        let with_set = |empty: bool| -> Vec<usize> {
+            (0..stuck.len())
+                .filter(|&i| sets[i].as_ref().is_some_and(|s| s.is_empty() == empty))
+                .collect()
+        };
+        // Paths nothing blocks are kept as the probe found them; the rest
+        // have nets to rip.
+        let (clear, able) = (with_set(true), with_set(false));
         // The attempts of this round: all together, then each alone.
         let mut plans: Vec<(BTreeSet<NetId>, Vec<usize>)> = Vec::new();
         let union: BTreeSet<NetId> = able
@@ -856,13 +1030,61 @@ pub(super) fn rip_up(
         }
         // Past the last round the probe only says what blocks what is left.
         let last = round > rs.max_rounds;
-        if !last {
+        if !last && !stopped {
             report.rounds = round;
+        }
+        if !stopped {
+            let fill = |p: &&Probe| p.routed && p.walled;
+            ctx.tell(RipUpEvent::Probe {
+                round,
+                stuck: stuck.len(),
+                rippable: able.len(),
+                unblocked: clear.len(),
+                behind_zone_fill: probes.iter().filter(fill).count(),
+                no_path: probes.iter().filter(|p| !p.routed).count(),
+            });
         }
         let mut accepted = false;
         let mut fresh_attempts = 0;
-        if !last {
-            for (nets, who) in &plans {
+        let net_names = |board: &RouteBoard, nets: BTreeSet<NetId>| -> Vec<String> {
+            nets.into_iter().map(|n| name(board, n)).collect()
+        };
+        if !last && !stopped && !clear.is_empty() {
+            let paths: Vec<&RoutedCopper> = clear.iter().map(|&i| &probes[i].path).collect();
+            let mut record = RipUpAttempt {
+                round,
+                stuck_nets: net_names(&state.board, clear.iter().map(|&i| stuck[i].net).collect()),
+                open_before: state.open,
+                order: "probe_path".to_string(),
+                ..RipUpAttempt::default()
+            };
+            ctx.tell(RipUpEvent::Attempt {
+                round,
+                order: record.order.clone(),
+                stuck_nets: record.stuck_nets.clone(),
+                ripped_nets: Vec::new(),
+                open_before: state.open,
+            });
+            let next = keep_paths(&ctx, &state, &paths);
+            record.open_after = next.open;
+            record.accepted = next.open < state.open;
+            record.open_nets_after =
+                net_names(&next.board, next.stuck.iter().map(|c| c.net).collect());
+            ctx.tell(RipUpEvent::AttemptDone {
+                round,
+                order: record.order.clone(),
+                open_after: next.open,
+                accepted: record.accepted,
+            });
+            fresh_attempts += 1;
+            if record.accepted {
+                state = next;
+                accepted = true;
+            }
+            report.attempts.push(record);
+        }
+        if !last && !stopped && !accepted {
+            'plans: for (nets, who) in &plans {
                 let conns: Vec<Connection> = who.iter().map(|&i| stuck[i]).collect();
                 let key: Tried = (
                     nets.clone(),
@@ -870,42 +1092,50 @@ pub(super) fn rip_up(
                 );
                 let mut record = RipUpAttempt {
                     round,
-                    stuck_nets: conns
-                        .iter()
-                        .map(|c| c.net)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .map(|n| name(&state.board, n))
-                        .collect(),
-                    ripped_nets: nets.iter().map(|n| name(&state.board, *n)).collect(),
+                    stuck_nets: net_names(&state.board, conns.iter().map(|c| c.net).collect()),
+                    ripped_nets: net_names(&state.board, nets.clone()),
                     open_before: state.open,
                     open_after: state.open,
                     ..RipUpAttempt::default()
                 };
+                if ctx.stop() {
+                    stopped = true;
+                    break;
+                }
                 if !tried.insert(key) {
                     record.repeat = true;
                     report.attempts.push(record);
                     continue;
                 }
                 fresh_attempts += 1;
+                for c in &conns {
+                    ripped_for.extend(nets.iter().map(|n| (*n, (c.net, c.from, c.to))));
+                }
                 for together in [false, true] {
-                    // A plain retry has no order to change.
-                    if together && nets.is_empty() {
-                        break;
+                    if together && ctx.stop() {
+                        stopped = true;
+                        break 'plans;
                     }
-                    let next = attempt(&ctx, &state, nets, &conns, together, round, backend, tel);
                     let mut record = record.clone();
                     record.order = if together { "together" } else { "stuck_first" }.to_string();
+                    ctx.tell(RipUpEvent::Attempt {
+                        round,
+                        order: record.order.clone(),
+                        stuck_nets: record.stuck_nets.clone(),
+                        ripped_nets: record.ripped_nets.clone(),
+                        open_before: state.open,
+                    });
+                    let next = attempt(&ctx, &state, nets, &conns, together, round, backend, tel);
+                    ctx.tell(RipUpEvent::AttemptDone {
+                        round,
+                        order: record.order.clone(),
+                        open_after: next.open,
+                        accepted: next.open < state.open,
+                    });
                     record.open_after = next.open;
                     record.accepted = next.open < state.open;
-                    record.open_nets_after = next
-                        .stuck
-                        .iter()
-                        .map(|c| c.net)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .map(|n| name(&next.board, n))
-                        .collect();
+                    record.open_nets_after =
+                        net_names(&next.board, next.stuck.iter().map(|c| c.net).collect());
                     report.attempts.push(record);
                     if next.open < state.open {
                         state = next;
@@ -924,22 +1154,20 @@ pub(super) fn rip_up(
         }
         // The stage ends here: say what blocks what is left. Connections
         // with no probe path are probed again with every nearby track, arc
-        // and via out, then with the zone fills out as well, only to name
-        // their blockers.
-        for take in [Take::Copper, Take::CopperAndFills] {
-            let lost: Vec<usize> = (0..stuck.len()).filter(|&i| !probes[i].routed).collect();
-            if lost.is_empty() {
-                break;
-            }
+        // and via out, only to name their blockers.
+        let lost: Vec<usize> = (0..stuck.len()).filter(|&i| !probes[i].routed).collect();
+        if !lost.is_empty() && !stopped {
             let again: Vec<Connection> = lost.iter().map(|&i| stuck[i]).collect();
-            let wide = probe(&ctx, &state, &again, take, backend, tel);
+            let wide = probe(&ctx, &state, &again, Take::Everything, backend, tel);
             for (i, p) in lost.into_iter().zip(wide) {
                 probes[i] = p;
             }
         }
-        report.stopped = if last {
+        report.stopped = if stopped {
+            "stop_requested"
+        } else if last {
             "max_rounds"
-        } else if plans.is_empty() {
+        } else if plans.is_empty() && clear.is_empty() {
             "nothing_to_rip"
         } else if fresh_attempts == 0 {
             "repeat"
@@ -948,9 +1176,18 @@ pub(super) fn rip_up(
         }
         .to_string();
         for (c, p) in stuck.iter().zip(&probes) {
+            // Copper that may be ripped was ripped for this connection only
+            // in an attempt, and an attempt needs every blocker rippable.
+            let rippable = |net: NetId| {
+                if ripped_for.contains(&(net, (c.net, c.from, c.to))) {
+                    "ripping_did_not_help"
+                } else {
+                    "not_tried"
+                }
+            };
             let mut by: BTreeMap<(NetId, &str), Vec<String>> = BTreeMap::new();
             for h in &p.hits {
-                by.entry((h.net, h.refusal.unwrap_or("ripping_did_not_help")))
+                by.entry((h.net, h.refusal.unwrap_or_else(|| rippable(h.net))))
                     .or_default()
                     .extend(h.uuid.clone());
             }
@@ -977,6 +1214,12 @@ pub(super) fn rip_up(
         .map(|n| name(&state.board, *n))
         .collect();
     report.ripped = state.ripped.clone();
+    ctx.tell(RipUpEvent::Stopped {
+        rounds: report.rounds,
+        open_before: report.open_before,
+        open_after: report.open_after,
+        stopped: report.stopped.clone(),
+    });
     let changed = report.changed().then_some((state.board, state.routed));
     Outcome { report, changed }
 }
