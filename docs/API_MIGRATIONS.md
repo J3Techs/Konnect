@@ -3,6 +3,48 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `audit_manufacturing` reports a footprint zone left away from its footprint
+
+No argument changes. `audit_manufacturing`, and through it
+`run_design_review` with a `board`, gains one finding and one result field.
+
+KiCad saves a placed footprint's own zones (the keepout under a Tag-Connect
+header or an antenna, the copper of a net tie) in board coordinates. Konnect's
+saved-file placement, move, rotate, flip and closed-board import used to treat
+them as relative to the footprint, so a board they wrote can hold a footprint
+at one place and its keepout at another, often off the board. Those tools now
+carry the zone, but a board written before keeps the damage, and neither
+KiCad's DRC nor any Konnect tool reported it.
+
+Each such zone is now a finding with `category: "dfm"` and
+`kind: "misplaced_footprint_zone"`. Beside the usual `severity`, `component`,
+`issue` and `recommendation` it carries `footprint` (reference, library id,
+UUID, position, rotation, side), `zone` (UUID, `kind` `rule_area` or `copper`,
+layers, centre and bounding box as saved), `expected`, `distance_mm` and
+`test`, which names the test that produced it:
+
+- `library_outline`: the library footprint resolved and holds a zone of this
+  shape, and the saved zone is not where that outline lands at the footprint's
+  position, rotation and side. `expected` is that outline's centre and
+  bounding box, with its points when there are at most 32. A zone the library
+  does not describe (reshaped on the board, or a library changed since) is not
+  judged by this test.
+- `footprint_extent`: the library could not be read, or holds no zone of this
+  shape. The zone is reported only when it lies further from the footprint's
+  position than everything else the footprint holds, by a margin of at least
+  10 mm. `expected` is the footprint's position and that distance.
+
+`severity` is `error` when the zone is clear of the footprint altogether
+(always so for `footprint_extent`), and `warning` when it is at the footprint
+but not where the library puts it. An `error` makes `run_design_review` answer
+NOT READY. Every footprint of KiCad's stock library that has a zone, placed by
+KiCad 10.0.7 at several rotations and on both sides, passes both tests.
+
+The result's new `footprint_zones` object counts the footprint zones checked,
+how many by each test, how many could not be read, and how many are misplaced.
+Other findings and fields are unchanged; findings that are not of this kind
+still have no `kind`.
+
 ## Unreleased: the HTTP server stops in order, and a stopped server takes its tool calls' child processes with it
 
 No tool's arguments or results change. What changes is what a client of an

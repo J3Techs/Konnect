@@ -207,6 +207,10 @@ Checks:
 - Test point accessibility
 - Fiducial marks present (for SMT assembly)
 - Mechanical clearances around mounting holes
+- A footprint's own zones (the keepout under a Tag-Connect header or an
+  antenna) lie where the footprint is. A finding of kind
+  `misplaced_footprint_zone` means the keepout keeps nothing out under the
+  part; KiCad's DRC does not report it.
 
 ---
 

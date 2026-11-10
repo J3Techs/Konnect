@@ -20,6 +20,25 @@ use anyhow::Context;
 use konnect_sexp::writer::apply_edits;
 use konnect_sexp::{SexpEdit, SexpNode};
 
+/// Where KiCad saves the library zone point `(local_x, local_y)` of a
+/// footprint whose root is `(at x y rotation)`, on the front or the back.
+///
+/// On the front the point is turned by the footprint's rotation about its
+/// position. On the back it is first mirrored in the footprint's own Y: KiCad
+/// flips about the footprint's position, top to bottom, and a left-to-right
+/// flip is the same mirror followed by a half turn that the saved rotation
+/// already carries, so side and saved rotation fix the point whichever way the
+/// footprint was flipped.
+pub(crate) fn placed_point(
+    (local_x, local_y): (f64, f64),
+    (x, y): (f64, f64),
+    rotation: f64,
+    back: bool,
+) -> (f64, f64) {
+    let local_y = if back { -local_y } else { local_y };
+    konnect_sexp::geometry::rotate_about(local_x, local_y, x, y, rotation)
+}
+
 /// Clause heads that carry a coordinate wherever they appear.
 const POINT_TAGS: [&str; 6] = ["xy", "pts", "start", "mid", "end", "center"];
 
