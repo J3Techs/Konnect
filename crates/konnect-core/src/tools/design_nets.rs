@@ -547,7 +547,8 @@ impl Hierarchy {
             Some(uuid) => uuid.clone(),
             None => {
                 problems.push(
-                    "the root schematic has no (uuid …), so symbol instance paths cannot be                      matched; references were taken from KiCad's netlist instead"
+                    "the root schematic has no (uuid …), so symbol instance paths cannot be \
+                     matched; references were taken from KiCad's netlist instead"
                         .to_owned(),
                 );
                 String::new()

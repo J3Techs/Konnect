@@ -279,7 +279,9 @@ async fn reopen<S: Stage>(
             json!({ "editor_endpoint": endpoint.clone() }),
         );
         return Err(format!(
-            "The PCB editor was started (pid {}), but this Konnect server found no KiCad IPC              endpoint when it started and does not look again{}. Restart the Konnect server              (reconnect the MCP client) before calling a live-board tool.",
+            "The PCB editor was started (pid {}), but this Konnect server found no KiCad IPC \
+             endpoint when it started and does not look again{}. Restart the Konnect server \
+             (reconnect the MCP client) before calling a live-board tool.",
             launched.pid,
             endpoint
                 .map(|endpoint| format!("; KiCad now listens on '{endpoint}'"))
@@ -360,10 +362,12 @@ pub(crate) async fn run_cycle<S: Stage>(
             );
             cycle.status = Status::BoardStateUnknown;
             cycle.message = format!(
-                "KiCad did not settle whether it holds this board ({detail}). {tool} would                  refuse on the same answer, so it was not run and nothing was changed."
+                "KiCad did not settle whether it holds this board ({detail}). {tool} would \
+                 refuse on the same answer, so it was not run and nothing was changed."
             );
             cycle.next_action = Some(format!(
-                "Check KiCad: finish what it is doing or answer its dialog, and make sure the                  board is either open and responsive or closed. Then call {OPERATION} again."
+                "Check KiCad: finish what it is doing or answer its dialog, and make sure the \
+                 board is either open and responsive or closed. Then call {OPERATION} again."
             ));
             cycle.steps = steps.0;
             return Ok(cycle);
