@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::footprint_fabrication::{
-    guard_live_rebuild,
+    check_live_rebuild, guard_live_rebuild, RebuildTarget,
     Remedy::{ClosedBoardPath, NoLosslessPath},
 };
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
@@ -3004,7 +3004,10 @@ pub fn tools() -> Vec<ToolDef> {
              footprint from its library, restores its pads and drawing shapes while preserving \
              placement, identity and pad nets, and applies every requested repair in one KiCad \
              undo commit. Defaults to a non-mutating dry run; apply requires the exact returned \
-             plan revision. Requires KiCAD running with the requested board open.",
+             plan revision. Requires KiCAD running with the requested board open. A footprint \
+             whose pads carry a fabrication property (pad_prop_heatsink, pad_prop_bga, …) is \
+             reported as a conflict and nothing is repaired, because KiCad 10's typed update \
+             re-creates pads without it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4234,6 +4237,39 @@ fn repair_plan_revision(
     format!("{:x}", hasher.finalize())
 }
 
+/// Each repair sends a whole footprint back through `UpdateItems`, and KiCad
+/// re-creates its pads from a message with no field for a pad's fabrication
+/// property. One diagnostic for every planned repair whose saved board copy
+/// or library footprint carries one, or that neither can speak for.
+fn repairs_that_would_drop_pad_properties(
+    board_path: &Path,
+    targets: &[RebuildTarget],
+) -> Vec<serde_json::Value> {
+    let Err(refusal) = check_live_rebuild(
+        board_path,
+        "repair_corrupted_footprints",
+        targets,
+        NoLosslessPath,
+    ) else {
+        return Vec::new();
+    };
+    refusal
+        .findings
+        .iter()
+        .map(|finding| {
+            json!({
+                "reference": finding.reference,
+                "code": "fabrication_property_rebuild_refused",
+                "message": format!(
+                    "{} A live repair would re-create its pads without it, and this tool has \
+                    no closed-board path; repair this footprint in KiCad itself.",
+                    finding.reason()
+                )
+            })
+        })
+        .collect()
+}
+
 async fn handle_repair_corrupted_footprints(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -4308,6 +4344,7 @@ async fn handle_repair_corrupted_footprints(
             let mut repairs = Vec::new();
             let mut source_digests = Vec::new();
             let mut diagnostics = Vec::new();
+            let mut rebuild_targets = Vec::new();
 
             for item in items {
                 let footprint = kiapi::board::types::FootprintInstance::decode(
@@ -4413,6 +4450,7 @@ async fn handle_repair_corrupted_footprints(
                     continue;
                 };
                 source_digests.push((reference.clone(), source.into_bytes()));
+                rebuild_targets.push(RebuildTarget::from_instance(&footprint));
                 repairs.push(CorruptedFootprintRepair {
                     reference,
                     footprint: summary.footprint.clone(),
@@ -4432,6 +4470,12 @@ async fn handle_repair_corrupted_footprints(
                     }));
                 }
             }
+            // Each repair sends a whole footprint back: refuse, on the dry
+            // run too, any that would lose a pad fabrication property.
+            diagnostics.extend(repairs_that_would_drop_pad_properties(
+                &board_for_ipc,
+                &rebuild_targets,
+            ));
             repairs.sort_by(|left, right| left.reference.cmp(&right.reference));
             source_digests.sort_by(|left, right| left.0.cmp(&right.0));
             let plan_revision = repair_plan_revision(&board_for_ipc, &repairs, &source_digests);
@@ -10529,10 +10573,23 @@ mod fabrication_guard_tests {
     /// A KiCad holding `board` with U1 (BGA) and R1 (plain), counting every
     /// `UpdateItems` it receives.
     fn kicad(board: &Path, updates: Arc<AtomicUsize>) -> crate::test_support::MockIpcServer {
-        let footprints = vec![
-            live("U1", "aaaaaaaa-0000-4000-8000-000000000001", "Bga", 10.0),
-            live("R1", "aaaaaaaa-0000-4000-8000-000000000002", "Plain", 20.0),
-        ];
+        kicad_holding(
+            board,
+            vec![
+                live("U1", "aaaaaaaa-0000-4000-8000-000000000001", "Bga", 10.0),
+                live("R1", "aaaaaaaa-0000-4000-8000-000000000002", "Plain", 20.0),
+            ],
+            updates,
+        )
+    }
+
+    /// A KiCad holding `board` with `footprints`, counting every
+    /// `UpdateItems` it receives.
+    fn kicad_holding(
+        board: &Path,
+        footprints: Vec<prost_types::Any>,
+        updates: Arc<AtomicUsize>,
+    ) -> crate::test_support::MockIpcServer {
         crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
             let url = command.type_url.as_str();
             if url.ends_with("GetItems") {
@@ -10659,6 +10716,201 @@ mod fabrication_guard_tests {
         .unwrap();
         assert!(!plain.is_error, "{}", text(&plain));
         assert_eq!(updates.load(Ordering::SeqCst), 1);
+    }
+
+    /// A legacy repair sends the whole footprint back too, so a planned repair
+    /// of a property-carrying footprint becomes a conflict diagnostic and an
+    /// ordinary one does not.
+    #[test]
+    fn a_planned_repair_of_a_property_carrying_footprint_is_a_conflict_diagnostic() {
+        let (_temp, board) = project();
+        let target = |item: &prost_types::Any| {
+            RebuildTarget::from_instance(
+                &kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap(),
+            )
+        };
+        let bga = target(&live(
+            "U1",
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "Bga",
+            10.0,
+        ));
+        let plain = target(&live(
+            "R1",
+            "aaaaaaaa-0000-4000-8000-000000000002",
+            "Plain",
+            20.0,
+        ));
+
+        let diagnostics =
+            repairs_that_would_drop_pad_properties(&board, &[plain.clone(), bga.clone()]);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0]["reference"], "U1");
+        assert_eq!(
+            diagnostics[0]["code"],
+            "fabrication_property_rebuild_refused"
+        );
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("pad 'A1' pad_prop_bga") && message.contains("in KiCad itself"),
+            "{message}"
+        );
+        assert!(repairs_that_would_drop_pad_properties(&board, &[plain]).is_empty());
+    }
+
+    /// `footprint` as issue #244 left it: its library pad `A1` intact and its
+    /// one drawing shape rewritten as an anonymous, layerless pad.
+    fn corrupted(footprint: prost_types::Any) -> prost_types::Any {
+        let mut instance =
+            kiapi::board::types::FootprintInstance::decode(footprint.value.as_slice()).unwrap();
+        instance.layer = kiapi::board::types::BoardLayer::BlFCu as i32;
+        instance.definition.as_mut().unwrap().items = vec![
+            konnect_ipc::builders::pack_any(
+                &kiapi::board::types::Pad {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "live-pad".to_string(),
+                    }),
+                    number: "A1".to_string(),
+                    pad_stack: Some(kiapi::board::types::PadStack {
+                        layers: vec![0],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Pad",
+            ),
+            konnect_ipc::builders::pack_any(
+                &kiapi::board::types::Pad::default(),
+                "kiapi.board.types.Pad",
+            ),
+        ];
+        konnect_ipc::builders::pack_any(&instance, "kiapi.board.types.FootprintInstance")
+    }
+
+    /// The handler, not only its helper: a corrupted footprint whose pads
+    /// carry a fabrication property is a conflict on the dry run and on the
+    /// apply, nothing is sent, and an ordinary corrupted footprint is still
+    /// planned.
+    #[tokio::test]
+    async fn repairing_a_corrupted_footprint_with_a_pad_fabrication_property_is_a_conflict_and_sends_nothing(
+    ) {
+        for property in ["pad_prop_heatsink", "pad_prop_mechanical"] {
+            let (temp, board) = project();
+            // Both library footprints own one drawing shape, the one the
+            // corruption turned into a pad. U1's fabrication property is on
+            // the board only, as when it was set there and not in the library.
+            let with_shape = |source: String| {
+                format!(
+                    "{}\t(fp_line (start -1 -1) (end 1 -1) (stroke (width 0.12) (type solid)) (layer \"F.SilkS\"))\n)\n",
+                    source.strip_suffix(")\n").unwrap()
+                )
+            };
+            let pretty = temp.path().join("Parts.pretty");
+            std::fs::write(
+                pretty.join("Bga.kicad_mod"),
+                with_shape(BGA.replace(" (property pad_prop_bga)", "")),
+            )
+            .unwrap();
+            std::fs::write(
+                pretty.join("Plain.kicad_mod"),
+                with_shape(BGA.replace(" (property pad_prop_bga)", "")),
+            )
+            .unwrap();
+            let saved = saved_board().replace("pad_prop_bga", property);
+            std::fs::write(&board, &saved).unwrap();
+
+            let updates = Arc::new(AtomicUsize::new(0));
+            let server = kicad_holding(
+                &board,
+                vec![
+                    corrupted(live(
+                        "U1",
+                        "aaaaaaaa-0000-4000-8000-000000000001",
+                        "Bga",
+                        10.0,
+                    )),
+                    corrupted(live(
+                        "R1",
+                        "aaaaaaaa-0000-4000-8000-000000000002",
+                        "Plain",
+                        20.0,
+                    )),
+                ],
+                updates.clone(),
+            );
+            let ctx =
+                crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+            let path = board.to_string_lossy().to_string();
+            let call = |request: serde_json::Value| {
+                let ctx = &ctx;
+                async move {
+                    let result = handle_repair_corrupted_footprints(&request, ctx)
+                        .await
+                        .unwrap();
+                    assert!(!result.is_error, "{property}: {}", text(&result));
+                    serde_json::from_str::<serde_json::Value>(&text(&result)).unwrap()
+                }
+            };
+
+            // Without the property the same corruption is a ready plan, so the
+            // conflict below comes from the guard and nothing else.
+            let plain = call(json!({ "board": path, "references": ["R1"] })).await;
+            assert_eq!(plain["status"], "ready", "{property}: {plain}");
+            assert_eq!(plain["candidate_count"], 1, "{property}: {plain}");
+
+            let mut request = json!({ "board": path, "references": ["U1"] });
+            for apply in [false, true] {
+                let refused = call(request.clone()).await;
+                assert_eq!(refused["status"], "conflict", "{property}: {refused}");
+                assert_eq!(refused["applied"], false, "{property}: {refused}");
+                assert_eq!(refused["candidate_count"], 1, "{property}: {refused}");
+                let diagnostics = refused["diagnostics"].as_array().unwrap();
+                assert_eq!(diagnostics.len(), 1, "{property}: {refused}");
+                assert_eq!(diagnostics[0]["reference"], "U1");
+                assert_eq!(
+                    diagnostics[0]["code"],
+                    "fabrication_property_rebuild_refused"
+                );
+                let message = diagnostics[0]["message"].as_str().unwrap();
+                assert!(
+                    message.contains(&format!("pad 'A1' {property}"))
+                        && message.contains("in KiCad itself"),
+                    "{message}"
+                );
+                if !apply {
+                    // The apply repeats the dry run's own revision, so only
+                    // the guard stands between it and the update.
+                    request["dry_run"] = json!(false);
+                    request["expected_plan_revision"] = refused["plan_revision"].clone();
+                }
+            }
+
+            // Repairing the whole board is refused for the one footprint.
+            let whole = call(json!({ "board": path })).await;
+            assert_eq!(whole["status"], "conflict", "{property}: {whole}");
+            assert_eq!(whole["candidate_count"], 2, "{property}: {whole}");
+            let diagnostics = whole["diagnostics"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), 1, "{property}: {whole}");
+            assert_eq!(diagnostics[0]["reference"], "U1");
+
+            // A property the library footprint itself carries was a conflict
+            // before the guard: its pads cannot be built for the typed update.
+            std::fs::write(
+                pretty.join("Bga.kicad_mod"),
+                with_shape(BGA.replace("pad_prop_bga", property)),
+            )
+            .unwrap();
+            let library = call(json!({ "board": path, "references": ["U1"] })).await;
+            assert_eq!(library["status"], "conflict", "{property}: {library}");
+            assert_eq!(library["applied"], false, "{property}: {library}");
+            assert_eq!(
+                library["diagnostics"][0]["code"], "library_pad_parse_failed",
+                "{property}: {library}"
+            );
+
+            assert_eq!(updates.load(Ordering::SeqCst), 0, "nothing reached KiCad");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), saved);
+        }
     }
 
     /// With the board closed the file path moves and rotates the same

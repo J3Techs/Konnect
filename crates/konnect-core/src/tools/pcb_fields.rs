@@ -1,6 +1,7 @@
 //! Footprint field edits, live and revision-bound, plus the closed-board pad
 //! fabrication-property setter (`pcb_components::pad_fabrication`).
 use super::{
+    footprint_fabrication::{check_live_rebuild, RebuildTarget, Remedy},
     pcb_board::{attempt_ipc_write, BoardWrite},
     ToolContext, ToolDef,
 };
@@ -317,7 +318,7 @@ fn select(items: Vec<prost_types::Any>, name: &str) -> Result<Footprint> {
 pub(crate) fn tools() -> [ToolDef; 4] {
     let schema = json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"},"fields":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"visible":{"type":"boolean"},"x":{"type":"number"},"y":{"type":"number"},"layer":{"type":"string"},"size":{"type":"number"},"stroke":{"type":"number"},"centered":{"type":"boolean","description":"True centers both axes on the field anchor; false preserves existing alignment"},"font_name":{"type":"string","description":"Font family; empty string uses KiCad stroke font"},"rotation":{"type":"number"},"create":{"type":"boolean","default":false}},"required":["name"],"additionalProperties":false}},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","reference","fields"],"additionalProperties":false});
     [tool!("list_footprint_fields","Read mandatory and custom fields from an exact footprint on the requested live board.",json!({"type":"object","properties":{"board":{"type":"string"},"reference":{"type":"string"}},"required":["board","reference"],"additionalProperties":false}),|args,ctx|async move {handle_list_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
-    tool!("edit_footprint_fields","Plan or apply footprint text visibility, style, position and custom properties through live IPC. Defaults to dry run. Apply requires exact revision and verifies the complete footprint after publishing one undo entry. Never renumbers references. No file fallback.",schema,|args,ctx|async move {handle_edit_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
+    tool!("edit_footprint_fields","Plan or apply footprint text visibility, style, position and custom properties through live IPC. Defaults to dry run. Apply requires exact revision and verifies the complete footprint after publishing one undo entry. Never renumbers references. No file fallback. A footprint whose pads carry a fabrication property (pad_prop_heatsink, pad_prop_bga, …) is refused, plan and apply, because KiCad 10's typed update re-creates pads without it; set_footprint_field_values (values) and edit_component reference_field (Reference presentation) edit such a footprint on a closed board.",schema,|args,ctx|async move {handle_edit_footprint_fields(args,ctx).await}).with_board_access(super::BoardAccess::LiveOnly),
     values::tool(),
     super::pcb_components::pad_fabrication::tool()]
 }
@@ -387,9 +388,14 @@ async fn handle(args: &Value, ctx: &ToolContext, editing: bool) -> Result<CallTo
         let fp=select(client.get_items_in(doc.clone(),kind)?,&name)?;
         let Some(a)=parsed else {return Ok(CallToolResult::json(&json!({"source":"ipc","board":path,"reference":name,"fields":view(&fp)?})));};
         let updated=match prepare(&fp,&a.fields){Ok(v)=>v,Err(e)=>return Ok(CallToolResult::json(&json!({"status":"conflict","applied":false,"source":"ipc","diagnostic":e.to_string()})))};
+        let changed=fp!=updated;
+        // A changed footprint is sent back whole, and KiCad re-creates its
+        // pads without any pad fabrication property. Refuse the plan too.
+        if changed {
+            if let Err(refusal)=check_live_rebuild(&path,"edit_footprint_fields",&[RebuildTarget::from_instance(&fp)],Remedy::NoLosslessPath){return Ok(refusal.into_result());}
+        }
         let rev=revision(&path.to_string_lossy(),&fp,&a.fields)?;
         if !a.dry_run && a.expected_plan_revision.as_deref()!=Some(&rev){return Ok(CallToolResult::json(&json!({"status":"conflict","applied":false,"source":"ipc","diagnostic":"stale_plan_revision"})));}
-        let changed=fp!=updated;
         if a.dry_run || !changed{return Ok(CallToolResult::json(&json!({"status":if changed{"ready"}else{"noop"},"applied":false,"source":"ipc","plan_revision":rev,"before":view(&fp)?,"after":view(&updated)?})));}
         // KiCad stages footprint replacement as Remove/Add until PushCommit.
         // GetItems inside that commit still returns the old footprint.
@@ -652,11 +658,19 @@ mod tests {
             let initial = captured.clone();
             let state = Arc::new(Mutex::new((captured, None::<Footprint>, 0usize)));
             let observed = state.clone();
-            // An absolute path on every platform: KiCad names an open board absolutely.
-            let board_path = std::env::temp_dir()
-                .join("field-test.kicad_pcb")
-                .to_string_lossy()
-                .into_owned();
+            // An absolute path on every platform: KiCad names an open board
+            // absolutely. The saved copy shows the footprint's pads carry no
+            // fabrication property, which the live edit needs proven.
+            let temp = tempfile::tempdir().unwrap();
+            let board_file = temp.path().join("field-test.kicad_pcb");
+            std::fs::write(
+                &board_file,
+                format!(
+                    "(kicad_pcb (version 20260206)\n\t(footprint \"Saved\" (layer \"F.Cu\")\n\t\t(property \"Reference\" \"{name}\" (at 0 0 0) (layer \"F.SilkS\"))\n\t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\"))\n\t)\n)\n"
+                ),
+            )
+            .unwrap();
+            let board_path = board_file.to_string_lossy().into_owned();
             let served_path = board_path.clone();
             let server = crate::test_support::MockIpcServer::spawn("field-commit", move |req| {
                 let msg = req.message.unwrap();
@@ -775,6 +789,271 @@ mod tests {
                 assert!(!actual.0.value_field.as_ref().unwrap().visible);
                 assert_eq!(actual.0.definition, initial.definition);
             }
+        }
+    }
+
+    /// U2's pad 9 carries `pad_prop_heatsink` in the saved board; R1's pads
+    /// carry nothing. [`guard_board`] writes it with each property the guard
+    /// tests cover.
+    const GUARD_BOARD: &str = "(kicad_pcb (version 20260206)\n\t(footprint \"Parts:Reg\" (layer \"F.Cu\") (uuid \"aaaaaaaa-0000-4000-8000-000000000001\") (at 10 10)\n\t\t(property \"Reference\" \"U2\" (at 0 -2 0) (layer \"F.SilkS\") (uuid \"aaaaaaaa-0000-4000-8000-000000000011\")\n\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n\t\t(property \"Value\" \"100nF\" (at 0 2 0) (layer \"F.Fab\") (uuid \"aaaaaaaa-0000-4000-8000-000000000012\")\n\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n\t\t(pad \"9\" smd rect (at 0 0) (size 2.95 4.9) (property pad_prop_heatsink) (layers \"F.Cu\" \"F.Mask\") (net 1 \"GND\") (uuid \"aaaaaaaa-0000-4000-8000-000000000013\"))\n\t)\n\t(footprint \"Parts:Plain\" (layer \"F.Cu\") (uuid \"aaaaaaaa-0000-4000-8000-000000000002\") (at 20 10)\n\t\t(property \"Reference\" \"R1\" (at 0 -2 0) (layer \"F.SilkS\") (uuid \"aaaaaaaa-0000-4000-8000-000000000021\")\n\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n\t\t(property \"Value\" \"100nF\" (at 0 2 0) (layer \"F.Fab\") (uuid \"aaaaaaaa-0000-4000-8000-000000000022\")\n\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n\t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (net 1 \"GND\") (uuid \"aaaaaaaa-0000-4000-8000-000000000023\"))\n\t)\n)\n";
+
+    fn named(reference: &str) -> Footprint {
+        let mut footprint = fixture();
+        let field = footprint.reference_field.as_mut().unwrap();
+        field.text.as_mut().unwrap().text.as_mut().unwrap().text = reference.into();
+        footprint
+    }
+
+    /// A KiCad holding `board` with U2 and R1, publishing each `UpdateItems`
+    /// it receives and counting them.
+    fn guard_kicad(
+        board: &std::path::Path,
+        updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::test_support::MockIpcServer {
+        use kiapi::common::{commands as cmd, types as ct};
+        let live = std::sync::Mutex::new(vec![named("U2"), named("R1")]);
+        crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
+            let url = command.type_url.as_str();
+            let mut live = live.lock().unwrap();
+            if url.ends_with("GetItems") {
+                return Some(builders::pack_any(
+                    &cmd::GetItemsResponse {
+                        header: None,
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        items: live
+                            .iter()
+                            .map(|footprint| builders::pack_any(footprint, FP_TYPE))
+                            .collect(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if url.ends_with("BeginCommit") {
+                return Some(builders::pack_any(
+                    &cmd::BeginCommitResponse {
+                        id: Some(ct::Kiid {
+                            value: "commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ));
+            }
+            if url.ends_with("EndCommit") {
+                return Some(builders::pack_any(
+                    &cmd::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ));
+            }
+            if url.ends_with("UpdateItems") {
+                updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request = cmd::UpdateItems::decode(command.value.as_slice()).unwrap();
+                for item in &request.items {
+                    let sent = Footprint::decode(item.value.as_slice()).unwrap();
+                    let slot = live
+                        .iter_mut()
+                        .find(|footprint| reference(footprint) == reference(&sent))
+                        .unwrap();
+                    *slot = sent;
+                }
+                return Some(builders::pack_any(
+                    &cmd::UpdateItemsResponse {
+                        header: None,
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        updated_items: request
+                            .items
+                            .into_iter()
+                            .map(|item| cmd::ItemUpdateResult {
+                                status: Some(cmd::ItemStatus {
+                                    code: cmd::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: Some(item),
+                            })
+                            .collect(),
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ));
+            }
+            None
+        })
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    /// The two fabrication properties a live `edit_footprint_fields` dropped
+    /// from a real board.
+    const GUARDED_PROPERTIES: [&str; 2] = ["pad_prop_heatsink", "pad_prop_mechanical"];
+
+    fn guard_board(property: &str) -> String {
+        GUARD_BOARD.replace("pad_prop_heatsink", property)
+    }
+
+    fn guard_project(property: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, guard_board(property)).unwrap();
+        (temp, board)
+    }
+
+    #[tokio::test]
+    async fn editing_a_field_of_a_footprint_with_a_pad_fabrication_property_is_refused_before_sending(
+    ) {
+        for property in GUARDED_PROPERTIES {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (_temp, board) = guard_project(property);
+            let updates = std::sync::Arc::new(AtomicUsize::new(0));
+            let server = guard_kicad(&board, updates.clone());
+            let ctx =
+                crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+            let path = board.to_string_lossy().to_string();
+
+            let mut request =
+                json!({"board":path,"reference":"U2","fields":[{"name":"Value","visible":false}]});
+            for apply in [false, true] {
+                if apply {
+                    request["dry_run"] = json!(false);
+                    request["expected_plan_revision"] = json!("any");
+                }
+                let refused = handle(&request, &ctx, true).await.unwrap();
+                let refusal = text(&refused);
+                assert!(refused.is_error, "{refusal}");
+                assert!(
+                    refusal.contains("plan_blocked")
+                        && refusal.contains("edit_footprint_fields")
+                        && refusal.contains(&format!("pad '9' {property}"))
+                        && refusal.contains("make this change in KiCad itself"),
+                    "{refusal}"
+                );
+            }
+            assert_eq!(updates.load(Ordering::SeqCst), 0, "nothing reached KiCad");
+            assert_eq!(
+                std::fs::read_to_string(&board).unwrap(),
+                guard_board(property)
+            );
+
+            // A request that changes nothing sends nothing, so it is not refused.
+            let noop = body(
+            handle(
+                &json!({"board":path,"reference":"U2","fields":[{"name":"Value","visible":true}]}),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+            assert_eq!(noop["status"], "noop");
+
+            // An ordinary footprint is planned and edited as before.
+            let mut plain =
+                json!({"board":path,"reference":"R1","fields":[{"name":"Value","visible":false}]});
+            let planned = body(handle(&plain, &ctx, true).await.unwrap());
+            assert_eq!(planned["status"], "ready");
+            plain["dry_run"] = json!(false);
+            plain["expected_plan_revision"] = planned["plan_revision"].clone();
+            let applied = body(handle(&plain, &ctx, true).await.unwrap());
+            assert_eq!(applied["status"], "complete");
+            assert_eq!(updates.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_values_live_refuses_the_whole_batch_when_one_footprint_has_a_pad_fabrication_property(
+    ) {
+        for property in GUARDED_PROPERTIES {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (_temp, board) = guard_project(property);
+            let updates = std::sync::Arc::new(AtomicUsize::new(0));
+            let server = guard_kicad(&board, updates.clone());
+            let ctx =
+                crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+            let path = board.to_string_lossy().to_string();
+
+            let mut batch = json!({"board":path,"edits":[
+                {"reference":"R1","fields":{"Value":"1uF"}},
+                {"reference":"U2","fields":{"Value":"1uF","MPN":"X"}}
+            ]});
+            for apply in [false, true] {
+                if apply {
+                    batch["dry_run"] = json!(false);
+                    batch["expected_revision"] = json!("any");
+                }
+                let refused = values::handle_set_footprint_field_values(&batch, &ctx)
+                    .await
+                    .unwrap();
+                let refusal = text(&refused);
+                assert!(refused.is_error, "{refusal}");
+                assert!(
+                    refusal.contains("plan_blocked")
+                        && refusal.contains("set_footprint_field_values")
+                        && refusal.contains("U2 (")
+                        && refusal.contains(&format!("pad '9' {property}"))
+                        && refusal.contains("close it in KiCad")
+                        && !refusal.contains("R1 ("),
+                    "{refusal}"
+                );
+            }
+            assert_eq!(updates.load(Ordering::SeqCst), 0, "nothing reached KiCad");
+            assert_eq!(
+                std::fs::read_to_string(&board).unwrap(),
+                guard_board(property)
+            );
+
+            // Naming the footprint without changing it sends nothing of it.
+            let mut plain = json!({"board":path,"edits":[
+                {"reference":"R1","fields":{"Value":"1uF"}},
+                {"reference":"U2","fields":{"Value":"100nF"}}
+            ]});
+            let planned = body(
+                values::handle_set_footprint_field_values(&plain, &ctx)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(planned["status"], "ready");
+            assert_eq!(planned["changed"], 1);
+            plain["dry_run"] = json!(false);
+            plain["expected_revision"] = planned["plan_revision"].clone();
+            let applied = body(
+                values::handle_set_footprint_field_values(&plain, &ctx)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(applied["status"], "complete");
+            assert_eq!(updates.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// The remedy the live refusal names: with the board closed the same
+    /// values are set in the saved file and the pad clause is untouched.
+    #[tokio::test]
+    async fn the_closed_board_path_sets_values_and_keeps_the_pad_fabrication_property() {
+        for property in GUARDED_PROPERTIES {
+            let (_temp, board) = guard_project(property);
+            let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+            let mut request = json!({"board":board.to_string_lossy(),"edits":[
+                {"reference":"U2","fields":{"Value":"1uF","MPN":"X"}}
+            ]});
+            let planned = body(
+                values::handle_set_footprint_field_values(&request, &ctx)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(planned["status"], "ready", "{planned}");
+            request["dry_run"] = json!(false);
+            request["expected_revision"] = planned["plan_revision"].clone();
+            let applied = values::handle_set_footprint_field_values(&request, &ctx)
+                .await
+                .unwrap();
+            assert!(!applied.is_error, "{}", text(&applied));
+            let written = std::fs::read_to_string(&board).unwrap();
+            assert!(written.contains("(property \"Value\" \"1uF\""), "{written}");
+            assert!(written.contains("(property \"MPN\" \"X\""), "{written}");
+            let pad = "(pad \"9\" smd rect (at 0 0) (size 2.95 4.9) (property pad_prop_heatsink) (layers \"F.Cu\" \"F.Mask\") (net 1 \"GND\") (uuid \"aaaaaaaa-0000-4000-8000-000000000013\"))".replace("pad_prop_heatsink", property);
+            assert!(written.contains(&pad), "{property}: {written}");
         }
     }
 }
