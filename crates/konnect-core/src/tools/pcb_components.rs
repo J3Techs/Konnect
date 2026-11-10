@@ -1148,7 +1148,7 @@ fn board_footprint_sexp(
     // A library zone's points are the footprint's own frame; on a board they
     // are board coordinates (see `child_zones`).
     out = child_zones::map_child_zones(&out, &|dx, dy| {
-        konnect_sexp::geometry::rotate_about(dx, dy, x, y, rotation)
+        child_zones::placed_point((dx, dy), (x, y), rotation, false)
     })
     .map_err(|error| {
         format!("footprint '{lib_id}' cannot be placed in the board file: {error:#}")

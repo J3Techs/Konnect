@@ -759,6 +759,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "editor_not_closed",
         "save_failed",
         "board_state_unknown",
+        // The kind of an `audit_manufacturing` finding, not a callable tool.
+        "misplaced_footprint_zone",
     ];
 
     let mut phantom = Vec::new();

@@ -27,6 +27,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+mod misplaced_zones;
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -96,7 +98,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "audit_manufacturing",
             "DFM checks for the configured fab house: component spacing, silkscreen overlap, \
-             via-in-pad, acid traps, board outline issues.",
+             via-in-pad, acid traps, board outline issues. Also reports a footprint's own zone \
+             (the keepout under a connector or antenna) left away from its footprint, which \
+             KiCad's DRC does not: kind 'misplaced_footprint_zone', naming the footprint, the \
+             zone, where it is and where it belongs.",
             json!({
                 "type": "object",
                 "properties": {
@@ -588,11 +593,21 @@ async fn handle_audit_manufacturing(
         }
     }
 
+    // Footprint zones left away from their footprint: a keepout that keeps
+    // nothing out, which KiCad's DRC does not report.
+    let zones = misplaced_zones::check(&tree, &board_path);
+    let mut findings = serde_json::to_value(&findings)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    findings.extend(zones.findings.iter().cloned());
+
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "manufacturing",
             "fab_house": fab_house,
             "components": { "front": front_count, "back": back_count },
+            "footprint_zones": zones.coverage(),
             "findings": findings,
             "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
         }))
