@@ -43,12 +43,16 @@
 pub mod allowances;
 pub mod backend;
 pub mod coverage;
+pub mod planes;
 
 pub use allowances::{
     default_excluded_classes, AllowanceError, AllowanceReport, LayerFallbackSpec, NeckDownSpec,
     ReferenceSpec, RoutingAllowances,
 };
 pub use backend::KernelBackend;
+pub use planes::{
+    crossed_zones, split_left_to_planes, PlaneNetReport, PlaneOpenReason, PlaneTracks, ZoneCrossing,
+};
 
 use crate::access::{compute_pin_access_with, AccessSettings, AccessStats, PadAccess};
 use crate::api::{
@@ -113,6 +117,11 @@ pub struct PipelineSettings {
     /// and never reported as failures. Empty by default; the job runner
     /// fills it from [`RoutingAllowances`] ([`default_excluded_classes`]).
     pub excluded_classes: BTreeSet<ClassId>,
+    /// Whether the open connections of plane nets (nets owning a copper
+    /// zone, filled or not) that the fanout leaves are routed as tracks.
+    /// [`PlaneTracks::All`] by default; the job runner leaves them to
+    /// their planes unless the caller names the net.
+    pub plane_tracks: PlaneTracks,
     /// Rescue rounds after negotiation ([`rescue`]): the connections still
     /// failed for a reason another try could change are routed globally
     /// again, over a grid whose capacity is what the copper routed so far
@@ -176,6 +185,7 @@ impl Default for PipelineSettings {
             neck_down: None,
             class_fallback: BTreeMap::new(),
             excluded_classes: BTreeSet::new(),
+            plane_tracks: PlaneTracks::All,
             // Measured on a dense real board: three rounds rescue most of
             // what they can; further rounds added next to nothing.
             rescue_rounds: 3,
@@ -256,6 +266,13 @@ pub struct PipelineResult {
     /// Open connections of [`PipelineSettings::excluded_classes`], left
     /// unrouted by policy (ids are positions in this list).
     pub excluded: Vec<Connection>,
+    /// Open connections of plane nets left to their planes
+    /// ([`PipelineSettings::plane_tracks`]): never routed and never
+    /// reported as failures (ids are positions in this list).
+    pub left_to_planes: Vec<Connection>,
+    /// Every plane net of the scope: the pads its planes join, the pads
+    /// the fanout joined and the pads still open, with why.
+    pub plane_nets: Vec<PlaneNetReport>,
     pub fanout: Option<PlaneViaPlan>,
     pub access: Vec<PadAccess>,
     /// Per net class (as a profile), what pin access did.
@@ -355,10 +372,14 @@ fn run(
 
     // 2. Plane fanout, kept to the scope, frozen into a working board.
     let mut work = board.clone();
+    // Pads whose fanout site the scope dropped.
+    let mut fanout_out_of_scope: BTreeSet<PadId> = BTreeSet::new();
     if let Some(fs) = &settings.fanout {
         let t = Instant::now();
+        // A via may sit in an island of a pour declared crossable
+        // (`ZonePiece::crossable`): the refill carves it there too.
         let mut plan = plan_plane_vias(board, rules, &before, fs);
-        plan.sites.retain(|s| {
+        let in_scope = |s: &crate::fanout::PlaneViaSite| {
             let net_ok = scope.nets.as_ref().is_none_or(|n| n.contains(&s.net));
             let r = s.via_diameter / 2 + 1;
             let mut b = BBox::point(s.via).inflate(r);
@@ -366,7 +387,9 @@ fn run(
                 b = b.union(BBox::from_points([a, e]).map_or(b, |x| x.inflate(w / 2 + 1)));
             }
             net_ok && scope.region.is_none_or(|reg| reg.contains_bbox(&b))
-        });
+        };
+        fanout_out_of_scope.extend(plan.sites.iter().filter(|s| !in_scope(s)).map(|s| s.pad));
+        plan.sites.retain(in_scope);
         // The class policy: classes left unrouted get no fanout copper either.
         if !settings.excluded_classes.is_empty() {
             let excluded = |net: NetId| {
@@ -410,9 +433,28 @@ fn run(
         scope.nets.as_ref(),
         scope.region,
     );
+    out.plane_nets = planes::report(
+        &work,
+        rules,
+        &conn,
+        scope,
+        settings,
+        out.fanout.as_ref(),
+        &fanout_out_of_scope,
+    );
     drop(conn);
-    (out.connections, out.excluded) = split_excluded(rules, selected, &settings.excluded_classes);
+    let (routable, excluded) = split_excluded(rules, selected, &settings.excluded_classes);
+    out.excluded = excluded;
     tel.count("pipeline_excluded_by_policy", out.excluded.len() as u64);
+    // Plane nets are left to their planes and the fanout unless asked.
+    (out.connections, out.left_to_planes) =
+        split_left_to_planes(&work, routable, &settings.plane_tracks);
+    for c in &out.left_to_planes {
+        if let Some(p) = out.plane_nets.iter_mut().find(|p| p.net == c.net) {
+            p.connections_left += 1;
+        }
+    }
+    tel.count("pipeline_left_to_planes", out.left_to_planes.len() as u64);
     tel.add_stage_time(Stage::Audit, t.elapsed().as_micros() as u64);
     tel.count("pipeline_connections", out.connections.len() as u64);
 

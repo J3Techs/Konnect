@@ -723,3 +723,199 @@ fn ripping_up_a_connection_keeps_a_via_another_one_shares() {
     assert_eq!(left.tracks, vec![a]);
     assert_eq!(left.vias, vec![vec![a]]);
 }
+
+/// A two-layer board whose SIG pads sit either side of a GND pour that
+/// spans the board on both layers: no way round it.
+fn walled_by_pours() -> RouteBoard {
+    let mut b = BoardBuilder::new(30.0, 12.0, &["F.Cu", "B.Cu"]);
+    b.zone("GND", "F.Cu", (12.0, 0.1, 18.0, 11.9));
+    b.zone("GND", "B.Cu", (12.0, 0.1, 18.0, 11.9));
+    let l = b.footprint("R1", (5.0, 6.0));
+    b.smd_pad(l, "1", "SIG", (5.0, 6.0), (0.8, 0.5), "F.Cu");
+    let r = b.footprint("R2", (25.0, 6.0));
+    b.smd_pad(r, "1", "SIG", (25.0, 6.0), (0.8, 0.5), "F.Cu");
+    b.build()
+}
+
+#[test]
+fn a_filled_pour_of_another_net_blocks_a_route_until_it_is_declared_crossable() {
+    let mut board = walled_by_pours();
+    let rules = UniformRules::default();
+    let sig = board.net_by_name("SIG").unwrap();
+    let blocked = route_board(&board, &rules, &PipelineScope::default(), &settings(2)).unwrap();
+    assert_eq!(blocked.connections.len(), 1);
+    assert_eq!(blocked.failed.len(), 1, "the pours wall the pads apart");
+    assert!(blocked.routed.tracks.is_empty());
+    assert!(crossed_zones(&board, &rules, &blocked.routed).is_empty());
+
+    // One pour declared crossable is enough: the route goes through it.
+    let front = board
+        .zones
+        .iter()
+        .position(|z| z.layer == LayerId(0))
+        .unwrap();
+    board.zones[front].crossable = true;
+    let r = route_board(&board, &rules, &PipelineScope::default(), &settings(2)).unwrap();
+    assert!(r.failed.is_empty(), "failed: {:?}", r.failed);
+    assert_eq!(r.connections_after, 0);
+    assert!(r.routed.tracks.iter().all(|t| t.net == sig));
+    assert!(
+        r.routed.tracks.iter().all(|t| t.layer == LayerId(0)) && r.routed.vias.is_empty(),
+        "the pour that was not declared still blocks its layer: {:?}",
+        r.routed
+    );
+    // The optimizer kept the crossing (its checker leaves the pour alone
+    // too), and S7 leaves every fill to the refill.
+    assert!(r.check.violations.is_empty(), "{:?}", r.check.violations);
+    let crossed = crossed_zones(&board, &rules, &r.routed);
+    assert_eq!(crossed.len(), 1, "{crossed:?}");
+    assert_eq!(crossed[0].zone, board.zones[front].id);
+    assert!(crossed[0].tracks > 0 && crossed[0].vias == 0);
+}
+
+#[test]
+fn copper_of_the_pours_own_net_or_clear_of_it_is_not_a_crossing() {
+    let mut board = walled_by_pours();
+    for z in &mut board.zones {
+        z.crossable = true;
+    }
+    let rules = UniformRules::default();
+    let (gnd, sig) = (
+        board.net_by_name("GND").unwrap(),
+        board.net_by_name("SIG").unwrap(),
+    );
+    let mm = |v: f64| konnect_geom::mm_to_nm(v).unwrap();
+    let track = |net, x1: f64, x2: f64| RoutedTrack {
+        net,
+        layer: LayerId(0),
+        seg: Segment::new(
+            Point::new(mm(x1), mm(6.0)),
+            Point::new(mm(x2), mm(6.0)),
+            mm(0.15),
+        ),
+        gen: crate::api::Generation(0),
+    };
+    let copper = |tracks| RoutedCopper {
+        tracks,
+        vias: vec![],
+    };
+    // GND's own track through its pour, and a SIG track 1 mm short of it.
+    let clear = copper(vec![track(gnd, 10.0, 20.0), track(sig, 5.0, 11.0)]);
+    assert!(crossed_zones(&board, &rules, &clear).is_empty());
+    // 0.1 mm from the pour's edge is inside the 0.2 mm clearance.
+    let near = copper(vec![track(sig, 5.0, 11.825)]);
+    let crossed = crossed_zones(&board, &rules, &near);
+    assert_eq!(crossed.len(), 1);
+    assert_eq!((crossed[0].tracks, crossed[0].vias), (1, 0));
+    // A pour that was not declared is never reported.
+    for z in &mut board.zones {
+        z.crossable = false;
+    }
+    assert!(crossed_zones(&board, &rules, &near).is_empty());
+}
+
+#[test]
+fn plane_nets_are_left_to_their_planes_unless_named_for_tracks() {
+    let board = plane_with_pads();
+    let rules = UniformRules::default();
+    let gnd = board.net_by_name("GND").unwrap();
+    let pad = |reference: &str, number: &str| {
+        board
+            .pads
+            .iter()
+            .find(|p| {
+                p.number == number
+                    && board.footprints[p.footprint.index()].reference.as_deref() == Some(reference)
+            })
+            .unwrap()
+            .id
+    };
+    // No fanout: the SMD pads stay open, and say why.
+    let left = PipelineSettings {
+        fanout: None,
+        plane_tracks: PlaneTracks::Only(BTreeSet::new()),
+        ..settings(2)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &left).unwrap();
+    assert!(r.connections.iter().all(|c| c.net != gnd));
+    assert_eq!(r.left_to_planes.len(), 2);
+    assert!(r
+        .left_to_planes
+        .iter()
+        .enumerate()
+        .all(|(i, c)| c.net == gnd && c.id.index() == i));
+    assert!(r.failed.is_empty(), "left to the plane is not a failure");
+    assert!(r.routed.tracks.iter().all(|t| t.net != gnd));
+    assert!(!r.routed.tracks.is_empty(), "SIG is still routed");
+    assert_eq!(
+        r.telemetry.counters.get("pipeline_left_to_planes"),
+        Some(&2)
+    );
+    assert_eq!(r.plane_nets.len(), 1);
+    let p = &r.plane_nets[0];
+    assert_eq!((p.net, p.filled, p.routed_as_tracks), (gnd, true, false));
+    assert_eq!(p.pads, 4);
+    assert_eq!(p.joined, vec![pad("J1", "1"), pad("J1", "2")]);
+    assert!(p.fanout.is_empty() && p.unfilled.is_empty());
+    assert_eq!(
+        p.open,
+        vec![
+            (pad("C1", "1"), PlaneOpenReason::FanoutOff),
+            (pad("R1", "1"), PlaneOpenReason::FanoutOff)
+        ]
+    );
+    assert_eq!(p.connections_left, 2);
+
+    // With the fanout, its vias join them and nothing is left.
+    let fanned = PipelineSettings {
+        plane_tracks: PlaneTracks::Only(BTreeSet::new()),
+        ..settings(2)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &fanned).unwrap();
+    let p = &r.plane_nets[0];
+    assert_eq!(p.fanout, vec![pad("C1", "1"), pad("R1", "1")]);
+    assert!(p.open.is_empty() && r.left_to_planes.is_empty());
+    assert_eq!(p.connections_left, 0);
+
+    // Named, the net is routed as tracks like any other.
+    let named = PipelineSettings {
+        fanout: None,
+        plane_tracks: PlaneTracks::Only(BTreeSet::from([gnd])),
+        ..settings(2)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &named).unwrap();
+    assert!(r.left_to_planes.is_empty());
+    assert_eq!(r.connections.iter().filter(|c| c.net == gnd).count(), 2);
+    assert!(r.plane_nets[0].routed_as_tracks);
+    assert_eq!(r.plane_nets[0].connections_left, 0);
+}
+
+#[test]
+fn a_plane_net_without_a_fill_is_reported_and_not_routed_as_tracks() {
+    let mut board = plane_with_pads();
+    for z in &mut board.zones {
+        z.filled = false;
+    }
+    let rules = UniformRules::default();
+    let gnd = board.net_by_name("GND").unwrap();
+    let left = PipelineSettings {
+        plane_tracks: PlaneTracks::Only(BTreeSet::new()),
+        ..settings(2)
+    };
+    let r = route_board(&board, &rules, &PipelineScope::default(), &left).unwrap();
+    // No fill, so no plane to fan out to, and no tracks in its place.
+    assert!(r.fanout_copper.vias.is_empty());
+    assert!(r.routed.tracks.iter().all(|t| t.net != gnd));
+    assert!(r.routed.vias.iter().all(|v| v.net != gnd));
+    assert_eq!(r.left_to_planes.len(), 3, "four pads, none joined");
+    assert!(r.failed.is_empty());
+    let p = &r.plane_nets[0];
+    assert_eq!((p.net, p.filled), (gnd, false));
+    assert_eq!(p.unfilled, vec![board.zones[0].id]);
+    assert!(p.joined.is_empty() && p.fanout.is_empty() && p.open.is_empty());
+    assert_eq!((p.pads, p.connections_left), (4, 3));
+    // The engine's own default still routes such a net when asked to.
+    let all = route_board(&board, &rules, &PipelineScope::default(), &settings(2)).unwrap();
+    assert!(all.left_to_planes.is_empty());
+    assert_eq!(all.connections.iter().filter(|c| c.net == gnd).count(), 3);
+}

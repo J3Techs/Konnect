@@ -484,6 +484,13 @@ pub struct ZonePiece {
     pub island: bool,
     pub zone_name: Option<String>,
     pub priority: u32,
+    /// The caller declared that a refill will carve this pour around new
+    /// copper: its fill is no obstacle to new copper of other nets
+    /// (negotiation, the optimizer's exact checker), while connectivity and
+    /// the plane fanout still read the fill as saved. Never set by the
+    /// loader; rule areas are [`Keepout`]s and cannot be crossed.
+    #[serde(default)]
+    pub crossable: bool,
 }
 
 /// What a keepout forbids; `true` means not allowed.

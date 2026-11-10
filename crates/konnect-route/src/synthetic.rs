@@ -403,6 +403,7 @@ impl BoardBuilder {
                 island: false,
                 zone_name: None,
                 priority: 0,
+                crossable: false,
             })
             .collect();
         let keepouts = self

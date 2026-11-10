@@ -665,3 +665,104 @@ async fn project_classes_need_no_kicad() {
         .unwrap()
         .is_err());
 }
+
+#[tokio::test]
+async fn zone_options_reach_the_spec_and_are_refused_before_anything_runs() {
+    let f = files();
+    let args = json!({
+        "board": f.board(), "output_plan": f.path("z.json"),
+        "carve_zones": ["GND plane"], "carve_zone_nets": ["G*"], "plane_nets_as_tracks": ["GND"]
+    });
+    let spec = job_spec(&args).unwrap().unwrap();
+    assert_eq!(spec.carve_zones, vec!["GND plane".to_string()]);
+    assert_eq!(spec.carve_zone_nets, vec!["G*".to_string()]);
+    assert_eq!(spec.plane_nets_as_tracks, vec!["GND".to_string()]);
+    assert!(check_zone_options(&spec).await.unwrap().is_ok());
+    let plain = job_spec(&json!({ "board": f.board(), "output_plan": f.path("y.json") }))
+        .unwrap()
+        .unwrap();
+    assert!(plain.carve_zones.is_empty() && plain.plane_nets_as_tracks.is_empty());
+    // Routing nothing, there is no plane net to route as tracks.
+    let taken = json!({ "board": f.board(), "output_plan": f.path("x.json"),
+                        "source": "board_unlocked", "plane_nets_as_tracks": ["GND"] });
+    assert!(job_spec(&taken).unwrap().is_err());
+    assert!(job_spec(
+        &json!({ "board": f.board(), "output_plan": f.path("w.json"),
+                              "carve_zones": "GND plane" })
+    )
+    .unwrap()
+    .is_err());
+
+    // A rule area, an unknown zone and a net without a zone are each
+    // refused by both tools, naming the argument; nothing is written.
+    let region = json!({ "x1": 15.0, "y1": 5.0, "x2": 40.0, "y2": 30.0 });
+    for (key, value, says) in [
+        ("carve_zones", json!(["no_vias"]), "rule area"),
+        (
+            "carve_zones",
+            json!(["Nope"]),
+            "no copper zone of the board is named 'Nope'",
+        ),
+        (
+            "carve_zone_nets",
+            json!(["SIG"]),
+            "no net with a copper zone matches 'SIG'",
+        ),
+        (
+            "plane_nets_as_tracks",
+            json!(["D?"]),
+            "no net with a copper zone matches 'D?'",
+        ),
+    ] {
+        let mut bad =
+            json!({ "board": f.board(), "output_plan": f.path("bad.json"), "region": region });
+        bad[key] = value;
+        for started in [false, true] {
+            let r = if started {
+                handle_start_native_route_job(&bad, &ctx()).await.unwrap()
+            } else {
+                handle_route_native_region(&bad, &ctx()).await.unwrap()
+            };
+            let said = text(&r);
+            assert!(r.is_error, "{key}: {said}");
+            assert!(said.contains(key) && said.contains(says), "{key}: {said}");
+            assert!(said.contains("Nothing was started"), "{said}");
+            assert!(!Path::new(&f.path("bad.json")).exists());
+            assert!(!native_route_job::job_dir_for(Path::new(&f.path("bad.json"))).exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn route_native_region_accounts_for_plane_nets_and_names_the_refill() {
+    let f = files();
+    let args = json!({
+        "board": f.board(), "output_plan": f.path("planes.json"), "threads": 2,
+        "region": { "x1": 15.0, "y1": 5.0, "x2": 40.0, "y2": 30.0 },
+        "carve_zone_nets": ["*"]
+    });
+    let r = handle_route_native_region(&args, &ctx()).await.unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    let gnd = &b["plane_nets"][0];
+    assert_eq!(gnd["net"], "GND", "{b}");
+    assert_eq!(gnd["fill"], "filled");
+    assert_eq!(gnd["handling"], "left_to_plane");
+    assert_eq!(
+        gnd["connected_by_plane"],
+        json!({ "count": 1, "pads": ["J1.1"] })
+    );
+    assert_eq!(
+        gnd["connected_by_fanout"],
+        json!({ "count": 1, "pads": ["R1.2"] })
+    );
+    assert_eq!(gnd["needs_via_or_track"], json!([]));
+    assert_eq!(b["warnings"], json!([]));
+    // The In1 plane was declared crossable, but no new copper is on In1.
+    assert_eq!(b["refill"]["required"], false, "{b}");
+    assert_eq!(
+        b["refill"]["crossable_zones"],
+        json!([{ "zone": "GND plane", "layer": "In1.Cu", "net": "GND" }])
+    );
+    assert_eq!(b["refill"]["crossed_zones"], json!([]));
+}

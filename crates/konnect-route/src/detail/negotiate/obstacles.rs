@@ -197,8 +197,9 @@ impl Obstacles {
             // An unfilled zone's outline only bounds what a refill could pour,
             // and a refill clears around new copper; only real fills on layers
             // the router uses block. Plane pieces elsewhere are refilled around
-            // new vias, so they constrain nothing here.
-            if z.filled && board.routable.contains(z.layer) {
+            // new vias, so they constrain nothing here. Nor does a pour the
+            // caller declared crossable: the refill it promises carves it.
+            if z.filled && !z.crossable && board.routable.contains(z.layer) {
                 push(
                     Shape::Polygon(z.region.clone()),
                     LayerMask::single(z.layer),

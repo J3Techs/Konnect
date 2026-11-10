@@ -12,7 +12,9 @@ use konnect_geom::BBox;
 use konnect_route::api::{ClassId, Connection, ItemRef, NetId};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::detail::negotiate::DetailFailure;
-use konnect_route::pipeline::{select_connections, split_excluded};
+use konnect_route::pipeline::{
+    select_connections, split_excluded, split_left_to_planes, PlaneTracks,
+};
 use konnect_route::{RouteBoard, RuleTable};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -259,8 +261,8 @@ pub struct OpenConnection {
     /// `no_corridor`, `no_pin`, `unreachable`, `budget_exhausted`,
     /// `exact_check_rejected`, `congestion`, `off_reference`) when the
     /// route stage failed exactly this pad pair, or `net_not_joined`,
-    /// `cleared`, `excluded_by_policy`, `outside_scope`, `not_routed`,
-    /// `unexplained` (see [`reason_text`]).
+    /// `cleared`, `excluded_by_policy`, `left_to_plane`, `outside_scope`,
+    /// `not_routed`, `unexplained` (see [`reason_text`]).
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_access: Option<Endpoint>,
@@ -303,6 +305,9 @@ pub struct Account<'a> {
     /// Where the run's own copper starts in the applied board.
     pub own_from: OwnFrom,
     pub excluded_classes: &'a BTreeSet<ClassId>,
+    /// Which plane nets the run routed as tracks: the open connections of
+    /// the others were left to their planes, and are no failure.
+    pub plane_tracks: &'a PlaneTracks,
     /// Whether the run routed (source native) rather than took copper.
     pub routed_here: bool,
     pub failures: &'a [RouteFailure],
@@ -320,8 +325,11 @@ pub fn unrouted(applied: &RouteBoard, rules: &dyn RuleTable, account: &Account<'
     let key = |c: &Connection| (c.net, c.from, c.to);
     let selected = select_connections(applied, open.clone(), account.nets, account.region);
     let in_scope: BTreeSet<_> = selected.iter().map(key).collect();
-    let (_, excluded) = split_excluded(rules, selected, account.excluded_classes);
+    let (routable, excluded) = split_excluded(rules, selected, account.excluded_classes);
     let excluded: BTreeSet<_> = excluded.iter().map(key).collect();
+    // Plane nets the run left to their planes, as the route stage split them.
+    let (_, left) = split_left_to_planes(applied, routable, account.plane_tracks);
+    let left_to_plane: BTreeSet<_> = left.iter().map(key).collect();
 
     // Failures not yet matched to an open pad pair, per net.
     let mut matched = vec![false; account.failures.len()];
@@ -370,6 +378,9 @@ pub fn unrouted(applied: &RouteBoard, rules: &dyn RuleTable, account: &Account<'
             3
         } else if excluded.contains(&key(c)) {
             row.reason = "excluded_by_policy".to_string();
+            2
+        } else if left_to_plane.contains(&key(c)) {
+            row.reason = "left_to_plane".to_string();
             2
         } else if !account.routed_here {
             row.reason = "not_routed".to_string();
@@ -432,6 +443,7 @@ pub fn reason_text(reason: &str) -> &'static str {
         "net_not_joined" => "The route stage failed tasks of this net (failed_tasks), none between exactly these two pads: these are the closest pads of the two parts the net is left in.",
         "cleared" => "Routed, then taken out by the clear stage because the internal check still found a defect in the net's copper (see cleared in the report).",
         "excluded_by_policy" => "Its net class is left unrouted by the allowances (see excluded_by_policy).",
+        "left_to_plane" => "Not a routing failure: its net owns a copper zone and is left to its plane and the plane fanout, so the run drew no track for it. plane_nets lists the net's pads that still need a via or a track; plane_nets_as_tracks routes the net as tracks.",
         "outside_scope" => "Not selected by the job's nets, or an end lies outside its region: the job did not try it.",
         "not_routed" => "The job took existing copper (source board_unlocked or plan) and routed nothing.",
         _ => "No stage of this run reported why it is open (a job resumed from a checkpoint written before failures were kept reports its failures this way).",
@@ -491,6 +503,7 @@ mod tests {
             region: None,
             own_from: (board.tracks.len(), board.vias.len()),
             excluded_classes: &none.0,
+            plane_tracks: &PlaneTracks::All,
             routed_here: true,
             failures,
             cleared: &none.1,

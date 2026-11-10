@@ -814,16 +814,18 @@ impl Ctx<'_> {
 /// Which zone pieces (`board.zones` index) belong to a zone named in
 /// `carve_zones` (exact names).
 pub(crate) fn carve_mask(board: &RouteBoard, carve_zones: &[String]) -> Vec<bool> {
-    if carve_zones.is_empty() {
+    if carve_zones.is_empty() && !board.zones.iter().any(|z| z.crossable) {
         return Vec::new();
     }
+    // A piece declared crossable is carved like a named one, named or not.
     board
         .zones
         .iter()
         .map(|z| {
-            z.zone_name
-                .as_ref()
-                .is_some_and(|n| carve_zones.contains(n))
+            z.crossable
+                || z.zone_name
+                    .as_ref()
+                    .is_some_and(|n| carve_zones.contains(n))
         })
         .collect()
 }

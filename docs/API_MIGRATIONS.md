@@ -3,6 +3,68 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the native router leaves plane nets to their planes and can cross zones a refill will carve
+
+`route_native_region` and `start_native_route_job` treated a net as a plane net
+only when its zone had a fill in the saved file. With the fills missing, the
+only sign was `unfilled_zones_skipped` in the connectivity stage, and every
+connection of GND and the power nets was then routed as ordinary tracks. With
+the fills present, each pour on a routing layer was an obstacle to every other
+net, and `zones_are_obstacles: false` did not change that: it reached the
+optimizer's checker and never the search, so the connections under an
+outer-layer pour failed as `unreachable` or `no_pin` either way.
+
+A net that owns a copper zone, filled or not, is now left to its plane. It
+gets the plane fanout's vias and no tracks; the connections that remain are
+counted as `left_to_planes` in the route stage, not as failures. New
+`plane_nets_as_tracks` (net names or `*` `?` patterns) routes the named plane
+nets as tracks like any other net, which is what every plane net got before.
+Results and job reports add `plane_nets`: per net its `fill` (`filled`,
+`partly_filled`, `unfilled`), its `handling` (`left_to_plane`,
+`routed_as_tracks`, `class_excluded`), `connected_by_plane` and
+`connected_by_fanout` (pad labels, at most 200 listed beside the full count),
+`needs_via_or_track` (every pad the plane does not join, with its layers and
+the reason, never truncated), `connections_left_unrouted` and
+`unrouted_connections` (those connections by their two ends, at most 200
+listed). `warnings` says so for every plane net with a pad its plane does not
+join, and for a plane whose pads are all joined to pieces that are not joined
+to each other. In `unrouted`, which lists every connection still open with the
+plan applied, such a connection carries the reason `left_to_plane` and is
+listed after the run's own failures: it is never `unexplained` or
+`net_not_joined`.
+
+A plane net whose zones have no fill in the saved file is not refused: the run
+still routes the other nets, leaves that net unrouted, plans no fanout for it
+and says so first in the new `warnings` array, with the zones and the two ways
+on (refill and save, or `plane_nets_as_tracks`). A refusal would stop a run
+whose output is correct as far as it goes; routing the net as tracks would not
+be.
+
+New `carve_zones` (exact zone names, as in `plan_trunk` and `plan_plane_vias`)
+and `carve_zone_nets` (net names or patterns; `["*"]` is every copper zone,
+named or not) declare zones crossable: a refill re-pours them around new
+copper, so their saved fill is no obstacle to other nets in routing or in the
+optimizer. Connectivity and the fanout still read the fill as saved. A rule
+area, an unknown zone name and a net without a zone are refused before
+anything starts; a rule area is a keepout under every one of these options.
+`zones_are_obstacles: false` now means what its name says: every copper zone,
+with a net or without, is crossable, in routing as well as in the optimizer
+and the interim check it already reached. Its default (`true`) is unchanged.
+Results add `refill`: `required`, the `crossable_zones` declared and the
+`crossed_zones` the plan's copper comes within clearance of, with track and
+via counts. Such a plan shorts to the saved fill until the zones are refilled.
+A refill is required before DRC or fabrication, and `refill.note` and
+`warnings` say so: refill, save and run DRC, because a pour carved around a
+new track can leave a pad it used to join on a cut-off island. When
+connections fail while undeclared fills lie on the routing layers, `warnings`
+names those zones and these options.
+
+This changes the default: a net with a copper zone is no longer routed as
+tracks. Callers that relied on that must pass `plane_nets_as_tracks`, and must
+read `warnings` and `plane_nets`, because the connections left to a plane are
+not counted as failures. Callers that worked around the obstacles by deleting
+outer-layer pours before a run can keep the pours and name them instead.
+
 ## Unreleased: a strict geometry refusal names its defects, and a route job lints its own plan
 
 `apply_route_plan` under the default `geometry_check: strict` refused a plan
