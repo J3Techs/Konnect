@@ -1064,6 +1064,28 @@ stays at 20).
   of several is now the rule, not a fallback).
 - **Tools.** `plan_plane_vias`: `plane_layer`, `plane_zone`; reply `planes`.
 
+### Via-in-pad on named pads
+
+Additive; no tool was added. Without the new argument nothing changes.
+
+- **The rule.** A via still may not touch an SMD pad of its own net, except
+  a pad the caller names: there the via's disc must lie wholly inside one
+  copper shape of the pad (`fanout::disc_within_pad`, exact; touching the
+  edge from inside counts; a pad with approximated copper holds nothing).
+  A via across a named pad's edge is `via: partly outside the pad named for
+  via-in-pad`. Every other via check is unchanged.
+- **`fanout::tap`.** `TapOptions::via_in_pad: Vec<PadId>`. For a named pad
+  the planner adds candidates inside it (the copper centre and a grid of
+  one via radius), with no stub, costed by their distance from the centre.
+  `TapSite::in_pad: Option<PadId>`; such a site has `stub: None`.
+  `check_via_site(.., carve_zones, via_in_pad) -> Result<Option<PadId>,
+  ViaSiteRefusal>`: `Ok` names the pad the via is in.
+- **Tools.** `plan_tap_vias` and `build_route` take `via_in_pad`
+  (`REFERENCE.NUMBER`; SMD pads with a net; for `plan_tap_vias` among
+  `pads`, for `build_route` of the route's net and only with a `new_via`).
+  `plan_tap_vias` sites carry `via_in_pad`, the reply `via_in_pad` and
+  `vias_in_pad`; `build_route`'s `new_vias` carry `in_pad`.
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

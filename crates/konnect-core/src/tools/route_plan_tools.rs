@@ -464,6 +464,19 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
             ),
         ));
     }
+    let via_in_pad = match via_in_pad_arg(&board, args) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    if let Some(p) = via_in_pad.iter().find(|p| !pads.contains(p)) {
+        return Ok(invalid(
+            "via_in_pad",
+            &format!(
+                "{} is not one of pads: only a pad being tapped can take its via inside it",
+                board_inspect::pad_label(&board, &board.pads[p.index()])
+            ),
+        ));
+    }
     let settings = konnect_route::fanout::FanoutSettings {
         retry_failed,
         ..Default::default()
@@ -471,6 +484,7 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let options = konnect_route::fanout::tap::TapOptions {
         carve_zones: carve.clone(),
         keepouts: keepouts.clone(),
+        via_in_pad: via_in_pad.clone(),
     };
     let t = std::time::Instant::now();
     let plan = match guarded("tap vias", || {
@@ -523,6 +537,7 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                     "from": pt(a), "to": pt(b), "width_mm": mm(w),
                     "length_mm": nm_to_mm((b - a).length_f64().round() as i64),
                 })),
+                "via_in_pad": s.in_pad.is_some(),
                 "carves": carved,
             })
         })
@@ -574,6 +589,8 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "keepouts": keepouts.iter().map(|b| json!({
             "x1": mm(b.min.x), "y1": mm(b.min.y), "x2": mm(b.max.x), "y2": mm(b.max.y),
         })).collect::<Vec<_>>(),
+        "via_in_pad": via_in_pad.iter().map(|p| label(*p)).collect::<Vec<_>>(),
+        "vias_in_pad": plan.sites.iter().filter(|s| s.in_pad.is_some()).count(),
         "requested": names.len(),
         "sites": sites,
         "failed": failed,
@@ -586,6 +603,45 @@ fn plan_tap_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "output_plan": if written { json!(output) } else { Value::Null },
         "next": "Review with render_board_layers_png (overlay_routing_file), apply with add_routing or apply_route_plan, then refill and run DRC. The site positions are the waypoints plan_trunk takes.",
     })))
+}
+
+/// `via_in_pad`: the SMD pads (REFERENCE.NUMBER) that may take a via of
+/// their own net inside them. Each must be an SMD pad with a net whose
+/// copper the board model holds exactly.
+pub(crate) fn via_in_pad_arg(
+    board: &RouteBoard,
+    args: &Value,
+) -> Result<Vec<konnect_route::api::PadId>, Refusal> {
+    let Some(names) = opt_strings(args, "via_in_pad")? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for i in board_inspect::named_pads(board, &names, "via_in_pad")? {
+        let pad = &board.pads[i];
+        let refuse = |why: &str| {
+            invalid(
+                "via_in_pad",
+                &format!("{} {why}", board_inspect::pad_label(board, pad)),
+            )
+        };
+        if pad.kind != konnect_route::board::PadKind::Smd {
+            return Err(refuse(
+                "is not an SMD pad: via-in-pad is for SMD pads (a through-hole pad needs no via)",
+            ));
+        }
+        if pad.net.is_none() {
+            return Err(refuse("has no net: a via in it would join nothing"));
+        }
+        if pad.approximated {
+            return Err(refuse(
+                "has copper the board model only approximates, so a via cannot be proven inside it",
+            ));
+        }
+        if !out.contains(&pad.id) {
+            out.push(pad.id);
+        }
+    }
+    Ok(out)
 }
 
 // ─── plan_trunk ──────────────────────────────────────────────────────────────

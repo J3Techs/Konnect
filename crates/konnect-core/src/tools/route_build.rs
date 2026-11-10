@@ -14,7 +14,8 @@
 //! there and a later call lands on it with `via_at` (this plan in its
 //! `avoid_routing_files`). A new via meets the tap-via site rules
 //! (`fanout::tap::check_via_site`: the via floor, clearances, no SMD pad of
-//! its own net, outside other nets' islands on every layer unless
+//! its own net unless `via_in_pad` names the pad and the via lies wholly
+//! inside its copper, outside other nets' islands on every layer unless
 //! `carve_zones` names them) and goes into the plan with the tracks.
 //!
 //! `replaces` / `replaces_file` name board tracks, arcs and vias the plan
@@ -38,7 +39,7 @@ use crate::tools::route_native::{
 };
 use crate::tools::route_plan_tools::{
     absolute, board_item_label, carve_labels, carve_zones_arg_hint, check_json, length_arg,
-    point_arg, read_avoid, refuse_existing, replaces_arg, write_plan, Replaced,
+    point_arg, read_avoid, refuse_existing, replaces_arg, via_in_pad_arg, write_plan, Replaced,
 };
 use crate::tools::{board_lint, get_path, route_geometry, ToolContext};
 use konnect_geom::{Coord, Point, Segment};
@@ -82,7 +83,7 @@ pub(crate) fn schema() -> Value {
                 "via_at": { "type": "object", "description": "Position of a via on the saved board or in avoid_routing_files, mm (within 1 micron)",
                             "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] },
                 "new_via": { "type": "object", "additionalProperties": false,
-                             "description": format!("Place a new through via of the route's net exactly at the {end} vertex, so the route can change layers there (a later build_route anchors on it with via_at and this plan in avoid_routing_files). It goes into the routing_file and is checked with the tracks; it must also meet the tap-via site rules (the via floor, clearances, no SMD pad of its own net under it, and outside other nets' islands on every layer unless carve_zones names them). Refused when a via of the net already sits there (use via_at), or together with extend_to on the same end"),
+                             "description": format!("Place a new through via of the route's net exactly at the {end} vertex, so the route can change layers there (a later build_route anchors on it with via_at and this plan in avoid_routing_files). It goes into the routing_file and is checked with the tracks; it must also meet the tap-via site rules (the via floor, clearances, no SMD pad of its own net under it unless via_in_pad names that pad, and outside other nets' islands on every layer unless carve_zones names them). Refused when a via of the net already sits there (use via_at), or together with extend_to on the same end"),
                              "properties": {
                                  "diameter_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Default: the net class via diameter" },
                                  "drill_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Default: the net class via drill" }
@@ -114,6 +115,8 @@ pub(crate) fn schema() -> Value {
                                      "description": "Planned copper (routing_files) the route is checked against as if it were on the board; their vias also serve via_at anchors" },
             "carve_zones": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1,
                              "description": "Zones (exact names) a refill will carve around the new copper. On the route's layer their fill is no obstacle (as for plan_trunk; the exact check leaves fills to the refill anyway) and the reply gives the route length over each; a new_via may sit inside their islands on any copper layer and lists the pours it carves. Each must be a copper zone of the board; without a new_via it must have copper on the route's layer" },
+            "via_in_pad": { "type": "array", "items": { "type": "string", "minLength": 3 }, "minItems": 1,
+                            "description": "SMD pads of the route's net (REFERENCE.NUMBER) a new_via may sit inside, for a large pad with no legal via site beside it. The via's copper must lie wholly inside the pad's copper (a via across the pad's edge is refused); every other check stays, and the new via reports in_pad. Unless the fabricator fills and caps the via, an open via in a pad wicks solder away from the joint. Needs a start or end new_via. Default: none, and no new via may touch an SMD pad of its net" },
             "replaces": crate::tools::route_native::replaces_prop(),
             "replaces_file": crate::tools::route_native::replaces_file_prop(),
             "parallel_to": { "type": "object", "description": "Instead of vertices: the polyline offset sideways from another route, one unbranched chain of tracks of one net on this layer in a routing_file (another net's plan, or a build_route output), run in the direction of its first listed track. Collinear tracks are one run. That file is also checked against",
@@ -1152,6 +1155,32 @@ fn build(
         ", and without a start or end new_via the route has no copper on other layers",
     )?;
 
+    // Pads a new via may sit inside: of the route's net, and only with a
+    // new via to put there.
+    let via_in_pad = via_in_pad_arg(board, args)?;
+    if let Some(p) = via_in_pad
+        .iter()
+        .map(|p| &board.pads[p.index()])
+        .find(|p| p.net != Some(net))
+    {
+        return Err(invalid(
+            "via_in_pad",
+            &format!(
+                "{} is on {}, not the route's net {}: only a pad of the via's own net can hold it",
+                board_inspect::pad_label(board, p),
+                p.net
+                    .map_or("no net".to_string(), |n| board.net(n).name.clone()),
+                board.net(net).name
+            ),
+        ));
+    }
+    if !via_in_pad.is_empty() && !any_new_via {
+        return Err(invalid(
+            "via_in_pad",
+            "needs a start or end new_via: it only says where a new via may sit",
+        ));
+    }
+
     // The polyline as given.
     let given = vertices_arg(args)?;
     let (base, field) = match (&given, &parallel) {
@@ -1307,6 +1336,8 @@ fn build(
         }
     }
     let route_net = board.net(net).name.clone();
+    // Per new via: the pad named in via_in_pad it sits wholly inside.
+    let mut in_pads: Vec<Option<konnect_route::api::PadId>> = Vec::new();
     for (i, (end_name, at, nv)) in new_vias.iter().enumerate() {
         let field = format!("{end_name}.new_via");
         let near = |c: Point| (c - *at).length_f64() <= ANCHOR_TOL_NM;
@@ -1341,16 +1372,20 @@ fn build(
                 nv.diameter,
                 nv.drill,
                 &carve,
+                &via_in_pad,
             )
         }) {
             Ok(v) => v,
             Err(e) => return Err(stage_failure("check_via_site", e)),
         };
-        if let Err(why) = verdict {
-            return Err(invalid(
-                &field,
-                &site_refusal(&checked, &why, &route_net, *at, nv),
-            ));
+        match verdict {
+            Ok(pad) => in_pads.push(pad),
+            Err(why) => {
+                return Err(invalid(
+                    &field,
+                    &site_refusal(&checked, &why, &route_net, *at, nv),
+                ))
+            }
         }
     }
     let all_layers = board.layers.all();
@@ -1445,11 +1480,13 @@ fn build(
     let new_vias_json: Vec<Value> = new_vias
         .iter()
         .zip(&via_carves)
-        .map(|((end_name, at, nv), zones)| {
+        .zip(&in_pads)
+        .map(|(((end_name, at, nv), zones), in_pad)| {
             json!({
                 "end": end_name, "at": pt(*at),
                 "diameter_mm": mm(nv.diameter), "drill_mm": mm(nv.drill),
                 "sized_from": nv.sized_from,
+                "in_pad": in_pad.map(|p| board_inspect::pad_label(board, &board.pads[p.index()])),
                 "carves": carve_labels(&checked, zones),
             })
         })
