@@ -415,8 +415,87 @@ pub struct PipelineReport {
     /// pad and by reason (`None` when the run stopped before the check).
     #[serde(default)]
     pub unrouted: Option<Unrouted>,
+    /// What `apply_route_plan`'s strict geometry lint finds in the plan
+    /// written (`None` when no plan was).
+    #[serde(default)]
+    pub plan_lint: Option<PlanLint>,
+    /// The same for the separate fanout plan, when one was written.
+    #[serde(default)]
+    pub fanout_plan_lint: Option<PlanLint>,
     pub telemetry: Telemetry,
 }
+
+/// The geometry lint of a plan the run wrote: the very check
+/// `apply_route_plan` makes under `geometry_check: strict`, run on the file's
+/// own contents, so a run says before anything is applied whether its plan
+/// will be refused, and for which tracks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanLint {
+    /// The routing file linted.
+    pub path: PathBuf,
+    /// Whether `apply_route_plan` takes the file under `geometry_check: strict`.
+    pub passes_strict: bool,
+    /// Defects found, all of them.
+    pub total: usize,
+    pub by_kind: BTreeMap<String, usize>,
+    /// Every defect: kind, net, layer, x, y, detail and the tracks involved
+    /// by their index in the file's tracks array, with their ends.
+    pub defects: Vec<Value>,
+}
+
+impl PlanLint {
+    /// Lint `plan`, written to `path`.
+    pub(crate) fn of(path: &Path, plan: &RoutePlan) -> Self {
+        use crate::tools::{route_geometry, route_native_apply};
+        let segments = route_native_apply::batch_of(plan, false).segments();
+        let report = route_geometry::lint(&segments, &route_geometry::Limits::default());
+        let listing = report.defect_listing(&segments, usize::MAX);
+        PlanLint {
+            path: path.to_path_buf(),
+            passes_strict: report.defects() == 0,
+            total: report.defects(),
+            by_kind: serde_json::from_value(listing["by_kind"].clone()).unwrap_or_default(),
+            defects: listing["defects"].as_array().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// The lint for a tool result: at most `listed` defects, the totals
+    /// always, and where the whole list is (`full_list`, a job's report
+    /// file) when some are left out.
+    pub(crate) fn bounded(&self, listed: usize, full_list: Option<&Path>) -> Value {
+        let shown = &self.defects[..self.defects.len().min(listed)];
+        let mut body = json!({
+            "path": self.path,
+            "passes_strict": self.passes_strict,
+            "total": self.total,
+            "by_kind": self.by_kind,
+            "listed": shown.len(),
+            "defects": shown,
+        });
+        if !self.passes_strict {
+            body["remedy"] = json!(crate::tools::route_geometry::STRICT_REMEDY);
+        }
+        if shown.len() < self.total {
+            body["note"] = json!(match full_list {
+                Some(file) => format!(
+                    "{} of {} defects listed; plan_lint.defects in {} has them all",
+                    shown.len(),
+                    self.total,
+                    file.display()
+                ),
+                None => format!(
+                    "{} of {} defects listed; apply_route_plan's strict refusal lists up to its max_listed",
+                    shown.len(),
+                    self.total
+                ),
+            });
+        }
+        body
+    }
+}
+
+/// Defects of a plan's lint a tool result lists; the totals cover all.
+pub(crate) const PLAN_LINT_LISTED: usize = 50;
 
 impl PipelineReport {
     fn stop(&mut self, kind: StopKind, why: String) {
@@ -1106,6 +1185,7 @@ pub fn run_pipeline(
                 .map_err(|e| anyhow::anyhow!("fanout plan: {e}"))?;
             write_new_atomic(path, plan.to_routing_file_json().as_bytes())?;
             report.fanout_plan_path = Some(path.clone());
+            report.fanout_plan_lint = Some(PlanLint::of(path, &plan));
         }
     }
     let planned = if separate.is_some() {
@@ -1137,8 +1217,13 @@ pub fn run_pipeline(
     report.plan_items = Some(plan.item_count());
     report.plan_chunks = Some(chunks);
     report.plan_path = Some(spec.output_plan.clone());
+    // The lint apply_route_plan will run, so the run says now what it finds.
+    let lint = PlanLint::of(&spec.output_plan, &plan);
     let detail = json!({ "items": plan.item_count(), "add_routing_calls": chunks,
-                         "path": spec.output_plan, "fanout_plan": report.fanout_plan_path });
+                         "path": spec.output_plan, "fanout_plan": report.fanout_plan_path,
+                         "strict_lint_defects": lint.total,
+                         "fanout_strict_lint_defects": report.fanout_plan_lint.as_ref().map(|l| l.total) });
+    report.plan_lint = Some(lint);
     record(&mut report, observer, "plan", "done", t, detail);
     Ok(report)
 }
@@ -1413,6 +1498,11 @@ fn report_listing(dir: &Path, status: &JobStatus, listed: usize) -> Value {
                 listed,
                 Some(report_path.display().to_string()),
             );
+        }
+        for key in ["plan_lint", "fanout_plan_lint"] {
+            if let Ok(lint) = serde_json::from_value::<PlanLint>(r[key].clone()) {
+                body["report"][key] = lint.bounded(PLAN_LINT_LISTED, Some(&report_path));
+            }
         }
     }
     body

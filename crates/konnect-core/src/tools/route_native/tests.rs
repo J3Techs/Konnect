@@ -424,6 +424,79 @@ async fn job_tools_refuse_bad_arguments_and_unknown_jobs() {
 }
 
 #[tokio::test]
+async fn a_strict_refusal_names_each_defect_and_the_plan_tracks_behind_it() {
+    let f = files();
+    // A clean track of another net first, so the indices are the file's:
+    // then two short sideways steps on SIG, each between two long runs.
+    let plan = write_plan(
+        &f,
+        "jogs.json",
+        vec![
+            t("OTHER", "F.Cu", (0.0, 9.0), (5.0, 9.0)),
+            t("SIG", "F.Cu", (0.0, 0.0), (5.0, 0.0)),
+            t("SIG", "F.Cu", (5.0, 0.0), (5.0, 0.08)),
+            t("SIG", "F.Cu", (5.0, 0.08), (9.0, 0.08)),
+            t("SIG", "F.Cu", (9.0, 0.08), (9.0, 0.16)),
+            t("SIG", "F.Cu", (9.0, 0.16), (14.0, 0.16)),
+        ],
+    );
+    let ledger = f.path("ledger.json");
+    let mut args = json!({ "board": f.board(), "routing_file": plan, "ledger_output": ledger });
+    let r = handle_apply_route_plan(&args, &ctx()).await.unwrap();
+    let said = text(&r);
+    assert!(r.is_error, "{said}");
+    let body: Value = serde_json::from_str(&said).unwrap();
+    assert!(
+        body["message"].as_str().unwrap().contains(
+            "the plan has 2 geometry defect(s) under geometry_check strict (2 short_jog)"
+        ),
+        "{said}"
+    );
+    assert_eq!(body["error"]["kind"], "invalid_argument");
+    assert_eq!(body["error"]["field"], "routing_file");
+    let detail = &body["geometry"];
+    assert_eq!(detail["total"], 2, "{detail}");
+    assert_eq!(detail["by_kind"], json!({ "short_jog": 2 }), "{detail}");
+    assert_eq!(detail["listed"], 2);
+    let first = &detail["defects"][0];
+    assert_eq!(first["kind"], "short_jog");
+    assert_eq!(first["net"], "SIG");
+    assert_eq!(first["layer"], "F.Cu");
+    assert_eq!((&first["x"], &first["y"]), (&json!(5.0), &json!(0.04)));
+    let indices = |d: &Value| -> Vec<u64> {
+        d["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["index"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(indices(first), [1, 2, 3]);
+    assert_eq!(indices(&detail["defects"][1]), [3, 4, 5]);
+    assert_eq!(first["tracks"][1]["from"], json!([5.0, 0.0]));
+    assert_eq!(first["tracks"][1]["to"], json!([5.0, 0.08]));
+    assert!(detail["remedy"].as_str().unwrap().contains("warn"));
+    assert!(detail.get("note").is_none());
+    assert!(!Path::new(&ledger).exists());
+
+    // The list is bounded; the totals are not.
+    args["max_listed"] = json!(1);
+    let r = handle_apply_route_plan(&args, &ctx()).await.unwrap();
+    let said = text(&r);
+    let body: Value = serde_json::from_str(&said).unwrap();
+    let detail = &body["geometry"];
+    assert_eq!(
+        (&detail["total"], &detail["listed"]),
+        (&json!(2), &json!(1))
+    );
+    assert_eq!(detail["defects"].as_array().unwrap().len(), 1);
+    assert!(
+        detail["note"].as_str().unwrap().contains("1 of 2"),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
 async fn apply_route_plan_refuses_before_any_ipc() {
     let f = files();
     let plan = write_plan(&f, "p.json", vec![t("SIG", "F.Cu", (1.0, 1.0), (2.0, 1.0))]);
