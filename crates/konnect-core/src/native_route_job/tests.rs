@@ -916,3 +916,244 @@ fn a_filled_plane_in_separate_pieces_is_warned_about_even_when_every_pad_is_join
     };
     assert!(warnings(&[whole], None).is_empty());
 }
+
+// --- Track width overrides ---------------------------------------------------
+
+/// A 2-layer board with an unrouted `+5V` (class Power, 0.8 mm) on J1.1,
+/// R1.1 and R2.1, 8 mm apart in a row, and `SIG` on R1.2 and R2.2.
+const FEED_BOARD: &str = r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(general
+		(thickness 1.6)
+	)
+	(layers
+		(0 "F.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+	)
+	(footprint "TestPoint"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000101")
+		(at 5 5)
+		(property "Reference" "J1" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+	)
+	(footprint "R_0603"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000102")
+		(at 13 5)
+		(property "Reference" "R1" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+		(pad "2" smd rect (at 0 4) (size 1 1) (layers "F.Cu" "F.Mask") (net "SIG"))
+	)
+	(footprint "R_0603"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000103")
+		(at 21 5)
+		(property "Reference" "R2" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+		(pad "2" smd rect (at 0 4) (size 1 1) (layers "F.Cu" "F.Mask") (net "SIG"))
+	)
+	(gr_rect
+		(start 0 0)
+		(end 26 14)
+		(stroke (width 0.05) (type default))
+		(fill no)
+		(layer "Edge.Cuts")
+	)
+)
+"#;
+
+const FEED_PRO: &str = r#"{
+    "board": { "design_settings": { "rules": {
+        "min_clearance": 0.1, "min_track_width": 0.1, "min_via_diameter": 0.4,
+        "min_via_annular_width": 0.1, "min_through_hole_diameter": 0.2,
+        "min_copper_edge_clearance": 0.3, "min_hole_clearance": 0.2, "min_hole_to_hole": 0.25
+    } } },
+    "net_settings": {
+        "classes": [
+            { "name": "Default", "clearance": 0.2, "track_width": 0.2,
+              "via_diameter": 0.6, "via_drill": 0.3 },
+            { "name": "Power", "clearance": 0.2, "track_width": 0.8 }
+        ],
+        "netclass_patterns": [ { "pattern": "+5V", "netclass": "Power" } ]
+    }
+}"#;
+
+fn feed_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("demo.kicad_pcb"), FEED_BOARD).unwrap();
+    std::fs::write(root.join("demo.kicad_pro"), FEED_PRO).unwrap();
+    Fixture { _dir: dir, root }
+}
+
+/// A native spec on the feed board that routes every class, with
+/// `track_widths`.
+fn feed_spec(root: &Path, out: &str, track_widths: Value) -> NativeJobSpec {
+    let mut s = spec(root, out, CopperSource::Native);
+    s.allowances = serde_json::from_value(json!({
+        "exclude_classes": [], "track_widths": track_widths
+    }))
+    .unwrap();
+    s
+}
+
+/// The distinct widths (mm) of the plan's tracks of `net` lying wholly
+/// within `x` (mm), sorted.
+fn plan_widths(plan: &Path, net: &str, x: (f64, f64)) -> Vec<f64> {
+    let plan: RoutePlan = read_json(plan).unwrap();
+    let mut w: Vec<f64> = plan
+        .tracks
+        .iter()
+        .filter(|t| t.net == net)
+        .filter(|t| [t.x1, t.x2].iter().all(|v| (x.0..=x.1).contains(v)))
+        .map(|t| t.width)
+        .collect();
+    w.sort_by(f64::total_cmp);
+    w.dedup();
+    w
+}
+
+#[test]
+fn a_net_s_track_width_reaches_the_plan_and_the_report_says_it_overrides_the_class() {
+    let f = feed_fixture();
+    // Without the option: the class width, and nothing about widths reported.
+    let plain = feed_spec(&f.root, "plain.json", json!([]));
+    let report = run_pipeline(&plain, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(
+        plan_widths(&plain.output_plan, "+5V", (0.0, 26.0)),
+        vec![0.8]
+    );
+    assert_eq!(
+        plan_widths(&plain.output_plan, "SIG", (0.0, 26.0)),
+        vec![0.2]
+    );
+    let allowances = serde_json::to_value(report.allowances.as_ref().unwrap()).unwrap();
+    assert!(allowances.get("track_widths").is_none(), "{allowances}");
+    let spec_json = serde_json::to_value(&plain).unwrap();
+    assert!(
+        spec_json["allowances"].get("track_widths").is_none(),
+        "{spec_json}"
+    );
+
+    // The whole net narrower than its class, one connection narrower still.
+    let hinted = feed_spec(
+        &f.root,
+        "hinted.json",
+        json!([
+            { "net": "+5V", "width_mm": 0.3 },
+            { "net": "+5V", "from": "J1.1", "to": "R1.1", "width_mm": 0.15 }
+        ]),
+    );
+    let report = run_pipeline(&hinted, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    // S6 and the clear stage keep the widths; S7 accepts them (only the
+    // minimum width is a rule).
+    let check = report.check.as_ref().unwrap();
+    assert_eq!(check.violations, 0, "{check:?}");
+    assert_eq!(
+        plan_widths(&hinted.output_plan, "+5V", (4.0, 13.6)),
+        vec![0.15]
+    );
+    assert_eq!(
+        plan_widths(&hinted.output_plan, "+5V", (12.4, 22.0)),
+        vec![0.3]
+    );
+    assert_eq!(
+        plan_widths(&hinted.output_plan, "SIG", (0.0, 26.0)),
+        vec![0.2]
+    );
+    let widths = &report.allowances.as_ref().unwrap().track_widths;
+    assert_eq!(
+        serde_json::to_value(widths).unwrap(),
+        json!([
+            { "net": "+5V", "width_nm": 300_000, "overrides_class": "Power",
+              "class_width_nm": 800_000, "connections": 1, "fanout_stubs": 0 },
+            { "net": "+5V", "from": "J1.1", "to": "R1.1", "width_nm": 150_000,
+              "overrides_class": "Power", "class_width_nm": 800_000, "connections": 1 }
+        ])
+    );
+}
+
+#[test]
+fn a_track_width_the_board_cannot_take_stops_the_run_naming_the_entry() {
+    let f = feed_fixture();
+    for (entries, needle) in [
+        (
+            json!([{ "net": "SIG", "width_mm": 0.25 }, { "net": "+5V", "width_mm": 0.05 }]),
+            "track_widths[1]: 0.05 mm is below the minimum track width",
+        ),
+        (
+            json!([{ "net": "+12V", "width_mm": 0.3 }]),
+            "track_widths[0]: no net named '+12V'",
+        ),
+        (
+            json!([{ "net": "+5V", "from": "J1.1", "to": "R9.1", "width_mm": 0.3 }]),
+            "track_widths[0]: 'R9'",
+        ),
+    ] {
+        let s = feed_spec(&f.root, "bad.json", entries);
+        let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+        assert_eq!(report.stop_kind, Some(StopKind::InputError));
+        let why = report.stopped.as_deref().unwrap();
+        assert!(why.contains(needle), "{why}");
+        assert!(!s.output_plan.exists());
+        assert!(matches!(
+            s.check_allowances().unwrap(),
+            Err(AllowanceError::TrackWidth { .. })
+        ));
+    }
+    // Under the default class policy the Power class is not routed at all,
+    // so a width for one of its nets would be silently unused.
+    let mut s = feed_spec(
+        &f.root,
+        "policy.json",
+        json!([{ "net": "+5V", "width_mm": 0.3 }]),
+    );
+    s.allowances.exclude_classes = None;
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    let why = report.stopped.as_deref().unwrap();
+    assert!(
+        why.contains("track_widths[0]") && why.contains("exclude_classes"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_net_s_track_width_reaches_the_fanout_stub_of_a_net_left_to_its_plane() {
+    let f = fixture();
+    // GND owns the In1 plane, so the run leaves it to the plane: no task,
+    // only the fanout's via for R1.2, on a stub drawn at the class width.
+    let plain = spec(&f.root, "plain.json", CopperSource::Native);
+    let report = run_pipeline(&plain, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(report.plane_nets[0].handling, "left_to_plane");
+    assert_eq!(
+        plan_widths(&plain.output_plan, "GND", (0.0, 100.0)),
+        vec![0.2]
+    );
+
+    // A net entry is the rule table's width, so the stub follows it even
+    // though no connection of the net is routed; the report counts the stub.
+    let mut s = spec(&f.root, "hinted.json", CopperSource::Native);
+    s.allowances =
+        serde_json::from_value(json!({ "track_widths": [{ "net": "GND", "width_mm": 0.3 }] }))
+            .unwrap();
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    let gnd = &report.plane_nets[0];
+    assert_eq!(gnd.handling, "left_to_plane");
+    assert_eq!(gnd.connected_by_fanout.pads, vec!["R1.2".to_string()]);
+    assert_eq!(plan_widths(&s.output_plan, "GND", (0.0, 100.0)), vec![0.3]);
+    let widths = serde_json::to_value(&report.allowances.as_ref().unwrap().track_widths).unwrap();
+    assert_eq!(widths[0]["net"], "GND", "{widths}");
+    assert_eq!(widths[0]["width_nm"], 300_000, "{widths}");
+    assert_eq!(widths[0]["connections"], 0, "{widths}");
+    assert_eq!(widths[0]["fanout_stubs"], 1, "{widths}");
+    // Left to its plane and joined by the stub: nothing of GND is open.
+    let open = report.unrouted.as_ref().unwrap();
+    assert!(open.connections.iter().all(|c| c.net != "GND"), "{open:?}");
+}

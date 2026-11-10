@@ -34,6 +34,7 @@ use konnect_route::api::Generation;
 use konnect_route::check::ViolationKind;
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
+use konnect_route::pipeline::AllowanceError;
 use konnect_route::plan::{PlanTrack, PlanVia, RoutePlan};
 use konnect_route::{RouteBoard, RuleTable};
 use serde_json::{json, Value};
@@ -96,6 +97,13 @@ fn job_props() -> Value {
                                        "reach_mm": { "type": "number", "exclusiveMinimum": 0, "default": 1.0 },
                                        "classes": { "type": "array", "items": { "type": "string" }, "description": "Only these classes (default: every class not excluded)" },
                                        "exclude_classes": { "type": "array", "items": { "type": "string" }, "description": "Classes that never neck down" } } },
+        "track_widths": { "type": "array", "minItems": 1,
+                          "description": "Native routing: track widths drawn instead of the net class width, for the small feeds of a net whose current its pours carry. { net, width_mm } sets every track the run draws for the net; { net, from, to, width_mm } sets only the open connection that joins the copper of those two pads of the net (REF.PAD each) and wins over the net's own entry (plane fanout stubs are not connections and take the net's entry). A width may be narrower or wider than the class width (the class width is a default, not a limit), never below the net's minimum track width (board minimum or a custom rule) nor above a custom rule's maximum; clearances are unchanged and still checked exactly. Refused before anything starts, naming the entry: an unknown net or pad, a pad of another net, a width outside those limits, a net whose class the run leaves unrouted (see exclude_classes), a second entry for the same net or pad pair. The report's allowances.track_widths lists each entry with the class it overrides, the connections routed under it and, for a net, its fanout_stubs",
+                          "items": { "type": "object", "required": ["net", "width_mm"], "additionalProperties": false, "properties": {
+                              "net": { "type": "string", "minLength": 1, "description": "Exact net name" },
+                              "from": { "type": "string", "description": "One pad of the connection, REF.PAD (with to)" },
+                              "to": { "type": "string", "description": "The other pad of the connection, REF.PAD (with from)" },
+                              "width_mm": { "type": "number", "exclusiveMinimum": 0 } } } },
         "exclude_classes": { "type": "array", "items": { "type": "string" },
                              "description": "Native routing: classes left unrouted (zones or hand copper); their connections are reported as excluded_by_policy, not as failures. Default: every class whose track width is at least 0.5 mm. [] routes every class" },
         "net_classes": { "type": "string", "enum": ["auto", "kicad", "project"], "default": "auto",
@@ -371,7 +379,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_native_region",
-            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed), at most max_listed of them. plan_lint (and fanout_plan_lint) in the result is the strict geometry lint apply_route_plan will run on the written file: passes_strict, total, by_kind and at most 50 defects with their plan track indices. Use start_native_route_job for a whole board. Native routing leaves a net that owns a copper zone to its plane: it gets fanout vias, no tracks (plane_nets_as_tracks opts a net in), and plane_nets lists per net the pads the plane joins, the pads the fanout joined, the pads still needing a via or a track and the connections left unrouted. A saved fill is an obstacle to other nets unless its zone is declared crossable (carve_zones, carve_zone_nets) because a refill will carve it; refill then names the zones the plan crosses, and such a plan shorts to their saved fill until the zones are refilled: refill before DRC or fabrication. warnings holds what must not be missed: a plane net with no fill in the saved file, plane pads or plane pieces left unconnected, a plan that depends on a refill.",
+            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed), at most max_listed of them. plan_lint (and fanout_plan_lint) in the result is the strict geometry lint apply_route_plan will run on the written file: passes_strict, total, by_kind and at most 50 defects with their plan track indices. track_widths draws named nets, or single connections named by two pads, at a width of their own instead of the net class width; the report lists each as an override of its class. Use start_native_route_job for a whole board. Native routing leaves a net that owns a copper zone to its plane: it gets fanout vias, no tracks (plane_nets_as_tracks opts a net in), and plane_nets lists per net the pads the plane joins, the pads the fanout joined, the pads still needing a via or a track and the connections left unrouted. A saved fill is an obstacle to other nets unless its zone is declared crossable (carve_zones, carve_zone_nets) because a refill will carve it; refill then names the zones the plan crosses, and such a plan shorts to their saved fill until the zones are refilled: refill before DRC or fabrication. warnings holds what must not be missed: a plane net with no fill in the saved file, plane pads or plane pieces left unconnected, a plan that depends on a refill.",
             {
                 let mut s = with_props(job_props(), &["board", "output_plan", "region"]);
                 s["properties"]["region"]["description"] = json!("The region to work on, mm (required here)");
@@ -382,7 +390,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "start_native_route_job",
-            "Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. Returns once the runner is running. State lives in '<output_plan>.konnect-native-job/' (status.json, progress.jsonl, checkpoint.json, report.json). report.json's unrouted.connections lists every connection the finished run leaves open, by pad and reason (get_native_route_job lists them). Follow with get_native_route_job; end early with stop_native_route_job; resume: true continues a stopped or lost job from its checkpoint. Plane nets and crossable zones (carve_zones, carve_zone_nets, plane_nets_as_tracks) work as in route_native_region; the finished job's report carries plane_nets, refill and warnings.",
+            "Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. Returns once the runner is running. State lives in '<output_plan>.konnect-native-job/' (status.json, progress.jsonl, checkpoint.json, report.json). report.json's unrouted.connections lists every connection the finished run leaves open, by pad and reason (get_native_route_job lists them). Follow with get_native_route_job; end early with stop_native_route_job; resume: true continues a stopped or lost job from its checkpoint. Plane nets and crossable zones (carve_zones, carve_zone_nets, plane_nets_as_tracks) work as in route_native_region; the finished job's report carries plane_nets, refill and warnings. track_widths draws named nets, or single connections named by two pads, at a width of their own instead of the net class width; the report lists each as an override of its class.",
             {
                 let mut p = job_props();
                 p["time_limit_seconds"] = json!({ "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop at the next stage boundary after this long, keeping the checkpoint" });
@@ -778,6 +786,7 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
             "neck_down",
             "exclude_classes",
             "fanout_share_within_mm",
+            "track_widths",
         ] {
             if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
                 allowance_args.insert(key.to_string(), v.clone());
@@ -788,7 +797,8 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
         if spec.source != CopperSource::Native && !spec.allowances.is_default() {
             return Err(invalid(
                 "allowances",
-                "class_layers, layer_fallback, neck_down, exclude_classes and                  fanout_share_within_mm apply only when source is native",
+                "class_layers, layer_fallback, neck_down, exclude_classes, \
+                 fanout_share_within_mm and track_widths apply only when source is native",
             ));
         }
         spec.fanout_plan = opt_path(args, "fanout_plan")?;
@@ -921,6 +931,31 @@ async fn kicad_classes(
     Ok(Ok(
         json!({ "source": "project_patterns", "kicad_unavailable": why_not }),
     ))
+}
+
+/// With `track_widths` given, resolve the allowances against the board and
+/// its rules before anything runs or starts, so an entry that cannot be used
+/// is refused by name (`track_widths[1]`) instead of failing the job later.
+async fn track_width_refusal(spec: &NativeJobSpec) -> anyhow::Result<Option<Refusal>> {
+    if spec.allowances.track_widths.is_empty() {
+        return Ok(None);
+    }
+    let spec = spec.clone();
+    let checked = tokio::task::spawn_blocking(move || spec.check_allowances()).await?;
+    Ok(match checked {
+        Err(e) => Some(CallToolResult::error(format!(
+            "could not read the board or its rules: {e:#}. Nothing was started."
+        ))),
+        Ok(Err(AllowanceError::TrackWidth { index, reason })) => Some(invalid(
+            &format!("track_widths[{index}]"),
+            &format!("{reason}. Nothing was routed or started."),
+        )),
+        Ok(Err(e)) => Some(invalid(
+            "allowances",
+            &format!("{e}. Nothing was routed or started."),
+        )),
+        Ok(Ok(())) => None,
+    })
 }
 
 pub(crate) fn loaded(
@@ -1849,6 +1884,9 @@ async fn handle_route_native_region(
         Ok(n) => n as usize,
         Err(r) => return Ok(r),
     };
+    if let Some(r) = track_width_refusal(&spec).await? {
+        return Ok(r);
+    }
     let run = spec.clone();
     let report =
         tokio::task::spawn_blocking(move || native_route_job::run_pipeline(&run, None, &mut Quiet))
@@ -1920,6 +1958,9 @@ async fn handle_start_native_route_job(
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
+    if let Some(r) = track_width_refusal(&spec).await? {
+        return Ok(r);
+    }
     let body = match native_route_job::start(&spec, resume).await {
         Ok(b) => b,
         Err(e) => {

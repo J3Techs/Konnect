@@ -3,6 +3,55 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the native router takes a track width per net or per connection
+
+The native router drew every track of a net at its net class width (or a
+custom rule's `opt`). A power net whose current is carried by its pours had
+its small feeds (a feedback divider tap, a pull-up, an LED) routed at the
+power width too, where they blocked pins; `neck_down` only narrows the stub
+out of a pad.
+
+`start_native_route_job` and `route_native_region` take a new optional
+`track_widths` array (native routing only):
+
+```json
+"track_widths": [
+  { "net": "+5V", "width_mm": 0.3 },
+  { "net": "+5V", "from": "U2.3", "to": "R12.1", "width_mm": 0.2 }
+]
+```
+
+- `{ net, width_mm }` sets the width of every track the run draws for the net,
+  its plane fanout stubs included.
+- `{ net, from, to, width_mm }` (two pads of the net, `REF.PAD`) sets the width
+  of the open connection that joins those two pads' copper, and wins over the
+  net's entry. The router joins islands of copper, so a pad already joined to a
+  pour stands for the whole pour. An entry whose pads no open connection joins
+  directly routes nothing at its width and reports `connections: 0`. Plane
+  fanout stubs are not connections: they take the net's entry.
+- A width may be narrower or wider than the class width: the class width is
+  the default KiCad draws with, not a rule KiCad or Konnect checks. It may not
+  be below the net's minimum track width (the board minimum or a custom
+  `track_width` rule's `min`) on any routable layer, nor above such a rule's
+  `max`. Clearances are not changed and are checked exactly as before.
+- Refused before anything is routed or a job starts, as `invalid_argument` with
+  field `track_widths[<index>]`: an unknown net or pad, a pad of another net,
+  one pad without the other, a width outside the limits above, a second entry
+  for the same net or pad pair, and a net whose class the run leaves unrouted
+  (by default every class at least 0.5 mm wide: pass `exclude_classes` without
+  that class, and `nets` to keep the run to the nets you mean).
+
+The report's `allowances.track_widths` lists every entry with `width_nm`, the
+class it overrides (`overrides_class`, `class_width_nm`), `connections`, the
+open connections routed under it, and for a net entry `fanout_stubs`, the plane
+fanout stubs drawn at its width, so a reviewer of the plan sees that a net was
+routed off its class width on purpose. The exact check, `check_route_rules`,
+`apply_route_plan` and KiCad's DRC hold a track only to the minimum width, so
+such a plan passes them as any other.
+
+Without `track_widths` nothing changes: the same plan, the same report keys
+and the same job spec (a job started before this change still resumes).
+
 ## Unreleased: the native router leaves plane nets to their planes and can cross zones a refill will carve
 
 `route_native_region` and `start_native_route_job` treated a net as a plane net

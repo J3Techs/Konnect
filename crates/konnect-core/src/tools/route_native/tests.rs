@@ -766,3 +766,211 @@ async fn route_native_region_accounts_for_plane_nets_and_names_the_refill() {
     );
     assert_eq!(b["refill"]["crossed_zones"], json!([]));
 }
+
+// --- Track width overrides ---------------------------------------------------
+
+/// A 2-layer board with an unrouted `+5V` (class Power, 0.8 mm) on J1.1,
+/// R1.1 and R2.1, 8 mm apart in a row, and `SIG` on R1.2 and R2.2.
+const FEED_BOARD: &str = r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(general
+		(thickness 1.6)
+	)
+	(layers
+		(0 "F.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+	)
+	(footprint "TestPoint"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000101")
+		(at 5 5)
+		(property "Reference" "J1" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+	)
+	(footprint "R_0603"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000102")
+		(at 13 5)
+		(property "Reference" "R1" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+		(pad "2" smd rect (at 0 4) (size 1 1) (layers "F.Cu" "F.Mask") (net "SIG"))
+	)
+	(footprint "R_0603"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000103")
+		(at 21 5)
+		(property "Reference" "R2" (at 0 -2 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net "+5V"))
+		(pad "2" smd rect (at 0 4) (size 1 1) (layers "F.Cu" "F.Mask") (net "SIG"))
+	)
+	(gr_rect
+		(start 0 0)
+		(end 26 14)
+		(stroke (width 0.05) (type default))
+		(fill no)
+		(layer "Edge.Cuts")
+	)
+)
+"#;
+
+const FEED_PRO: &str = r#"{
+    "board": { "design_settings": { "rules": {
+        "min_clearance": 0.1, "min_track_width": 0.1, "min_via_diameter": 0.4,
+        "min_via_annular_width": 0.1, "min_through_hole_diameter": 0.2,
+        "min_copper_edge_clearance": 0.3, "min_hole_clearance": 0.2, "min_hole_to_hole": 0.25
+    } } },
+    "net_settings": {
+        "classes": [
+            { "name": "Default", "clearance": 0.2, "track_width": 0.2,
+              "via_diameter": 0.6, "via_drill": 0.3 },
+            { "name": "Power", "clearance": 0.2, "track_width": 0.8 }
+        ],
+        "netclass_patterns": [ { "pattern": "+5V", "netclass": "Power" } ]
+    }
+}"#;
+
+fn feed_files() -> Files {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("demo.kicad_pcb"), FEED_BOARD).unwrap();
+    std::fs::write(root.join("demo.kicad_pro"), FEED_PRO).unwrap();
+    Files { _dir: dir, root }
+}
+
+#[test]
+fn track_widths_reach_the_spec_and_typos_are_refused() {
+    let f = feed_files();
+    let args = json!({
+        "board": f.board(), "output_plan": f.path("p.json"), "exclude_classes": [],
+        "track_widths": [
+            { "net": "+5V", "width_mm": 0.3 },
+            { "net": "+5V", "from": "J1.1", "to": "R1.1", "width_mm": 0.2 }
+        ]
+    });
+    let spec = job_spec(&args).unwrap().unwrap();
+    let w = &spec.allowances.track_widths;
+    assert_eq!(
+        (w[0].net.as_str(), w[0].width_mm, w[0].from.as_deref()),
+        ("+5V", 0.3, None)
+    );
+    assert_eq!(
+        (w[1].from.as_deref(), w[1].to.as_deref()),
+        (Some("J1.1"), Some("R1.1"))
+    );
+    assert!(spec.check_allowances().unwrap().is_ok());
+    let typo = json!({ "board": f.board(), "output_plan": f.path("q.json"),
+                       "track_widths": [{ "net": "+5V", "width": 0.3 }] });
+    assert!(job_spec(&typo).unwrap().is_err());
+    // A width steers native routing only.
+    let taken = json!({ "board": f.board(), "output_plan": f.path("r.json"),
+                        "source": "board_unlocked",
+                        "track_widths": [{ "net": "+5V", "width_mm": 0.3 }] });
+    assert!(job_spec(&taken).unwrap().is_err());
+}
+
+#[tokio::test]
+async fn a_track_width_the_board_cannot_take_is_refused_before_a_job_starts() {
+    let f = feed_files();
+    let refusal = |entries: Value| {
+        let args = json!({ "board": f.board(), "output_plan": f.path("job.json"),
+                           "exclude_classes": [], "net_classes": "project",
+                           "track_widths": entries });
+        async move {
+            let r = handle_start_native_route_job(&args, &ctx()).await.unwrap();
+            assert!(r.is_error, "{}", text(&r));
+            let region = {
+                let mut a = args.clone();
+                a["region"] = json!({ "x1": 0, "y1": 0, "x2": 26, "y2": 14 });
+                handle_route_native_region(&a, &ctx()).await.unwrap()
+            };
+            assert!(region.is_error);
+            assert_eq!(body(&region)["error"], body(&r)["error"]);
+            r
+        }
+    };
+    let field = |r: &CallToolResult| {
+        let b = body(r);
+        assert_eq!(b["error"]["kind"], "invalid_argument", "{b}");
+        b["error"]["field"].as_str().unwrap().to_string()
+    };
+    // Below the board minimum (0.1 mm): refused naming the entry.
+    let r = refusal(json!([
+        { "net": "SIG", "width_mm": 0.25 }, { "net": "+5V", "width_mm": 0.05 }
+    ]))
+    .await;
+    assert_eq!(field(&r), "track_widths[1]");
+    assert!(
+        text(&r).contains("below the minimum track width"),
+        "{}",
+        text(&r)
+    );
+    // An unknown net, and an unknown pad.
+    let r = refusal(json!([{ "net": "+12V", "width_mm": 0.3 }])).await;
+    assert_eq!(field(&r), "track_widths[0]");
+    assert!(text(&r).contains("no net named '+12V'"), "{}", text(&r));
+    let r = refusal(json!([
+        { "net": "+5V", "from": "J1.1", "to": "R1.7", "width_mm": 0.3 }
+    ]))
+    .await;
+    assert_eq!(field(&r), "track_widths[0]");
+    assert!(
+        text(&r).contains("footprint 'R1' has no pad '7'"),
+        "{}",
+        text(&r)
+    );
+    // Nothing was started or written: no job directory, no plan.
+    assert!(!f.root.join("job.json").exists());
+    assert!(!native_route_job::job_dir_for(&f.root.join("job.json")).exists());
+}
+
+#[tokio::test]
+async fn route_native_region_routes_a_net_at_its_track_width_and_reports_the_override() {
+    let f = feed_files();
+    let args = |out: &str, widths: Value| {
+        let mut a = json!({ "board": f.board(), "output_plan": f.path(out),
+                            "region": { "x1": 0, "y1": 0, "x2": 26, "y2": 14 },
+                            "exclude_classes": [], "net_classes": "project", "threads": 2 });
+        if !widths.is_null() {
+            a["track_widths"] = widths;
+        }
+        a
+    };
+    let widths = |out: &str, net: &str| {
+        let plan: RoutePlan =
+            serde_json::from_str(&std::fs::read_to_string(f.root.join(out)).unwrap()).unwrap();
+        let mut w: Vec<f64> = plan
+            .tracks
+            .iter()
+            .filter(|t| t.net == net)
+            .map(|t| t.width)
+            .collect();
+        w.sort_by(f64::total_cmp);
+        w.dedup();
+        w
+    };
+    let r = handle_route_native_region(&args("plain.json", Value::Null), &ctx())
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    assert_eq!(widths("plain.json", "+5V"), vec![0.8]);
+    assert!(body(&r)["allowances"].get("track_widths").is_none());
+
+    let r = handle_route_native_region(
+        &args("hinted.json", json!([{ "net": "+5V", "width_mm": 0.3 }])),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(widths("hinted.json", "+5V"), vec![0.3]);
+    assert_eq!(widths("hinted.json", "SIG"), widths("plain.json", "SIG"));
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(
+        b["allowances"]["track_widths"],
+        json!([{ "net": "+5V", "width_nm": 300_000, "overrides_class": "Power",
+                 "class_width_nm": 800_000, "connections": 2, "fanout_stubs": 0 }])
+    );
+}
