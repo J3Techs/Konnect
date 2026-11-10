@@ -3,6 +3,45 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the closed-board flip mirrors child zones and custom pads
+
+The saved-file flip behind `flip_component` and a `layer` in
+`set_component_placements` refused any footprint with a child zone, a custom
+pad, or a pad carrying `(offset …)`, `(rect_delta …)`, `(chamfer_ratio …)` or
+`(primitives …)`. A Tag-Connect header (via keepout) and a solder jumper
+(custom pads) could therefore not change sides on a closed board. It now
+mirrors them as KiCad 10.0.7's own flip does:
+
+- a child zone's outline and fills are mirrored about the footprint's
+  position in board coordinates and its layers exchanged; a filled zone whose
+  layers change is saved as no longer filled, as KiCad saves it;
+- a custom pad's primitives are mirrored in the pad's frame (an arc's start
+  and end exchange), a pad offset and a trapezoid's `rect_delta` reverse in Y,
+  chamfered corners exchange top and bottom, and per-side tenting exchanges
+  front and back;
+- inner copper layers named by a pad, graphic or zone are reversed by the
+  board's stackup (`In1.Cu` and `In2.Cu` exchange on four layers);
+- polygon arcs and `fp_curve` are mirrored.
+
+What it still cannot mirror is refused, and the refusal names the footprint
+and the pad clause or child: a custom `(padstack …)`, a non-empty
+`(zone_layer_connections …)`, any other pad clause that tells the board's
+sides apart, a text box, dimension, image, table or barcode inside the
+footprint, a zone outline with an entry other than a vertex or arc, and a 3D
+model the flip would have to move. The old messages `custom pads are not
+supported by closed-board footprint flipping` and `pad geometry containing
+(… ...) is not supported` are gone.
+
+When several footprints in one `set_component_placements` batch cannot change
+sides, the refusal lists every one with its reason instead of only the first.
+A refusal for a single footprint now starts with its reference.
+
+Setting a footprint to the rotation it already has no longer rewrites its
+text angles; previously a field at 270 was turned to 90 even though nothing
+rotated, which after a flip differed from KiCad.
+
+Arguments and results are unchanged.
+
 ## Unreleased: saved-file footprint edits carry child zones in board coordinates
 
 KiCad saves a placed footprint's child zone (the via keepout under a
