@@ -235,9 +235,10 @@ running across sessions, see
 ## The HTTP server stops when the session that started it ends
 
 A Konnect started with `transport = "http"` is an ordinary foreground process.
-It has no daemon mode, installs no service and handles no shutdown signal.
-Started as a background task of an AI client's session, or from a terminal
-that is later closed, it ends when that parent ends its children: an agent
+It has no daemon mode and installs no service. It handles a stop signal by
+[stopping in order](#stopping-the-http-server), but that does not keep it
+alive: started as a background task of an AI client's session, or from a
+terminal that is later closed, it ends when that parent ends its children: an agent
 session's time limit, for example, takes the server with it in the middle of a
 job. For a server that must outlive any session, start it from the operating
 system's service manager, as the same user as KiCad and inside that user's
@@ -280,8 +281,20 @@ KillMode=process
 WantedBy=default.target
 ```
 
-`KillMode=process` matters for route jobs: systemd's default ends every
-process in the unit's control group when the unit stops, job runners included.
+`KillMode=process` makes `systemctl --user stop konnect` signal the server
+alone, and that matters twice. Route job runners are left running: systemd's
+default ends every process in the unit's control group when the unit stops,
+job runners included. And a `kicad-cli` or Freerouting `java` working for a
+tool call in flight is not signalled along with the server, so the call can
+finish and be answered within the
+[grace period](#stopping-the-http-server); under the default it would get
+SIGTERM at the same moment as the server and the call would fail instead. The
+other side of it: a child the server does not end itself (see
+[below](#what-happens-to-work-in-progress-when-the-server-stops)) stays
+behind after the stop. systemd follows SIGTERM with SIGKILL after
+`TimeoutStopSec` (90 seconds unless the system sets another default), so an
+`http_shutdown_grace_seconds` near or above that needs a longer
+`TimeoutStopSec`.
 
 **macOS**, a launch agent at `~/Library/LaunchAgents/local.konnect.plist`,
 then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.konnect.plist`:
@@ -305,6 +318,15 @@ then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.konnect.plis
 </plist>
 ```
 
+`launchctl bootout gui/$(id -u)/local.konnect` stops it with SIGTERM, which
+the server handles, and launchd follows with SIGKILL after `ExitTimeOut` (20
+seconds by default): add that key before raising
+`http_shutdown_grace_seconds` near it. `KeepAlive` starts the server again
+whenever it exits while the agent is loaded, an orderly stop included. Once
+the server has exited, launchd ends whatever is left of its process group
+unless `AbandonProcessGroup` is set: that takes a `kicad-cli` or `java` still
+running, and not a route job runner, which has a group of its own.
+
 **Windows**, a scheduled task that starts at logon, from PowerShell. The
 action goes through `cmd.exe` only to redirect stdin, and the settings remove
 Task Scheduler's default three-day execution limit and its default of not
@@ -318,6 +340,10 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) 
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "Konnect HTTP" -Action $action -Trigger $trigger -Settings $settings
 ```
+
+Stopping the task (`Stop-ScheduledTask`, or End in Task Scheduler) ends its
+processes without sending a stop signal: for the server it is an outright
+kill, with no grace period. Logoff and system shutdown are stop signals.
 
 ### Reconnecting a client
 
@@ -333,26 +359,78 @@ once the server is up. What a restart does lose is the process's memory:
 - the SSE stream on `GET /mcp` that carries notifications, which the client
   must reopen.
 
+### Stopping the HTTP server
+
+A standalone `konnect` serving HTTP (`transport = "http"` or `"both"`) stops in
+order on a stop signal: SIGINT (Ctrl+C) or SIGTERM on Linux and macOS; Ctrl+C,
+Ctrl+Break, a closed console window, logoff or system shutdown on Windows. It
+stops accepting connections, waits for the requests it is already handling to
+be answered, and exits with status 0. The log says which signal arrived, how
+many requests were in flight, and at the end either
+`HTTP transport stopped: no request was left unanswered` or how many were
+abandoned, then `Konnect stopped`.
+
+- The wait is at most `http_shutdown_grace_seconds` (default 10; 0 does not
+  wait). A tool call still running then is abandoned: the client's connection
+  is closed without a response. A second signal ends the wait at once.
+- Windows itself ends a process about five seconds after its console is
+  closed, and at logoff or shutdown, whatever the setting says.
+- A route that takes minutes does not fit a grace period. Run it as a route
+  job (`start_native_route_job`, `start_specctra_route_job`): the runner is a
+  separate process and a stopping server leaves it running.
+- On Windows the child processes of a tool call (`kicad-cli`, the Freerouting
+  `java`) do not share the server's console, so a Ctrl+C typed there reaches
+  the server alone and a `kicad-cli` in flight finishes its work. On Linux and
+  macOS a terminal sends Ctrl+C to the children as well, and a service manager
+  may signal every process of the service, so a call in flight can fail there
+  instead of finishing.
+- A process started with Ctrl+C disabled never receives it. Windows does that
+  for a process created in a new process group (`start /b`,
+  `CREATE_NEW_PROCESS_GROUP`) and for its children; Ctrl+Break still arrives.
+
+Everything else ends the server abruptly, with no grace period and nothing in
+the log: SIGKILL, SIGHUP from a terminal that closes (it is not among the
+signals handled), Task Manager, `Stop-Process`, `taskkill /F`, a parent or
+service manager that terminates its processes, a crash. With
+`transport = "both"`, the end of standard input also ends the server without
+a grace period.
+
+This was exercised with the real binary on Windows for Ctrl+C, Ctrl+Break and
+an outright kill. Console close, logoff and system shutdown are handled by the
+same code but were not exercised, and nothing was exercised on Linux or macOS
+beyond the automated test that sends SIGTERM. The stdio transport is unchanged:
+it ends when its input closes. A server embedded in KiCad as a plugin installs
+no signal handler.
+
 ### What happens to work in progress when the server stops
 
-Nothing is finished or rolled back on the way out; the process simply ends.
+A stop in order lets the requests in flight finish within the grace period
+and rolls nothing back. An abrupt end finishes nothing and rolls nothing back.
 
-- **A tool call in flight** ends with the process and the client sees a
-  dropped connection instead of a result. That includes the routers that run
-  inside the server, `route_native_region` and `route_specctra_dsn`.
-  Whatever the call had already written to a file or sent to KiCad stays as
-  it was at that moment, so inspect before repeating it. Konnect ends the
-  Freerouting `java` process of a `route_specctra_dsn` call only when the
-  call itself ends; a server that is killed does not, so that process goes
-  only if the stop takes the server's child processes too. Look for a
-  leftover `java` process before routing again.
+- **A tool call in flight** is answered when it completes within the grace
+  period of a stop in order. A call abandoned when that period ends, or cut
+  off by an abrupt end, is not: the client sees a dropped connection instead
+  of a result. The routers that run inside the server, `route_native_region`
+  and `route_specctra_dsn`, seldom fit a grace period. Whatever an unanswered
+  call had already written to a file or sent to KiCad stays as it was at that
+  moment, so inspect before repeating it.
+- **The child processes of a tool call** are `kicad-cli` and the Freerouting
+  `java` of `route_specctra_dsn` and `check_freerouting`. On Windows they end
+  with the server however it ends, an outright kill included: Konnect holds
+  them in a job object that the system closes with the process. On Linux and
+  macOS the `java` of an abandoned call is ended and a `kicad-cli` runs its
+  command to the end on its own; a server ended abruptly there leaves either
+  running, unless whatever ended it takes the server's child processes too.
+  On those systems look for a leftover `java` process before routing again.
 - **A route job** (`start_native_route_job`, `start_specctra_route_job`) is a
   separate `konnect` runner process and keeps its state on disk, in
-  `<output_plan>.konnect-native-job/` or `<ses_output_path>.konnect-job/`. On Unix the
-  runner has its own process group. On Windows it is started broken away from
-  the server's job object when that job allows it; the start result says so in
-  `left_client_job`, and when that is `false` the runner ends with whatever
-  ends the server. A runner that survives carries on, and
+  `<output_plan>.konnect-native-job/` or `<ses_output_path>.konnect-job/`. A
+  stop in order leaves it running. On Unix the runner has its own process
+  group. On Windows it is not in the job object that holds the tool calls'
+  children, and it is started broken away from any job the server itself runs
+  in when that job allows it; the start result says so in `left_client_job`,
+  and when that is `false` the runner ends with whatever ends the server's
+  own job. A runner that survives carries on, and
   `get_native_route_job` / `get_specctra_route_job` on the restarted server
   report it, because they read only the job directory.
 - **A runner that was killed too** shows as `RUNNER_LOST` once its heartbeat

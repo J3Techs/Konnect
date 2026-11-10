@@ -3,6 +3,43 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the HTTP server stops in order, and a stopped server takes its tool calls' child processes with it
+
+No tool's arguments or results change. What changes is what a client of an
+HTTP server (`transport = "http"` or `"both"`) sees when that server is
+stopped, and what is left running afterwards.
+
+A standalone server now handles the stop signals: SIGINT and SIGTERM on Linux
+and macOS; Ctrl+C, Ctrl+Break, console close, logoff and system shutdown on
+Windows. Before, the signal ended the process on the spot: every call in
+flight lost its connection, and the exit status was the signal's (on Windows
+`0xC000013A`). Now the server stops accepting connections, answers the
+requests it is already handling for up to `http_shutdown_grace_seconds`
+(new startup setting, default 10), and exits with status 0. A request sent
+after the signal is refused or gets no answer; a call still running when the
+grace period ends, or when a second signal arrives, loses its connection as
+before. An open SSE stream on `GET /mcp` is ended by the server when it starts
+to stop. The stdio transport and a server embedded in KiCad are unchanged.
+
+`kicad-cli` and the `java` of `route_specctra_dsn` and `check_freerouting` are
+started differently on Windows, under every transport:
+
+- They are held in a job object that the system closes when the server
+  process ends, so a server that is killed outright no longer leaves them
+  running. Before, a killed server left the `java` of a `route_specctra_dsn`
+  call routing on its own, and while such a child lived the client's
+  connection stayed open with no answer coming.
+- They get a hidden console of their own instead of sharing the server's.
+  A Ctrl+C or Ctrl+Break typed at the server used to reach them directly and
+  end them, so the call the server was waiting for failed with
+  `kicad-cli exited with -1073741510`; it now finishes.
+
+Route job runners (`start_native_route_job`, `start_specctra_route_job`) are
+not part of this: they survive a stop or a kill of the server as before.
+On Linux and macOS only the signal handling is new; a server killed with
+SIGKILL still leaves such a child running. See
+[Stopping the HTTP server](TROUBLESHOOTING.md#stopping-the-http-server).
+
 ## Unreleased: live footprint field edits and legacy repairs refuse footprints with pad fabrication properties
 
 KiCad 10's `Pad` protobuf has no fabrication-property field and

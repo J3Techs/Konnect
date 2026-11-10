@@ -416,8 +416,7 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let child = test_support::spawn_cli(&mut cmd)
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
     #[cfg(not(test))]
-    let child = cmd
-        .spawn()
+    let child = crate::child_guard::spawn(&mut cmd)
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
 
     let output = timeout(timeout_dur, child.wait_with_output())
@@ -601,7 +600,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn spawn_cli(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
-        spawn_with_executable_busy_retry(|| cmd.spawn(), std::thread::sleep)
+        spawn_with_executable_busy_retry(|| crate::child_guard::spawn(cmd), std::thread::sleep)
     }
 
     pub(crate) fn write_script(

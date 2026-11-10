@@ -83,6 +83,15 @@ base64 = "0.23"
 # Platform directories (home dir, config dir)
 dirs = "7"
 winreg = "0.56"
+# Job Objects: end a tool call's child processes with the server (child_guard.rs).
+# Window messages: the close request `run_closed_board_edit` sends to a PCB editor.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # SVG parsing (import_svg_logo)
 usvg = "0.48"
