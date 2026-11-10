@@ -4728,7 +4728,7 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        self.create_items_in(document.clone(), vec![item])?;
+        self.create_footprints_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints
             .iter()
@@ -4744,6 +4744,55 @@ impl KiCadIpcClient {
                     "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
                 )
             })
+    }
+
+    /// [`Self::create_footprints_in`] on the bound board.
+    pub fn create_footprints(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        self.create_footprints_in(self.get_board_document()?, items)
+    }
+
+    /// `CreateItems` for footprints that may own zones.
+    ///
+    /// A footprint's rule areas travel as items of its definition. Two things
+    /// about them need the board:
+    ///
+    /// * A library zone can name layers this board does not have (`*.Cu`, or
+    ///   inner layers on a two-layer board). KiCad's own placement keeps only
+    ///   the board's layers (pcbnew 10.0.7 holds `F.Cu B.Cu In1.Cu In2.Cu` for
+    ///   a `*.Cu` keepout on a four-layer board), so each zone is cut down to
+    ///   the enabled layers here, and one left with no layer refuses the whole
+    ///   request before anything is sent.
+    /// * The footprints KiCad echoes back must hold as many zones as were
+    ///   sent. A shortfall is reported, never passed over.
+    ///
+    /// Items that carry no zone cost nothing extra: the enabled layers are
+    /// only asked for when a zone is present.
+    pub fn create_footprints_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        mut items: Vec<prost_types::Any>,
+    ) -> Result<()> {
+        let sent = footprint_zone_count(&items)?;
+        if sent == 0 {
+            return self.create_items_in(document, items);
+        }
+        let enabled = self
+            .get_enabled_layers_in(document.clone())?
+            .layers
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for item in &mut items {
+            fit_footprint_zone_layers(item, &enabled)?;
+        }
+        let created = self.create_items_in_returning(document, items)?;
+        let held = footprint_zone_count(&created)?;
+        anyhow::ensure!(
+            held == sent,
+            "KiCad created the footprints with {held} of their {sent} zones; the board now holds \
+             footprints without all of their library's rule areas"
+        );
+        Ok(())
     }
 
     /// Measure every item of an exact open board (#688).
@@ -5969,6 +6018,131 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
     let mut seen = std::collections::HashSet::new();
     paths.iter().copied().find(|path| !seen.insert(*path))
+}
+
+/// How many zones the footprints among `items` own.
+fn footprint_zone_count(items: &[prost_types::Any]) -> Result<usize> {
+    let mut zones = 0;
+    for item in items {
+        if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+            continue;
+        }
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("a footprint item is unreadable")?;
+        zones += footprint
+            .definition
+            .iter()
+            .flat_map(|definition| &definition.items)
+            .filter(|child| crate::builders::any_is(child, "kiapi.board.types.Zone"))
+            .count();
+    }
+    Ok(zones)
+}
+
+/// Keep only the layers in `enabled` on every zone `item` owns, when `item`
+/// is a footprint. A zone left with no layer is an error: KiCad has nothing to
+/// hold it on.
+pub fn fit_footprint_zone_layers(
+    item: &mut prost_types::Any,
+    enabled: &std::collections::BTreeSet<i32>,
+) -> Result<()> {
+    if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        return Ok(());
+    }
+    let mut footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        .context("a footprint item is unreadable")?;
+    let Some(definition) = footprint.definition.as_mut() else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for child in &mut definition.items {
+        if !crate::builders::any_is(child, "kiapi.board.types.Zone") {
+            continue;
+        }
+        let mut zone = kiapi::board::types::Zone::decode(child.value.as_slice())
+            .context("a footprint zone is unreadable")?;
+        let before = zone.layers.len();
+        zone.layers.retain(|layer| enabled.contains(layer));
+        anyhow::ensure!(
+            !zone.layers.is_empty(),
+            "a zone of the footprint{} is on no layer this board has enabled",
+            if zone.name.is_empty() {
+                String::new()
+            } else {
+                format!(" ('{}')", zone.name)
+            }
+        );
+        if zone.layers.len() != before {
+            *child = crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
+            changed = true;
+        }
+    }
+    if changed {
+        *item = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod footprint_zone_tests {
+    use super::*;
+    use kiapi::board::types::BoardLayer;
+
+    fn footprint_with_zone(layers: &[BoardLayer], name: &str) -> prost_types::Any {
+        let zone = kiapi::board::types::Zone {
+            layers: layers.iter().map(|layer| *layer as i32).collect(),
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let footprint = kiapi::board::types::FootprintInstance {
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![crate::builders::pack_any(&zone, "kiapi.board.types.Zone")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn zone_layers(item: &prost_types::Any) -> Vec<i32> {
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        kiapi::board::types::Zone::decode(footprint.definition.unwrap().items[0].value.as_slice())
+            .unwrap()
+            .layers
+    }
+
+    #[test]
+    fn a_footprint_zone_keeps_only_the_layers_the_board_has() {
+        let enabled = [BoardLayer::BlFCu, BoardLayer::BlBCu]
+            .map(|layer| layer as i32)
+            .into_iter()
+            .collect();
+        let mut item = footprint_with_zone(
+            &[BoardLayer::BlFCu, BoardLayer::BlIn1Cu, BoardLayer::BlBCu],
+            "",
+        );
+        assert_eq!(
+            footprint_zone_count(std::slice::from_ref(&item)).unwrap(),
+            1
+        );
+        fit_footprint_zone_layers(&mut item, &enabled).unwrap();
+        assert_eq!(
+            zone_layers(&item),
+            [BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32]
+        );
+    }
+
+    #[test]
+    fn a_footprint_zone_on_no_enabled_layer_is_refused_by_name() {
+        let enabled = [BoardLayer::BlFCu as i32].into_iter().collect();
+        let mut item = footprint_with_zone(&[BoardLayer::BlIn3Cu], "Inner keepout");
+        let error = fit_footprint_zone_layers(&mut item, &enabled).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("('Inner keepout') is on no layer"),
+            "{error:#}"
+        );
+    }
 }
 
 #[cfg(test)]

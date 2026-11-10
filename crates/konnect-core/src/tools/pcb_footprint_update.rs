@@ -1581,6 +1581,23 @@ fn build_updated_instance(
         );
     }
 
+    // The definition sent back is rebuilt from the library, and a library
+    // footprint with a zone is refused when it is parsed. A zone the placed
+    // footprint holds all the same (one KiCad placed from an older library,
+    // or one drawn into it on the board) is in no library data, so sending
+    // the rebuilt definition would delete it.
+    let held_zones = current_definition
+        .items
+        .iter()
+        .filter(|item| item.type_url.ends_with("kiapi.board.types.Zone"))
+        .count();
+    if held_zones > 0 {
+        bail!(
+            "the placed footprint holds {held_zones} zone(s) its library footprint does not; a \
+             typed library refresh would delete them"
+        );
+    }
+
     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
     for item in &current_definition.items {
         if !item.type_url.ends_with("kiapi.board.types.Pad") {
@@ -3547,6 +3564,37 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("connected pad 2"), "{error:#}");
+    }
+
+    /// The refresh sends a definition rebuilt from the library. A zone the
+    /// placed footprint owns is not in it, so the footprint is refused rather
+    /// than refreshed without its keepout.
+    #[test]
+    fn a_placed_footprint_that_owns_a_zone_is_not_rebuilt_without_it() {
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &kiapi::board::types::Zone {
+                    r#type: kiapi::board::types::ZoneType::ZtRuleArea as i32,
+                    ..Default::default()
+                },
+                "kiapi.board.types.Zone",
+            ));
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+
+        let error = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("holds 1 zone(s)"), "{error:#}");
     }
 
     #[test]

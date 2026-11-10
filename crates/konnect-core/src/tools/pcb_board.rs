@@ -2557,13 +2557,23 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
+        // As `place_component`: a library zone KiCad's API cannot be given
+        // refuses the live placement before anything is sent.
+        if let Some(refused) = prepared_ipc.unplaceable_zones() {
+            return Ok(Err(refused.clone()));
+        }
         let item = prepared_ipc.build_item(&lib_id_ipc, &reference_ipc, x, y, 0.0, "F.Cu")?;
         c.place_footprint_item(&requested_board, &reference_ipc, item)
+            .map(Ok)
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Err(refused)) => Ok(refused.into_result(
+            "add_mounting_hole",
+            super::library_footprint::zones::Remedy::ClosedBoardPlacement,
+        )),
+        BoardWrite::Ipc(Ok(fp)) => Ok(CallToolResult::json(&json!({
             "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
             "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
             "geometry": geometry,

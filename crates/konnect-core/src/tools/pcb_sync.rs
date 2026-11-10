@@ -163,7 +163,8 @@ fn create_sync_items_in(
     creates: &[prost_types::Any],
 ) -> Result<()> {
     for chunk in creates.chunks(SYNC_CREATE_CHUNK_SIZE) {
-        client.create_items_in(document.clone(), chunk.to_vec())?;
+        // Footprints, some with their library's rule areas.
+        client.create_footprints_in(document.clone(), chunk.to_vec())?;
     }
     Ok(())
 }
@@ -7240,6 +7241,75 @@ mod tests {
         // A library footprint marked DNP; the schematic says it is fitted.
         part.library.attributes.do_not_populate = true;
         assert!(!built_dnp(&part, false));
+    }
+
+    /// A footprint the sync adds is built from pads, drawings and fields, so
+    /// its library's rule areas have to be added to it like the attributes
+    /// and models: in board coordinates, where the sync parks the footprint.
+    /// One KiCad's API cannot create as the library defines it refuses the
+    /// footprint by name instead of being placed without it.
+    #[test]
+    fn an_added_footprint_gets_its_library_s_rule_areas_or_is_refused() {
+        use konnect_ipc::gen::kiapi;
+
+        let with_zone = |min_thickness: &str| {
+            let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+            let end = source.rfind(')').unwrap();
+            format!(
+                "{}\t(zone\n\t\t(net 0)\n\t\t(net_name \"\")\n\t\t(layer \"F.Cu\")\n\t\t(name \"Under part\")\n\
+                 \t\t(hatch edge 0.5)\n\t\t(connect_pads (clearance 0))\n\t\t(min_thickness {min_thickness})\n\
+                 \t\t(keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))\n\
+                 \t\t(placement (enabled no) (sheetname \"\"))\n\
+                 \t\t(fill (thermal_gap 0.5) (thermal_bridge_width 0.5) (island_removal_mode 0))\n\
+                 \t\t(polygon (pts (xy -0.3 -0.3) (xy 0.3 -0.3) (xy 0.3 0.3) (xy -0.3 0.3)))\n\t)\n{}",
+                &source[..end],
+                &source[end..]
+            )
+        };
+        let part = prepare_footprint_source(&with_zone("0.25")).unwrap();
+        let item = build_added_footprint(
+            &PlannedChange::Add {
+                reference: "C1".into(),
+                value: "100n".into(),
+                footprint_id: STOCK_0603.into(),
+                symbol_path: "/c1-uuid".into(),
+                dnp: false,
+                pad_nets: BTreeMap::new(),
+                position: Point { x: 10.0, y: 20.0 },
+            },
+            &part,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let zones = footprint
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Zone"))
+            .map(|child| kiapi::board::types::Zone::decode(child.value.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].name, "Under part");
+        let corner = &zones[0].outline.as_ref().unwrap().polygons[0]
+            .outline
+            .as_ref()
+            .unwrap()
+            .nodes[0];
+        assert_eq!(
+            corner.geometry,
+            Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                konnect_ipc::builders::vec2(9.7, 19.7)
+            ))
+        );
+
+        let refusal = prepare_footprint_source(&with_zone("0.254")).unwrap_err();
+        assert_eq!(refusal.0, "unsupported_library_footprint");
+        assert!(refusal.1.contains("zone 1 'Under part'"), "{}", refusal.1);
+        assert!(refusal.1.contains("min_thickness 0.254"), "{}", refusal.1);
+        assert!(refusal.1.contains("place_component"), "{}", refusal.1);
     }
 
     /// A model the shared reader refuses refuses the footprint, under the code
