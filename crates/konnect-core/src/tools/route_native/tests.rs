@@ -353,6 +353,26 @@ async fn route_native_region_optimizes_a_plan_inside_its_region() {
     assert!(!r.is_error, "{}", text(&r));
     assert_eq!(body(&r)["work_tracks"], 0);
     assert!(body(&r)["output_plan"].is_null());
+    // ... and the board's open connection is listed by pad as one the run
+    // was not asked to route; max_listed bounds the list, not the totals.
+    let open = body(&r)["unrouted"].clone();
+    assert_eq!(open["total"], 1, "{open}");
+    assert_eq!(open["by_reason"]["outside_scope"], 1, "{open}");
+    let listed = &open["connections"][0];
+    assert_eq!(listed["reason"], "outside_scope");
+    for end in ["from", "to"] {
+        assert_eq!(listed[end]["kind"], "pad", "{listed}");
+        assert!(listed[end]["reference"].is_string() && listed[end]["pad"].is_string());
+        assert!(listed[end]["position_mm"].is_array() && listed[end]["layers"].is_array());
+    }
+    assert!(open["reasons"]["outside_scope"].is_string());
+    native["output_plan"] = json!(f.path("native1.json"));
+    native["max_listed"] = json!(0);
+    let r = handle_route_native_region(&native, &ctx()).await.unwrap();
+    let open = body(&r)["unrouted"].clone();
+    assert_eq!((&open["total"], &open["listed"]), (&json!(1), &json!(0)));
+    assert!(open["note"].as_str().unwrap().contains("0 of 1"), "{open}");
+    native.as_object_mut().unwrap().remove("max_listed");
     // ... while a box holding the open connection runs every stage and
     // plans the copper that joins it.
     native["output_plan"] = json!(f.path("native2.json"));
@@ -369,6 +389,8 @@ async fn route_native_region_optimizes_a_plan_inside_its_region() {
         .clone();
     assert_eq!(route["state"], "done", "{b}");
     assert_eq!(route["detail"]["connections_after"], 0, "{b}");
+    assert_eq!(b["unrouted"]["total"], 0, "{b}");
+    assert_eq!(b["unrouted"]["connections"], json!([]), "{b}");
     assert_eq!(b["check"]["violations"], 0, "{b}");
     assert!(b["plan_items"].as_u64().unwrap() >= 1, "{b}");
     assert!(Path::new(&f.path("native2.json")).is_file());
