@@ -919,3 +919,166 @@ fn a_plane_net_without_a_fill_is_reported_and_not_routed_as_tracks() {
     assert!(all.left_to_planes.is_empty());
     assert_eq!(all.connections.iter().filter(|c| c.net == gnd).count(), 3);
 }
+
+// ─── Track width overrides ───────────────────────────────────────────────────
+
+const FEED_PRO: &str = r#"{
+    "board": { "design_settings": { "rules": {
+        "min_clearance": 0.1, "min_track_width": 0.1, "min_via_diameter": 0.4,
+        "min_via_annular_width": 0.1, "min_through_hole_diameter": 0.2,
+        "min_copper_edge_clearance": 0.3, "min_hole_clearance": 0.2, "min_hole_to_hole": 0.25
+    } } },
+    "net_settings": {
+        "classes": [
+            { "name": "Default", "clearance": 0.2, "track_width": 0.2,
+              "via_diameter": 0.6, "via_drill": 0.3 },
+            { "name": "Power", "clearance": 0.2, "track_width": 0.8 }
+        ],
+        "netclass_patterns": [ { "pattern": "+5V", "netclass": "Power" } ]
+    }
+}"#;
+
+/// `+5V` (class Power, 0.8 mm) on three pads in a row, J1.1, R1.1 and R2.1
+/// 8 mm apart (two connections), and a Default-class net `SIG` below them.
+fn feed_board() -> (RouteBoard, crate::ProjectRuleTable) {
+    let mut b = BoardBuilder::new(22.0, 10.0, &["F.Cu", "B.Cu"]);
+    let j1 = b.footprint("J1", (3.0, 3.0));
+    let r1 = b.footprint("R1", (11.0, 3.0));
+    let r2 = b.footprint("R2", (19.0, 3.0));
+    b.smd_pad(j1, "1", "+5V", (3.0, 3.0), (1.0, 1.0), "F.Cu");
+    b.smd_pad(r1, "1", "+5V", (11.0, 3.0), (1.0, 1.0), "F.Cu");
+    b.smd_pad(r2, "1", "+5V", (19.0, 3.0), (1.0, 1.0), "F.Cu");
+    b.smd_pad(j1, "2", "SIG", (3.0, 7.0), (1.0, 1.0), "F.Cu");
+    b.smd_pad(r2, "2", "SIG", (19.0, 7.0), (1.0, 1.0), "F.Cu");
+    let mut board = b.build();
+    let rules = crate::ProjectRuleTable::from_project(FEED_PRO, None, &board).unwrap();
+    rules.assign_classes(&mut board);
+    (board, rules)
+}
+
+/// Route the feed board with `track_widths` (every class routed).
+fn route_feeds(track_widths: serde_json::Value) -> (RouteBoard, PipelineResult, AllowanceReport) {
+    let (board, mut rules) = feed_board();
+    let allowances: RoutingAllowances = serde_json::from_value(serde_json::json!({
+        "exclude_classes": [], "track_widths": track_widths
+    }))
+    .unwrap();
+    let mut s = settings(2);
+    let mut report = allowances.resolve(&board, rules.classes(), &mut s).unwrap();
+    allowances
+        .resolve_track_widths(&board, &mut rules, &mut s, &mut report)
+        .unwrap();
+    let r = route_board(&board, &rules, &PipelineScope::default(), &s).unwrap();
+    report.count_track_width_connections(
+        &board,
+        &r.connections,
+        &r.connection_widths,
+        &r.fanout_copper,
+    );
+    (board, r, report)
+}
+
+/// The widths of `net`'s routed tracks lying wholly within `x` (mm).
+fn widths_within(board: &RouteBoard, r: &PipelineResult, net: &str, x: (f64, f64)) -> Vec<Coord> {
+    let net = board.net_by_name(net).unwrap();
+    let (lo, hi) = ((x.0 * 1e6) as Coord, (x.1 * 1e6) as Coord);
+    let mut w: Vec<Coord> = r
+        .routed
+        .tracks
+        .iter()
+        .filter(|t| t.net == net)
+        .filter(|t| [t.seg.a.x, t.seg.b.x].iter().all(|x| (lo..=hi).contains(x)))
+        .map(|t| t.seg.width)
+        .collect();
+    w.sort_unstable();
+    w.dedup();
+    w
+}
+
+#[test]
+fn a_net_with_a_track_width_routes_at_that_width_not_its_class_width() {
+    let (board, plain, _) = route_feeds(serde_json::json!([]));
+    assert_complete(&plain);
+    assert_eq!(
+        widths_within(&board, &plain, "+5V", (0.0, 22.0)),
+        vec![800_000]
+    );
+
+    let (board, r, report) = route_feeds(serde_json::json!([{ "net": "+5V", "width_mm": 0.3 }]));
+    assert_complete(&r);
+    assert_eq!(widths_within(&board, &r, "+5V", (0.0, 22.0)), vec![300_000]);
+    // Other nets keep their class width.
+    assert_eq!(widths_within(&board, &r, "SIG", (0.0, 22.0)), vec![200_000]);
+    assert_eq!(
+        widths_within(&board, &plain, "SIG", (0.0, 22.0)),
+        vec![200_000]
+    );
+    assert!(r.connection_widths.is_empty());
+    let entry = &report.track_widths[0];
+    assert_eq!(
+        (
+            entry.width_nm,
+            entry.overrides_class.as_str(),
+            entry.class_width_nm
+        ),
+        (300_000, "Power", 800_000)
+    );
+    assert_eq!((entry.connections, entry.fanout_stubs), (Some(2), Some(0)));
+}
+
+#[test]
+fn a_connection_s_track_width_beats_its_net_s() {
+    let (board, r, report) = route_feeds(serde_json::json!([
+        { "net": "+5V", "width_mm": 0.3 },
+        { "net": "+5V", "from": "R1.1", "to": "J1.1", "width_mm": 0.15 }
+    ]));
+    assert_complete(&r);
+    // J1.1 to R1.1 (x 3 to 11 mm) at the connection's width, R1.1 to R2.1
+    // (x 11 to 19 mm) at the net's.
+    assert_eq!(widths_within(&board, &r, "+5V", (2.0, 11.6)), vec![150_000]);
+    assert_eq!(
+        widths_within(&board, &r, "+5V", (10.4, 20.0)),
+        vec![300_000]
+    );
+    assert_eq!(r.connection_widths.len(), 1);
+    assert_eq!(report.track_widths[0].connections, Some(1));
+    assert_eq!(report.track_widths[1].connections, Some(1));
+
+    // Alone, the connection's width leaves the rest at the class width.
+    let (board, r, report) = route_feeds(serde_json::json!([
+        { "net": "+5V", "from": "J1.1", "to": "R1.1", "width_mm": 0.15 }
+    ]));
+    assert_complete(&r);
+    assert_eq!(widths_within(&board, &r, "+5V", (2.0, 11.6)), vec![150_000]);
+    assert_eq!(
+        widths_within(&board, &r, "+5V", (10.4, 20.0)),
+        vec![800_000]
+    );
+    assert_eq!(report.track_widths[0].connections, Some(1));
+}
+
+#[test]
+fn a_connection_width_for_pads_no_open_connection_joins_routes_nothing_at_it() {
+    // The task list joins J1.1 to R1.1 and R1.1 to R2.1, never J1.1 to R2.1.
+    let (board, r, report) = route_feeds(serde_json::json!([
+        { "net": "+5V", "from": "J1.1", "to": "R2.1", "width_mm": 0.15 }
+    ]));
+    assert_complete(&r);
+    assert!(r.connection_widths.is_empty());
+    assert_eq!(report.track_widths[0].connections, Some(0));
+    assert_eq!(widths_within(&board, &r, "+5V", (0.0, 22.0)), vec![800_000]);
+}
+
+#[test]
+fn a_track_width_equal_to_the_class_width_changes_nothing() {
+    let (_, plain, _) = route_feeds(serde_json::json!([]));
+    let (_, same, _) = route_feeds(serde_json::json!([
+        { "net": "+5V", "width_mm": 0.8 },
+        { "net": "SIG", "width_mm": 0.2 }
+    ]));
+    assert_eq!(
+        plain.plan.to_routing_file_json(),
+        same.plan.to_routing_file_json()
+    );
+    assert_eq!(plain.check, same.check);
+}

@@ -47,7 +47,7 @@ pub mod planes;
 
 pub use allowances::{
     default_excluded_classes, AllowanceError, AllowanceReport, LayerFallbackSpec, NeckDownSpec,
-    ReferenceSpec, RoutingAllowances,
+    ReferenceSpec, RoutingAllowances, TrackWidthReport, TrackWidthSpec,
 };
 pub use backend::KernelBackend;
 pub use planes::{
@@ -122,6 +122,10 @@ pub struct PipelineSettings {
     /// [`PlaneTracks::All`] by default; the job runner leaves them to
     /// their planes unless the caller names the net.
     pub plane_tracks: PlaneTracks,
+    /// A track width for single connections ([`ConnectionWidth`]), drawn
+    /// instead of the net's width. A net's own width is the rule table's
+    /// ([`crate::ProjectRuleTable::set_net_track_width`]). Empty by default.
+    pub connection_widths: Vec<ConnectionWidth>,
     /// Rescue rounds after negotiation ([`rescue`]): the connections still
     /// failed for a reason another try could change are routed globally
     /// again, over a grid whose capacity is what the copper routed so far
@@ -186,6 +190,7 @@ impl Default for PipelineSettings {
             class_fallback: BTreeMap::new(),
             excluded_classes: BTreeSet::new(),
             plane_tracks: PlaneTracks::All,
+            connection_widths: Vec::new(),
             // Measured on a dense real board: three rounds rescue most of
             // what they can; further rounds added next to nothing.
             rescue_rounds: 3,
@@ -219,6 +224,63 @@ impl Default for PipelineSettings {
             threads: 0,
         }
     }
+}
+
+/// A track width for the connection that joins two pads of a net.
+///
+/// The task list joins islands of copper, not pads: the entry applies to
+/// the open connection between the island holding a `from` pad and the
+/// island holding a `to` pad, in either order (so a pad already joined to
+/// a pour names the pour's whole island). It applies to no connection when
+/// the two are already joined, or when the task list joins them through a
+/// third island. Where two entries name one connection, the first wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionWidth {
+    pub net: NetId,
+    /// The pads one end was named by (pads that share a number).
+    pub from: Vec<PadId>,
+    pub to: Vec<PadId>,
+    pub width: Coord,
+}
+
+/// Which entry of `widths` governs each of `connections`, by the islands
+/// of `report` (the connectivity `connections` came from).
+fn match_connection_widths(
+    board: &RouteBoard,
+    report: &ConnectivityReport,
+    connections: &[Connection],
+    widths: &[ConnectionWidth],
+) -> BTreeMap<ConnectionId, usize> {
+    let mut out = BTreeMap::new();
+    if widths.is_empty() {
+        return out;
+    }
+    let island = report.island_of_pads(board);
+    let of_pad = |p: PadId| island.get(p.index()).copied().flatten();
+    let of_item = |item: ItemRef| match item {
+        ItemRef::Pad(p) => of_pad(p),
+        _ => None,
+    };
+    let ends =
+        |pads: &[PadId]| -> BTreeSet<u32> { pads.iter().filter_map(|&p| of_pad(p)).collect() };
+    let entries: Vec<(BTreeSet<u32>, BTreeSet<u32>)> = widths
+        .iter()
+        .map(|w| (ends(&w.from), ends(&w.to)))
+        .collect();
+    for c in connections {
+        let (Some(a), Some(b)) = (of_item(c.from), of_item(c.to)) else {
+            continue;
+        };
+        let hit = widths.iter().zip(&entries).position(|(w, (from, to))| {
+            w.net == c.net
+                && ((from.contains(&a) && to.contains(&b))
+                    || (from.contains(&b) && to.contains(&a)))
+        });
+        if let Some(i) = hit {
+            out.insert(c.id, i);
+        }
+    }
+    out
 }
 
 /// Extra layers a class may use when its own layers cannot route a
@@ -273,6 +335,10 @@ pub struct PipelineResult {
     /// Every plane net of the scope: the pads its planes join, the pads
     /// the fanout joined and the pads still open, with why.
     pub plane_nets: Vec<PlaneNetReport>,
+    /// The entry of [`PipelineSettings::connection_widths`] each connection
+    /// of [`Self::connections`] was routed under (those with none are not
+    /// listed).
+    pub connection_widths: BTreeMap<ConnectionId, usize>,
     pub fanout: Option<PlaneViaPlan>,
     pub access: Vec<PadAccess>,
     /// Per net class (as a profile), what pin access did.
@@ -442,13 +508,16 @@ fn run(
         out.fanout.as_ref(),
         &fanout_out_of_scope,
     );
-    drop(conn);
     let (routable, excluded) = split_excluded(rules, selected, &settings.excluded_classes);
     out.excluded = excluded;
     tel.count("pipeline_excluded_by_policy", out.excluded.len() as u64);
     // Plane nets are left to their planes and the fanout unless asked.
     (out.connections, out.left_to_planes) =
         split_left_to_planes(&work, routable, &settings.plane_tracks);
+    // Matched against the list that is routed: its ids are final here.
+    out.connection_widths =
+        match_connection_widths(&work, &conn, &out.connections, &settings.connection_widths);
+    drop(conn);
     for c in &out.left_to_planes {
         if let Some(p) = out.plane_nets.iter_mut().find(|p| p.net == c.net) {
             p.connections_left += 1;
@@ -515,6 +584,14 @@ fn run(
             Vec::new()
         },
         neck_down: settings.neck_down.clone(),
+        connection_widths: out
+            .connection_widths
+            .iter()
+            .map(|(id, &entry)| {
+                let c = &out.connections[id.index()];
+                ((c.from, c.to), settings.connection_widths[entry].width)
+            })
+            .collect(),
     };
     let mut detail = negotiate_connections_with(
         &work,

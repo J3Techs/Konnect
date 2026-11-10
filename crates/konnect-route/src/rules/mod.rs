@@ -280,6 +280,9 @@ pub struct ProjectRuleTable {
     net_names: Vec<String>,
     references: Vec<Option<String>>,
     max_clearance: Coord,
+    /// A caller's track width for single nets, drawn instead of the class
+    /// width ([`ProjectRuleTable::set_net_track_width`]).
+    net_track_width: BTreeMap<NetId, Coord>,
 }
 
 impl ProjectRuleTable {
@@ -341,6 +344,7 @@ impl ProjectRuleTable {
                 .map(|f| f.reference.clone())
                 .collect(),
             max_clearance,
+            net_track_width: BTreeMap::new(),
         })
     }
 
@@ -368,6 +372,38 @@ impl ProjectRuleTable {
             self.ambiguous_nets.retain(|n| n != name);
         }
         true
+    }
+
+    /// Draw `net`'s tracks `width` wide instead of its class width (or a
+    /// custom rule's `opt`): an owner's choice for one net, such as the
+    /// small feeds of a power net whose current its pours carry. Only the
+    /// preferred width changes; every minimum still holds (a width below
+    /// one is drawn at the minimum), and so does the net's clearance.
+    /// Returns `false`, changing nothing, when the net is unknown.
+    pub fn set_net_track_width(&mut self, net: NetId, width: Coord) -> bool {
+        if net.index() >= self.class_by_net.len() {
+            return false;
+        }
+        self.net_track_width.insert(net, width);
+        true
+    }
+
+    /// The width set for `net` with [`Self::set_net_track_width`].
+    pub fn net_track_width(&self, net: NetId) -> Option<Coord> {
+        self.net_track_width.get(&net).copied()
+    }
+
+    /// The narrowest and (when a custom rule caps it) widest track `net`
+    /// may draw on `layer`: the board minimum and the last matching custom
+    /// `track_width` rule's `min` and `max`.
+    pub fn track_width_limits(&self, net: NetId, layer: LayerId) -> (Coord, Option<Coord>) {
+        let subject = RuleSubject::new(ItemKind::Track, Some(net));
+        let rule = self.last_match(ConstraintKind::TrackWidth, Some(layer), &subject, None);
+        let min = rule
+            .and_then(|c| c.min)
+            .map_or(0, to_nm)
+            .max(self.board.min_track_width);
+        (min, rule.and_then(|c| c.max).map(to_nm))
     }
 
     pub fn board_rules(&self) -> &BoardRules {
@@ -503,10 +539,11 @@ impl RuleTable for ProjectRuleTable {
             .and_then(|c| c.min)
             .map_or(0, to_nm)
             .max(self.board.min_track_width);
-        WidthRule {
-            min,
-            preferred: preferred(rule, class.track_width, min),
-        }
+        let preferred = match subject.net.and_then(|n| self.net_track_width.get(&n)) {
+            Some(&width) => width.max(min),
+            None => preferred(rule, class.track_width, min),
+        };
+        WidthRule { min, preferred }
     }
 
     fn via(&self, subject: &RuleSubject<'_>) -> ViaRule {
@@ -1163,6 +1200,31 @@ mod tests {
         assert_eq!(t.report().ambiguous_nets, vec!["IO_PWR".to_string()]);
         assert!(t.pin_net_class(io_pwr, "Fast"));
         assert!(t.report().ambiguous_nets.is_empty());
+    }
+
+    #[test]
+    fn a_net_track_width_replaces_the_class_width_but_never_the_minimum() {
+        let b = board();
+        let mut t = table(&b);
+        let power = b.net_by_name("PWR_MAIN").unwrap();
+        let subject = RuleSubject::new(ItemKind::Track, Some(power));
+        // The custom rule's floor and cap, for a caller to check a width against.
+        assert_eq!(
+            t.track_width_limits(power, LayerId(0)),
+            (90_000, Some(200_000))
+        );
+        assert!(t.set_net_track_width(power, 120_000));
+        assert_eq!(t.net_track_width(power), Some(120_000));
+        let w = t.track_width(&subject, LayerId(0));
+        assert_eq!((w.min, w.preferred), (90_000, 120_000));
+        // Below the floor, the floor is drawn.
+        assert!(t.set_net_track_width(power, 50_000));
+        assert_eq!(t.track_width(&subject, LayerId(0)).preferred, 90_000);
+        // Other nets of the class keep the class answer.
+        let gnd = RuleSubject::new(ItemKind::Track, b.net_by_name("GND"));
+        let before = table(&b).track_width(&gnd, LayerId(0));
+        assert_eq!(t.track_width(&gnd, LayerId(0)), before);
+        assert!(!t.set_net_track_width(NetId(999), 120_000));
     }
 
     #[test]

@@ -21,13 +21,14 @@
 //! runner never talks to KiCad: it reads saved files and writes a plan.
 
 use anyhow::{bail, Context, Result};
-use konnect_route::api::{Generation, NetId, Stage};
+use konnect_route::api::{Connection, ConnectionId, Generation, NetId, Stage};
 use konnect_route::check::{CheckReport, ViolationKind};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
 use konnect_route::optimize::{OptimizeOptions, OptimizeReport};
 use konnect_route::pipeline::{
-    AllowanceReport, ClassFallback, PipelineSettings, ReferenceReport, RoutingAllowances,
+    AllowanceError, AllowanceReport, ClassFallback, PipelineSettings, ReferenceReport,
+    RoutingAllowances,
 };
 use konnect_route::plan::{RoutedCopper, ADD_ROUTING_MAX_ITEMS};
 use konnect_route::telemetry::Telemetry;
@@ -132,8 +133,8 @@ pub struct NativeJobSpec {
     #[serde(default)]
     pub time_limit_seconds: Option<u64>,
     /// Owner routing allowances and the class policy, by name (class
-    /// layers, layer fallbacks, neck-down, excluded classes). Native
-    /// routing only. Default: none, and wide-copper classes excluded
+    /// layers, layer fallbacks, neck-down, excluded classes, track widths
+    /// per net or connection). Native routing only. Default: none, and wide-copper classes excluded
     /// ([`konnect_route::pipeline::default_excluded_classes`]).
     #[serde(default, skip_serializing_if = "RoutingAllowances::is_default")]
     pub allowances: RoutingAllowances,
@@ -301,6 +302,22 @@ impl NativeJobSpec {
         };
         rules.assign_classes(&mut board);
         Ok((board, load, rules, source))
+    }
+
+    /// Resolve the allowances against the board and its rules exactly as a
+    /// run will, changing nothing: for a starter, so that a name or a
+    /// track width the board cannot take is refused before a runner starts.
+    /// The outer error is the board or rules not loading.
+    pub(crate) fn check_allowances(&self) -> Result<Result<(), AllowanceError>> {
+        let (board, _, mut rules) = self.load_inputs()?;
+        let mut settings = PipelineSettings::default();
+        Ok(self
+            .allowances
+            .resolve(&board, rules.classes(), &mut settings)
+            .and_then(|mut report| {
+                self.allowances
+                    .resolve_track_widths(&board, &mut rules, &mut settings, &mut report)
+            }))
     }
 
     fn hash(&self) -> String {
@@ -693,6 +710,10 @@ struct NativeRoute {
     detail: Value,
     /// The tasks behind `detail.failed`, by pad.
     failures: Vec<RouteFailure>,
+    /// The task list, and the connection width entry each task was routed
+    /// under ([`konnect_route::pipeline::PipelineResult::connection_widths`]).
+    connections: Vec<Connection>,
+    connection_widths: BTreeMap<ConnectionId, usize>,
     telemetry: Telemetry,
 }
 
@@ -707,6 +728,8 @@ impl NativeRoute {
             failed: 0,
             detail: json!({}),
             failures: Vec::new(),
+            connections: Vec::new(),
+            connection_widths: BTreeMap::new(),
             telemetry: Telemetry::default(),
         }
     }
@@ -772,6 +795,8 @@ fn route_native(
         plane_nets: planes::summaries(board, &r.plane_nets, &r.left_to_planes),
         failed: r.detail.failure_details.len(),
         detail,
+        connections: r.connections,
+        connection_widths: r.connection_widths,
         telemetry: r.telemetry,
     })
 }
@@ -821,7 +846,7 @@ pub fn run_pipeline(
     // S0: ingest and rules.
     let t = Instant::now();
     observer.event("ingest", "start", &json!({}));
-    let (mut board, load, rules, classes) = spec.load_inputs_reported()?;
+    let (mut board, load, mut rules, classes) = spec.load_inputs_reported()?;
     report
         .telemetry
         .add_stage_time(Stage::Ingest, t.elapsed().as_micros() as u64);
@@ -932,10 +957,17 @@ pub fn run_pipeline(
         // fanout unless the caller asks for tracks.
         settings.plane_tracks =
             konnect_route::pipeline::PlaneTracks::Only(zone_policy.as_tracks.clone());
-        match spec
+        // Track widths last: they read the class policy, and a net's width
+        // becomes the rule table's answer for every later stage.
+        let resolved = spec
             .allowances
             .resolve(&board, rules.classes(), &mut settings)
-        {
+            .and_then(|mut a| {
+                spec.allowances
+                    .resolve_track_widths(&board, &mut rules, &mut settings, &mut a)
+                    .map(|()| a)
+            });
+        match resolved {
             Ok(a) => report.allowances = Some(a),
             Err(e) => {
                 report.stop(StopKind::InputError, format!("allowances: {e}"));
@@ -1008,6 +1040,14 @@ pub fn run_pipeline(
                 report.excluded_by_policy = r.excluded.clone();
                 report.plane_nets = r.plane_nets.clone();
                 zone_hint = planes::obstacle_hint(&board, r.failed);
+                if let Some(a) = report.allowances.as_mut() {
+                    a.count_track_width_connections(
+                        &board,
+                        &r.connections,
+                        &r.connection_widths,
+                        &r.fanout,
+                    );
+                }
                 let mut detail = json!({ "tracks": r.routed.tracks.len(), "vias": r.routed.vias.len(),
                                          "fanout_tracks": r.fanout.tracks.len(),
                                          "fanout_vias": r.fanout.vias.len() });

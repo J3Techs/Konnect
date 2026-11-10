@@ -286,6 +286,11 @@ pub struct NegotiationInputs {
     pub access: Vec<PadAccess>,
     /// Neck-down at pads (`None`: never).
     pub neck_down: Option<NeckDown>,
+    /// A track width for single connections, keyed by the connection's
+    /// two terminals (`from`, `to`) as the task list gives them: drawn
+    /// instead of the net's width on every layer (never below the layer's
+    /// minimum). Such a connection gets a clearance profile of its own.
+    pub connection_widths: BTreeMap<(ItemRef, ItemRef), Coord>,
 }
 
 /// One tile of the schedule.
@@ -564,8 +569,9 @@ pub(crate) struct Ctx<'a> {
     pub slots: Vec<LayerId>,
     pub profiles: Vec<Profile>,
     pub net_profile: Vec<u16>,
-    /// Track width per (net, slot).
-    net_width: Vec<Coord>,
+    /// The profile of each connection with a width of its own
+    /// ([`NegotiationInputs::connection_widths`]), by its terminals.
+    conn_profile: HashMap<(ItemRef, ItemRef), u16>,
     pub net_via: Vec<ViaRule>,
     /// Context a commit needs inside its tile window.
     pub margin: Coord,
@@ -582,6 +588,7 @@ impl<'a> Ctx<'a> {
         rules: &'a dyn RuleTable,
         tuning: NegotiationTuning,
         inputs: &NegotiationInputs,
+        connections: &[Connection],
     ) -> Self {
         let obstacles = Obstacles::build(board, rules);
         let slots: Vec<LayerId> = board.routable.iter().collect();
@@ -595,7 +602,7 @@ impl<'a> Ctx<'a> {
         let mut profiles: Vec<Profile> = Vec::new();
         let mut keys: BTreeMap<ProfileKey, u16> = BTreeMap::new();
         let mut net_profile = Vec::with_capacity(board.nets.len());
-        let mut net_width = Vec::with_capacity(board.nets.len() * slots.len());
+        let mut net_keys: Vec<ProfileKey> = Vec::with_capacity(board.nets.len());
         let mut net_via = Vec::with_capacity(board.nets.len());
         for net in &board.nets {
             let track = RuleSubject::new(ItemKind::Track, Some(net.id));
@@ -621,7 +628,7 @@ impl<'a> Ctx<'a> {
                 clearances,
             };
             let next = profiles.len() as u16;
-            let p = *keys.entry(key).or_insert_with(|| {
+            let p = *keys.entry(key.clone()).or_insert_with(|| {
                 profiles.push(Profile {
                     rep: net.id,
                     widths: widths.clone(),
@@ -630,18 +637,49 @@ impl<'a> Ctx<'a> {
                 next
             });
             net_profile.push(p);
-            net_width.extend_from_slice(&widths);
+            net_keys.push(key);
             net_via.push(via);
         }
+        // A connection with a width of its own: its net's profile at that
+        // width (the layer's minimum still a floor), painted for the net.
+        let mut conn_profile = HashMap::new();
+        if !inputs.connection_widths.is_empty() {
+            for c in connections {
+                let Some(&width) = inputs.connection_widths.get(&(c.from, c.to)) else {
+                    continue;
+                };
+                let Some(net_key) = net_keys.get(c.net.index()) else {
+                    continue;
+                };
+                let track = RuleSubject::new(ItemKind::Track, Some(c.net));
+                let widths: Vec<Coord> = slots
+                    .iter()
+                    .map(|&l| width.max(rules.track_width(&track, l).min).max(1))
+                    .collect();
+                let key = ProfileKey {
+                    widths: widths.clone(),
+                    ..net_key.clone()
+                };
+                let next = profiles.len() as u16;
+                let p = *keys.entry(key).or_insert_with(|| {
+                    profiles.push(Profile {
+                        rep: c.net,
+                        widths,
+                        via_diameter: net_via[c.net.index()].diameter,
+                    });
+                    next
+                });
+                conn_profile.insert((c.from, c.to), p);
+            }
+        }
         // The widest copper any net draws: its tracks, and its own via (not
-        // a profile representative's).
-        let widest = net_width
-            .iter()
-            .copied()
+        // a profile representative's). Every net's widths are a profile's.
+        let track_widths = || profiles.iter().flat_map(|p| p.widths.iter().copied());
+        let widest = track_widths()
             .chain(net_via.iter().map(|v| v.diameter))
             .max()
             .unwrap_or(0);
-        let max_half_width = net_width.iter().map(|w| w / 2 + w % 2).max().unwrap_or(0);
+        let max_half_width = track_widths().map(|w| w / 2 + w % 2).max().unwrap_or(0);
         // Copper of a commit reaches widest / 2 past its centre line, and
         // what it must keep clear of lies within the largest copper or hole
         // clearance of that; the 2 pitches cover a node's half-diagonal.
@@ -658,7 +696,7 @@ impl<'a> Ctx<'a> {
             slots,
             profiles,
             net_profile,
-            net_width,
+            conn_profile,
             net_via,
             margin,
             max_half_width,
@@ -676,8 +714,18 @@ impl<'a> Ctx<'a> {
         self.slots.iter().position(|&l| l == layer)
     }
 
-    pub fn width(&self, net: NetId, slot: usize) -> Coord {
-        self.net_width[net.index() * self.slots.len() + slot]
+    /// The profile a connection routes with: its own when it has a width
+    /// of its own, else its net's.
+    fn profile_of(&self, c: &Connection) -> u16 {
+        self.conn_profile
+            .get(&(c.from, c.to))
+            .copied()
+            .unwrap_or(self.net_profile[c.net.index()])
+    }
+
+    /// The track width `task` draws on `slot`.
+    pub fn width(&self, task: &Task, slot: usize) -> Coord {
+        self.profiles[task.profile as usize].widths[slot]
     }
 
     pub fn geometry(&self, profile: u16, slot: usize) -> ProfileGeometry {
@@ -807,7 +855,7 @@ fn build_tasks(
             layers,
             line,
             hints,
-            profile: ctx.net_profile[c.net.index()],
+            profile: ctx.profile_of(c),
             from_island: island(c.from),
             to_island: island(c.to),
         });
@@ -1386,7 +1434,7 @@ fn run_negotiation(
         .expect("a rayon pool builds");
     telemetry.threads = pool.current_num_threads() as u32;
     let t_setup = Instant::now();
-    let ctx = Ctx::new(board, rules, *tuning, inputs);
+    let ctx = Ctx::new(board, rules, *tuning, inputs, connections);
     let (tasks, refused) = build_tasks(&ctx, connections, report, global, grid);
     telemetry.count("us_setup", t_setup.elapsed().as_micros() as u64);
     let n = tasks.len();
@@ -1530,7 +1578,7 @@ fn run_negotiation(
             for (tile, job) in &layout.jobs {
                 if let pieces::Terminal::Pin(p) = job.to {
                     let slot = ctx.slot_of(p.layer).expect("pins use routable layers");
-                    registry.add(net, p.layer, p.at, ctx.width(net, slot));
+                    registry.add(net, p.layer, p.at, ctx.width(&tasks[ti], slot));
                 }
                 if pieces_bad.contains(&job.piece) {
                     report.pieces += 1;

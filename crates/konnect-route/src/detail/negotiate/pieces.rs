@@ -319,7 +319,7 @@ fn choose_pin(
     let mut loose: Option<(i64, Point, LayerId)> = None;
     for (li, &layer) in layers.iter().enumerate() {
         let slot = ctx.slot_of(layer)?;
-        let width = ctx.width(task.conn.net, slot);
+        let width = ctx.width(task, slot);
         'steps: for step in 0..=max_steps {
             let offsets = [step, -step];
             for &k in &offsets[..if step == 0 { 1 } else { 2 }] {
@@ -429,12 +429,7 @@ pub(crate) fn split(
             });
         };
         let slot = ctx.slot_of(pin.layer).expect("pins use routable layers");
-        registry.add(
-            task.conn.net,
-            pin.layer,
-            pin.at,
-            ctx.width(task.conn.net, slot),
-        );
+        registry.add(task.conn.net, pin.layer, pin.at, ctx.width(task, slot));
         pins.push(pin);
     }
     let mut out = Vec::with_capacity(pins.len() + 1);

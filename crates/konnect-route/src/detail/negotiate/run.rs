@@ -852,7 +852,7 @@ impl TileRun {
         let class = ctx.rules.class_of(Some(net));
         let stack = self.stacks[k].as_ref().expect("stack at home");
         let core = &stack.layers[slot].core;
-        let full = ctx.width(net, slot);
+        let full = ctx.width(task, slot);
         let mut widths = vec![(full, ctx.tuning.stub_reach)];
         if let Some(n) = ctx.neck.as_ref().filter(|n| !n.excluded.contains(&class)) {
             let min = ctx
@@ -1192,7 +1192,7 @@ impl TileRun {
             |s: usize, e: usize, segs: &mut Vec<SegCopper>, steps: &mut Vec<(usize, usize)>| {
                 if e > s {
                     let slot = nodes[s].layer as usize;
-                    let seg = Segment::new(pt(&nodes[s]), pt(&nodes[e]), ctx.width(net, slot));
+                    let seg = Segment::new(pt(&nodes[s]), pt(&nodes[e]), ctx.width(task, slot));
                     let courtyards = ctx.obstacles.courtyards.hits(&Shape::Segment(seg));
                     segs.push(SegCopper {
                         layer: ctx.slots[slot],
