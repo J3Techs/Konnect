@@ -162,6 +162,30 @@ fn board_copper_can_be_reoptimized_and_a_region_freezes_the_rest() {
     let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
     // The board's one unlocked track and via.
     assert_eq!((report.work_tracks, report.work_vias), (1, 1));
+    // The report file holds every connection the run leaves open, by pad;
+    // the tools' view lists them and says where the file is.
+    let open = report.unrouted.expect("the open connections");
+    assert_eq!(open.total, open.connections.len());
+    assert!(open.total >= 1, "{open:?}");
+    for c in &open.connections {
+        assert_eq!(c.reason, "not_routed", "{c:?}");
+        assert!(c.from.reference.is_some() && c.from.pad.is_some(), "{c:?}");
+        assert!(c.to.reference.is_some() && c.to.pad.is_some(), "{c:?}");
+    }
+    let body = status_of(&s.output_plan);
+    let listed = &body["report"]["unrouted"];
+    assert_eq!(listed["total"], json!(open.total));
+    assert_eq!(listed["by_reason"]["not_routed"], json!(open.total));
+    assert_eq!(
+        listed["full_list"],
+        json!(dir.join(REPORT_FILE).display().to_string())
+    );
+    let capped = status_listing(&s.output_plan, 0).unwrap();
+    assert_eq!(capped["report"]["unrouted"]["listed"], 0);
+    assert!(capped["report"]["unrouted"]["note"]
+        .as_str()
+        .unwrap()
+        .contains("report.json"));
 
     // A region away from that copper leaves nothing to plan.
     s.output_plan = f.root.join("empty.json");

@@ -368,17 +368,18 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_native_region",
-            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. Use start_native_route_job for a whole board.",
+            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them. Use start_native_route_job for a whole board.",
             {
                 let mut s = with_props(job_props(), &["board", "output_plan", "region"]);
                 s["properties"]["region"]["description"] = json!("The region to work on, mm (required here)");
+                s["properties"]["max_listed"] = json!({ "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Unrouted connections listed; unrouted.total and by_reason cover all" });
                 s
             },
             |args, ctx| async move { handle_route_native_region(args, ctx).await }
         ),
         tool!(
             "start_native_route_job",
-            "Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. Returns once the runner is running. State lives in '<output_plan>.konnect-native-job/' (status.json, progress.jsonl, checkpoint.json, report.json). Follow with get_native_route_job; end early with stop_native_route_job; resume: true continues a stopped or lost job from its checkpoint.",
+            "Start the native pipeline on the saved board in a separate Konnect runner process that outlives this session; several jobs (one per output_plan) run at once. Returns once the runner is running. State lives in '<output_plan>.konnect-native-job/' (status.json, progress.jsonl, checkpoint.json, report.json). report.json's unrouted.connections lists every connection the finished run leaves open, by pad and reason (get_native_route_job lists them). Follow with get_native_route_job; end early with stop_native_route_job; resume: true continues a stopped or lost job from its checkpoint.",
             {
                 let mut p = job_props();
                 p["time_limit_seconds"] = json!({ "type": "integer", "minimum": 1, "maximum": 86400, "description": "Stop at the next stage boundary after this long, keeping the checkpoint" });
@@ -389,10 +390,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_native_route_job",
-            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished, and whether the plan and a checkpoint exist. Reads the job directory only.",
+            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished, and whether the plan and a checkpoint exist. report.unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them with the total, the counts by reason and the path of report.json, which holds them all; report.stages keeps the route stage's failed counts. Reads the job directory only.",
             json!({
                 "type": "object",
-                "properties": { "output_plan": { "type": "string", "description": "The output_plan the job was started with" } },
+                "properties": {
+                    "output_plan": { "type": "string", "description": "The output_plan the job was started with" },
+                    "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": LISTED_DEFAULT, "description": "Unrouted connections listed; report.unrouted.total and by_reason cover all, and report.json holds the full list" }
+                },
                 "required": ["output_plan"]
             }),
             |args, ctx| async move { handle_get_native_route_job(args, ctx).await }
@@ -1800,6 +1804,10 @@ async fn handle_route_native_region(
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
+    let listed = match opt_count(args, "max_listed", LISTED_DEFAULT, 10_000) {
+        Ok(n) => n as usize,
+        Err(r) => return Ok(r),
+    };
     let run = spec.clone();
     let report =
         tokio::task::spawn_blocking(move || native_route_job::run_pipeline(&run, None, &mut Quiet))
@@ -1832,6 +1840,13 @@ async fn handle_route_native_region(
         "excluded_by_policy": report.excluded_by_policy,
         "reference": report.reference,
         "fanout_plan": report.fanout_plan_path,
+        "unrouted": report.unrouted.as_ref().map(|u| {
+            native_route_job::unrouted::listing(
+                &serde_json::to_value(u).unwrap_or_default(),
+                listed,
+                None,
+            )
+        }),
         "next": "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones.",
     })))
 }
@@ -1880,7 +1895,11 @@ async fn handle_get_native_route_job(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output_plan")?;
-    match native_route_job::status(&output) {
+    let listed = match opt_count(args, "max_listed", LISTED_DEFAULT, 10_000) {
+        Ok(n) => n as usize,
+        Err(r) => return Ok(r),
+    };
+    match native_route_job::status_listing(&output, listed) {
         Ok(body) => Ok(CallToolResult::json(&body)),
         Err(e) => Ok(CallToolResult::error_kind(
             ToolErrorKind::FileNotFound {

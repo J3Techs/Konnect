@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the native router's report names the connections it left open
+
+A finished native route job reported its failures only as counts in the route
+stage record (`failed: {congestion, no_access, no_pin, unreachable}`). Which
+pads were still unconnected could only be learned by applying the plan, saving
+and reading KiCad's DRC.
+
+The job report now carries `unrouted`: every connection still open with the
+run's copper on the board, which is what KiCad's DRC reports as unconnected
+once the plan is applied. Each entry has the net, the closest pads of the two
+parts it would join (`from` / `to`: `reference`, `pad`, `position_mm`,
+`layers`), their distance and a `reason`. The reason is the route stage's own
+failure when it failed exactly that pad pair (`no_access` names the terminal
+with no open grid node, `congestion` the connections it lost to);
+`net_not_joined` with the net's failed tasks when the stage failed other pairs
+of the net; or `cleared`, `off_reference`, `excluded_by_policy`,
+`outside_scope`, `not_routed`. A connection no stage accounts for is
+`unexplained`, never guessed.
+
+`report.json` in the job directory holds the full list, and
+`unrouted.route_failures` beside it holds the route stage's failed tasks as it
+saw them. `get_native_route_job` and `route_native_region` list at most
+`max_listed` (new, default 50) connections with `total`, `by_reason`, a
+`reasons` legend and, for a job, `full_list` (the path of `report.json`). The
+route stage's `failed` counts are unchanged. KiCad may draw its ratsnest line
+to a track of the same part rather than to the part's nearest pad; the count
+per net is the same.
+
 ## Unreleased: a via may sit inside an SMD pad that is named for it
 
 `plan_tap_vias` and `build_route`'s `new_via` never put a via on an SMD pad of

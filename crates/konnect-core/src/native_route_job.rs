@@ -41,6 +41,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod unrouted;
+pub use unrouted::{RouteFailure, Unrouted};
+
 /// The hidden subcommand the starter runs.
 pub const RUNNER_SUBCOMMAND: &str = "native-route-runner";
 
@@ -408,6 +411,10 @@ pub struct PipelineReport {
     /// The separate fanout plan, when one was asked for and written.
     #[serde(default)]
     pub fanout_plan_path: Option<PathBuf>,
+    /// Every connection still open with the run's copper on the board, by
+    /// pad and by reason (`None` when the run stopped before the check).
+    #[serde(default)]
+    pub unrouted: Option<Unrouted>,
     pub telemetry: Telemetry,
 }
 
@@ -431,6 +438,10 @@ pub struct Checkpoint {
     /// stages (never optimized), but part of the plan.
     #[serde(default)]
     pub fanout: RoutedCopper,
+    /// The tasks the route stage gave up on, so a resumed run still
+    /// reports why a connection is open.
+    #[serde(default)]
+    pub route_failures: Vec<RouteFailure>,
     pub optimize: Option<OptimizeReport>,
     pub check: Option<CheckSummary>,
     pub written_unix: u64,
@@ -564,6 +575,8 @@ struct NativeRoute {
     excluded: BTreeMap<String, usize>,
     /// Counts for the `route` stage record.
     detail: Value,
+    /// The tasks behind `detail.failed`, by pad.
+    failures: Vec<RouteFailure>,
     telemetry: Telemetry,
 }
 
@@ -575,6 +588,7 @@ impl NativeRoute {
             routed,
             excluded: BTreeMap::new(),
             detail: json!({}),
+            failures: Vec::new(),
             telemetry: Telemetry::default(),
         }
     }
@@ -622,7 +636,17 @@ fn route_native(
         "excluded_by_policy": excluded,
         "fallback_routed": r.telemetry.counters.get("pipeline_fallback_routed").copied().unwrap_or(0),
     });
+    // The stage's tasks name items of the board with its fanout appended.
+    let own_from = (board.tracks.len(), board.vias.len());
+    let mut routed_on = board.clone();
+    konnect_route::pipeline::add_locked(&mut routed_on, &r.fanout_copper);
     Ok(NativeRoute {
+        failures: RouteFailure::collect(
+            &routed_on,
+            own_from,
+            &r.connections,
+            &r.detail.failure_details,
+        ),
         fanout: r.fanout_copper,
         routed: r.routed,
         excluded,
@@ -735,6 +759,7 @@ pub fn run_pipeline(
         copper: RoutedCopper::default(),
         frozen: RoutedCopper::default(),
         fanout: RoutedCopper::default(),
+        route_failures: Vec::new(),
         optimize: None,
         check: None,
         written_unix: 0,
@@ -777,7 +802,9 @@ pub fn run_pipeline(
     }
 
     let t = Instant::now();
-    let (mut work, frozen, fanout) = if let Some(cp) = resume.as_ref().filter(|_| done("route")) {
+    let (mut work, frozen, fanout, route_failures) = if let Some(cp) =
+        resume.as_ref().filter(|_| done("route"))
+    {
         // The board still holds the copper the source took; take it off
         // again so it is not doubled, then freeze what the run froze.
         if spec.source == CopperSource::BoardUnlocked {
@@ -793,7 +820,12 @@ pub fn run_pipeline(
             json!({ "tracks": cp.copper.tracks.len(), "vias": cp.copper.vias.len(),
                     "fanout_tracks": cp.fanout.tracks.len(), "fanout_vias": cp.fanout.vias.len() }),
         );
-        (cp.copper.clone(), cp.frozen.clone(), cp.fanout.clone())
+        (
+            cp.copper.clone(),
+            cp.frozen.clone(),
+            cp.fanout.clone(),
+            cp.route_failures.clone(),
+        )
     } else {
         observer.event("route", "start", &json!({ "source": spec.source }));
         let routed: Result<NativeRoute> = match &spec.source {
@@ -838,7 +870,7 @@ pub fn run_pipeline(
                 // Copper outside the region or nets is frozen as board
                 // copper: an obstacle and terminal, never edited or planned.
                 let (work, frozen) = r.routed.partition(nets.as_ref(), region);
-                (work, frozen, r.fanout)
+                (work, frozen, r.fanout, r.failures)
             }
             Err(e) => {
                 record(
@@ -854,7 +886,13 @@ pub fn run_pipeline(
             }
         }
     };
+    // Copper past these counts is the run's own: what a native run routed
+    // and planned, or the work a taking run took.
+    let mut own_from = (board.tracks.len(), board.vias.len());
     frozen.freeze_into(&mut board);
+    if spec.source != CopperSource::Native {
+        own_from = (board.tracks.len(), board.vias.len());
+    }
     // The fanout is board copper for every later stage, and planned at S8.
     fanout.freeze_into(&mut board);
     report.work_tracks = work.tracks.len();
@@ -864,6 +902,7 @@ pub fn run_pipeline(
     checkpoint.copper = work.clone();
     checkpoint.frozen = frozen;
     checkpoint.fanout = fanout.clone();
+    checkpoint.route_failures = route_failures.clone();
     checkpoint.written_unix = now_unix();
     observer.checkpoint(&checkpoint);
     if let Some((kind, why)) = stop_check(observer) {
@@ -976,6 +1015,31 @@ pub fn run_pipeline(
                 );
             }
         }
+    }
+
+    // What stays open with this copper on the board, by pad and reason.
+    {
+        let t = Instant::now();
+        let mut applied = board.clone();
+        konnect_route::pipeline::add_locked(&mut applied, &work);
+        let none = Vec::new();
+        report.unrouted = Some(unrouted::unrouted(
+            &applied,
+            &rules,
+            &unrouted::Account {
+                nets: nets.as_ref(),
+                region,
+                own_from,
+                excluded_classes: &settings.excluded_classes,
+                routed_here: spec.source == CopperSource::Native,
+                failures: &route_failures,
+                cleared: report.cleared.as_ref().map_or(&none, |c| &c.nets),
+                off_reference: report.reference.as_ref().map_or(&none, |r| &r.dropped_nets),
+            },
+        ));
+        report
+            .telemetry
+            .add_stage_time(Stage::Audit, t.elapsed().as_micros() as u64);
     }
 
     // S7: check.
@@ -1300,8 +1364,18 @@ pub fn run_runner(args: &[String]) -> Result<()> {
     run_job_dir(&dir).map(|_| ())
 }
 
-/// What the tools report about a job.
+/// Unrouted connections the tools list unless asked for more or fewer.
+pub const UNROUTED_LISTED_DEFAULT: usize = 50;
+
+/// What the tools report about a job, with the default number of unrouted
+/// connections listed.
 fn report(dir: &Path, status: &JobStatus) -> Value {
+    report_listing(dir, status, UNROUTED_LISTED_DEFAULT)
+}
+
+/// What the tools report about a job: at most `listed` unrouted
+/// connections (the report file holds all of them).
+fn report_listing(dir: &Path, status: &JobStatus, listed: usize) -> Value {
     let age = now_unix().saturating_sub(status.heartbeat_unix);
     let lost = !status.finished && age > STALE_HEARTBEAT_SECONDS;
     let mut body = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
@@ -1333,6 +1407,13 @@ fn report(dir: &Path, status: &JobStatus) -> Value {
             "excluded_by_policy": r["excluded_by_policy"], "reference": r["reference"],
             "stage_wall_us": r["telemetry"]["stages"], "threads": r["telemetry"]["threads"],
         });
+        if r["unrouted"].is_object() {
+            body["report"]["unrouted"] = unrouted::listing(
+                &r["unrouted"],
+                listed,
+                Some(report_path.display().to_string()),
+            );
+        }
     }
     body
 }
@@ -1427,6 +1508,11 @@ pub async fn start(spec: &NativeJobSpec, resume: bool) -> Result<Value> {
 }
 
 pub fn status(output_plan: &Path) -> Result<Value> {
+    status_listing(output_plan, UNROUTED_LISTED_DEFAULT)
+}
+
+/// [`status`], listing at most `listed` unrouted connections.
+pub fn status_listing(output_plan: &Path, listed: usize) -> Result<Value> {
     let dir = job_dir_for(output_plan);
     if !dir.is_dir() {
         bail!(
@@ -1436,7 +1522,7 @@ pub fn status(output_plan: &Path) -> Result<Value> {
         );
     }
     let status: JobStatus = read_json(&dir.join(STATUS_FILE))?;
-    Ok(report(&dir, &status))
+    Ok(report_listing(&dir, &status, listed))
 }
 
 pub async fn stop(output_plan: &Path, wait: Duration) -> Result<Value> {
