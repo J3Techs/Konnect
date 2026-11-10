@@ -3,6 +3,44 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the project manager running without a PCB editor no longer blocks saved-file board edits
+
+With only KiCad's project manager running, IPC answers but refuses
+`GetOpenDocuments` as unhandled, because no PCB editor is registered at the
+endpoint. Mutating board tools treated that like any other rejection: the
+hybrid tools (`add_mounting_hole`, `place_component`, …) and every tool behind
+the closed-board proof (`set_closed_board_stackup`, the closed-board placement,
+pad-property and model paths, `update_pcb_from_schematic`'s closed backends)
+refused until KiCad was quit entirely, although no editor held the board.
+
+That answer now counts as "this endpoint holds no board", under the same rule
+as an unreachable KiCad: the edit goes to the saved file only when KiCad's
+sibling lock for this exact board (`~<board>.kicad_pcb.lck`) is absent. The
+lock is what covers a standalone PCB editor the endpoint cannot speak for: a
+`pcbnew` started while the project manager owns the IPC address holds its
+board without being reachable. A lock present or uninspectable refuses with
+`unsafe_file_fallback` (`kicad_lock_present` / `kicad_lock_unreadable`). A
+board this server observed live earlier still needs KiCad's clean-close
+evidence (its lock seen, then removed) and otherwise refuses with
+`board_previously_observed_live`.
+
+Results that disclose why a file edit was allowed gain a third value:
+`fallback_reason.kind` and the closed-board `board_closure.evidence.kind` can
+now be `no_pcb_editor_at_endpoint`, beside `transport_unreachable` and
+`board_not_open`.
+
+The file-only guard used by the project-file editors (`create_netclass`,
+`assign_net_to_class`, `remove_netclass_patterns`, `set_design_rules`,
+`set_predefined_sizes`) and by placement applies already let this state
+through, with no lock check at all. It now applies the same rule, so those
+tools newly refuse in two cases they used to edit through: a sibling lock
+beside the board, and a board observed live earlier in the session without
+clean-close evidence.
+
+An endpoint whose build does not implement `GetOpenDocuments`
+(`AS_UNIMPLEMENTED`) is unchanged: it says nothing about its editors and
+mutating tools still refuse.
+
 ## Unreleased: reference designators can be placed by a planner
 
 Moving each reference designator into clear space was done by hand: one

@@ -210,6 +210,9 @@ pub(crate) enum NoLiveBoard {
     /// KiCad answered and holds another project, or none. Carries that
     /// answer, which names the boards it does hold.
     NotOpen(String),
+    /// KiCad answered that its endpoint has no PCB editor at all: the project
+    /// manager is running and no board is open in it. Carries that answer.
+    NoPcbEditor(String),
 }
 
 impl NoLiveBoard {
@@ -218,6 +221,9 @@ impl NoLiveBoard {
         match self {
             Self::Unreachable => "KiCad IPC is unreachable.".to_string(),
             Self::NotOpen(answer) => format!("KiCad is reachable but {answer}."),
+            Self::NoPcbEditor(_) => {
+                "KiCad is reachable but has no PCB editor at its IPC endpoint.".to_string()
+            }
         }
     }
 
@@ -232,6 +238,13 @@ impl NoLiveBoard {
                 "kind": "board_not_open",
                 "message": answer
             }),
+            Self::NoPcbEditor(answer) => json!({
+                "kind": "no_pcb_editor_at_endpoint",
+                "message": format!(
+                    "KiCad answered that no PCB editor is at its IPC endpoint ({answer}) and no \
+                     exact-board sibling lock was present."
+                )
+            }),
         }
     }
 
@@ -243,6 +256,11 @@ impl NoLiveBoard {
                 "KiCad IPC was unreachable, so Konnect could not contact a live editor; no exact-board sibling lock was present.".to_string()
             }
             Self::NotOpen(answer) => format!("KiCad was reachable, and {answer}"),
+            Self::NoPcbEditor(_) => {
+                "KiCad was reachable and has no PCB editor at its IPC endpoint (the project \
+                 manager is running without one); no exact-board sibling lock was present."
+                    .to_string()
+            }
         };
         format!(
             "{observed} This board has not been observed live during the current Konnect server \
@@ -272,6 +290,10 @@ impl NoLiveBoard {
 /// * A reachable KiCAD that does not hold this board is a third answer, not a
 ///   refusal: it has no unsaved state for a board it never opened, so the file
 ///   is authoritative and the edit proceeds there.
+/// * A KiCad whose endpoint has no PCB editor at all (`AS_UNHANDLED`: the
+///   project manager with no board open) holds no board either, but says
+///   nothing about a standalone PCB editor that could not claim the endpoint.
+///   See [`no_pcb_editor_verdict`].
 pub(crate) async fn attempt_ipc_write<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,
@@ -291,11 +313,16 @@ where
             LiveBoard::Uncertain(message) => {
                 BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
             }
-            // An endpoint that served no board is mapped exactly as a
-            // rejection, which is what it was before those cases had names —
-            // `observed_live` and `absence` deliberately unread here. Whether
-            // a write should instead treat a proven-absent editor as
-            // permission is #577's question, not this one's.
+            LiveBoard::Unserved {
+                absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
+                message,
+                observed_live,
+            } => match no_pcb_editor_verdict(ctx, board_path, observed_live) {
+                Some(refusal) => BoardWrite::Refused(refusal),
+                None => BoardWrite::File(NoLiveBoard::NoPcbEditor(message)),
+            },
+            // A build that does not implement the open-document command says
+            // nothing about its editors, so it stays a rejection.
             LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
                 BoardWrite::Refused(CallToolResult::error(format!(
                     "KiCAD rejected the {what} over IPC: {message}. \
@@ -323,6 +350,36 @@ where
             } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
         },
     )
+}
+
+/// What an endpoint with no PCB editor (`AS_UNHANDLED` for the open-document
+/// command) permits: `None` when the saved file may be edited, the refusal
+/// otherwise.
+///
+/// The answer proves the process behind the endpoint has no PCB editor, so it
+/// holds no board in memory. It does not speak for other KiCad processes: a
+/// standalone PCB editor started while the project manager owns the endpoint
+/// holds its board without being reachable at all (on Windows both use one
+/// pipe name and the first process keeps it). That editor is covered by the
+/// evidence the unreachable-transport case already rests on, KiCad's own
+/// sibling lock, which it creates when it opens the board and removes when it
+/// closes it. So the rule is the unreachable rule: a lock, or a lock that
+/// cannot be inspected, refuses; and a board this process watched KiCad hold
+/// is released only by the clean-close lock evidence in `board_session`.
+fn no_pcb_editor_verdict(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    observed_live: bool,
+) -> Option<CallToolResult> {
+    if observed_live && !ctx.board_session.authorize_file_fallback(board_path) {
+        return Some(lost_board_refusal(
+            board_path,
+            "Konnect previously reached KiCad with this board open, and KiCad now has no PCB \
+             editor at its IPC endpoint.",
+            true,
+        ));
+    }
+    board_lock_refusal(board_path)
 }
 
 /// A board observed live and now out of reach. When the transport is what
@@ -419,14 +476,18 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
                  be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
                  there) and retry — this tool has no IPC path for a live board yet."
             ))),
+            // No PCB editor at the endpoint: the same verdict as
+            // `attempt_ipc_write`, lock included. Without the lock check a
+            // standalone PCB editor the project manager's endpoint hides would
+            // have its project file edited behind it.
+            LiveBoard::Unserved {
+                absence: crate::tools::BoardEditorAbsence::NoPcbEditor,
+                observed_live,
+                ..
+            } => no_pcb_editor_verdict(ctx, board_path, observed_live),
             // KiCad answered at all, so it may hold this board; a rejection is
             // not the proof of absence this guard needs, and it is not proof of
             // presence either. It refuses nothing.
-            //
-            // An endpoint that served no board lands here for the same reason
-            // it does in `attempt_ipc_write`: preserved as it was before those
-            // cases had names, not decided. These two gates disagree about what
-            // it permits, and that disagreement is #577's to settle.
             LiveBoard::Rejected(_) | LiveBoard::Unserved { .. } | LiveBoard::NotOpen { .. } => None,
             LiveBoard::Uncertain(message) => Some(crate::tools::ipc_uncertain_result(&message)),
             LiveBoard::Recovered(message) => Some(crate::tools::ipc_recovered_result(&message)),
@@ -3767,49 +3828,172 @@ mod board_session_safety_tests {
         kiapi::common::ApiStatusCode::AsUnimplemented,
     ];
 
-    /// Pins today's mapping, not a decision. A mutating tool whose KiCad
-    /// serves no board refuses and leaves the file alone, exactly as it did
-    /// before #656 gave those answers a name. Whether an editor proven absent
-    /// should permit the file edit is #577's question; this test exists so
-    /// that answer shows up as a changed test rather than a silent one.
-    #[tokio::test]
-    async fn a_mutating_tool_refuses_when_kicad_serves_no_board() {
-        for status in SERVING_NO_BOARD {
-            let dir = tempfile::tempdir().unwrap();
-            let board = super::mounting_hole_tests::blank_board(dir.path());
-            let before = std::fs::read(&board).unwrap();
-            let server = spawn_kicad_serving_no_board(status);
-            let ctx = ctx_talking_to(server.address().to_string());
+    fn add_hole(board: &std::path::Path) -> serde_json::Value {
+        json!({ "board": board.to_string_lossy(), "x": 5.0, "y": 6.0, "reference": "H1" })
+    }
 
-            let result = super::handle_add_mounting_hole(
-                &json!({
-                    "board": board.to_string_lossy(),
-                    "x": 5.0,
-                    "y": 6.0,
-                    "reference": "H1"
-                }),
-                &ctx,
-            )
+    /// A build that does not implement the open-document command says nothing
+    /// about its editors: a mutating tool refuses and leaves the file alone.
+    #[tokio::test]
+    async fn a_mutating_tool_refuses_when_kicad_cannot_name_its_open_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnimplemented);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = super::handle_add_mounting_hole(&add_hole(&board), &ctx)
             .await
             .unwrap();
 
-            let text = super::mounting_hole_tests::result_text(&result);
-            assert!(result.is_error, "{status:?} was written: {text}");
-            assert!(
-                text.contains("The board file was not modified"),
-                "{status:?}: {text}"
-            );
-            assert_eq!(std::fs::read(&board).unwrap(), before, "{status:?}");
+        let text = super::mounting_hole_tests::result_text(&result);
+        assert!(result.is_error, "{text}");
+        assert!(text.contains("The board file was not modified"), "{text}");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// The project manager with no PCB editor (`AS_UNHANDLED`) holds no board,
+    /// and no lock sits beside this one: the saved file is edited, and the
+    /// result says on what evidence.
+    #[tokio::test]
+    async fn a_mutating_tool_edits_the_file_when_kicad_has_no_pcb_editor_and_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnhandled);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = super::handle_add_mounting_hole(&add_hole(&board), &ctx)
+            .await
+            .unwrap();
+
+        let text = super::mounting_hole_tests::result_text(&result);
+        assert!(!result.is_error, "{text}");
+        assert_ne!(std::fs::read(&board).unwrap(), before);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["fallback_reason"]["kind"], "no_pcb_editor_at_endpoint",
+            "{text}"
+        );
+    }
+
+    /// The case the lock exists for: a standalone PCB editor holds the board
+    /// while the project manager owns the endpoint and answers for it. Both
+    /// gates refuse on the lock, and a lock that cannot be read is no better.
+    #[tokio::test]
+    async fn no_pcb_editor_at_the_endpoint_does_not_outrank_a_sibling_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock, "{}").unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnhandled);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let write = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+        let BoardWrite::Refused(refusal) = write else {
+            panic!("a locked board must not be edited")
+        };
+        assert_eq!(error_reason(&refusal), "kicad_lock_present");
+
+        let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("the file-only guard must refuse a locked board too");
+        assert_eq!(error_reason(&guarded), "kicad_lock_present");
+
+        let closure = crate::tools::closed_board::prove_closed(&ctx, &board, "test edit")
+            .await
+            .unwrap();
+        assert!(closure.is_err(), "closure must not be proven beside a lock");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+        assert!(lock.exists(), "the lock is KiCad's and is left alone");
+    }
+
+    /// With no lock, the strict closed-board proof passes and records what it
+    /// rested on.
+    #[tokio::test]
+    async fn closure_is_proven_when_kicad_has_no_pcb_editor_and_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnhandled);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let closure = crate::tools::closed_board::prove_closed(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("closure is proven");
+
+        assert_eq!(closure["proven_closed"], true);
+        assert_eq!(closure["evidence"]["kind"], "no_pcb_editor_at_endpoint");
+        assert_eq!(closure["kicad_sibling_lock"], "absent");
+
+        // The build that cannot name its documents proves nothing.
+        let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnimplemented);
+        let ctx = ctx_talking_to(server.address().to_string());
+        assert!(
+            crate::tools::closed_board::prove_closed(&ctx, &board, "test edit")
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    /// A board this process watched KiCad hold is not released by the editor
+    /// merely being gone from the endpoint: only a lock seen and then removed
+    /// (KiCad's own clean close) releases it, in both gates.
+    #[tokio::test]
+    async fn a_board_seen_live_needs_clean_close_evidence_once_the_editor_is_gone() {
+        for clean_close in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = super::mounting_hole_tests::blank_board(dir.path());
+            let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+            let server = spawn_kicad_serving_no_board(kiapi::common::ApiStatusCode::AsUnhandled);
+            let ctx = ctx_talking_to(server.address().to_string());
+            if clean_close {
+                // Seen live with its lock, which KiCad then removed.
+                std::fs::write(&lock, "{}").unwrap();
+                ctx.board_session.observe_live(&board);
+                std::fs::remove_file(&lock).unwrap();
+            } else {
+                // Seen live with no lock: nothing can show how it went away.
+                ctx.board_session.observe_live(&board);
+            }
+
+            let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+                .await
+                .unwrap();
+            let write = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                .await
+                .unwrap();
+
+            if clean_close {
+                assert!(guarded.is_none());
+                assert!(matches!(
+                    write,
+                    BoardWrite::File(NoLiveBoard::NoPcbEditor(_))
+                ));
+            } else {
+                assert_eq!(
+                    error_reason(&guarded.expect("the file-only guard refuses")),
+                    "board_previously_observed_live"
+                );
+                let BoardWrite::Refused(refusal) = write else {
+                    panic!("a board seen live without close evidence must refuse")
+                };
+                assert_eq!(error_reason(&refusal), "board_previously_observed_live");
+            }
         }
     }
 
-    /// The other gate's half of the same preserved mapping. The file-only
-    /// guard, for tools with no IPC path, lets the edit through when KiCad
-    /// serves no board, as it let any rejection through before #656. The two
-    /// gates disagree about this state and that disagreement is #577's to
-    /// settle; pinned here so it cannot move by accident.
+    /// The file-only guard, for tools with no IPC path, still lets the edit
+    /// through when KiCad serves no board and no lock is present, for both
+    /// answers: it always did, and an unimplemented command refuses nothing
+    /// there.
     #[tokio::test]
-    async fn the_file_only_guard_still_lets_an_unserved_endpoint_through() {
+    async fn the_file_only_guard_lets_an_unserved_endpoint_through_when_no_lock_is_present() {
         for status in SERVING_NO_BOARD {
             let dir = tempfile::tempdir().unwrap();
             let board = super::mounting_hole_tests::blank_board(dir.path());
