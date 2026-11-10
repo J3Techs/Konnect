@@ -10,8 +10,23 @@
 //! every candidate is checked exactly against every layer (annulus and stub
 //! clearance with the resolved rules, hole to hole, hole clearance, board
 //! edge, keepouts, the via floor), the via stays out of other nets' islands
-//! on every layer it passes, a via never lands on an SMD pad of its own net,
-//! and sites of different pads are placed so they clear each other.
+//! on every layer it passes, a via never lands on an SMD pad of its own net
+//! (unless the caller names the pad, below), and sites of different pads are
+//! placed so they clear each other.
+//!
+//! # Via-in-pad
+//!
+//! A pad the caller names ([`TapOptions::via_in_pad`]) may take a via of its
+//! own net inside it, for a large pad with no legal site beside it. The
+//! via's copper must lie wholly inside one copper shape of the pad (a via
+//! across the pad's edge is refused), and every other check stays: the via
+//! floor, clearance to other nets on every layer, hole to hole, hole
+//! clearance, the board edge, rule areas, islands and keep-out boxes. Such
+//! a site has no stub, since the pad itself joins the via, and says which
+//! pad it is in ([`TapSite::in_pad`]). Sites inside the pad are tried before
+//! the exits beside it, the pad's copper centre first. A pad that is not
+//! named is never entered, and a pad whose copper the loader could only
+//! approximate holds no via.
 //!
 //! Zones the caller names to carve ([`TapOptions::carve_zones`]) are ones a
 //! refill will cut an antipad into around the via, on whichever copper
@@ -40,9 +55,13 @@ pub struct TapSite {
     pub at: Point,
     /// `None` for a through-hole pad, which needs no via.
     pub via: Option<(Coord, Coord)>,
-    /// Stub from the pad's copper centre to the via, on `layer`.
+    /// Stub from the pad's copper centre to the via, on `layer`. `None`
+    /// also for a via inside its own pad.
     pub stub: Option<(Point, Point, Coord)>,
     pub layer: LayerId,
+    /// The pad named for via-in-pad the via sits wholly inside.
+    #[serde(default)]
+    pub in_pad: Option<PadId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -95,6 +114,10 @@ pub struct TapOptions {
     /// Boxes no tap via or stub may touch.
     #[serde(default)]
     pub keepouts: Vec<BBox>,
+    /// SMD pads that may take a via of their own net inside them (see the
+    /// module documentation). Default: none.
+    #[serde(default)]
+    pub via_in_pad: Vec<PadId>,
 }
 
 /// Plan a tap for each of `pads` (a pad listed twice is planned once).
@@ -112,7 +135,7 @@ pub fn plan_tap_vias(
 ) -> TapPlan {
     let options = TapOptions {
         carve_zones: carve_zones.to_vec(),
-        keepouts: Vec::new(),
+        ..TapOptions::default()
     };
     plan_tap_vias_with(board, rules, pads, target, &options, settings)
 }
@@ -138,6 +161,9 @@ pub fn plan_tap_vias_with(
         .iter()
         .filter_map(|b| ConvexPoly::axis_rect(*b, 0).map(Shape::ConvexPoly))
         .collect();
+    let mut via_in_pad = options.via_in_pad.clone();
+    via_in_pad.sort_unstable();
+    via_in_pad.dedup();
     let mut plan = TapPlan::default();
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
@@ -166,6 +192,7 @@ pub fn plan_tap_vias_with(
                     via: None,
                     stub: None,
                     layer: target,
+                    in_pad: None,
                 },
             );
             continue;
@@ -187,6 +214,7 @@ pub fn plan_tap_vias_with(
         carved: &carved,
         target: &[],
         keepouts: &keepouts,
+        via_in_pad: &via_in_pad,
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
         .par_iter()
@@ -224,8 +252,9 @@ pub fn plan_tap_vias_with(
                         net: u.net,
                         at: c.via,
                         via: Some((c.diameter, c.drill)),
-                        stub: Some((c.stub.a, c.stub.b, c.stub.width)),
+                        stub: c.stub.map(|s| (s.a, s.b, s.width)),
                         layer: c.layer,
+                        in_pad: c.in_pad,
                     },
                 );
             }
@@ -283,6 +312,11 @@ pub struct ViaSiteRefusal {
 /// islands of zones named in `carve_zones`. Other nets' base pours are not
 /// obstacles (a refill pours around the via). Copper planned elsewhere is
 /// checked only when the caller has frozen it into `board`.
+///
+/// A pad in `via_in_pad` may hold the via when it is of `net` and the via's
+/// copper lies wholly inside the pad's (see the module documentation);
+/// `Ok` names the pad the via is then in.
+#[allow(clippy::too_many_arguments)]
 pub fn check_via_site(
     board: &RouteBoard,
     rules: &dyn RuleTable,
@@ -291,7 +325,11 @@ pub fn check_via_site(
     diameter: Coord,
     drill: Coord,
     carve_zones: &[String],
-) -> Result<(), ViaSiteRefusal> {
+    via_in_pad: &[PadId],
+) -> Result<Option<PadId>, ViaSiteRefusal> {
+    let mut via_in_pad = via_in_pad.to_vec();
+    via_in_pad.sort_unstable();
+    via_in_pad.dedup();
     let settings = FanoutSettings {
         require_own_plane: false,
         clear_of_zones_on: None,
@@ -307,10 +345,11 @@ pub fn check_via_site(
         carved: &carved,
         target: &[],
         keepouts: &[],
+        via_in_pad: &via_in_pad,
     };
     let mut cache = ClearanceCache::default();
     match check_via(&ctx, &mut cache, net, center, diameter, drill, &[]) {
-        Ok(_) => Ok(()),
+        Ok((_, in_pad)) => Ok(in_pad),
         Err(why) => {
             let mut out = ViaSiteRefusal {
                 reason: why.label(),
@@ -322,7 +361,9 @@ pub fn check_via_site(
             match why {
                 ViaReject::Island(z) | ViaReject::TargetZone(z) => out.zone = Some(z),
                 ViaReject::Floor(f) => out.floor = Some(f),
-                ViaReject::OwnSmdPad(p) => out.item = Some(ItemRef::Pad(p)),
+                ViaReject::OwnSmdPad(p) | ViaReject::PartlyOutsidePad(p) => {
+                    out.item = Some(ItemRef::Pad(p))
+                }
                 ViaReject::Conflict(c) => match c {
                     Conflict::Copper { item, .. }
                     | Conflict::HoleToHole { item }
@@ -542,8 +583,8 @@ mod tests {
             Point::new(at.x + 100_000, at.y + 100_000),
         );
         let options = TapOptions {
-            carve_zones: Vec::new(),
             keepouts: vec![b],
+            ..TapOptions::default()
         };
         let plan = plan_tap_vias_with(
             &board,
@@ -565,11 +606,11 @@ mod tests {
         assert!(!touches(&Shape::Segment(Segment::new(a, z, w)), &ko));
         // A box over the whole pad leaves no site at all.
         let everything = TapOptions {
-            carve_zones: Vec::new(),
             keepouts: vec![BBox::new(
                 Point::new(0, 0),
                 Point::new(30_000_000, 20_000_000),
             )],
+            ..TapOptions::default()
         };
         let plan = plan_tap_vias_with(
             &board,
@@ -592,16 +633,16 @@ mod tests {
         let rules = UniformRules::default();
         let net = board.net_by_name("P5V").unwrap();
         let at = Point::new(12_000_000, 10_000_000);
-        let r = check_via_site(&board, &rules, net, at, 600_000, 300_000, &[]).unwrap_err();
+        let r = check_via_site(&board, &rules, net, at, 600_000, 300_000, &[], &[]).unwrap_err();
         assert_eq!(r.reason, "via: inside another net's island");
         assert_eq!(r.zone, Some(ZoneId(1)));
         let carve = ["P12V island".to_string()];
         assert_eq!(
-            check_via_site(&board, &rules, net, at, 600_000, 300_000, &carve),
-            Ok(())
+            check_via_site(&board, &rules, net, at, 600_000, 300_000, &carve, &[]),
+            Ok(None)
         );
         // Below the floor (UniformRules' floor is the class via).
-        let r = check_via_site(&board, &rules, net, at, 500_000, 300_000, &carve).unwrap_err();
+        let r = check_via_site(&board, &rules, net, at, 500_000, 300_000, &carve, &[]).unwrap_err();
         assert_eq!(r.reason, "via: below the via floor here");
         assert!(r.floor.is_some());
         // Too close to another net's via.
@@ -618,9 +659,185 @@ mod tests {
             600_000,
             300_000,
             &[],
+            &[],
         )
         .unwrap_err();
         assert_eq!(r.reason, "via: copper clearance");
         assert_eq!(r.item, Some(ItemRef::Via(crate::api::ViaId(0))));
+    }
+
+    /// A 3.3 x 2.5 mm GND pad at (20, 20) on F.Cu (an SMC diode's anode),
+    /// framed 0.3 mm away on every side by 8 mm of P5V pad copper, so no
+    /// site beside it is legal. Pad 0 is the GND pad.
+    fn boxed_pad_board() -> RouteBoard {
+        let mut b = BoardBuilder::new(40.0, 40.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        for n in ["GND", "P5V"] {
+            b.net(n);
+        }
+        let d = b.footprint("D1", (20.0, 20.0));
+        b.smd_pad(d, "2", "GND", (20.0, 20.0), (3.3, 2.5), "F.Cu");
+        let f = b.footprint("X1", (20.0, 20.0));
+        b.smd_pad(f, "1", "P5V", (20.0, 14.45), (19.9, 8.0), "F.Cu");
+        b.smd_pad(f, "2", "P5V", (20.0, 25.55), (19.9, 8.0), "F.Cu");
+        b.smd_pad(f, "3", "P5V", (14.05, 20.0), (8.0, 3.1), "F.Cu");
+        b.smd_pad(f, "4", "P5V", (25.95, 20.0), (8.0, 3.1), "F.Cu");
+        b.build()
+    }
+
+    fn tap(board: &RouteBoard, via_in_pad: &[PadId]) -> TapPlan {
+        let options = TapOptions {
+            via_in_pad: via_in_pad.to_vec(),
+            ..TapOptions::default()
+        };
+        plan_tap_vias_with(
+            board,
+            &UniformRules::default(),
+            &[PadId(0)],
+            board.layers.by_name("In2.Cu").unwrap(),
+            &options,
+            &FanoutSettings::default(),
+        )
+    }
+
+    #[test]
+    fn a_pad_named_for_via_in_pad_takes_its_via_at_the_copper_centre_without_a_stub() {
+        let board = boxed_pad_board();
+        // As ever without the opt-in: the pad is never entered, and here
+        // nothing beside it is legal.
+        let plan = tap(&board, &[]);
+        assert!(plan.sites.is_empty(), "{:?}", plan.sites);
+        assert_eq!(plan.failed, vec![(PadId(0), FanoutFailure::NoLegalSite)]);
+
+        let plan = tap(&board, &[PadId(0)]);
+        assert!(plan.failed.is_empty(), "{:?}", plan.details);
+        let site = &plan.sites[0];
+        assert_eq!(site.in_pad, Some(PadId(0)));
+        assert_eq!(site.at, Point::new(20_000_000, 20_000_000));
+        assert_eq!(site.via, Some((600_000, 300_000)));
+        assert_eq!(site.stub, None, "the pad is the join");
+        let copper = plan.routed(&board);
+        assert_eq!((copper.vias.len(), copper.tracks.len()), (1, 0));
+        let report = check_routed(&board, &UniformRules::default(), &copper);
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    #[test]
+    fn naming_a_pad_changes_nothing_for_the_pads_that_are_not_named() {
+        // The two-cap board: C1.1 named, C2.1 not. C2.1's site is the one
+        // it gets with nothing named, beside the pad. (C1.1's 0.6 mm pad is
+        // as large as the via, which so fits only at its centre.)
+        let board = board();
+        let rules = UniformRules::default();
+        let target = board.layers.by_name("In2.Cu").unwrap();
+        let pads: Vec<PadId> = board
+            .pads
+            .iter()
+            .filter(|p| p.number == "1")
+            .map(|p| p.id)
+            .collect();
+        let s = FanoutSettings::default();
+        let plain = plan_tap_vias(&board, &rules, &pads, target, &[], &s);
+        let options = TapOptions {
+            via_in_pad: vec![pads[0]],
+            ..TapOptions::default()
+        };
+        let named = plan_tap_vias_with(&board, &rules, &pads, target, &options, &s);
+        assert!(named.failed.is_empty(), "{:?}", named.details);
+        assert_eq!(named.sites[1], plain.sites[1]);
+        assert_eq!(named.sites[1].in_pad, None);
+        assert_eq!(named.sites[0].in_pad, Some(pads[0]));
+        assert_eq!(
+            named.sites[0].at,
+            copper_center(&board.pads[pads[0].index()].shapes).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_single_site_in_a_named_pad_must_be_wholly_inside_it_and_of_its_net() {
+        let board = boxed_pad_board();
+        let rules = UniformRules::default();
+        let gnd = board.net_by_name("GND").unwrap();
+        let p5v = board.net_by_name("P5V").unwrap();
+        let pad = PadId(0);
+        let site = |net, x: Coord, named: &[PadId]| {
+            let at = Point::new(x, 20_000_000);
+            check_via_site(&board, &rules, net, at, 600_000, 300_000, &[], named)
+        };
+        // Not named: refused as it always was.
+        let r = site(gnd, 20_000_000, &[]).unwrap_err();
+        assert_eq!(r.reason, "via: on an SMD pad of its own net");
+        assert_eq!(r.item, Some(ItemRef::Pad(pad)));
+        // Named: accepted, and the reply names the pad. Touching the pad's
+        // edge from inside still counts (the edge is at x = 21.65 mm).
+        assert_eq!(site(gnd, 20_000_000, &[pad]), Ok(Some(pad)));
+        assert_eq!(site(gnd, 21_350_000, &[pad]), Ok(Some(pad)));
+        // A nanometre farther the via crosses the edge.
+        let r = site(gnd, 21_350_001, &[pad]).unwrap_err();
+        assert_eq!(r.reason, "via: partly outside the pad named for via-in-pad");
+        assert_eq!(r.item, Some(ItemRef::Pad(pad)));
+        // Another net's via in the named pad: the clearances to the pad
+        // stand, named or not (the hole's is the first one found).
+        let r = site(p5v, 20_000_000, &[pad]).unwrap_err();
+        assert_eq!(r.reason, "via: hole clearance");
+        assert_eq!(r.item, Some(ItemRef::Pad(pad)));
+        // And naming a pad of another net admits no via of this one.
+        let other = PadId(1);
+        let at = board.pads[1].center;
+        let r =
+            check_via_site(&board, &rules, gnd, at, 600_000, 300_000, &[], &[other]).unwrap_err();
+        assert_eq!(r.reason, "via: hole clearance");
+        assert_eq!(r.item, Some(ItemRef::Pad(other)));
+    }
+
+    #[test]
+    fn a_disc_is_inside_a_pad_only_when_one_copper_shape_holds_all_of_it() {
+        let mut board = boxed_pad_board();
+        let c = Point::new(20_000_000, 20_000_000);
+        let at = |dx: Coord, dy: Coord| Point::new(c.x + dx, c.y + dy);
+        let mut holds = |shape: Shape, p: Point, r: Coord| {
+            board.pads[0].shapes = vec![shape];
+            disc_within_pad(&board.pads[0], p, r)
+        };
+        // A round pad of radius 1 mm.
+        let round = || Shape::Circle(Circle::new(c, 1_000_000));
+        assert!(holds(round(), at(700_000, 0), 300_000));
+        assert!(!holds(round(), at(700_001, 0), 300_000));
+        assert!(!holds(round(), c, 1_000_001));
+        // An oval pad: a 2 mm long, 1 mm wide stadium along x.
+        let oval = || Shape::Segment(Segment::new(at(-1_000_000, 0), at(1_000_000, 0), 1_000_000));
+        assert!(holds(oval(), at(1_200_000, 0), 300_000));
+        assert!(!holds(oval(), at(1_200_001, 0), 300_000));
+        assert!(holds(oval(), at(500_000, 200_000), 300_000));
+        assert!(!holds(oval(), at(500_000, 200_001), 300_000));
+        // A sharp 2 x 1 mm rectangle.
+        let rect = |radius: Coord, half: (Coord, Coord)| {
+            let b = BBox::new(at(-half.0, -half.1), at(half.0, half.1));
+            Shape::ConvexPoly(ConvexPoly::axis_rect(b, radius).unwrap())
+        };
+        let sharp = || rect(0, (1_000_000, 500_000));
+        assert!(holds(sharp(), at(700_000, 200_000), 300_000));
+        assert!(!holds(sharp(), at(700_001, 200_000), 300_000));
+        assert!(!holds(sharp(), at(700_000, 200_001), 300_000));
+        // The same extent with corners rounded by 0.25 mm, less than the
+        // disc's radius: the disc still fits into the corner, and no
+        // farther along either edge.
+        let rounded = || rect(250_000, (750_000, 250_000));
+        assert!(holds(rounded(), at(700_000, 200_000), 300_000));
+        assert!(!holds(rounded(), at(700_001, 200_000), 300_000));
+        assert!(!holds(rounded(), at(700_000, 200_001), 300_000));
+        assert!(holds(rounded(), at(700_000, 0), 300_000));
+        assert!(!holds(rounded(), at(700_001, 0), 300_000));
+        // A disc smaller than the rounding fits into the corner's arc only.
+        let k = 176_776; // 0.25 mm / sqrt(2), rounded down
+        assert!(holds(
+            rounded(),
+            at(750_000 + k / 2, 250_000 + k / 2),
+            100_000
+        ));
+        assert!(!holds(rounded(), at(750_000 + k, 250_000 + k), 100_000));
+        // Copper the loader could only approximate holds nothing.
+        board.pads[0].shapes = vec![rect(0, (1_000_000, 500_000))];
+        board.pads[0].approximated = true;
+        assert!(!disc_within_pad(&board.pads[0], c, 300_000));
     }
 }

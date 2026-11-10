@@ -1269,3 +1269,127 @@ async fn carve_zones_must_name_a_zone_on_the_layer_used() {
     let r = check(json!(["GND plane"])).await;
     assert!(!r.is_error, "{}", text(&r));
 }
+
+// ─── plan_tap_vias: via-in-pad ───────────────────────────────────────────────
+
+/// A 3.3 x 2.5 mm GND pad (D1.2, an SMC diode's anode) at (20, 20), framed
+/// 0.3 mm away on every side by P5V pad copper 8 mm deep, so no via beside
+/// it is legal.
+const BOXED_PAD_BOARD: &str = r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(layers
+		(0 "F.Cu" signal)
+		(4 "In1.Cu" signal)
+		(6 "In2.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+	)
+	(footprint "D_SMC"
+		(layer "F.Cu")
+		(at 20 20)
+		(property "Reference" "D1" (at 0 -3 0) (layer "F.SilkS"))
+		(pad "2" smd rect (at 0 0) (size 3.3 2.5) (layers "F.Cu" "F.Mask") (net "GND"))
+	)
+	(footprint "Frame"
+		(layer "F.Cu")
+		(at 20 20)
+		(property "Reference" "X1" (at 0 -12 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 -5.55) (size 19.9 8) (layers "F.Cu" "F.Mask") (net "P5V"))
+		(pad "2" smd rect (at 0 5.55) (size 19.9 8) (layers "F.Cu" "F.Mask") (net "P5V"))
+		(pad "3" smd rect (at -5.95 0) (size 8 3.1) (layers "F.Cu" "F.Mask") (net "P5V"))
+		(pad "4" smd rect (at 5.95 0) (size 8 3.1) (layers "F.Cu" "F.Mask") (net "P5V"))
+	)
+	(gr_rect (start 0 0) (end 40 40) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts"))
+)
+"#;
+
+#[tokio::test]
+async fn plan_tap_vias_puts_the_via_inside_a_pad_only_when_via_in_pad_names_it() {
+    let f = files_with(BOXED_PAD_BOARD);
+    let args = |out: &str, extra: Value| {
+        with(
+            json!({ "board": f.board(), "pads": ["D1.2"], "target_layer": "In2.Cu",
+                    "output_plan": f.path(out) }),
+            extra,
+        )
+    };
+    // Without the opt-in the pad is never entered, and nothing beside it
+    // is legal.
+    let r = route_plan_tools::handle_plan_tap_vias(&args("plain.json", json!({})), &ctx())
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["sites"], json!([]), "{b}");
+    assert_eq!(b["failed"][0]["pad"], "D1.2", "{b}");
+    assert_eq!(b["via_in_pad"], json!([]));
+    assert_eq!(b["vias_in_pad"], 0);
+    assert_eq!(b["plan_written"], false);
+
+    // Named: the via sits at the pad's centre, with no stub, flagged.
+    let out = f.path("in_pad.json");
+    let r = route_plan_tools::handle_plan_tap_vias(
+        &args("in_pad.json", json!({ "via_in_pad": ["D1.2"] })),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["failed"], json!([]), "{b}");
+    let site = &b["sites"][0];
+    assert_eq!(site["pad"], "D1.2");
+    assert_eq!(site["via_in_pad"], true, "{b}");
+    assert_eq!(
+        (site["x"].as_f64(), site["y"].as_f64()),
+        (Some(20.0), Some(20.0))
+    );
+    assert_eq!(site["stub"], Value::Null, "the pad is the join");
+    assert_eq!(site["via"]["diameter_mm"], 0.6);
+    assert_eq!(b["via_in_pad"], json!(["D1.2"]));
+    assert_eq!(b["vias_in_pad"], 1);
+    assert_eq!(
+        (b["vias"].as_u64(), b["stubs"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(b["plan_written"], true);
+    // The written file passes the independent rule check too.
+    let r = route_native::handle_check_route_rules(
+        &json!({ "board": f.board(), "routing_file": out }),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(body(&r)["violations"], 0, "{}", text(&r));
+}
+
+#[tokio::test]
+async fn plan_tap_vias_refuses_a_via_in_pad_name_that_is_not_a_tapped_smd_pad() {
+    let f = files_with(BOXED_PAD_BOARD);
+    for (names, needle) in [
+        (json!(["X1.1"]), "is not one of pads"),
+        (json!(["D1.9"]), "no such pad"),
+        (json!(["D1"]), "REFERENCE.NUMBER"),
+    ] {
+        let a = json!({ "board": f.board(), "pads": ["D1.2"], "target_layer": "In2.Cu",
+                        "output_plan": f.path("no.json"), "via_in_pad": names });
+        let r = route_plan_tools::handle_plan_tap_vias(&a, &ctx())
+            .await
+            .unwrap();
+        assert!(r.is_error, "{names}");
+        assert_eq!(field_of(&r), "via_in_pad", "{}", text(&r));
+        assert!(text(&r).contains(needle), "{}", text(&r));
+        assert!(!Path::new(&f.path("no.json")).exists());
+    }
+    // A through-hole pad needs no via.
+    let f = files();
+    let a = json!({ "board": f.board(), "pads": ["J1.2"], "target_layer": "In2.Cu",
+                    "output_plan": f.path("no.json"), "via_in_pad": ["J1.2"] });
+    let r = route_plan_tools::handle_plan_tap_vias(&a, &ctx())
+        .await
+        .unwrap();
+    assert_eq!(field_of(&r), "via_in_pad", "{}", text(&r));
+    assert!(text(&r).contains("is not an SMD pad"), "{}", text(&r));
+}

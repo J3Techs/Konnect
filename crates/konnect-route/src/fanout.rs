@@ -42,7 +42,9 @@
 //!   included); the same for the stub on its layer;
 //! - hole-to-hole to every hole, hole clearance both ways, copper-to-edge;
 //! - via and track keepouts;
-//! - the via must not overlap any SMD pad (no accidental via-in-pad);
+//! - the via must not overlap any SMD pad (no accidental via-in-pad). The
+//!   tap planner and the single-site check take pads the caller names for
+//!   via-in-pad: see [`tap`];
 //! - on the net's target plane layer ([`choose_planes`]), the via disc grown
 //!   by `plane_margin` lies inside one of the net's filled pieces there, and
 //!   at least `min_spokes` of four spoke directions reach plane copper. On
@@ -630,6 +632,7 @@ pub fn plan_plane_vias_targeting(
         carved: &carved,
         target: &target_pieces,
         keepouts: &[],
+        via_in_pad: &[],
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
         .par_iter()
@@ -692,7 +695,7 @@ pub fn plan_plane_vias_targeting(
                     via: c.via,
                     via_diameter: c.diameter,
                     via_drill: c.drill,
-                    stub: Some((c.stub.a, c.stub.b, c.stub.width)),
+                    stub: c.stub.map(|s| (s.a, s.b, s.width)),
                     layer: c.layer,
                     shared: false,
                 });
@@ -793,6 +796,9 @@ struct Ctx<'a> {
     target: &'a [bool],
     /// Regions no via or stub may touch (caller keep-out boxes).
     keepouts: &'a [Shape],
+    /// SMD pads the caller names for via-in-pad, ascending: a via of the
+    /// pad's net may sit wholly inside one (empty: never).
+    via_in_pad: &'a [PadId],
 }
 
 impl Ctx<'_> {
@@ -956,9 +962,12 @@ struct Cand {
     via: Point,
     diameter: Coord,
     drill: Coord,
-    stub: Segment,
+    /// `None` for a via inside the pad it serves: the pad is the join.
+    stub: Option<Segment>,
     via_key: SubjectKey,
     stub_key: SubjectKey,
+    /// The pad named for via-in-pad the via sits wholly inside.
+    in_pad: Option<PadId>,
     cost: i64,
     floor_via: bool,
     min_stub: bool,
@@ -1208,7 +1217,7 @@ fn try_exit(
                 continue;
             }
         }
-        let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers) {
+        let (via_key, in_pad) = match check_via(ctx, cache, net, via, diameter, drill, own_layers) {
             Ok(k) => k,
             Err(why) => {
                 last = (via, why.label(), why.class());
@@ -1247,9 +1256,10 @@ fn try_exit(
                 via,
                 diameter,
                 drill,
-                stub,
+                stub: Some(stub),
                 via_key,
                 stub_key,
+                in_pad,
                 cost,
                 floor_via,
                 min_stub,
@@ -1295,6 +1305,13 @@ fn candidates_with(
         .iter()
         .filter_map(|&p| pad_plan(ctx, net, p))
         .collect();
+
+    // Before any exit: sites inside the pads named for via-in-pad.
+    for pp in &plans {
+        if ctx.via_in_pad.binary_search(&pp.pid).is_ok() {
+            in_pad_candidates(ctx, cache, net, &own_layers, pp, &mut out, &mut rej);
+        }
+    }
 
     // Pass 1: the octilinear and corner exits at the near gaps. Pass 2, only
     // when pass 1 found nothing: more directions, farther out. The far exits
@@ -1364,6 +1381,96 @@ fn candidates_with(
     (out, rej)
 }
 
+/// Sites inside a pad named for via-in-pad: its copper centre and a grid of
+/// one via radius across it. Each lies wholly inside the pad's copper and
+/// is checked like any other via; the cost is the distance from the centre,
+/// so the centre wins where it is legal. No stub: the pad is the join.
+fn in_pad_candidates(
+    ctx: &Ctx<'_>,
+    cache: &mut ClearanceCache,
+    net: NetId,
+    own_layers: &[LayerId],
+    pp: &PadPlan<'_>,
+    out: &mut Vec<Cand>,
+    rej: &mut Rejections,
+) {
+    /// Grid steps tried each side of the centre, per axis.
+    const STEPS: i64 = 12;
+    let outside = ViaReject::PartlyOutsidePad(pp.pid);
+    let refuse = |rej: &mut Rejections, at: Point, why: &'static str, kind: u8| {
+        rej.total += 1;
+        rej.note(why);
+        rej.trials.push((pp.pid, at, why));
+        match kind {
+            1 => rej.plane += 1,
+            2 => rej.spokes += 1,
+            _ => rej.board += 1,
+        }
+    };
+    let Some(bb) = pp.pad.bbox() else {
+        return;
+    };
+    let Some(&(first, _, _)) = pp.sizes.first() else {
+        return;
+    };
+    let half = bb.width().max(bb.height()) / 2;
+    let step = i64::from(radius_of(first)).max(half / STEPS).max(1);
+    let n = (half / step).min(STEPS);
+    let mut any = false;
+    for i in -n..=n {
+        for j in -n..=n {
+            let via = Point::new(
+                (i64::from(pp.c.x) + i * step) as Coord,
+                (i64::from(pp.c.y) + j * step) as Coord,
+            );
+            let fits = |d: Coord| disc_within_pad(pp.pad, via, radius_of(d));
+            if !pp.sizes.iter().any(|s| fits(s.0)) {
+                continue;
+            }
+            any = true;
+            let mut last = (outside.label(), outside.class());
+            let mut placed = false;
+            for &(diameter, drill, floor_via) in pp.sizes.iter().filter(|s| fits(s.0)) {
+                let disc = Shape::Circle(Circle::from_diameter(via, diameter));
+                if ctx.keepouts.iter().any(|k| touches(&disc, k)) {
+                    last = ("via: in a keep-out box", 0);
+                    continue;
+                }
+                match check_via(ctx, cache, net, via, diameter, drill, own_layers) {
+                    Ok((key, in_pad)) => {
+                        rej.total += 1;
+                        out.push(Cand {
+                            pad: pp.pid,
+                            layer: pp.layer,
+                            via,
+                            diameter,
+                            drill,
+                            stub: None,
+                            via_key: key,
+                            stub_key: key,
+                            cost: (via - pp.c).length_f64() as i64
+                                + if floor_via { 400_000 } else { 0 },
+                            floor_via,
+                            min_stub: false,
+                            in_pad,
+                        });
+                        placed = true;
+                        break;
+                    }
+                    Err(why) => last = (why.label(), why.class()),
+                }
+            }
+            if !placed {
+                refuse(rej, via, last.0, last.1);
+            }
+        }
+    }
+    if !any {
+        // The pad is too small for the via (or its copper is approximated).
+        refuse(rej, pp.c, outside.label(), outside.class());
+    }
+}
+
 fn stub_label(c: &Conflict) -> &'static str {
     match c {
         Conflict::Copper { .. } => "stub: copper clearance",
@@ -1400,6 +1507,8 @@ enum ViaReject {
     Conflict(Conflict),
     /// On an SMD pad of the via's own net.
     OwnSmdPad(PadId),
+    /// On a pad named for via-in-pad, but not wholly inside its copper.
+    PartlyOutsidePad(PadId),
 }
 
 impl ViaReject {
@@ -1412,6 +1521,7 @@ impl ViaReject {
             ViaReject::Floor(_) => "via: below the via floor here",
             ViaReject::Conflict(c) => via_label(c),
             ViaReject::OwnSmdPad(_) => "via: on an SMD pad of its own net",
+            ViaReject::PartlyOutsidePad(_) => "via: partly outside the pad named for via-in-pad",
         }
     }
 
@@ -1435,7 +1545,7 @@ fn check_via(
     diameter: Coord,
     drill: Coord,
     own_layers: &[LayerId],
-) -> Result<SubjectKey, ViaReject> {
+) -> Result<(SubjectKey, Option<PadId>), ViaReject> {
     let space = ctx.space;
     let s = ctx.settings;
     let r = radius_of(diameter);
@@ -1522,7 +1632,11 @@ fn check_via(
         return Err(ViaReject::Conflict(c));
     }
     // No via-in-pad by accident: stay off the net's own SMD pads (other
-    // nets' pads are already kept at their clearance).
+    // nets' pads are already kept at their clearance). A pad the caller
+    // names for via-in-pad takes the via when the via's copper lies wholly
+    // inside the pad's: a via across the pad's edge is neither in the pad
+    // nor clear of it.
+    let mut named: Vec<PadId> = Vec::new();
     for l in space.board.layers.all().iter() {
         for id in space.items_near(l, &disc.bbox()) {
             let it = &space.items[id as usize];
@@ -1531,12 +1645,72 @@ fn check_via(
                     && space.board.pads[pid.index()].kind == PadKind::Smd
                     && gap_cmp(&disc, &it.shape, 1) == Ordering::Less
                 {
-                    return Err(ViaReject::OwnSmdPad(pid));
+                    if ctx.via_in_pad.binary_search(&pid).is_err() {
+                        return Err(ViaReject::OwnSmdPad(pid));
+                    }
+                    if !named.contains(&pid) {
+                        named.push(pid);
+                    }
                 }
             }
         }
     }
-    Ok(key)
+    named.sort_unstable();
+    let holds = |pid: &&PadId| disc_within_pad(&space.board.pads[pid.index()], via, r);
+    let in_pad = match (named.iter().find(holds), named.first()) {
+        (Some(p), _) => Some(*p),
+        (None, Some(p)) => return Err(ViaReject::PartlyOutsidePad(*p)),
+        (None, None) => None,
+    };
+    Ok((key, in_pad))
+}
+
+/// Whether the closed disc of radius `r` around `c` lies wholly inside one
+/// copper shape of `pad` (touching its edge from inside counts). Exact. A
+/// pad the loader stored as a superset of its copper holds nothing: the
+/// answer could not be trusted.
+pub(crate) fn disc_within_pad(pad: &crate::board::Pad, c: Point, r: Coord) -> bool {
+    use konnect_geom::{
+        point_segment_distance_cmp, point_shape_distance_cmp, shape_within_polygon,
+    };
+    if pad.approximated || r < 0 {
+        return false;
+    }
+    let disc = Shape::Circle(Circle::new(c, r));
+    pad.shapes.iter().any(|shape| match shape {
+        Shape::Circle(k) => {
+            k.radius >= r && {
+                let d = i128::from(k.radius - r);
+                (c - k.center).length2() <= d * d
+            }
+        }
+        // A stadium: the centre within half the width less the radius of
+        // the centre line (an odd width's half rounds down).
+        Shape::Segment(s) => {
+            s.width / 2 >= r
+                && point_segment_distance_cmp(c, s.a, s.b, i64::from(s.width / 2 - r))
+                    != Ordering::Greater
+        }
+        // Every point within `radius` of the polygon. A disc no larger than
+        // the rounding fits when its centre is within the difference of the
+        // polygon; a larger one when its centre is inside the polygon and at
+        // least the difference from every edge.
+        Shape::ConvexPoly(p) if p.radius() >= r => {
+            ConvexPoly::new(p.points().to_vec(), p.radius() - r).is_some_and(|grown| {
+                point_shape_distance_cmp(c, 0, &Shape::ConvexPoly(grown), 0) != Ordering::Greater
+            })
+        }
+        Shape::ConvexPoly(p) => {
+            let pts = p.points();
+            let d = i64::from(r - p.radius());
+            (0..pts.len()).all(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                (b - a).cross(c - a) >= 0
+                    && point_segment_distance_cmp(c, a, b, d) != Ordering::Less
+            })
+        }
+        Shape::Polygon(p) => shape_within_polygon(&disc, p),
+    })
 }
 
 // ─── Via sharing ─────────────────────────────────────────────────────────────
@@ -1656,9 +1830,11 @@ fn stub_clears(
         return false;
     }
     if o.layer == layer {
-        let c = space.clearance(cache, ctx.rules, key, &o.stub_key, layer);
-        if gap_cmp(stub, &Shape::Segment(o.stub), i64::from(c)) == Ordering::Less {
-            return false;
+        if let Some(other) = o.stub {
+            let c = space.clearance(cache, ctx.rules, key, &o.stub_key, layer);
+            if gap_cmp(stub, &Shape::Segment(other), i64::from(c)) == Ordering::Less {
+                return false;
+            }
         }
     }
     true
@@ -1766,7 +1942,12 @@ fn compatible(
         // Two stubs of one net on one layer may not touch: KiCad measures
         // the angle wherever same-net tracks meet, and a crossing is
         // rarely square.
-        return a.layer != b.layer || !touches(&Shape::Segment(a.stub), &Shape::Segment(b.stub));
+        return match (a.stub, b.stub) {
+            (Some(sa), Some(sb)) => {
+                a.layer != b.layer || !touches(&Shape::Segment(sa), &Shape::Segment(sb))
+            }
+            _ => true,
+        };
     }
     let (da, db) = (
         Shape::Circle(Circle::from_diameter(a.via, a.diameter)),
@@ -1778,22 +1959,26 @@ fn compatible(
             return false;
         }
     }
-    let (sa, sb) = (Shape::Segment(a.stub), Shape::Segment(b.stub));
-    let c = space.clearance(cache, rules, &a.stub_key, &b.via_key, a.layer);
-    if gap_cmp(&sa, &db, i64::from(c)) == Ordering::Less
-        || gap_cmp(&sa, &hb, i64::from(space.hole_clearance)) == Ordering::Less
-    {
-        return false;
+    let (sa, sb) = (a.stub.map(Shape::Segment), b.stub.map(Shape::Segment));
+    if let Some(sa) = &sa {
+        let c = space.clearance(cache, rules, &a.stub_key, &b.via_key, a.layer);
+        if gap_cmp(sa, &db, i64::from(c)) == Ordering::Less
+            || gap_cmp(sa, &hb, i64::from(space.hole_clearance)) == Ordering::Less
+        {
+            return false;
+        }
     }
-    let c = space.clearance(cache, rules, &b.stub_key, &a.via_key, b.layer);
-    if gap_cmp(&sb, &da, i64::from(c)) == Ordering::Less
-        || gap_cmp(&sb, &ha, i64::from(space.hole_clearance)) == Ordering::Less
-    {
-        return false;
+    if let Some(sb) = &sb {
+        let c = space.clearance(cache, rules, &b.stub_key, &a.via_key, b.layer);
+        if gap_cmp(sb, &da, i64::from(c)) == Ordering::Less
+            || gap_cmp(sb, &ha, i64::from(space.hole_clearance)) == Ordering::Less
+        {
+            return false;
+        }
     }
-    if a.layer == b.layer {
+    if let (Some(sa), Some(sb), true) = (&sa, &sb, a.layer == b.layer) {
         let c = space.clearance(cache, rules, &a.stub_key, &b.stub_key, a.layer);
-        if gap_cmp(&sa, &sb, i64::from(c)) == Ordering::Less {
+        if gap_cmp(sa, sb, i64::from(c)) == Ordering::Less {
             return false;
         }
     }
@@ -1802,9 +1987,8 @@ fn compatible(
 
 /// The candidate's copper bounding box (via annulus and stub).
 fn cand_bbox(c: &Cand) -> BBox {
-    Circle::from_diameter(c.via, c.diameter)
-        .bbox()
-        .union(c.stub.bbox())
+    let disc = Circle::from_diameter(c.via, c.diameter).bbox();
+    c.stub.map_or(disc, |s| disc.union(s.bbox()))
 }
 
 /// Islands whose candidates reach farther than this from the island anchor

@@ -975,3 +975,106 @@ async fn renders_lay_a_list_of_routing_files_over_the_board() {
     assert!(!r.is_error, "{}", text(&r));
     assert!(body(&r)["tiles_written"].as_u64().unwrap() >= 1);
 }
+
+// ─── build_route: via-in-pad ─────────────────────────────────────────────────
+
+/// A diode with 3.3 x 2.5 mm pads: D1.2 of GND at (20, 20), D1.1 of P5V at
+/// (12, 20).
+const DIODE_BOARD: &str = r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(general (thickness 1.6))
+	(layers
+		(0 "F.Cu" signal)
+		(4 "In1.Cu" signal)
+		(6 "In2.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+	)
+	(footprint "D_SMC"
+		(layer "F.Cu")
+		(uuid "fp-d1")
+		(at 20 20)
+		(property "Reference" "D1" (at 0 -3 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at -8 0) (size 3.3 2.5) (layers "F.Cu" "F.Mask") (net "P5V") (uuid "pad-d1-1"))
+		(pad "2" smd rect (at 0 0) (size 3.3 2.5) (layers "F.Cu" "F.Mask") (net "GND") (uuid "pad-d1-2"))
+	)
+	(gr_rect (start 0 0) (end 40 40) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts"))
+)
+"#;
+
+#[tokio::test]
+async fn a_new_via_may_sit_inside_an_smd_pad_only_when_via_in_pad_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("demo.kicad_pcb"), DIODE_BOARD).unwrap();
+    std::fs::write(root.join("demo.kicad_pro"), PRO).unwrap();
+    let f = Files { _dir: dir, root };
+    // A GND route on In2.Cu up to a new 0.8 mm via at `end_y` on x = 20.
+    let run = |out: &'static str, end_y: f64, extra: Value| {
+        let args = with(
+            json!({ "board": f.board(), "net": "GND", "layer": "In2.Cu",
+                    "output_plan": f.path(out), "width_mm": 0.5,
+                    "vertices": [xy(20.0, 32.0), xy(20.0, end_y)], "end": { "new_via": {} } }),
+            extra,
+        );
+        async move {
+            crate::tools::route_build::handle_build_route(&args, &ctx())
+                .await
+                .unwrap()
+        }
+    };
+
+    // Not named: refused as it always was.
+    let r = run("plain.json", 20.0, json!({})).await;
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+    assert!(
+        text(&r).contains("via: on an SMD pad of its own net"),
+        "{}",
+        text(&r)
+    );
+    assert!(!Path::new(&f.path("plain.json")).exists());
+
+    // Named: written, checked clean, and the new via says which pad.
+    let r = run("in_pad.json", 20.0, json!({ "via_in_pad": ["D1.2"] })).await;
+    assert!(!r.is_error, "{}", text(&r));
+    let b = body(&r);
+    assert_eq!(b["plan_written"], true, "{b}");
+    assert_eq!(b["check"]["violations"], 0, "{b}");
+    assert_eq!(b["new_vias"][0]["in_pad"], "D1.2", "{b}");
+    assert_eq!(b["new_vias"][0]["at"], json!([20.0, 20.0]));
+
+    // Across the pad's edge (the pad ends at y = 21.25, the via reaches
+    // 21.4): neither in the pad nor clear of it.
+    let r = run("edge.json", 21.0, json!({ "via_in_pad": ["D1.2"] })).await;
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(field_of(&r), "end.new_via", "{}", text(&r));
+    assert!(
+        text(&r).contains("via: partly outside the pad named for via-in-pad")
+            && text(&r).contains("D1.2"),
+        "{}",
+        text(&r)
+    );
+    assert!(!Path::new(&f.path("edge.json")).exists());
+
+    // A new via clear of the named pad is an ordinary via.
+    let r = run("clear.json", 24.0, json!({ "via_in_pad": ["D1.2"] })).await;
+    assert!(!r.is_error, "{}", text(&r));
+    assert_eq!(body(&r)["new_vias"][0]["in_pad"], Value::Null);
+
+    // A pad of another net cannot be named, nor a pad without a new via.
+    let r = run("other.json", 20.0, json!({ "via_in_pad": ["D1.1"] })).await;
+    assert!(r.is_error);
+    assert_eq!(field_of(&r), "via_in_pad", "{}", text(&r));
+    assert!(text(&r).contains("not the route's net GND"), "{}", text(&r));
+    let r = run(
+        "none.json",
+        24.0,
+        json!({ "via_in_pad": ["D1.2"], "end": Value::Null }),
+    )
+    .await;
+    assert!(r.is_error);
+    assert_eq!(field_of(&r), "via_in_pad", "{}", text(&r));
+    assert!(text(&r).contains("new_via"), "{}", text(&r));
+}

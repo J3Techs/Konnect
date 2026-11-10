@@ -3,6 +3,37 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a via may sit inside an SMD pad that is named for it
+
+`plan_tap_vias` and `build_route`'s `new_via` never put a via on an SMD pad of
+its own net. For a large power pad boxed in by other nets' copper that left no
+checked way to drop a via: the only site was inside the pad, and the fallback
+was `add_via`, which checks nothing.
+
+Both tools take `via_in_pad`, a list of SMD pads as `REFERENCE.NUMBER`. For a
+named pad, a via of the pad's net may sit inside it when the via's copper lies
+wholly inside the pad's copper; a via across the pad's edge is refused
+(`via: partly outside the pad named for via-in-pad`). Every other check stays:
+the via floor, clearance to other nets on every layer, hole to hole, hole
+clearance, the board edge, rule areas, islands and keep-out boxes.
+
+- `plan_tap_vias`: each name must be one of `pads`. A named pad's sites inside
+  it are tried with the exits beside it, nearest the pad's copper centre first;
+  such a site has no stub (`stub: null`) and `via_in_pad: true`. The reply
+  echoes `via_in_pad` and counts `vias_in_pad`. Every site now carries
+  `via_in_pad` (false for a via beside its pad).
+- `build_route`: each name must be a pad of the route's net, and the call must
+  place a `new_via`. Each entry of `new_vias` carries `in_pad`: the pad's name,
+  or null.
+
+A name that is not an SMD pad with a net, or whose copper the board model only
+approximates, is refused (`invalid_argument`, field `via_in_pad`). Without the
+argument nothing changes: no via enters an SMD pad.
+
+An open via in a pad wicks solder away from the joint. Name a pad only when
+the fabricator fills and caps its vias, or when that is acceptable for the
+part.
+
 ## Unreleased: plane vias reach one named or chosen plane, and fill slits are copper
 
 `plan_plane_vias` rejected nearly every site of a net that pours on several
