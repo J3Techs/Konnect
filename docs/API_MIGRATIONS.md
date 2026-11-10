@@ -3,6 +3,37 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `edit_component` moves a misplaced footprint zone back with `library_zones`
+
+`edit_component` gains a fourth closed-board aspect, `library_zones`, beside
+`attributes` and `reference_field`; give only one aspect per call. It is the
+repair for an `audit_manufacturing` finding of kind `misplaced_footprint_zone`
+whose `test` is `library_outline`, and that finding's `recommendation` now
+names it. No existing argument or result changes.
+
+- `library_zones: {}` is a dry run. It resolves the footprint's library and
+  reports each of the footprint's own zones with a `state`: `in_place`,
+  `misplaced` (the library's zone, vertex for vertex, somewhere else) or
+  `not_in_library` (not the library's shape: reshaped on the board, or the
+  library changed since). For a misplaced zone it gives `before` and `after`
+  (centre, bounding box, and the points when there are at most 32). `status`
+  is `ready` or `noop`, and `revision` covers the saved board and the library
+  footprint.
+- `library_zones: {"restore": true}` writes, optionally bound to a dry run
+  with `expected_revision`. Each misplaced zone's outline becomes the library
+  outline at the footprint's position, rotation and side, which is where KiCad
+  saves it for an instance placed there. Its `(filled_polygon …)` blocks are
+  removed and its `(fill yes …)` loses the `yes`, since a fill computed where
+  the zone was is stale; refill zones in KiCad afterwards. Zones that are
+  `in_place` or `not_in_library` are never touched, and every byte outside the
+  rewritten clauses is kept, which the write checks on readback.
+
+It needs the exact board closed in KiCad (`run_closed_board_edit` runs it on a
+board KiCad has open) and the footprint's library resolvable; otherwise it
+returns `plan_blocked` and writes nothing. A zone reported by the
+`footprint_extent` test has no library outline to go back to and is not
+repaired here: update the footprint from its library in KiCad.
+
 ## Unreleased: `audit_manufacturing` reports a footprint zone left away from its footprint
 
 No argument changes. `audit_manufacturing`, and through it

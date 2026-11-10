@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 mod attributes;
 pub(crate) mod child_zones;
+mod library_zones;
 pub(crate) mod pad_fabrication;
 pub(crate) mod reference_field;
 mod saved_graphics;
@@ -2972,7 +2973,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
-            "Update a footprint value through live KiCad IPC, or inspect/edit its assembly attributes or its Reference field's presentation in the saved board while KiCad does not hold it. Attribute and reference_field edits preserve every other footprint clause and use an atomic revision-checked write. Give only one of value, attributes and reference_field per call. reference_field takes position, angle, size, stroke and visible. For many Reference fields in one call, or a board open in KiCad, use set_reference_field_presentations.",
+            "Update a footprint value through live KiCad IPC, or inspect/edit its assembly attributes, its Reference field's presentation or the place of its own zones in the saved board while KiCad does not hold it. Attribute, reference_field and library_zones edits preserve every other footprint clause and use an atomic revision-checked write. Give only one of value, attributes, reference_field and library_zones per call. reference_field takes position, angle, size, stroke and visible. For many Reference fields in one call, or a board open in KiCad, use set_reference_field_presentations. library_zones repairs what audit_manufacturing reports as misplaced_footprint_zone: a footprint's own zone (a keepout under a connector or antenna) that is the library's zone somewhere else is moved to where KiCad saves it for the footprint's position, rotation and side, and its stale fill is dropped; an empty object plans without writing, restore true writes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2990,7 +2991,15 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "reference_field": reference_field_schema(
                         "Requires the exact board closed. Set the saved Reference field's local position, text angle, character width/height and stroke; omitted values are kept, and an empty object inspects the saved values without a write."
-                    )
+                    ),
+                    "library_zones": {
+                        "type": "object", "additionalProperties": false,
+                        "description": "Requires the exact board closed and the footprint's library resolvable. Empty object: dry run, reporting each zone of the footprint as in_place, misplaced (the library's zone, somewhere else) or not_in_library (not the library's shape; never touched), where a misplaced one would go, and a revision. restore true writes: each misplaced zone's outline becomes the library outline at the footprint's position, rotation and side, its filled polygons are removed (refill in KiCad), and every other byte of the board is kept.",
+                        "properties": {
+                            "restore": { "type": "boolean", "default": false, "description": "Write the planned move instead of reporting it." },
+                            "expected_revision": { "type": "string", "description": "Optional: the revision a dry run returned; the call is refused if the saved board, the library footprint or the request changed since." }
+                        }
+                    }
                 },
                 "required": ["board", "reference"]
             }),
@@ -3972,6 +3981,15 @@ async fn handle_edit_component(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let given = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
+    if given("library_zones") {
+        if given("value") || given("attributes") || given("reference_field") {
+            return Ok(CallToolResult::error(
+                "Edit value, closed-board attributes, the Reference field and the footprint's                  zones in separate calls."
+                    .to_string(),
+            ));
+        }
+        return library_zones::handle(args, ctx).await;
+    }
     if given("reference_field") {
         if given("value") || given("attributes") {
             return Ok(CallToolResult::error(
