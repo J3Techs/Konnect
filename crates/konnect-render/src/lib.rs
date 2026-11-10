@@ -54,7 +54,9 @@ pub fn svg_to_png(svg: &[u8], width_px: u32) -> Result<Rendered> {
     // its stroke-font paths, paints nothing regardless of fonts.
     if svg_contains_visible_text(svg) {
         bail!(
-            "SVG contains visible <text> elements; rendering them requires              fonts and is not deterministic. KiCad schematic exports draw              text as stroke-font paths."
+            "SVG contains visible <text> elements; rendering them requires \
+             fonts and is not deterministic. KiCad schematic exports draw \
+             text as stroke-font paths."
         );
     }
 

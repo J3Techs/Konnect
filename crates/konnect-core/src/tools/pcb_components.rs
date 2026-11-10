@@ -3261,7 +3261,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_board_2d_view",
-            "Render the board with kicad-cli and return it as a base64 PNG. Note this is              kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is              no layer selection. Use export_svg for layer-aware 2-D output.",
+            "Render the board with kicad-cli and return it as a base64 PNG. Note this is \
+             kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is \
+             no layer selection. Use export_svg for layer-aware 2-D output.",
             json!({
                 "type": "object",
                 "properties": {

@@ -415,6 +415,78 @@ mod tests {
         }
     }
 
+    /// A description written across several source lines needs a `\` at the
+    /// end of each one. Where it is missing the literal keeps the line break
+    /// and the next line's indentation, and the client reads a sentence with
+    /// a newline and a dozen spaces in the middle of it. Nothing compiles
+    /// prose, so this reads what the server publishes: every toolset and tool
+    /// description, and every string anywhere in an input schema.
+    #[test]
+    fn no_published_text_carries_source_indentation() {
+        fn defect(text: &str) -> Option<&'static str> {
+            if text.contains("   ") {
+                return Some("a run of three or more spaces");
+            }
+            if text.contains("\n ") || text.contains("\n\t") {
+                return Some("a line break followed by indentation");
+            }
+            if text.contains('\t') || text.contains('\r') {
+                return Some("a tab or carriage return");
+            }
+            None
+        }
+
+        fn visit(value: &serde_json::Value, path: &str, bad: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => {
+                    if let Some(what) = defect(text) {
+                        bad.push(format!("{path}: {what}: {text:?}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        visit(item, &format!("{path}/{index}"), bad);
+                    }
+                }
+                serde_json::Value::Object(members) => {
+                    for (key, member) in members {
+                        visit(member, &format!("{path}/{key}"), bad);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut bad = Vec::new();
+        let mut note = |path: String, text: &str| {
+            if let Some(what) = defect(text) {
+                bad.push(format!("{path}: {what}: {text:?}"));
+            }
+        };
+        let mut schemas = Vec::new();
+        for meta in registry::ALL_TOOLSETS {
+            note(format!("toolset {}", meta.name), meta.description);
+            for tool in registry::tools_for(meta.name).expect("registered toolset") {
+                note(format!("{} description", tool.name), tool.description);
+                schemas.push((tool.name.to_string(), tool.input_schema));
+            }
+        }
+        for tool in meta_tools::meta_tool_descriptions_for(true) {
+            note(format!("{} description", tool.name), &tool.description);
+            schemas.push((tool.name, tool.input_schema));
+        }
+        for (name, schema) in &schemas {
+            visit(schema, name, &mut bad);
+        }
+
+        assert!(
+            bad.is_empty(),
+            "published text contains source formatting; end the source line with `\\` so the \
+             literal continues as one sentence:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     #[test]
     fn starter_kit_entries_are_all_valid_toolsets() {
         for name in registry::STARTER_KIT {

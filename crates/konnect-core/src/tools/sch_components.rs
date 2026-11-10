@@ -189,7 +189,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
+            "REFUSED until implemented: moving a symbol while stretching its connected \
+             wires is not built yet. Calling this returns an error naming \
+             move_schematic_component as the working alternative — it moves the symbol \
+             only, leaving wires where they are.",
             // No parameters: the handler refuses unconditionally, and the
             // schema-parameter guard (rightly) refuses a schema that advertises
             // arguments nothing reads. The old parameters are documented in
@@ -415,7 +418,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_view",
-            "Render a schematic sheet with kicad-cli and return the path to the SVG it wrote.              There is no PNG: KiCad ships no schematic rasteriser — `sch export` offers no bitmap              format and there is no `sch render` — so this is a vector file, not an image that can              be shown inline. It lands in a temporary directory and is overwritten by the next view              of the same sheet; use export_schematic_svg (toolset sch_export) to choose where it              goes. The SVG doubles as a geometry source: kicad-cli writes every string a second              time as an invisible <text opacity=\"0\"> element carrying x, y, textLength, font-size              and text-anchor, so text content, position and width can be checked without rendering              a pixel.",
+            "Render a schematic sheet with kicad-cli and return the path to the SVG it wrote. \
+             There is no PNG: KiCad ships no schematic rasteriser — `sch export` offers no bitmap \
+             format and there is no `sch render` — so this is a vector file, not an image that can \
+             be shown inline. It lands in a temporary directory and is overwritten by the next view \
+             of the same sheet; use export_schematic_svg (toolset sch_export) to choose where it \
+             goes. The SVG doubles as a geometry source: kicad-cli writes every string a second \
+             time as an invisible <text opacity=\"0\"> element carrying x, y, textLength, font-size \
+             and text-anchor, so text content, position and width can be checked without rendering \
+             a pixel.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3447,7 +3458,11 @@ async fn handle_move_connected(
     // claim work it does not do: refuse until the wire-carrying move exists
     // (it needs #120's connectivity model to know which wires to stretch).
     Ok(CallToolResult::error(
-        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
+        "move_connected is not implemented: it used to move the symbol and leave \
+         every wire behind while reporting the connections preserved. Use \
+         move_schematic_component (moves the symbol only), then re-route or use \
+         connect_pins for the affected nets. Wire-carrying moves are tracked in \
+         issue #315 and depend on the connectivity work in #120.",
     ))
 }
 
