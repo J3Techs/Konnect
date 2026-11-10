@@ -179,7 +179,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
 | `flip_component`          | Set F.Cu/B.Cu via native IPC (KiCad 10.0.6+) or safe file fallback |
-| `set_placed_footprint_models` | Inspect or edit exact indexed 3D-model entries on a live placed footprint |
+| `set_placed_footprint_models` | Inspect or edit exact indexed 3D-model entries on a placed footprint: live, or in the saved file of a closed board (required when its pads carry fabrication properties) |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 

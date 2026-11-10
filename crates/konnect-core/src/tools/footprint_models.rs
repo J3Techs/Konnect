@@ -394,7 +394,7 @@ fn indent_before(source: &str, offset: usize) -> Option<String> {
         .then(|| indent.to_string())
 }
 
-fn quote_string(value: &str) -> String {
+pub(crate) fn quote_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     escaped.push('"');
     for character in value.chars() {
