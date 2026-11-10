@@ -11,6 +11,8 @@ use anyhow::{bail, Context, Result};
 use konnect_ipc::gen::kiapi;
 use konnect_sexp::SexpNode;
 
+pub(crate) mod zones;
+
 /// Everything below, read once, for a caller that builds a new footprint from
 /// pads, drawings and fields and must give it the rest of its library data:
 /// `update_pcb_from_schematic`'s additions and `place_component`.
@@ -19,21 +21,31 @@ pub(crate) struct LibraryData {
     pub(crate) attributes: kiapi::board::types::FootprintAttributes,
     pub(crate) description_and_keywords: kiapi::board::types::FootprintAttributes,
     pub(crate) models: Vec<kiapi::board::types::Footprint3DModel>,
+    /// The footprint's rule areas, in its own frame.
+    pub(crate) zones: Vec<zones::LibraryZone>,
 }
 
 impl LibraryData {
     pub(crate) fn read(root: &SexpNode) -> Result<Self> {
+        Self::with_zones(root, zones::read(root)?)
+    }
+
+    /// As [`Self::read`], with the zones a caller has read itself: one that
+    /// can still place the footprint another way when they cannot be carried.
+    pub(crate) fn with_zones(root: &SexpNode, zones: Vec<zones::LibraryZone>) -> Result<Self> {
         Ok(Self {
             attributes: attributes(root)?,
             description_and_keywords: description_and_keywords(root),
             models: models(root)?,
+            zones,
         })
     }
 
     /// Give a footprint built from pads, drawings and fields the instance
-    /// attributes, the definition's description and keywords, and the 3D
-    /// models. Without them a placed SMD part had no `smd` attribute, so
-    /// KiCad treated it as unspecified, and its models were gone (#789).
+    /// attributes, the definition's description and keywords, the 3D models
+    /// and the rule areas. Without them a placed SMD part had no `smd`
+    /// attribute, so KiCad treated it as unspecified, its models were gone
+    /// (#789), and a footprint's keepouts never reached the board.
     pub(crate) fn apply(
         &self,
         footprint: &mut kiapi::board::types::FootprintInstance,
@@ -47,7 +59,7 @@ impl LibraryData {
         definition.items.extend(self.models.iter().map(|model| {
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }));
-        Ok(())
+        zones::apply(&self.zones, footprint)
     }
 }
 
@@ -221,7 +233,7 @@ mod tests {
     }
 
     /// Where KiCad's own footprint libraries are installed, if they are.
-    fn installed_footprint_dir() -> Option<std::path::PathBuf> {
+    pub(super) fn installed_footprint_dir() -> Option<std::path::PathBuf> {
         ["KICAD10_FOOTPRINT_DIR", "KICAD_FOOTPRINT_DIR"]
             .iter()
             .filter_map(std::env::var_os)

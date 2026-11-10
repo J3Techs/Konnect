@@ -3,6 +3,52 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: live placement creates a footprint's rule areas, or refuses
+
+A library footprint can own zones: the keepout under a Tag-Connect header, the
+antenna clearance of an RF module (229 of the footprints KiCad 10.0.7 ships
+carry 475 of them, all rule areas). With the board open in KiCad, Konnect
+built the footprint from its pads, drawings, fields and library data and sent
+that, so the footprint reached the board without its keepouts and the result
+said nothing. The closed-board placement already kept them.
+
+KiCad 10's API does take a footprint's zone, as one more item of the
+footprint, so the live paths now send it, in board coordinates and on the
+layers of the library zone that the board has enabled (as KiCad's own
+placement does for `*.Cu` or inner layers):
+
+- `place_component` and `add_mounting_hole` (live path),
+- `place_component_array` and `duplicate_component`,
+- the footprints `update_pcb_from_schematic` adds.
+
+Arguments and successful results are unchanged. What is new is a refusal. A
+rule area's typed message has no field for a zone's copper-pour settings
+(`connect_pads`, `min_thickness`, `fill`), so a zone created through the API
+is saved with KiCad's own values for them (`clearance 0`, `0.25`,
+`thermal_gap 0.5`, `thermal_bridge_width 0.5`). They do nothing on a rule
+area, but KiCad's library check compares them, and a footprint whose library
+zone says anything else (`0.254` and `0.508` in 103 of the 229 stock
+footprints, the Tag-Connect ones among them) would be reported as
+`lib_footprint_mismatch`. Such a footprint is refused before anything is sent,
+as is one with a zone the message cannot describe at all (a copper zone, a
+placement rule area, more than one outline):
+
+- `place_component`, `add_mounting_hole`, `place_component_array` and
+  `duplicate_component` return `plan_blocked`, naming the footprint, each zone
+  and why. Place the footprint with the board saved and closed, where
+  `place_component` copies the library footprint whole;
+  `run_closed_board_edit` does the save, close, placement and reopen on an
+  open board.
+- `update_pcb_from_schematic` reports the footprint as
+  `unsupported_library_footprint` in the dry run, as it does for any footprint
+  it cannot place. Place it as above and plan again.
+
+`update_footprints_from_library` already refused a library footprint with a
+zone. It now also refuses (`footprint_update_conflict`) a placed footprint
+that holds a zone its library does not, which the rebuilt definition would
+have deleted. Live moves, rotations and flips were never affected: they send
+back the footprint KiCad holds, zones included.
+
 ## Unreleased: a server started before KiCad reaches it without a restart
 
 The KiCad IPC address was resolved once, at startup: `ipc_address`, then

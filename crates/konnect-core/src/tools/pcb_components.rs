@@ -1433,6 +1433,21 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
+/// The rule areas of a library footprint, for a live path that builds the
+/// footprint from pads, drawings and fields. The error is an
+/// [`UnplaceableZones`](super::library_footprint::zones::UnplaceableZones)
+/// when a zone cannot be carried, named for `lib_id`.
+fn library_zones(
+    source: &str,
+    lib_id: &str,
+) -> anyhow::Result<Vec<super::library_footprint::zones::LibraryZone>> {
+    let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+    super::library_footprint::zones::read(&root).map_err(|mut refused| {
+        refused.footprint = lib_id.to_string();
+        anyhow::Error::new(refused)
+    })
+}
+
 /// One prepared footprint placement shared by the IPC and guarded file paths.
 ///
 /// Callers choose whether the definition came from a KiCad library or from
@@ -1445,9 +1460,12 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
-    /// The library's attributes, description, keywords and 3D models; `None`
-    /// for inline geometry, which has no library to carry them.
+    /// The library's attributes, description, keywords, 3D models and rule
+    /// areas; `None` for inline geometry, which has no library to carry them.
     library: Option<super::library_footprint::LibraryData>,
+    /// The library's zones KiCad's API cannot be given. The saved-file path
+    /// copies the footprint's text and keeps them; the live path must refuse.
+    unplaceable_zones: Option<super::library_footprint::zones::UnplaceableZones>,
     board_sexp: String,
 }
 
@@ -1469,11 +1487,15 @@ impl PreparedFootprintPlacement {
         let pads = extract_pad_definitions(&prepared)?;
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
+        let root = konnect_sexp::parse_sexp(&prepared)?;
+        let (zones, unplaceable_zones) = match super::library_footprint::zones::read(&root) {
+            Ok(zones) => (zones, None),
+            Err(refused) => (Vec::new(), Some(refused)),
+        };
         let library =
-            super::library_footprint::LibraryData::read(&konnect_sexp::parse_sexp(&prepared)?)
-                .map_err(|error| {
-                    anyhow::anyhow!("footprint '{lib_id}' library data cannot be placed: {error:#}")
-                })?;
+            super::library_footprint::LibraryData::with_zones(&root, zones).map_err(|error| {
+                anyhow::anyhow!("footprint '{lib_id}' library data cannot be placed: {error:#}")
+            })?;
         let board_sexp =
             board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
                 .map_err(anyhow::Error::msg)?;
@@ -1489,6 +1511,7 @@ impl PreparedFootprintPlacement {
             graphics,
             fields,
             library: Some(library),
+            unplaceable_zones,
             board_sexp,
         })
     }
@@ -1506,13 +1529,23 @@ impl PreparedFootprintPlacement {
             graphics,
             fields,
             library: None,
+            unplaceable_zones: None,
             board_sexp,
         }
     }
 
+    /// The library zones a live placement would have to leave out, for the
+    /// caller to refuse with before it sends anything.
+    pub(crate) fn unplaceable_zones(
+        &self,
+    ) -> Option<&super::library_footprint::zones::UnplaceableZones> {
+        self.unplaceable_zones.as_ref()
+    }
+
     /// The typed item the IPC path creates: built from the pads, drawings and
-    /// fields, then given the library's attributes, description, keywords and
-    /// 3D models when there is a library. The library source is only read.
+    /// fields, then given the library's attributes, description, keywords, 3D
+    /// models and rule areas when there is a library. The library source is
+    /// only read.
     pub(crate) fn build_item(
         &self,
         lib_id: &str,
@@ -1522,6 +1555,9 @@ impl PreparedFootprintPlacement {
         rotation: f64,
         layer: &str,
     ) -> anyhow::Result<prost_types::Any> {
+        if let Some(refused) = &self.unplaceable_zones {
+            return Err(anyhow::Error::new(refused.clone()));
+        }
         let item = KiCadIpcClient::build_footprint_item(
             lib_id,
             reference,
@@ -3346,14 +3382,25 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
+        // KiCad holds this board, so the footprint goes in through its API,
+        // which cannot be given every zone a library can hold. Refuse before
+        // anything is sent; the saved-file path below keeps them.
+        if let Some(refused) = prepared_ipc.unplaceable_zones() {
+            return Ok(Err(refused.clone()));
+        }
         let item =
             prepared_ipc.build_item(&footprint_ipc, &reference_ipc, x, y, rotation, &layer_ipc)?;
         c.place_footprint_item(&requested_board, &reference_ipc, item)
+            .map(Ok)
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Err(refused)) => Ok(refused.into_result(
+            "place_component",
+            super::library_footprint::zones::Remedy::ClosedBoardPlacement,
+        )),
+        BoardWrite::Ipc(Ok(fp)) => Ok(CallToolResult::json(&json!({
             "placed": fp.reference,
             "footprint": fp.footprint,
             "x": fp.position.x, "y": fp.position.y,
@@ -5460,6 +5507,18 @@ async fn handle_place_array(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&source);
+    // Every instance gets the library's rule areas; one the typed API cannot
+    // be given refuses the whole array before anything is sent.
+    let zones = match library_zones(&source, &footprint) {
+        Ok(zones) => zones,
+        Err(error) => {
+            return Ok(super::library_footprint::zones::preparation_error_result(
+                &error,
+                "place_component_array",
+                super::library_footprint::zones::Remedy::NoLosslessPath,
+            ))
+        }
+    };
 
     let value = footprint
         .split_once(':')
@@ -5520,10 +5579,11 @@ async fn handle_place_array(
                     0.0,
                     "F.Cu",
                 )
+                .and_then(|item| super::library_footprint::zones::apply_to_item(&zones, item))
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        c.run_commit("Place footprint array", |c| c.create_items(items))?;
+        c.run_commit("Place footprint array", |c| c.create_footprints(items))?;
 
         let mut created = c
             .list_footprints()?
@@ -5684,20 +5744,36 @@ async fn handle_duplicate_component(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&prepared);
+    // The copy is built from the library, so it gets the library's rule
+    // areas; one the typed API cannot be given refuses before anything is
+    // sent.
+    let zones = match library_zones(&prepared, &src.footprint) {
+        Ok(zones) => zones,
+        Err(error) => {
+            return Ok(super::library_footprint::zones::preparation_error_result(
+                &error,
+                "duplicate_component",
+                super::library_footprint::zones::Remedy::NoLosslessPath,
+            ))
+        }
+    };
     let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
-        &fp_id,
-        &ipc_reference,
-        &fp_value,
-        &pads,
-        &graphics,
-        &fields,
-        x,
-        y,
-        fp_rotation,
-        &fp_layer
-    ));
+    let fp = ipc!(ctx, args, |c| {
+        let item = KiCadIpcClient::build_footprint_item(
+            &fp_id,
+            &ipc_reference,
+            &fp_value,
+            &pads,
+            &graphics,
+            &fields,
+            x,
+            y,
+            fp_rotation,
+            &fp_layer,
+        )?;
+        let item = super::library_footprint::zones::apply_to_item(&zones, item)?;
+        c.place_footprint_item(&dup_board, &ipc_reference, item)
+    });
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
@@ -11371,6 +11447,39 @@ mod placement_library_data_tests {
                         },
                         "kiapi.common.commands.GetItemsResponse",
                     ))
+                } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                    use kiapi::board::types::BoardLayer;
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            copper_layer_count: 4,
+                            layers: [
+                                BoardLayer::BlFCu,
+                                BoardLayer::BlIn1Cu,
+                                BoardLayer::BlIn2Cu,
+                                BoardLayer::BlBCu,
+                                BoardLayer::BlFPaste,
+                                BoardLayer::BlFSilkS,
+                                BoardLayer::BlEdgeCuts,
+                            ]
+                            .map(|layer| layer as i32)
+                            .to_vec(),
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
+                    ))
+                } else if command.type_url.ends_with("BeginCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "commit".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("EndCommit") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
                 } else if command.type_url.ends_with("CreateItems") {
                     let request =
                         kiapi::common::commands::CreateItems::decode(command.value.as_slice())
@@ -11602,6 +11711,257 @@ mod placement_library_data_tests {
         let text = format!("{:?}", result.content);
         assert!(text.contains("mystery_flag"), "{text}");
         assert!(created.lock().unwrap().is_empty());
+    }
+
+    /// A keepout as a KiCad library writes one, with the copper-pour settings
+    /// KiCad's API gives a zone it creates.
+    const KEEPOUT: &str = "\t(zone\r\n\
+        \t\t(net 0)\r\n\
+        \t\t(net_name \"\")\r\n\
+        \t\t(layers \"*.Cu\" \"B.Paste\")\r\n\
+        \t\t(name \"Probe keepout\")\r\n\
+        \t\t(hatch edge 0.5)\r\n\
+        \t\t(connect_pads (clearance 0))\r\n\
+        \t\t(min_thickness 0.25)\r\n\
+        \t\t(keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints not_allowed))\r\n\
+        \t\t(placement (enabled no) (sheetname \"\"))\r\n\
+        \t\t(fill (thermal_gap 0.5) (thermal_bridge_width 0.5) (island_removal_mode 0))\r\n\
+        \t\t(polygon (pts (xy 1.27 -0.635) (xy -1.27 -0.635) (xy -1.27 0.635) (xy 1.27 0.635)))\r\n\
+        \t)\r\n";
+
+    fn library_with(zone: &str) -> String {
+        LIBRARY.replacen("\t(model ", &format!("{zone}\t(model "), 1)
+    }
+
+    /// Every zone of every created footprint, decoded.
+    fn created_zones(created: &Created) -> Vec<Vec<kiapi::board::types::Zone>> {
+        created
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                    .expect("a footprint instance")
+                    .definition
+                    .expect("a definition")
+                    .items
+                    .iter()
+                    .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Zone"))
+                    .map(|child| {
+                        kiapi::board::types::Zone::decode(child.value.as_slice()).expect("a zone")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn first_outline_point(zone: &kiapi::board::types::Zone) -> (i64, i64) {
+        let node = &zone.outline.as_ref().unwrap().polygons[0]
+            .outline
+            .as_ref()
+            .unwrap()
+            .nodes[0];
+        match node.geometry.as_ref().unwrap() {
+            kiapi::common::types::poly_line_node::Geometry::Point(point) => {
+                (point.x_nm, point.y_nm)
+            }
+            other => panic!("a point, got {other:?}"),
+        }
+    }
+
+    /// The live path used to send pads, drawings, fields and library data
+    /// only, so a footprint's keepouts never reached the board. Each one is
+    /// now an item of the created footprint, in board coordinates, on the
+    /// layers of its library zone that this board has.
+    #[tokio::test]
+    async fn place_component_creates_the_library_s_rule_areas_with_the_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        std::fs::write(&library, library_with(KEEPOUT)).unwrap();
+        let (server, created) = spawn_creating_kicad(&board);
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "reference": "U1",
+                "x": 80.0, "y": 60.0, "rotation": 90.0,
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let zones = created_zones(&created);
+        let [zones] = zones.as_slice() else {
+            panic!("one created footprint, got {}", zones.len());
+        };
+        let [zone] = zones.as_slice() else {
+            panic!("one zone on it, got {}", zones.len());
+        };
+        assert_eq!(zone.name, "Probe keepout");
+        assert_eq!(
+            zone.r#type,
+            kiapi::board::types::ZoneType::ZtRuleArea as i32
+        );
+        // pcbnew 10.0.7 saves this outline's first corner here for a
+        // footprint at (80, 60) turned 90 degrees.
+        assert_eq!(first_outline_point(zone), (79_365_000, 58_730_000));
+        // `*.Cu` on a four-layer board; the back paste layer it lacks is gone.
+        use kiapi::board::types::BoardLayer;
+        assert_eq!(
+            zone.layers,
+            [
+                BoardLayer::BlFCu,
+                BoardLayer::BlIn1Cu,
+                BoardLayer::BlIn2Cu,
+                BoardLayer::BlBCu
+            ]
+            .map(|layer| layer as i32)
+        );
+    }
+
+    /// KiCad's API cannot set a rule area's copper-pour settings, and its
+    /// library check compares them. A zone drawn with other values than the
+    /// API's own is refused on the live path before anything is sent, and the
+    /// closed-board path, which copies the footprint's text, still places it
+    /// whole.
+    #[tokio::test]
+    async fn a_rule_area_the_api_cannot_reproduce_refuses_live_and_is_kept_on_a_closed_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        std::fs::write(
+            &library,
+            library_with(&KEEPOUT.replace("(min_thickness 0.25)", "(min_thickness 0.254)")),
+        )
+        .unwrap();
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Test:QFN_Test",
+            "reference": "U1",
+            "x": 50.0, "y": 50.0,
+        });
+        let (server, created) = spawn_creating_kicad(&board);
+        let before = std::fs::read(&board).unwrap();
+
+        let refused = handle_place_component(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        assert!(refused.is_error);
+        let body = serde_json::to_value(&refused).unwrap().to_string();
+        assert!(body.contains("plan_blocked"), "{body}");
+        assert!(
+            body.contains("Test:QFN_Test zone 1 'Probe keepout'"),
+            "{body}"
+        );
+        assert!(body.contains("min_thickness 0.254"), "{body}");
+        assert!(body.contains("run_closed_board_edit"), "{body}");
+        assert!(created.lock().unwrap().is_empty(), "nothing was sent");
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "nothing was written"
+        );
+        drop(server);
+
+        // No KiCad: the saved-file path copies the library footprint.
+        let placed = handle_place_component(&args, &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        assert!(!placed.is_error, "{:?}", placed.content);
+        let saved = std::fs::read_to_string(&board).unwrap();
+        assert!(saved.contains("(name \"Probe keepout\")"), "{saved}");
+        assert!(saved.contains("(min_thickness 0.254)"), "{saved}");
+        // In board coordinates, as KiCad saves a placed footprint's zone.
+        assert!(saved.contains("(xy 51.27 49.365)"), "{saved}");
+    }
+
+    /// The array and the duplicate build their footprints from the library
+    /// too: each instance gets the rule areas, and a zone that cannot be
+    /// created exactly refuses the whole request.
+    #[tokio::test]
+    async fn an_array_and_a_duplicate_carry_the_rule_areas_or_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (board, library) = project(tmp.path());
+        std::fs::write(&library, library_with(KEEPOUT)).unwrap();
+        let (server, created) = spawn_creating_kicad(&board);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let array = handle_place_array(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Test:QFN_Test",
+                "start_x": 10.0, "start_y": 20.0,
+                "count_x": 2, "spacing_x": 5.0,
+                "ref_prefix": "U", "ref_start": 1,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!array.is_error, "{:?}", array.content);
+        let duplicate = handle_duplicate_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "U1", "new_reference": "U9",
+                "x": 100.0, "y": 100.0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!duplicate.is_error, "{:?}", duplicate.content);
+
+        let zones = created_zones(&created);
+        assert_eq!(zones.len(), 3);
+        assert_eq!(
+            zones
+                .iter()
+                .map(|zones| first_outline_point(&zones[0]))
+                .collect::<Vec<_>>(),
+            [
+                (11_270_000, 19_365_000),
+                (16_270_000, 19_365_000),
+                (101_270_000, 99_365_000)
+            ]
+        );
+
+        std::fs::write(
+            &library,
+            library_with(&KEEPOUT.replace("(thermal_gap 0.5)", "(thermal_gap 0.508)")),
+        )
+        .unwrap();
+        for refused in [
+            handle_place_array(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "footprint": "Test:QFN_Test",
+                    "start_x": 10.0, "start_y": 40.0,
+                    "count_x": 2, "spacing_x": 5.0,
+                    "ref_prefix": "V", "ref_start": 1,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+            handle_duplicate_component(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "reference": "U1", "new_reference": "U10",
+                    "x": 120.0, "y": 100.0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        ] {
+            assert!(refused.is_error);
+            let body = serde_json::to_value(&refused).unwrap().to_string();
+            assert!(body.contains("plan_blocked"), "{body}");
+            assert!(body.contains("thermal_gap 0.508"), "{body}");
+        }
+        assert_eq!(created.lock().unwrap().len(), 3, "nothing more was created");
     }
 
     /// The item carries the reference the placement checks and reads back;
