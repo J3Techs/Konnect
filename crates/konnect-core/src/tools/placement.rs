@@ -187,21 +187,27 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "set_reference_field_presentations",
-            "Set many placed footprints' Reference-field presentation in one atomic write to \
-             the saved .kicad_pcb of a board KiCad does not hold open: local position (or \
-             board position), text angle, character width/height and stroke. Only each \
-             field's (at …), (size …) and (thickness …) change; its UUID, text, layer, \
-             mirror and visibility, and every pad, fabrication property, net, model and \
-             schematic link stay byte for byte. Every member is validated before anything is \
-             written: an unknown or duplicate reference, a footprint with no single Reference \
-             field, a duplicated (at/effects/font/size/thickness) clause or an outline-font \
-             field with a saved render cache refuses the whole batch. Defaults to a dry run \
-             whose revision covers the saved bytes and the normalized request; apply requires \
-             that revision, re-proves the board closed and its KiCad lock absent, and reads \
-             the persisted bytes back. Give the fields inline or as 'fields_file'; \
-             'report_file' writes the full report to disk for large batches. A dry run \
-             naming only references reads every field's saved presentation. \
-             edit_component's reference_field inspects or edits one.",
+            "Set many placed footprints' Reference-field presentation in one call: local \
+             position (or board position), text angle, character width/height, stroke and \
+             visibility (visible: false hides a designator). One dry run and one apply cover \
+             the whole batch, and every member is validated before anything is written: an \
+             unknown or duplicate reference or a footprint with no single Reference field \
+             refuses the whole batch. Defaults to a dry run; apply requires its revision. \
+             Closed board (source 'saved'): one atomic write to the saved .kicad_pcb that \
+             changes only each field's (at …), (hide …), (size …) and (thickness …); its \
+             UUID, text, layer and mirror, and every pad, fabrication property, net, model and \
+             schematic link stay byte for byte. The revision covers the saved bytes and the \
+             request; apply re-proves the board closed and its KiCad lock absent and reads \
+             the persisted bytes back. A duplicated clause, an older-format hide token or an \
+             outline-font field with a saved render cache also refuses the batch. Board open \
+             in KiCad (source 'ipc'): the changed footprints are updated in one commit, one \
+             undo step, and read back; the board is not saved. A live footprint update \
+             re-creates pads without their fabrication property, so a batch that would change \
+             a footprint carrying one (or one that cannot be checked) is refused whole before \
+             anything is sent: close the board and repeat it. Give the fields inline or as \
+             'fields_file'; 'report_file' writes the full report to disk for large batches. \
+             A dry run naming only references reads every field's presentation. \
+             edit_component's reference_field inspects or edits one on a closed board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -227,7 +233,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_set_reference_field_presentations(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
     ]
 }
 
@@ -343,6 +349,69 @@ async fn handle_set_reference_field_presentations(
             "expected_revision",
             "apply requires the revision a current dry run returned",
         ));
+    }
+
+    // Live first: the board KiCad holds open is the authoritative copy.
+    let live_board = board.clone();
+    let live_requests = requests.clone();
+    let live_revision = expected_revision.clone();
+    let attempt =
+        crate::tools::pcb_board::attempt_ipc_write(ctx, &board, OPERATION, move |client| {
+            reference_field::live::run(
+                client,
+                &live_board,
+                &live_requests,
+                dry_run,
+                live_revision.as_deref(),
+                report_all,
+            )
+        })
+        .await?;
+    match attempt {
+        crate::tools::pcb_board::BoardWrite::File(_) => {}
+        crate::tools::pcb_board::BoardWrite::Refused(refusal) => return Ok(refusal),
+        crate::tools::pcb_board::BoardWrite::Ipc(outcome) => {
+            use reference_field::live::Outcome;
+            return match outcome {
+                Outcome::Report(body) => reference_field_report(body, report_file.as_deref()),
+                Outcome::Fabrication(refusal) => Ok(refusal.into_result()),
+                Outcome::Blocked(reasons) => Ok(CallToolResult::error_kind(
+                    ToolErrorKind::PlanBlocked {
+                        operation: OPERATION.to_string(),
+                        reasons: reasons.clone(),
+                    },
+                    format!(
+                        "No Reference field changed; {} member(s) cannot be planned: {}. \
+                         Nothing was sent to KiCad.",
+                        reasons.len(),
+                        reasons.join("; ")
+                    ),
+                )),
+                Outcome::Stale => Ok(CallToolResult::error_kind(
+                    ToolErrorKind::StaleTarget {
+                        target: board.display().to_string(),
+                        reason: "stale_revision".to_string(),
+                    },
+                    format!(
+                        "{OPERATION}: expected_revision does not match the footprints KiCad \
+                         holds now and this request. Rerun the dry run and apply its new \
+                         revision. Nothing was sent to KiCad."
+                    ),
+                )),
+                Outcome::Uncertain(reason) => Ok(CallToolResult::error_kind(
+                    ToolErrorKind::MutationOutcomeUncertain {
+                        operation: OPERATION.to_string(),
+                        path: board.display().to_string(),
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "{OPERATION} sent one commit to KiCad and could not confirm it: \
+                         {reason}. Inspect the open board (one undo reverts the commit if it \
+                         was applied) before retrying."
+                    ),
+                )),
+            };
+        }
     }
 
     let closure = match closed_board::prove_closed(ctx, &board, OPERATION).await? {

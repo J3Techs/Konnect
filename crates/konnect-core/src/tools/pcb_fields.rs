@@ -282,7 +282,7 @@ fn revision(board: &str, fp: &Footprint, changes: &[Change]) -> Result<String> {
     h.update(serde_json::to_vec(changes)?);
     Ok(format!("{:x}", h.finalize()))
 }
-fn comparable(fp: &Footprint) -> Result<Footprint> {
+pub(crate) fn comparable(fp: &Footprint) -> Result<Footprint> {
     let mut out = fp.clone();
     // KiCad serializes custom fields ahead of pads, independent of insertion order.
     out.definition

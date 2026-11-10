@@ -302,11 +302,17 @@ Board Setup's stackup, save, and run DRC before relying on it.
 
 ## Reference labels
 
-To resize or reposition Reference fields on a closed board, use
-`set_reference_field_presentations` for a batch (dry run, then apply with its
-`expected_revision`) or `edit_component` with `reference_field` for one; an
-empty `reference_field` inspects the saved values. Keep the board's text rules:
-fix labels, do not hide them or lower the minimum height. Re-run DRC afterwards.
+To resize, reposition, hide or show Reference fields, use
+`set_reference_field_presentations` for a batch: one dry run, then one apply
+with its `expected_revision`, however many footprints it names. It works on a
+closed board (one atomic file write) and on a board open in KiCad (one commit,
+one undo step, not saved). An open board refuses a batch that touches a
+footprint whose pads carry a fabrication property; save, close the board and
+repeat it there. `edit_component` with `reference_field` edits one on a closed
+board; an empty `reference_field` inspects the saved values. Keep the board's
+text rules: move a label into clear space first, hide one (`visible: false`)
+only when it has no clear position, and do not lower the minimum height.
+Re-run DRC afterwards.
 
 ### Routing Tools
 

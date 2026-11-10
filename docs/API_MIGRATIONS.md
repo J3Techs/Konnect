@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: reference designators can be hidden, and batched on an open board
+
+`set_reference_field_presentations` could not change a Reference field's
+visibility and refused a board open in KiCad, so hiding or moving designators
+on an open board went through `edit_footprint_fields`: one footprint per call,
+a dry run and an apply each.
+
+Each member of `fields` (and `edit_component`'s `reference_field`) now accepts
+`visible`: `false` hides the field, `true` shows it. Reports carry `visible`
+beside the existing `hidden`. On a closed board the field's `(hide yes)` clause
+is the fourth span the write may touch, placed after the field's `(layer …)`
+as KiCad saves it; everything else stays byte for byte. A field hidden by an
+older format's bare `hide` token is read as hidden but its visibility is not
+rewritten: open and save the board in KiCad 10 first.
+
+The batch tool now also serves a board KiCad holds open, where it used to
+answer `board_open_in_kicad`. The dry run reads the live footprints and its
+`revision` covers them and the request; apply sends every changed footprint in
+one commit, which is one undo step, reads each back and reports
+`source: "ipc"`, `saved: false`. Validation is still all or nothing. A live
+footprint update re-creates pads without their fabrication property, so a batch
+that would change a footprint carrying one, or one whose saved board and
+library cannot be read to rule it out, is refused whole before anything is
+sent, on the dry run too: save, close the board and repeat the request, where
+the saved-file path keeps every pad clause. `edit_component`'s
+`reference_field` remains closed-board only.
+
 ## Unreleased: the closed-board flip mirrors child zones and custom pads
 
 The saved-file flip behind `flip_component` and a `layer` in

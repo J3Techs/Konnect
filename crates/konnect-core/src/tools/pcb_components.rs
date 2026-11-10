@@ -2843,7 +2843,8 @@ pub(crate) fn reference_field_schema(description: &str) -> serde_json::Value {
             "relative_angle_deg": { "type": "number", "description": "Text angle relative to the footprint angle; instead of angle_deg" },
             "width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
             "height_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
-            "stroke_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 25 }
+            "stroke_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 25 },
+            "visible": { "type": "boolean", "description": "false hides the Reference field, true shows it" }
         }
     })
 }
@@ -2971,7 +2972,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
-            "Update a footprint value through live KiCad IPC, or inspect/edit its assembly attributes or its Reference field's presentation in the saved board while KiCad does not hold it. Attribute and reference_field edits preserve every other footprint clause and use an atomic revision-checked write. Give only one of value, attributes and reference_field per call. For many Reference fields in one write use set_reference_field_presentations.",
+            "Update a footprint value through live KiCad IPC, or inspect/edit its assembly attributes or its Reference field's presentation in the saved board while KiCad does not hold it. Attribute and reference_field edits preserve every other footprint clause and use an atomic revision-checked write. Give only one of value, attributes and reference_field per call. reference_field takes position, angle, size, stroke and visible. For many Reference fields in one call, or a board open in KiCad, use set_reference_field_presentations.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1,11 +1,13 @@
 //! Closed-board presentation of placed footprints' Reference fields: local
-//! position, text angle, character width and height, and stroke width.
+//! position, text angle, character width and height, stroke width and
+//! visibility.
 //!
-//! Only three spans of each requested field change — its `(at …)`, and the
-//! `(size …)` and `(thickness …)` inside its `(effects (font …))` — so the
-//! field's UUID, text, layer, mirror, visibility and every other clause of the
-//! footprint (pads, fabrication properties, nets, models, schematic links)
-//! stay byte for byte. No typed footprint rebuild is involved.
+//! Only four spans of each requested field change — its `(at …)`, its
+//! `(hide yes)`, and the `(size …)` and `(thickness …)` inside its
+//! `(effects (font …))` — so the field's UUID, text, layer, mirror and every
+//! other clause of the footprint (pads, fabrication properties, nets, models,
+//! schematic links) stay byte for byte. No typed footprint rebuild is
+//! involved. The board KiCad holds open goes through [`live`] instead.
 //!
 //! Conventions, as KiCad 10 saves a footprint field
 //! (`PCB_IO_KICAD_SEXPR::format( const PCB_TEXT* )`, read back by
@@ -20,12 +22,16 @@
 //! - `angle_deg` is the text's board angle as KiCad saves it;
 //!   `relative_angle_deg` is that minus the footprint angle.
 //! - `(size H W)` is height then width.
+//! - A hidden field carries `(hide yes)` after its `(layer …)`; a visible one
+//!   carries no hide clause.
 
 use super::*;
 use konnect_sexp::SexpNode;
 use serde_json::{Map, Value};
 
 use crate::tools::closed_board::only_spans_changed;
+
+pub(crate) mod live;
 
 const TOLERANCE: f64 = 5e-7;
 const MAX_TEXT_MM: f64 = 100.0;
@@ -39,7 +45,8 @@ pub(crate) const CONVENTION: &str = "local_x/local_y: the saved (at …) offset 
      back-side footprint). board_x/board_y = anchor + local turned by the footprint angle θ \
      (x' = x·cos θ + y·sin θ, y' = −x·sin θ + y·cos θ). angle_deg: the text's board angle as \
      KiCad saves it; relative_angle_deg = angle_deg − footprint angle. width_mm/height_mm: \
-     character size, saved as (size height width); stroke_mm: (thickness …).";
+     character size, saved as (size height width); stroke_mm: (thickness …). visible: false \
+     hides the field (hide yes), true shows it.";
 
 /// One requested Reference field. Every value is optional; none at all is an
 /// inspection.
@@ -54,6 +61,7 @@ pub(crate) struct FieldRequest {
     pub width_mm: Option<f64>,
     pub height_mm: Option<f64>,
     pub stroke_mm: Option<f64>,
+    pub visible: Option<bool>,
 }
 
 impl FieldRequest {
@@ -64,11 +72,12 @@ impl FieldRequest {
             "board_xy": self.board_xy.map(|(x, y)| [x, y]),
             "angle_deg": self.angle_deg, "relative_angle_deg": self.relative_angle_deg,
             "width_mm": self.width_mm, "height_mm": self.height_mm, "stroke_mm": self.stroke_mm,
+            "visible": self.visible,
         })
     }
 }
 
-pub(crate) const FIELD_KEYS: [&str; 9] = [
+pub(crate) const FIELD_KEYS: [&str; 10] = [
     "local_x",
     "local_y",
     "board_x",
@@ -78,6 +87,7 @@ pub(crate) const FIELD_KEYS: [&str; 9] = [
     "width_mm",
     "height_mm",
     "stroke_mm",
+    "visible",
 ];
 
 /// `(field, reason)` for a value that is not a valid request.
@@ -136,6 +146,11 @@ pub(crate) fn field_request(
         width_mm: number("width_mm", MAX_TEXT_MM, true)?,
         height_mm: number("height_mm", MAX_TEXT_MM, true)?,
         stroke_mm: number("stroke_mm", MAX_STROKE_MM, true)?,
+        visible: match object.get("visible") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(visible)) => Some(*visible),
+            Some(_) => return Err((name("visible"), "must be true or false".to_string())),
+        },
     };
     if request.board_xy.is_some() && (request.local_x.is_some() || request.local_y.is_some()) {
         return Err((
@@ -219,6 +234,7 @@ impl Observed {
             "layer": self.layer,
             "mirrored": self.mirrored,
             "hidden": self.hidden,
+            "visible": !self.hidden,
             "local_x": self.local.0,
             "local_y": self.local.1,
             "board_x": board_x,
@@ -238,6 +254,13 @@ struct FieldSpans {
     font: (usize, usize),
     size: Option<(usize, usize)>,
     thickness: Option<(usize, usize)>,
+    /// The field's own `(layer …)`, which a new `(hide yes)` follows.
+    layer: Option<(usize, usize)>,
+    /// The field's own `(hide …)` clause.
+    hide: Option<(usize, usize)>,
+    /// Hidden by something other than that clause: a bare `hide` token or a
+    /// hide inside `(effects …)`, as older KiCad versions saved it.
+    older_hide: bool,
 }
 
 pub(super) fn head_of(block: &str) -> &str {
@@ -392,17 +415,33 @@ fn read_field(source: &str, footprint: (usize, usize)) -> Result<(Observed, Fiel
             .iter()
             .any(|c| c.as_str() == Some("mirror"))
     });
-    let hidden = field_node
-        .find("hide")
-        .is_some_and(|h| h.get(1).and_then(SexpNode::as_str) != Some("no"))
-        || effects_node
-            .find("hide")
-            .is_some_and(|h| h.get(1).and_then(SexpNode::as_str) != Some("no"))
-        || field_node
-            .children()
+    let hide = one(
+        tagged(field_text, parent, "hide"),
+        field_offset,
+        "Reference (hide …)",
+    )?;
+    let field_layer = one(
+        tagged(field_text, parent, "layer"),
+        field_offset,
+        "Reference (layer …)",
+    )?;
+    let bare_hide = |node: &SexpNode| {
+        node.children()
             .unwrap_or(&[])
             .iter()
-            .any(|c| matches!(c, SexpNode::Atom(a) if a == "hide"));
+            .any(|c| matches!(c, SexpNode::Atom(a) if a == "hide"))
+    };
+    let older_hide = bare_hide(&field_node)
+        || bare_hide(&effects_node)
+        || effects_node
+            .find("hide")
+            .is_some_and(|h| h.get(1).and_then(SexpNode::as_str) != Some("no"));
+    let hidden = older_hide
+        || hide.is_some_and(|(s, e)| {
+            konnect_sexp::parse_sexp(&source[s..e])
+                .ok()
+                .is_none_or(|h| h.get(1).and_then(SexpNode::as_str) != Some("no"))
+        });
     let observed = Observed {
         footprint: node.get(1).and_then(SexpNode::as_str).map(str::to_string),
         footprint_uuid: crate::tools::footprint_fabrication::footprint_identity(&node)
@@ -431,6 +470,9 @@ fn read_field(source: &str, footprint: (usize, usize)) -> Result<(Observed, Fiel
             font,
             size,
             thickness,
+            layer: field_layer,
+            hide,
+            older_hide,
         },
     ))
 }
@@ -483,7 +525,19 @@ fn requested(observed: &Observed, want: &FieldRequest) -> Observed {
     if let Some(t) = want.stroke_mm {
         after.stroke_mm = Some(round_nm(t));
     }
+    if let Some(visible) = want.visible {
+        after.hidden = !visible;
+    }
     after
+}
+
+/// The whitespace run that ends at `at`: what separates a clause from the one
+/// before it, a space on one line or a line break and its indentation.
+fn separator_before(source: &str, at: usize) -> &str {
+    let start = source[..at]
+        .rfind(|c: char| !c.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &source[start..at]
 }
 
 #[derive(Debug)]
@@ -593,6 +647,37 @@ pub(crate) fn prepare(source: &str, requests: &[FieldRequest]) -> Result<Prepare
                     edits.push((at, at, text.len()));
                     changes.push(SexpEdit::insert(at, text));
                 }
+            }
+        }
+        if after.hidden != observed.hidden {
+            if spans.older_hide {
+                reasons.push(format!(
+                    "'{reference}' is hidden by a hide token of an older KiCad format; open and \
+                     save the board in KiCad 10 before changing its visibility"
+                ));
+                continue;
+            }
+            match (after.hidden, spans.hide) {
+                (true, Some((s, e))) => {
+                    let text = "(hide yes)";
+                    edits.push((s, e, text.len()));
+                    changes.push(SexpEdit::replace(s, e, text));
+                }
+                (true, None) => {
+                    // After the field's (layer …), as KiCad writes it, set off
+                    // the way that clause is; else after its (at …).
+                    let (anchor, end) = spans.layer.unwrap_or(spans.at);
+                    let text = format!("{}(hide yes)", separator_before(source, anchor));
+                    edits.push((end, end, text.len()));
+                    changes.push(SexpEdit::insert(end, text));
+                }
+                (false, Some((s, e))) => {
+                    // A visible field carries no clause: cut it with its separator.
+                    let start = s - separator_before(source, s).len();
+                    edits.push((start, e, 0));
+                    changes.push(SexpEdit::replace(start, e, ""));
+                }
+                (false, None) => unreachable!("hidden only by a clause or an older token"),
             }
         }
         before.push((reference.to_string(), observed));
@@ -784,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn three_spans_change_and_everything_else_is_byte_for_byte() {
+    fn only_the_planned_spans_change_and_everything_else_is_byte_for_byte() {
         let prepared = prepare(
             BOARD,
             &[request(
@@ -922,6 +1007,103 @@ mod tests {
     }
 
     #[test]
+    fn hiding_adds_one_hide_clause_after_the_layer_and_showing_removes_it() {
+        let hidden = prepare(BOARD, &[request("U1", json!({ "visible": false }))]).unwrap();
+        assert_eq!(
+            hidden.candidate,
+            BOARD.replacen(
+                "(at 0 -2 37) (layer \"F.SilkS\") (uuid \"2111",
+                "(at 0 -2 37) (layer \"F.SilkS\") (hide yes) (uuid \"2111",
+                1
+            )
+        );
+        assert_eq!(hidden.edits.len(), 1);
+        let after = hidden.expected[0].1.json("U1");
+        assert_eq!(after["visible"], false);
+        assert_eq!(after["hidden"], true);
+        assert_eq!(after["local_y"], -2.0, "the position is kept");
+
+        // Hiding a hidden field is a no-op; showing it restores the original bytes.
+        let again = prepare(
+            &hidden.candidate,
+            &[request("U1", json!({ "visible": false }))],
+        )
+        .unwrap();
+        assert!(again.edits.is_empty());
+        let shown = prepare(
+            &hidden.candidate,
+            &[request("U1", json!({ "visible": true }))],
+        )
+        .unwrap();
+        assert_eq!(shown.candidate, BOARD);
+
+        // KiCad's own layout: one clause a line. The new clause takes the
+        // layer's line break and indentation, and one request can hide and move.
+        let saved = "(kicad_pcb (version 20260206)
+	(footprint \"R:R\"
+		(layer \"F.Cu\")
+		(at 1 2)
+		(property \"Reference\" \"R9\"
+			(at 0 -1.2 0)
+			(layer \"F.SilkS\")
+			(uuid \"aaaaaaaa-0000-4000-8000-000000000009\")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+	)
+)
+";
+        let both = prepare(
+            saved,
+            &[request("R9", json!({ "visible": false, "local_y": 1.5 }))],
+        )
+        .unwrap();
+        assert_eq!(
+            both.candidate,
+            saved.replace("(at 0 -1.2 0)", "(at 0 1.5 0)").replace(
+                "			(layer \"F.SilkS\")
+",
+                "			(layer \"F.SilkS\")
+			(hide yes)
+"
+            )
+        );
+        let back = prepare(
+            &both.candidate,
+            &[request("R9", json!({ "visible": true, "local_y": -1.2 }))],
+        )
+        .unwrap();
+        assert_eq!(back.candidate, saved);
+    }
+
+    #[test]
+    fn an_older_hide_token_reads_as_hidden_and_refuses_a_visibility_change() {
+        let older = BOARD.replacen(
+            "(fp_text reference \"C7\" (at 1 0) (layer \"F.SilkS\")",
+            "(fp_text reference \"C7\" (at 1 0) (layer \"F.SilkS\") hide",
+            1,
+        );
+        let read = prepare(&older, &[request("C7", json!({ "visible": false }))]).unwrap();
+        assert!(read.edits.is_empty(), "already hidden");
+        assert_eq!(read.before[0].1.json("C7")["visible"], false);
+        let moved = prepare(&older, &[request("C7", json!({ "local_x": 2 }))]).unwrap();
+        assert_eq!(moved.edits.len(), 1, "its position can still change");
+        let reasons = prepare(
+            &older,
+            &[
+                request("U1", json!({ "visible": false })),
+                request("C7", json!({ "visible": true })),
+            ],
+        )
+        .unwrap_err();
+        assert!(reasons[0].contains("older KiCad format"), "{reasons:?}");
+    }
+
+    #[test]
     fn malformed_or_conflicting_values_are_refused_before_planning() {
         for values in [
             json!({ "height_mm": 0 }),
@@ -932,6 +1114,8 @@ mod tests {
             json!({ "board_x": 1, "board_y": 2, "local_x": 0 }),
             json!({ "angle_deg": 0, "relative_angle_deg": 0 }),
             json!({ "height_mm": "1" }),
+            json!({ "visible": "no" }),
+            json!({ "visible": 0 }),
         ] {
             assert!(
                 field_request("U1", values.as_object().unwrap(), "").is_err(),
@@ -1088,14 +1272,9 @@ mod tests {
         std::fs::write(&board, BOARD).unwrap();
         let args = json!({ "board": board, "fields": [{ "reference": "U1", "height_mm": 1, "width_mm": 1 }] });
 
+        // edit_component's single form stays closed-board only; the batch takes
+        // an open board live (reference_field::live).
         let server = spawn_kicad_holding_board(&board, |_| None);
-        let (error, refused) =
-            batch(ctx_talking_to(server.address().to_string()), args.clone()).await;
-        assert!(error);
-        assert_eq!(
-            refused["error"]["reasons"][0], "board_open_in_kicad",
-            "{refused}"
-        );
         let single = handle(
             &json!({ "board": board, "reference": "U1", "reference_field": { "height_mm": 1 } }),
             &ctx_talking_to(server.address().to_string()),
