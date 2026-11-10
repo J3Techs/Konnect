@@ -210,7 +210,9 @@ Checks:
 - A footprint's own zones (the keepout under a Tag-Connect header or an
   antenna) lie where the footprint is. A finding of kind
   `misplaced_footprint_zone` means the keepout keeps nothing out under the
-  part; KiCad's DRC does not report it.
+  part; KiCad's DRC does not report it. With the board closed,
+  `edit_component` with an empty `library_zones` plans the move back and
+  `library_zones: {"restore": true}` writes it.
 
 ---
 

@@ -156,6 +156,108 @@ pub(crate) fn map_child_zones(
     Ok(apply_edits(footprint.to_string(), edits))
 }
 
+// ─── Reading a zone and telling where it is ──────────────────────────────────
+
+/// How far (mm) a saved point may sit from where the library puts it. KiCad
+/// saves nanometres; this allows for a file written with fewer decimals.
+pub(crate) const MATCH_MM: f64 = 0.002;
+/// How closely (mm) a zone must repeat the library outline's shape to count
+/// as that outline, moved.
+pub(crate) const SHAPE_MM: f64 = 0.005;
+
+pub(crate) type Point = (f64, f64);
+/// The outlines of one zone, one list of vertices per `(polygon …)`. An arc
+/// contributes its start, middle and end.
+pub(crate) type Outlines = Vec<Vec<Point>>;
+
+pub(crate) fn xy(node: &SexpNode) -> Option<Point> {
+    Some((node.get_f64(1)?, node.get_f64(2)?))
+}
+
+pub(crate) fn outlines(zone: &SexpNode) -> Option<Outlines> {
+    let mut all = Vec::new();
+    for polygon in zone.find_all("polygon") {
+        let mut points = Vec::new();
+        for entry in polygon.find("pts")?.children()?.iter().skip(1) {
+            match entry.head()? {
+                "xy" => points.push(xy(entry)?),
+                "arc" => {
+                    for part in ["start", "mid", "end"] {
+                        points.push(xy(entry.find(part)?)?);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if points.is_empty() {
+            return None;
+        }
+        all.push(points);
+    }
+    (!all.is_empty()).then_some(all)
+}
+
+pub(crate) fn distance(a: Point, b: Point) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// Whether `zone` is `expected`: the same outlines, each holding the same
+/// vertices. The order of the vertices in an outline is not held against it.
+pub(crate) fn same_place(zone: &Outlines, expected: &Outlines) -> bool {
+    zone.len() == expected.len()
+        && zone.iter().zip(expected).all(|(got, want)| {
+            if got.len() != want.len() {
+                return false;
+            }
+            if got
+                .iter()
+                .zip(want)
+                .all(|(g, w)| distance(*g, *w) <= MATCH_MM)
+            {
+                return true;
+            }
+            let mut used = vec![false; got.len()];
+            want.iter().all(|w| {
+                let free = (0..got.len()).find(|&i| !used[i] && distance(got[i], *w) <= MATCH_MM);
+                free.map(|i| used[i] = true).is_some()
+            })
+        })
+}
+
+/// Whether `zone` is the outline `library`, vertex for vertex, after some
+/// turn, shift and (possibly) mirror: the library's zone, somewhere.
+pub(crate) fn same_shape(zone: &Outlines, library: &Outlines) -> bool {
+    if zone.len() != library.len() || zone.iter().zip(library).any(|(z, l)| z.len() != l.len()) {
+        return false;
+    }
+    let got: Vec<Point> = zone.iter().flatten().copied().collect();
+    let lib: Vec<Point> = library.iter().flatten().copied().collect();
+    // The library vertex furthest from the first fixes the turn.
+    let far = (0..lib.len())
+        .max_by(|&a, &b| distance(lib[a], lib[0]).total_cmp(&distance(lib[b], lib[0])))
+        .unwrap_or(0);
+    let span = distance(lib[far], lib[0]);
+    if (distance(got[far], got[0]) - span).abs() > SHAPE_MM {
+        return false;
+    }
+    if span <= SHAPE_MM {
+        return got.iter().all(|p| distance(*p, got[0]) <= SHAPE_MM);
+    }
+    let heading = |a: Point, b: Point| (b.1 - a.1).atan2(b.0 - a.0);
+    [1.0, -1.0].into_iter().any(|mirror| {
+        let local = |p: Point| (p.0 - lib[0].0, mirror * (p.1 - lib[0].1));
+        let turn = heading(got[0], got[far]) - heading((0.0, 0.0), local(lib[far]));
+        let (sin, cos) = turn.sin_cos();
+        lib.iter().zip(&got).all(|(l, g)| {
+            let (x, y) = local(*l);
+            distance(
+                (got[0].0 + x * cos - y * sin, got[0].1 + x * sin + y * cos),
+                *g,
+            ) <= SHAPE_MM
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
