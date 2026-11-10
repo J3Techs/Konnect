@@ -218,6 +218,11 @@ async fn run() -> Result<Option<transport::http::HttpStop>> {
         eager_toolsets: config.eager_toolsets,
     };
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    // No KiCad was listening when this server started. One started later is
+    // looked for when a tool call needs it, instead of never.
+    if ipc_source == config::IpcAddressSource::Unresolved {
+        handler.enable_ipc_discovery();
+    }
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),

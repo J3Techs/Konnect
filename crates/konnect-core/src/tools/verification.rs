@@ -861,7 +861,7 @@ async fn handle_check_kicad_ui(
         Ok(timeout) => timeout,
         Err(error) => return Ok(error),
     };
-    let addr = ctx.config.ipc_address.clone();
+    let addr = ctx.ipc_address();
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
@@ -917,7 +917,7 @@ async fn handle_launch_kicad_ui(
         Ok(_child) => {
             if wait_ready {
                 // Poll IPC until responsive or timeout
-                let addr = ctx.config.ipc_address.clone();
+                let addr = ctx.ipc_address();
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 

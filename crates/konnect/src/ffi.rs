@@ -73,26 +73,32 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             eager_toolsets: config.eager_toolsets,
         };
         match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
-            Ok(handler) => match config.transport {
-                TransportMode::Stdio => {
-                    // This server is embedded in the host process. Even on
-                    // Unix stdio, current_exe() names that host (for example
-                    // KiCad), not the Konnect cdylib, so in-place reload is a
-                    // standalone-binary capability and is not enabled here.
-                    run_embedded_stdio(handler).await;
+            Ok(handler) => {
+                if ipc_source == crate::config::IpcAddressSource::Unresolved {
+                    handler.enable_ipc_discovery();
                 }
-                TransportMode::Http => {
-                    let _ = crate::transport::http::run_http(handler, &config.http_address).await;
-                }
-                TransportMode::Both => {
-                    let handler_http = handler.clone();
-                    let http_addr = config.http_address.clone();
-                    tokio::select! {
-                        _ = crate::transport::http::run_http(handler_http, &http_addr) => {},
-                        _ = run_embedded_stdio(handler) => {},
+                match config.transport {
+                    TransportMode::Stdio => {
+                        // This server is embedded in the host process. Even on
+                        // Unix stdio, current_exe() names that host (for example
+                        // KiCad), not the Konnect cdylib, so in-place reload is a
+                        // standalone-binary capability and is not enabled here.
+                        run_embedded_stdio(handler).await;
+                    }
+                    TransportMode::Http => {
+                        let _ =
+                            crate::transport::http::run_http(handler, &config.http_address).await;
+                    }
+                    TransportMode::Both => {
+                        let handler_http = handler.clone();
+                        let http_addr = config.http_address.clone();
+                        tokio::select! {
+                            _ = crate::transport::http::run_http(handler_http, &http_addr) => {},
+                            _ = run_embedded_stdio(handler) => {},
+                        }
                     }
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("kicad_plugin_init: failed to create handler: {}", e);
             }

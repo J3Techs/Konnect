@@ -20,7 +20,9 @@ conflict rather than an overwrite.
 
 `crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes
 from `ipc_address`, then `KICAD_API_SOCKET`, then discovery of KiCad's default
-endpoint by `konnect-ipc/src/socket.rs`; KiCad-provided credentials such as
+endpoint by `konnect-ipc/src/socket.rs`, at startup and, when startup found
+none, again whenever a tool call needs it (`ToolContext::ipc_address`);
+KiCad-provided credentials such as
 `KICAD_API_TOKEN` are carried in the IPC client request metadata.
 
 Discovery is per-platform because the endpoint is: a Unix socket is a

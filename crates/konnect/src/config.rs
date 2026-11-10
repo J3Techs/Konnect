@@ -99,8 +99,10 @@ impl IpcAddressSource {
 
         warn!(
             "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
-             Live-KiCad tools will fail and file-backed ones will edit the \
-             project on disk instead. Enable Edit > Preferences > Plugins > \
+             Until one appears there, live-KiCad tools will fail and file-backed \
+             ones will edit the project on disk instead; the path is looked at \
+             again when a tool needs KiCad, so a KiCad started later is reached \
+             without restarting this server. Enable Edit > Preferences > Plugins > \
              'Enable KiCad API' in KiCad, or set ipc_address in your config.",
             konnect_ipc::candidate_socket_paths()
                 .iter()
