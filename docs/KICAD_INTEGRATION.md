@@ -213,6 +213,11 @@ list above is not consulted, and `get_installation_info` reports
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
+With `transport = "http"` the server is a foreground process that ends with
+whatever started it. Running it as a long-lived service, reconnecting a client
+and what a stop does to a running route job are covered in
+[TROUBLESHOOTING](TROUBLESHOOTING.md#the-http-server-stops-when-the-session-that-started-it-ends).
+
 A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
 JLCPCB database tools. They use the platform default (`%APPDATA%/konnect/jlcpcb.db`
 on Windows, `$HOME/.konnect/jlcpcb.db` elsewhere) unless a nonblank configured
