@@ -51,7 +51,7 @@ pub mod placement;
 pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;
-mod route_geometry;
+pub(crate) mod route_geometry;
 mod routing_batch;
 // Native router: the `native_routing` toolset (`route_native`) and the plan
 // apply path (`route_native_apply`) behind its `apply_route_plan` tool.

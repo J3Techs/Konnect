@@ -134,7 +134,69 @@ impl Report {
             "findings": listed,
         })
     }
+
+    /// Every defect (collinear vertices are not defects) as one flat list
+    /// for a refusal or a report: its kind, net, layer, position and the
+    /// tracks involved, each by its index in `segments` (the position of
+    /// the track in the linted routing file) with its two ends. At most
+    /// `listed` are listed; `total` and `by_kind` cover all.
+    pub(crate) fn defect_listing(&self, segments: &[Segment], listed: usize) -> serde_json::Value {
+        let defects: Vec<&Finding> = self
+            .findings
+            .iter()
+            .filter(|f| f.kind != "collinear_vertex")
+            .collect();
+        let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+        for f in &defects {
+            *by_kind.entry(f.kind).or_default() += 1;
+        }
+        let shown: Vec<serde_json::Value> = defects
+            .iter()
+            .take(listed)
+            .map(|f| {
+                let tracks: Vec<serde_json::Value> = f
+                    .segments
+                    .iter()
+                    .filter_map(|&i| segments.get(i).map(|s| (i, s)))
+                    .map(|(i, s)| {
+                        json!({
+                            "index": i,
+                            "from": [round4(s.a.0), round4(s.a.1)],
+                            "to": [round4(s.b.0), round4(s.b.1)],
+                            "length_mm": round4(dist(s.a, s.b)),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "kind": f.kind, "net": f.net, "layer": f.layer,
+                    "x": round4(f.at.0), "y": round4(f.at.1),
+                    "detail": f.detail,
+                    "tracks": tracks,
+                })
+            })
+            .collect();
+        let count = shown.len();
+        let mut body = json!({
+            "total": defects.len(),
+            "by_kind": by_kind,
+            "listed": count,
+            "defects": shown,
+        });
+        if count < defects.len() {
+            body["note"] = json!(format!(
+                "{count} of {} defects listed; raise max_listed for the rest",
+                defects.len()
+            ));
+        }
+        body
+    }
 }
+
+/// Defects a refusal or report lists unless asked for more or fewer.
+pub(crate) const DEFECTS_LISTED_DEFAULT: u64 = 50;
+
+/// What to do about a plan the strict lint refuses.
+pub(crate) const STRICT_REMEDY: &str = "Each defect names the tracks involved by their index in the routing_file's tracks array (0-based), with their ends. Edit those tracks in the file and apply again: remove or lengthen the short step of a short_jog or hairpin, replace the corner of an acute_bend with a wider one, and split the passing track (the last one listed) of an unsplit_t_junction at the junction point. Or route those nets again. geometry_check: \"warn\" applies the plan as it is and counts the defects; KiCad's DRC does not judge these shapes, except an acute bend when the board has a track_angle rule.";
 
 pub(crate) fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0

@@ -97,6 +97,7 @@ pub(crate) enum ApplyRefusal {
         field: String,
         reason: String,
     },
+    /// The strict lint found defects; `detail` is [`strict_detail`].
     Geometry {
         defects: usize,
         detail: serde_json::Value,
@@ -108,9 +109,9 @@ impl std::fmt::Display for ApplyRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApplyRefusal::Invalid { field, reason } => write!(f, "{field}: {reason}"),
-            ApplyRefusal::Geometry { defects, .. } => write!(
+            ApplyRefusal::Geometry { defects, detail } => write!(
                 f,
-                "{defects} geometry defect(s) under geometry_check strict"
+                "{defects} geometry defect(s) under geometry_check strict: {detail}"
             ),
             ApplyRefusal::MissingNets(n) => {
                 write!(f, "{} net(s) not on the board: {}", n.len(), n.join(", "))
@@ -147,14 +148,27 @@ pub(crate) fn batch_of(plan: &RoutePlan, locked: bool) -> Batch {
     }
 }
 
+/// What a strict refusal says: every defect by kind, net, layer, position
+/// and plan track index (at most `listed` of them), and the remedy.
+pub(crate) fn strict_detail(
+    report: &route_geometry::Report,
+    segments: &[route_geometry::Segment],
+    listed: usize,
+) -> serde_json::Value {
+    let mut detail = report.defect_listing(segments, listed);
+    detail["remedy"] = json!(route_geometry::STRICT_REMEDY);
+    detail
+}
+
 /// Everything that can be checked before the first write, with the geometry
-/// lint either refusing (`strict`) or only counted. Returns the chunks and
-/// the lint's defect count.
+/// lint either refusing (`strict`, listing at most `listed` defects) or only
+/// counted. Returns the chunks and the lint's defect count.
 pub(crate) fn preflight(
     plan: &RoutePlan,
     limits: &route_geometry::Limits,
     strict: bool,
     max_items: usize,
+    listed: usize,
 ) -> Result<(Vec<PlanChunk>, usize), ApplyRefusal> {
     plan.validate().map_err(|e| match e {
         konnect_route::plan::PlanError::Invalid { field, reason } => {
@@ -165,12 +179,12 @@ pub(crate) fn preflight(
             reason: other.to_string(),
         },
     })?;
-    let whole = batch_of(plan, false);
-    let report = route_geometry::lint(&whole.segments(), limits);
+    let segments = batch_of(plan, false).segments();
+    let report = route_geometry::lint(&segments, limits);
     if strict && report.defects() > 0 {
         return Err(ApplyRefusal::Geometry {
             defects: report.defects(),
-            detail: report.to_json(limits),
+            detail: strict_detail(&report, &segments, listed),
         });
     }
     Ok((
@@ -254,21 +268,33 @@ pub(crate) fn apply_plan(
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
 ) -> Result<ApplyOutcome, ApplyRefusal> {
-    apply_plan_with(plan, locked, limits, true, max_items, codes, sink)
+    apply_plan_with(
+        plan,
+        locked,
+        limits,
+        true,
+        max_items,
+        route_geometry::DEFECTS_LISTED_DEFAULT as usize,
+        codes,
+        sink,
+    )
 }
 
 /// [`apply_plan`], with the geometry lint refusing (`strict_geometry`) or
-/// only counted in [`ApplyLedger::geometry_defects`].
+/// only counted in [`ApplyLedger::geometry_defects`]. A refusal lists at
+/// most `listed` defects.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_plan_with(
     plan: &RoutePlan,
     locked: bool,
     limits: &route_geometry::Limits,
     strict_geometry: bool,
     max_items: usize,
+    listed: usize,
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
 ) -> Result<ApplyOutcome, ApplyRefusal> {
-    let (chunks, geometry_defects) = preflight(plan, limits, strict_geometry, max_items)?;
+    let (chunks, geometry_defects) = preflight(plan, limits, strict_geometry, max_items, listed)?;
     // Every chunk's items are built before the first is sent, so a missing
     // net refuses the whole plan.
     let mut built = Vec::with_capacity(chunks.len());
@@ -676,6 +702,28 @@ mod tests {
             "{err}"
         );
         assert!(kicad.calls.is_empty());
+        // The refusal names the defect and the plan tracks behind it.
+        let ApplyRefusal::Geometry { detail, .. } = &err else {
+            unreachable!()
+        };
+        assert_eq!(detail["total"], 1, "{detail}");
+        assert_eq!(detail["by_kind"]["short_jog"], 1, "{detail}");
+        let d = &detail["defects"][0];
+        assert_eq!(d["kind"], "short_jog", "{d}");
+        assert_eq!((&d["net"], &d["layer"]), (&json!("A"), &json!("F.Cu")));
+        assert_eq!((&d["x"], &d["y"]), (&json!(5.0), &json!(0.04)));
+        let indices: Vec<u64> = d["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(indices, [0, 1, 2]);
+        assert_eq!(d["tracks"][1]["from"], json!([5.0, 0.0]));
+        assert_eq!(d["tracks"][1]["to"], json!([5.0, 0.08]));
+        assert_eq!(d["tracks"][1]["length_mm"], json!(0.08));
+        assert!(detail["remedy"].as_str().unwrap().contains("index"));
+        assert!(err.to_string().contains("short_jog"), "{err}");
     }
 
     #[test]

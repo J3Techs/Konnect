@@ -368,7 +368,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_native_region",
-            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them. Use start_native_route_job for a whole board.",
+            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them. plan_lint (and fanout_plan_lint) in the result is the strict geometry lint apply_route_plan will run on the written file: passes_strict, total, by_kind and at most 50 defects with their plan track indices. Use start_native_route_job for a whole board.",
             {
                 let mut s = with_props(job_props(), &["board", "output_plan", "region"]);
                 s["properties"]["region"]["description"] = json!("The region to work on, mm (required here)");
@@ -390,7 +390,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_native_route_job",
-            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished, and whether the plan and a checkpoint exist. report.unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them with the total, the counts by reason and the path of report.json, which holds them all; report.stages keeps the route stage's failed counts. Reads the job directory only.",
+            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished, and whether the plan and a checkpoint exist. report.unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, outside_scope, not_routed), at most max_listed of them with the total, the counts by reason and the path of report.json, which holds them all; report.stages keeps the route stage's failed counts. The report's plan_lint (and fanout_plan_lint) says whether the written plan passes apply_route_plan's strict geometry lint: passes_strict, total, by_kind and at most 50 defects with their plan track indices; report.json in the job directory lists them all. Reads the job directory only.",
             json!({
                 "type": "object",
                 "properties": {
@@ -403,7 +403,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "apply_route_plan",
-            "Create a routing_file's tracks and vias in the board KiCad holds open, however many there are: every member, net name and (with geometry_check strict) the geometry lint is checked before anything is written, then the plan goes in as net-whole CreateItems chunks of at most 20,000 items. Writes a ledger (the KIID KiCad gave each plan item) to ledger_output for map_route_plan_drc. A failure part-way reports the chunks already created. Does not save, refill or run DRC.",
+            "Create a routing_file's tracks and vias in the board KiCad holds open, however many there are: every member, net name and (with geometry_check strict) the geometry lint is checked before anything is written, then the plan goes in as net-whole CreateItems chunks of at most 20,000 items. A strict refusal lists every defect (kind, net, layer, x, y and the tracks involved by their index in the routing_file's tracks array, with their ends; at most max_listed, with total and by_kind) and the remedy, and needs no open board. Writes a ledger (the KIID KiCad gave each plan item) to ledger_output for map_route_plan_drc. A failure part-way reports the chunks already created. Does not save, refill or run DRC.",
             json!({
                 "type": "object",
                 "properties": {
@@ -412,7 +412,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "ledger_output": { "type": "string", "description": "New JSON ledger to write; an existing file is never replaced" },
                     "locked": { "type": "boolean", "default": false, "description": "Create every item locked" },
                     "geometry_check": { "type": "string", "enum": ["strict", "warn"], "default": "strict",
-                                        "description": "strict refuses a plan with any geometry lint defect; warn counts them and applies" },
+                                        "description": "strict refuses a plan with any geometry lint defect, listing each one; warn counts them and applies" },
+                    "max_listed": { "type": "integer", "minimum": 0, "maximum": 10000, "default": super::route_geometry::DEFECTS_LISTED_DEFAULT, "description": "Defects a strict refusal lists; its total and by_kind cover all" },
                     "max_items": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 20000, "description": "Items per CreateItems call" }
                 },
                 "required": ["board", "routing_file", "ledger_output"]
@@ -1847,7 +1848,9 @@ async fn handle_route_native_region(
                 None,
             )
         }),
-        "next": "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones.",
+        "plan_lint": report.plan_lint.as_ref().map(|l| l.bounded(native_route_job::PLAN_LINT_LISTED, None)),
+        "fanout_plan_lint": report.fanout_plan_lint.as_ref().map(|l| l.bounded(native_route_job::PLAN_LINT_LISTED, None)),
+        "next": "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones. A plan whose plan_lint.passes_strict is false is refused under geometry_check strict: see its defects and remedy first.",
     })))
 }
 
@@ -1962,6 +1965,7 @@ struct ApplyArgs {
     locked: bool,
     strict: bool,
     max_items: usize,
+    listed: usize,
 }
 
 fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
@@ -1976,6 +1980,24 @@ fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
         0 => return Err(invalid("max_items", "must be at least 1")),
         n => n as usize,
     };
+    let listed = opt_count(
+        args,
+        "max_listed",
+        super::route_geometry::DEFECTS_LISTED_DEFAULT,
+        10_000,
+    )? as usize;
+    // The lint needs no board, so a strict refusal comes before any IPC.
+    if strict && plan.validate().is_ok() {
+        let segments = route_native_apply::batch_of(&plan, false).segments();
+        let report =
+            super::route_geometry::lint(&segments, &super::route_geometry::Limits::default());
+        if report.defects() > 0 {
+            return Err(geometry_refusal(
+                report.defects(),
+                &route_native_apply::strict_detail(&report, &segments, listed),
+            ));
+        }
+    }
     if ledger_path.exists() {
         return Err(CallToolResult::error_kind(
             ToolErrorKind::Conflict {
@@ -1992,7 +2014,35 @@ fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
         locked,
         strict,
         max_items,
+        listed,
     })
+}
+
+/// The strict lint's refusal: the usual error envelope, plus every defect
+/// and the remedy under `geometry` ([`route_native_apply::strict_detail`]).
+fn geometry_refusal(defects: usize, detail: &Value) -> CallToolResult {
+    let kinds = detail["by_kind"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(kind, n)| format!("{n} {kind}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let body = json!({
+        "message": format!(
+            "Nothing was created: the plan has {defects} geometry defect(s) under geometry_check strict ({kinds}). geometry.defects lists each one with the tracks involved; geometry.remedy says what to do."
+        ),
+        "error": ToolErrorKind::InvalidArgument {
+            field: "routing_file".to_string(),
+            reason: format!("{defects} geometry defect(s) under geometry_check strict"),
+        },
+        "geometry": detail,
+    });
+    let mut result = CallToolResult::json(&body);
+    result.is_error = true;
+    result
 }
 
 async fn handle_apply_route_plan(
@@ -2011,7 +2061,7 @@ async fn handle_apply_route_plan(
     let t = std::time::Instant::now();
     let applied = {
         let plan = a.plan.clone();
-        let (locked, strict, max_items) = (a.locked, a.strict, a.max_items);
+        let (locked, strict, max_items, listed) = (a.locked, a.strict, a.max_items, a.listed);
         super::with_bound_board_ipc_classified(ctx, &board, move |client, document| {
             let codes: BTreeMap<String, i32> = client
                 .get_nets_in(document.clone())?
@@ -2020,7 +2070,7 @@ async fn handle_apply_route_plan(
                 .collect();
             let mut sink = IpcSink { client, document };
             Ok(route_native_apply::apply_plan_with(
-                &plan, locked, &limits, strict, max_items, &codes, &mut sink,
+                &plan, locked, &limits, strict, max_items, listed, &codes, &mut sink,
             ))
         })
         .await?
@@ -2044,6 +2094,9 @@ async fn handle_apply_route_plan(
     };
     let elapsed_ms = t.elapsed().as_millis() as u64;
     let (ledger, complete, failure) = match outcome {
+        Err(route_native_apply::ApplyRefusal::Geometry { defects, detail }) => {
+            return Ok(geometry_refusal(defects, &detail))
+        }
         Err(refusal) => {
             return Ok(CallToolResult::error_kind(
                 ToolErrorKind::InvalidArgument {

@@ -493,3 +493,83 @@ fn a_fanout_plan_must_be_a_new_file_of_its_own() {
         assert!(plain.get(key).is_none(), "{key} in {plain}");
     }
 }
+
+/// What `apply_route_plan` says about a written plan under strict.
+fn strict_apply_defects(path: &Path) -> usize {
+    use crate::tools::{route_geometry, route_native_apply};
+    let plan: RoutePlan = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    match route_native_apply::preflight(&plan, &route_geometry::Limits::default(), true, 20_000, 0)
+    {
+        Ok(_) => 0,
+        Err(route_native_apply::ApplyRefusal::Geometry { defects, .. }) => defects,
+        Err(other) => panic!("{other}"),
+    }
+}
+
+#[test]
+fn a_native_run_lints_its_own_plan_as_apply_route_plan_will() {
+    let f = fixture();
+    let s = spec(&f.root, "native.json", CopperSource::Native);
+    let dir = prepare(&s, false).unwrap();
+    assert_eq!(run_job_dir(&dir).unwrap().state, "COMPLETED");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    assert!(s.output_plan.exists(), "{report:?}");
+    let lint = report.plan_lint.expect("a written plan is linted");
+    assert_eq!(lint.path, s.output_plan);
+    // The report and the apply tool agree, whatever the router drew.
+    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert_eq!(lint.passes_strict, lint.total == 0);
+    assert_eq!(lint.defects.len(), lint.total);
+    // This board's routes are clean, and the tools say so.
+    assert!(lint.passes_strict, "{lint:?}");
+    let body = status_of(&s.output_plan);
+    assert_eq!(body["report"]["plan_lint"]["passes_strict"], true);
+    assert_eq!(body["report"]["plan_lint"]["total"], 0);
+    assert!(body["report"]["plan_lint"].get("remedy").is_none());
+}
+
+#[test]
+fn a_plan_the_strict_lint_will_refuse_is_reported_with_its_tracks_before_it_is_applied() {
+    let f = fixture();
+    let seed = staircase_plan(&f.root);
+    // The optimizer off: the staircase reaches the plan as it is.
+    let mut s = spec(&f.root, "stairs.json", CopperSource::Plan { path: seed });
+    s.optimize = false;
+    let dir = prepare(&s, false).unwrap();
+    assert_eq!(run_job_dir(&dir).unwrap().state, "COMPLETED");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let lint = report.plan_lint.expect("a written plan is linted");
+    assert!(!lint.passes_strict);
+    assert!(lint.total > PLAN_LINT_LISTED, "{}", lint.total);
+    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert_eq!(lint.by_kind.get("short_jog"), Some(&lint.total), "{lint:?}");
+    // The report file lists every defect, each with its plan tracks.
+    assert_eq!(lint.defects.len(), lint.total);
+    let plan: RoutePlan =
+        serde_json::from_str(&std::fs::read_to_string(&s.output_plan).unwrap()).unwrap();
+    let first = &lint.defects[0];
+    assert_eq!(
+        (&first["net"], &first["layer"]),
+        (&json!("GND"), &json!("B.Cu"))
+    );
+    let tracks = first["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 3, "{first}");
+    let short = &plan.tracks[tracks[1]["index"].as_u64().unwrap() as usize];
+    assert_eq!(tracks[1]["from"], json!([short.x1, short.y1]));
+    assert_eq!(tracks[1]["to"], json!([short.x2, short.y2]));
+    // The plan stage record counts them; the tool result lists a bounded
+    // number, the total, the remedy and where the whole list is.
+    let stage = report.stages.last().unwrap();
+    assert_eq!(stage.detail["strict_lint_defects"], json!(lint.total));
+    let body = status_of(&s.output_plan);
+    let shown = &body["report"]["plan_lint"];
+    assert_eq!(shown["passes_strict"], false);
+    assert_eq!(shown["total"], json!(lint.total));
+    assert_eq!(shown["listed"], json!(PLAN_LINT_LISTED));
+    assert_eq!(shown["defects"].as_array().unwrap().len(), PLAN_LINT_LISTED);
+    assert!(shown["remedy"].as_str().unwrap().contains("index"));
+    assert!(
+        shown["note"].as_str().unwrap().contains(REPORT_FILE),
+        "{shown}"
+    );
+}

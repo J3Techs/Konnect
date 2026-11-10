@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a strict geometry refusal names its defects, and a route job lints its own plan
+
+`apply_route_plan` under the default `geometry_check: strict` refused a plan
+with only a count ("2 geometry defect(s) under geometry_check strict"). The
+lint's findings were computed and then dropped, so the caller could not tell
+which tracks to fix, and plans written by the native router itself were
+refused this way.
+
+The refusal is still `invalid_argument` on `routing_file`, and now carries
+`geometry`: `total`, `by_kind`, `listed`, `defects` and `remedy`. Each defect
+has its `kind` (`short_jog`, `hairpin`, `acute_bend`, `unsplit_t_junction`),
+`net`, `layer`, `x`, `y`, a `detail` sentence and `tracks`: the plan tracks
+involved, each by its 0-based `index` in the routing file's `tracks` array
+with `from`, `to` and `length_mm`. New `max_listed` (default 50, at most
+10000) bounds the list; `total` and `by_kind` always cover every defect, and a
+`note` says when some are left out. The lint needs no board, so the refusal
+now comes before KiCad is contacted and before the ledger path is checked. The
+strict check itself is unchanged, and router output is not exempt.
+
+`route_native_region` and a finished `start_native_route_job` now run that
+same lint on the plan they write and report it as `plan_lint` (and
+`fanout_plan_lint` for a separate fanout plan): `path`, `passes_strict`,
+`total`, `by_kind`, at most 50 `defects` in the same shape, and the `remedy`
+when it does not pass. A job's `report.json` holds the full list, and the
+`plan` stage record counts them as `strict_lint_defects`. A caller therefore
+knows before applying whether the plan will be refused, and for which tracks.
+Existing fields are unchanged.
+
 ## Unreleased: the native router's report names the connections it left open
 
 A finished native route job reported its failures only as counts in the route
