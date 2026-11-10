@@ -3,6 +3,39 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: reference designators can be placed by a planner
+
+Moving each reference designator into clear space was done by hand: one
+position worked out per footprint, then checked with DRC.
+
+The `placement` toolset gains `plan_reference_designator_placement`. It reads
+the saved board and writes nothing. For each footprint it tries the designator
+beside the footprint's courtyard on each side in `positions` order (default
+top, bottom, left, right), at each angle in `angles_deg` (default 0, then 90),
+centred on that side and then flush with either end of it, `clearance_mm`
+(default 0.15) away. A candidate is rejected when its text box touches a pad on
+that face, another footprint's courtyard, other visible silkscreen text
+(designators placed earlier in the plan included), footprint silkscreen
+artwork, or comes within `edge_clearance_mm` (default 0.3) of the board edge.
+The first candidate left is the placement. A designator with none is planned
+hidden, or left where it is with `allow_hide: false`. A visible designator
+that touches nothing where it is and keeps the edge clearance is kept
+(`keep_clear_existing`, default true). Footprints are planned in natural
+reference order, so the same saved board and options always give the same
+plan.
+
+The result reports every footprint's action (`placed`, `kept`, `hidden`,
+`unplaced`), the chosen side, board coordinates and text box, and what each
+rejected candidate touched. Its `fields` list, or the file named by
+`plan_file`, is a request for `set_reference_field_presentations`, which
+applies the whole plan with one dry run and one apply. No existing tool's
+arguments change.
+
+The text box is an estimate of the ink of KiCad's stroke font, fitted to KiCad
+10.0.7; pads, courtyards and artwork are taken as their bounding boxes. Run
+KiCad DRC on the applied board. A board open in KiCad is planned from its
+saved file: save it first.
+
 ## Unreleased: reference designators can be hidden, and batched on an open board
 
 `set_reference_field_presentations` could not change a Reference field's

@@ -306,6 +306,25 @@ pub(super) fn footprints_by_reference(
     Ok(out)
 }
 
+/// A footprint's reference and its Reference field as the setter reads it;
+/// `Err` is why the setter would refuse that footprint.
+pub(crate) type ObservedField = (String, Result<Observed, String>);
+
+/// Every footprint's Reference field, by reference. `Err` is a board that
+/// cannot be indexed at all.
+pub(crate) fn observe_all(source: &str) -> Result<Vec<ObservedField>, String> {
+    Ok(footprints_by_reference(source)?
+        .into_iter()
+        .map(|(reference, spans)| {
+            let observed = match spans.as_slice() {
+                [span] => read_field(source, *span).map(|(observed, _)| observed),
+                _ => Err(format!("{} footprints carry this reference", spans.len())),
+            };
+            (reference, observed)
+        })
+        .collect())
+}
+
 fn read_field(source: &str, footprint: (usize, usize)) -> Result<(Observed, FieldSpans), String> {
     let block = &source[footprint.0..footprint.1];
     let node = konnect_sexp::parse_sexp(block).map_err(|e| e.to_string())?;

@@ -39,6 +39,7 @@
 //! the request (the recurring defect class this repo pins tests against).
 
 mod plan_status;
+mod reference_placer;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -234,6 +235,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_set_reference_field_presentations(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        reference_placer::tool(),
     ]
 }
 
