@@ -89,6 +89,7 @@ async fn several_runner_processes_route_at_once() {
             allowances: Default::default(),
             net_classes: None,
             fanout_plan: None,
+            rip_up: Default::default(),
         })
         .collect();
     let mut pids = Vec::new();

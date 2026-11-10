@@ -53,6 +53,7 @@ fn spec(root: &Path, out: &str, source: CopperSource) -> NativeJobSpec {
         allowances: Default::default(),
         net_classes: None,
         fanout_plan: None,
+        rip_up: Default::default(),
     }
 }
 
@@ -492,7 +493,7 @@ fn a_fanout_plan_must_be_a_new_file_of_its_own() {
         .contains("never replaced"));
     // A default spec keeps its old serialised form (and so its hash).
     let plain = serde_json::to_value(spec(&f.root, "main.json", CopperSource::Native)).unwrap();
-    for key in ["allowances", "net_classes", "fanout_plan"] {
+    for key in ["allowances", "net_classes", "fanout_plan", "rip_up"] {
         assert!(plain.get(key).is_none(), "{key} in {plain}");
     }
 }
@@ -1156,4 +1157,336 @@ fn a_net_s_track_width_reaches_the_fanout_stub_of_a_net_left_to_its_plane() {
     // Left to its plane and joined by the stub: nothing of GND is open.
     let open = report.unrouted.as_ref().unwrap();
     assert!(open.connections.iter().all(|c| c.net != "GND"), "{open:?}");
+}
+
+/// Net A's pad TP1 inside a ring of net B drawn on both copper layers
+/// (so no via gets out), its other pad TP2 outside. B's two pads sit on
+/// opposite corners of the ring.
+fn sealed_pin_board(locked: bool) -> String {
+    let pad = |reference: &str, n: u32, x: f64, y: f64, net: &str| {
+        format!(
+            r#"	(footprint "TP"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0001-{n:012}")
+		(at {x} {y})
+		(property "Reference" "{reference}" (at 0 -1 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 0.6 0.6) (layers "F.Cu") (net "{net}")
+			(uuid "00000000-0000-0000-0002-{n:012}"))
+	)
+"#
+        )
+    };
+    let lock = if locked { "(locked yes) " } else { "" };
+    let mut segments = String::new();
+    let corners = [(3.0, 4.0), (7.0, 4.0), (7.0, 8.0), (3.0, 8.0)];
+    for (l, layer) in ["F.Cu", "B.Cu"].iter().enumerate() {
+        for i in 0..4 {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            segments.push_str(&format!(
+                "\t(segment (start {} {}) (end {} {}) (width 0.2) {lock}(layer \"{layer}\") \
+                 (net \"B\") (uuid \"00000000-0000-0000-0003-{:012}\"))\n",
+                a.0,
+                a.1,
+                b.0,
+                b.1,
+                l * 4 + i
+            ));
+        }
+    }
+    format!(
+        r#"(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(general (thickness 1.6))
+	(layers
+		(0 "F.Cu" signal)
+		(2 "B.Cu" signal)
+		(25 "Edge.Cuts" user)
+	)
+{}{}{}{}	(gr_rect (start 0 0) (end 20 12) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts"))
+{segments})
+"#,
+        pad("TP1", 1, 5.0, 6.0, "A"),
+        pad("TP2", 2, 15.0, 6.0, "A"),
+        pad("TP3", 3, 3.0, 4.0, "B"),
+        pad("TP4", 4, 7.0, 8.0, "B"),
+    )
+}
+
+fn sealed_fixture(locked: bool) -> Fixture {
+    let f = fixture();
+    std::fs::write(f.root.join("demo.kicad_pcb"), sealed_pin_board(locked)).unwrap();
+    f
+}
+
+/// Open connections of the saved board once `plan` is applied to it, the
+/// UUIDs in `delete` deleted first.
+fn open_after_apply(s: &NativeJobSpec, plan: Option<&Path>, delete: &[String]) -> usize {
+    let (mut board, _, _) = s.load_inputs().unwrap();
+    board.tracks.retain(|t| {
+        t.uuid
+            .as_ref()
+            .is_none_or(|u| !delete.iter().any(|d| d == u))
+    });
+    for (i, t) in board.tracks.iter_mut().enumerate() {
+        t.id = konnect_route::api::TrackId(i as u32);
+    }
+    if let Some(path) = plan {
+        let plan: RoutePlan =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        plan.to_routed(&board, Generation(0))
+            .unwrap()
+            .freeze_into(&mut board);
+    }
+    ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default()).connection_count()
+}
+
+#[test]
+fn a_rip_up_unlocked_job_routes_the_sealed_pin_and_lists_the_board_copper_its_plan_replaces() {
+    let f = sealed_fixture(false);
+    let mut s = spec(&f.root, "ripped.json", CopperSource::Native);
+    s.rip_up = RipUp::Unlocked;
+    assert_eq!(open_after_apply(&s, None, &[]), 1, "A is open on the board");
+    let dir = prepare(&s, false).unwrap();
+    let status = run_job_dir(&dir).unwrap();
+    assert_eq!(status.state, "COMPLETED", "{status:?}");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let rip = report.rip_up.clone().expect("the rip-up stage ran");
+    assert_eq!((rip.open_before, rip.open_after, rip.rounds), (1, 0, 1));
+    assert_eq!(rip.rerouted_nets, ["B"]);
+    assert!(rip.still_open.is_empty() && !rip.restored);
+    // Every unlocked track of B is listed with its UUID, net and layer.
+    assert_eq!(rip.ripped.len(), 8, "{:?}", rip.ripped);
+    assert!(rip
+        .ripped
+        .iter()
+        .all(|i| i.net == "B" && !i.reason.is_empty()));
+    for layer in ["F.Cu", "B.Cu"] {
+        assert_eq!(rip.ripped.iter().filter(|i| i.layer == layer).count(), 4);
+    }
+    // The deletions file names exactly those, in the shape delete_routing,
+    // the replaces_file arguments and apply_route_plan read.
+    let replaces = replaces_path_for(&s.output_plan);
+    assert_eq!(report.replaces_path.as_deref(), Some(replaces.as_path()));
+    let body: Value = read_json(&replaces).unwrap();
+    let mut listed: Vec<String> = rip.ripped.iter().map(|i| i.uuid.clone()).collect();
+    listed.sort();
+    assert_eq!(body["delete_uuids"], json!(listed));
+    assert_eq!(body["ripped"].as_array().unwrap().len(), 8);
+    // The plan routes both nets and is clean against the board without the
+    // ring; applied with the deletions, nothing is left open.
+    let plan: RoutePlan =
+        serde_json::from_str(&std::fs::read_to_string(&s.output_plan).unwrap()).unwrap();
+    for net in ["A", "B"] {
+        assert!(
+            plan.tracks.iter().any(|t| t.net == net),
+            "no {net} in the plan"
+        );
+    }
+    assert_eq!(report.check.as_ref().unwrap().violations, 0);
+    assert_eq!(open_after_apply(&s, Some(&s.output_plan), &listed), 0);
+    // The guard after the clear stage recorded what was left open.
+    let guard = report.stages.iter().find(|r| r.stage == "rip_up").unwrap();
+    assert_eq!(guard.state, "done");
+    assert_eq!(guard.detail["open_after_optimize_and_clear"], 0);
+    // The tools' view carries the report and the deletions file.
+    let view = status_of(&s.output_plan);
+    assert_eq!(
+        view["report"]["rip_up"]["ripped"].as_array().unwrap().len(),
+        8
+    );
+    assert_eq!(view["report"]["replaces_file"], json!(replaces));
+    // A second run for the same plan name would write the same deletions
+    // file: refused, like the plan itself.
+    std::fs::remove_file(&s.output_plan).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let again = prepare(&s, false).unwrap_err().to_string();
+    assert!(again.contains("replaces.json"), "{again}");
+}
+
+#[test]
+fn by_default_a_job_leaves_board_copper_alone_and_says_what_blocks_the_pin() {
+    let f = sealed_fixture(false);
+    let s = spec(&f.root, "own.json", CopperSource::Native);
+    let dir = prepare(&s, false).unwrap();
+    assert_eq!(run_job_dir(&dir).unwrap().state, "COMPLETED");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let rip = report.rip_up.expect("the rip-up stage ran");
+    assert!(rip.ripped.is_empty() && rip.attempts.is_empty());
+    assert_eq!((rip.open_before, rip.open_after), (1, 1));
+    assert_eq!(rip.still_open.len(), 1);
+    let open = &rip.still_open[0];
+    assert_eq!((open.net.as_str(), open.from.as_str()), ("A", "TP1.1"));
+    assert_eq!(open.blocked_by[0].net, "B");
+    assert_eq!(open.blocked_by[0].reason, "board_copper_not_requested");
+    assert!(report.replaces_path.is_none());
+    assert!(!replaces_path_for(&s.output_plan).exists());
+    assert!(!s.output_plan.exists(), "nothing was routed, so no plan");
+}
+
+#[test]
+fn a_job_never_rips_locked_copper_and_reports_it_as_the_blocker() {
+    let f = sealed_fixture(true);
+    let mut s = spec(&f.root, "locked.json", CopperSource::Native);
+    s.rip_up = RipUp::Unlocked;
+    let dir = prepare(&s, false).unwrap();
+    assert_eq!(run_job_dir(&dir).unwrap().state, "COMPLETED");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+    let rip = report.rip_up.expect("the rip-up stage ran");
+    assert!(rip.ripped.is_empty() && rip.attempts.is_empty());
+    assert_eq!(rip.still_open.len(), 1);
+    assert_eq!(rip.still_open[0].blocked_by[0].reason, "locked");
+    assert!(!rip.still_open[0].blocked_by[0].uuids.is_empty());
+    assert!(!replaces_path_for(&s.output_plan).exists());
+}
+
+#[test]
+fn rip_up_is_refused_for_copper_that_is_not_routed_natively() {
+    let f = fixture();
+    let mut s = spec(&f.root, "board.json", CopperSource::BoardUnlocked);
+    s.rip_up = RipUp::Unlocked;
+    let e = prepare(&s, false).unwrap_err().to_string();
+    assert!(e.contains("rip_up"), "{e}");
+}
+
+/// [`sealed_pin_board`] with the ring unlocked, and a second sealed pin to
+/// its right: net C's pad TP5 inside a locked ring of net D, its other pad
+/// TP6 outside. Nothing may open that one.
+fn two_sealed_pins_board() -> String {
+    let pad = |reference: &str, n: u32, x: f64, y: f64, net: &str| {
+        format!(
+            r#"	(footprint "TP"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0001-{n:012}")
+		(at {x} {y})
+		(property "Reference" "{reference}" (at 0 -1 0) (layer "F.SilkS"))
+		(pad "1" smd rect (at 0 0) (size 0.6 0.6) (layers "F.Cu") (net "{net}")
+			(uuid "00000000-0000-0000-0002-{n:012}"))
+	)
+"#
+        )
+    };
+    let mut extra = String::new();
+    for (reference, n, x, y, net) in [
+        ("TP5", 5, 23.0, 6.0, "C"),
+        ("TP6", 6, 28.0, 6.0, "C"),
+        ("TP7", 7, 21.0, 4.0, "D"),
+        ("TP8", 8, 25.0, 8.0, "D"),
+    ] {
+        extra.push_str(&pad(reference, n, x, y, net));
+    }
+    let corners = [(21.0, 4.0), (25.0, 4.0), (25.0, 8.0), (21.0, 8.0)];
+    for (l, layer) in ["F.Cu", "B.Cu"].iter().enumerate() {
+        for i in 0..4 {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            extra.push_str(&format!(
+                "\t(segment (start {} {}) (end {} {}) (width 0.2) (locked yes) (layer \"{layer}\") \
+                 (net \"D\") (uuid \"00000000-0000-0000-0004-{:012}\"))\n",
+                a.0,
+                a.1,
+                b.0,
+                b.1,
+                l * 4 + i
+            ));
+        }
+    }
+    let board = sealed_pin_board(false).replace("(end 20 12)", "(end 30 12)");
+    let end = board.rfind(')').unwrap();
+    format!("{}{extra}{}", &board[..end], &board[end..])
+}
+
+#[test]
+fn after_a_kept_rip_the_report_lists_exactly_what_is_open_with_its_blockers_and_lints_the_plan() {
+    let f = fixture();
+    std::fs::write(f.root.join("demo.kicad_pcb"), two_sealed_pins_board()).unwrap();
+    let mut s = spec(&f.root, "two.json", CopperSource::Native);
+    s.rip_up = RipUp::Unlocked;
+    // B is ripped and routed again: at the width asked for it.
+    s.allowances =
+        serde_json::from_value(json!({ "track_widths": [{ "net": "B", "width_mm": 0.3 }] }))
+            .unwrap();
+    assert_eq!(open_after_apply(&s, None, &[]), 2, "A and C are open");
+    let dir = prepare(&s, false).unwrap();
+    let status = run_job_dir(&dir).unwrap();
+    assert_eq!(status.state, "COMPLETED", "{status:?}");
+    let report: PipelineReport = read_json(&dir.join(REPORT_FILE)).unwrap();
+
+    // The stage opened A's ring and could not open C's.
+    let rip = report.rip_up.clone().expect("the rip-up stage ran");
+    assert_eq!((rip.open_before, rip.open_after), (2, 1), "{rip:?}");
+    assert_eq!(rip.rerouted_nets, ["B"]);
+    assert_eq!(rip.ripped.len(), 8, "{:?}", rip.ripped);
+    assert!(!rip.restored);
+    assert_eq!(rip.still_open.len(), 1, "{:?}", rip.still_open);
+    let stuck = &rip.still_open[0];
+    assert_eq!(
+        (stuck.net.as_str(), stuck.from.as_str(), stuck.to.as_str()),
+        ("C", "TP5.1", "TP6.1")
+    );
+    assert_eq!(stuck.blocked_by[0].net, "D");
+    assert_eq!(stuck.blocked_by[0].reason, "locked");
+
+    // `unrouted` lists that one connection and no other: A and B are
+    // joined by the plan, on the board without the copper it replaces.
+    let deleted: Vec<String> = rip.ripped.iter().map(|i| i.uuid.clone()).collect();
+    let open = report.unrouted.as_ref().expect("the run reached the check");
+    assert_eq!(open.total, 1, "{open:?}");
+    assert_eq!(
+        open.total,
+        open_after_apply(&s, Some(&s.output_plan), &deleted)
+    );
+    let c = &open.connections[0];
+    assert_eq!(c.net, "C");
+    assert_eq!(
+        (c.from.label(), c.to.label()),
+        ("TP5.1".to_string(), "TP6.1".to_string())
+    );
+    // It is the route stage's own failure of that pad pair, and it carries
+    // what the rip-up stage found in its way: the two accounts agree.
+    assert_eq!(open.route_failures.len(), 1, "{:?}", open.route_failures);
+    assert_eq!(open.route_failures[0].net, "C");
+    assert_eq!(c.reason, open.route_failures[0].reason);
+    assert_eq!(open.by_reason, BTreeMap::from([(c.reason.clone(), 1)]));
+    assert_eq!(c.blocked_by.as_ref(), Some(&stuck.blocked_by));
+    let view = status_of(&s.output_plan);
+    assert_eq!(
+        view["report"]["unrouted"]["connections"][0]["blocked_by"][0]["reason"], "locked",
+        "{view}"
+    );
+
+    // The plan a rip-up run writes is linted like any other, and the
+    // apply tool agrees with the report.
+    let lint = report.plan_lint.as_ref().expect("a written plan is linted");
+    assert_eq!(lint.path, s.output_plan);
+    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert!(lint.passes_strict, "{lint:?}");
+    assert_eq!(view["report"]["plan_lint"]["passes_strict"], true);
+    assert_eq!(report.check.as_ref().unwrap().violations, 0);
+
+    // The net routed again kept its width; A, with no entry, its class's.
+    assert_eq!(plan_widths(&s.output_plan, "B", (0.0, 100.0)), vec![0.3]);
+    assert_eq!(plan_widths(&s.output_plan, "A", (0.0, 100.0)), vec![0.2]);
+    let widths = serde_json::to_value(&report.allowances.as_ref().unwrap().track_widths).unwrap();
+    assert_eq!(widths[0]["net"], "B", "{widths}");
+    assert_eq!(widths[0]["connections"], 1, "{widths}");
+}
+
+#[test]
+fn a_run_without_a_kept_rip_carries_the_blocker_on_the_connection_it_leaves_open() {
+    // Board copper is not asked for: nothing is ripped, and the open
+    // connection says in one place why and what is in its way.
+    let f = sealed_fixture(false);
+    let s = spec(&f.root, "own2.json", CopperSource::Native);
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    let rip = report.rip_up.as_ref().expect("the rip-up stage ran");
+    let open = report.unrouted.as_ref().unwrap();
+    assert_eq!(open.total, 1, "{open:?}");
+    let c = &open.connections[0];
+    assert_eq!(c.net, "A");
+    let by = c.blocked_by.as_ref().expect("the stage's blockers");
+    assert_eq!(by, &rip.still_open[0].blocked_by);
+    assert_eq!(
+        (by[0].net.as_str(), by[0].reason.as_str()),
+        ("B", "board_copper_not_requested")
+    );
 }

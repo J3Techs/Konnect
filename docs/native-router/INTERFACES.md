@@ -1086,6 +1086,60 @@ Additive; no tool was added. Without the new argument nothing changes.
   `plan_tap_vias` sites carry `via_in_pad`, the reply `via_in_pad` and
   `vias_in_pad`; `build_route`'s `new_vias` carry `in_pad`.
 
+### Rip-up and retry
+
+`pipeline::rip_up` runs after the rescue rounds and the class fallback,
+before S6, on the connections still open within the scope
+(`PipelineSettings::rip_up`, a `RipUpSettings`: `mode` `RipUp::{None, Own,
+Unlocked}`, default `Own`; `max_rounds` 4; `probe_radius` 2.5 mm;
+`max_nets` 6; `single_attempts` 3). A struct literal of `PipelineSettings`
+needs the new field.
+
+- **Probe.** The open connections are routed on a copy of the board from
+  which rippable copper within `probe_radius` of their pads is taken out
+  (`Own`: this run's copper; `Unlocked`: also `Ownership::Fixed` tracks,
+  arcs and vias with a UUID, of nets inside the scope, not of an excluded
+  class and without a zone). The S7 checker then checks the probe paths
+  against the real copper: the nets they collide with are the blockers. A
+  connection with no probe path is probed again with every nearby track,
+  arc and via out, then with every zone fill out as well, only to report
+  its blockers (`StillOpen::blocked_by`, a zone fill as `zone_fill`).
+- **Attempt.** The blockers are ripped whole (a net, not single tracks).
+  The stuck connections are routed first around what is left, then the
+  ripped nets around those (`route_around`, pin access recomputed on that
+  copper); when that does not pay, the same rip set once more with all of
+  them as one negotiated batch (`RipUpAttempt::order`). The new copper
+  goes through `clear_findings` against the rest.
+  The attempt is kept only when `open_connection_count` of the whole
+  board (`ConnectivityReport::connection_count` less the connections
+  `PipelineSettings::plane_tracks` leaves to their planes, which are never
+  stuck connections either) is lower than before it. Each batch is routed
+  with `PipelineSettings::connection_widths` matched again to its tasks.
+  A round tries all stuck
+  connections together, then each alone, and ends with its first kept
+  attempt; a (rip set, stuck connections) pair is tried once.
+- **After a kept attempt** `PipelineResult::rip_up` (`RipUpReport`) lists
+  `ripped` board items (`RippedItem`: UUID, kind, net, layer, round,
+  reason). Every later stage, the plan, the check and `connections_after`
+  are against `without_ripped(board, &ripped)`; a caller that continues
+  the pipeline itself (the job runner) must do the same. `connections` is
+  then the task list of that board, `detail` is brought to connectivity
+  (`routed` joined, the rest failed with their earlier reason or
+  `Unreachable`; `track_owner`, `via_users` and `short_segments` emptied),
+  and `global` keeps its statistics but no corridors.
+- **Guarantee.** The stage's state never has more open connections than
+  the state before it. `route_board` runs again without the stage when its
+  own tail (S6, clear, repair) leaves `connections_after` above the
+  stage's `open_before` (`RipUpReport::restored`); the job runner does the
+  same after its clear stage.
+- Counters `pipeline_rip_up_{rounds, attempts, accepted, ripped_items,
+  joined, us, restored}`; time charged to `Stage::Detail`.
+- The job: `NativeJobSpec::rip_up` (serialised only when not `Own`),
+  `PipelineReport::{rip_up, replaces_path}`, `Checkpoint::rip_up`,
+  `replaces_path_for(output_plan)`, a `rip_up` stage record after the
+  clear stage (`done` or `restored`). `unrouted::OpenConnection::blocked_by`
+  is the `StillOpen::blocked_by` of the same pad pair.
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

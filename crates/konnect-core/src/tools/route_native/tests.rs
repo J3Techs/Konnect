@@ -421,6 +421,20 @@ async fn job_tools_refuse_bad_arguments_and_unknown_jobs() {
     .await
     .unwrap();
     assert!(r.is_error && text(&r).contains("threads"));
+    // rip_up is none, own or unlocked, and only for native routing.
+    for extra in [
+        json!({ "rip_up": "everything" }),
+        json!({ "rip_up": true }),
+        json!({ "rip_up": "unlocked", "source": "board_unlocked" }),
+    ] {
+        let mut args = json!({ "board": f.board(), "output_plan": f.path("p.json") });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = handle_start_native_route_job(&args, &ctx()).await.unwrap();
+        assert!(r.is_error && text(&r).contains("rip_up"), "{}", text(&r));
+    }
+    assert!(!Path::new(&f.path("p.json.konnect-native-job")).exists());
 }
 
 #[tokio::test]
@@ -517,6 +531,12 @@ async fn apply_route_plan_refuses_before_any_ipc() {
             json!({ "routing_file": f.path("missing.json") }),
             "routing_file",
         ),
+        (
+            json!({ "replaces_file": f.path("missing.json") }),
+            "replaces_file",
+        ),
+        // A file that holds no UUID list.
+        (json!({ "replaces_file": plan }), "replaces_file"),
     ] {
         let r = handle_apply_route_plan(&call(extra), &ctx()).await.unwrap();
         assert!(
