@@ -46,12 +46,25 @@ pub(crate) struct Limits {
     pub min_bend_angle_deg: f64,
 }
 
-impl Default for Limits {
-    fn default() -> Self {
+impl Limits {
+    /// The strict lint's limits: what `apply_route_plan` refuses a plan
+    /// under and what a route job judges the plan it writes by. They are
+    /// the router's own ([`konnect_route::optimize::lint`]: the optimizer
+    /// takes no edit they refuse), read from the one definition there, so
+    /// the router and the apply cannot come to judge a bend differently.
+    pub(crate) fn strict() -> Self {
+        use konnect_route::optimize::lint::{STRICT_JOG_LENGTH_NM, STRICT_MIN_BEND_ANGLE_DEG};
         Self {
-            jog_length_mm: 0.25,
-            min_bend_angle_deg: 90.0,
+            jog_length_mm: konnect_geom::nm_to_mm(i64::from(STRICT_JOG_LENGTH_NM)),
+            min_bend_angle_deg: STRICT_MIN_BEND_ANGLE_DEG,
         }
+    }
+}
+
+impl Default for Limits {
+    /// [`Limits::strict`]: every geometry lint starts from the same limits.
+    fn default() -> Self {
+        Self::strict()
     }
 }
 
@@ -436,6 +449,100 @@ pub(crate) fn lint(segments: &[Segment], limits: &Limits) -> Report {
     report
 }
 
+/// A plan's tracks linted as they will sit on the board.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlanLint {
+    /// The findings that count against the plan: every track of each is
+    /// the plan's.
+    pub report: Report,
+    /// What was linted: the plan's tracks in file order, then the board
+    /// tracks that shape their joints. Finding indices point at the first
+    /// `plan_tracks` of these.
+    pub segments: Vec<Segment>,
+    /// How many of `segments` are the plan's.
+    pub plan_tracks: usize,
+}
+
+impl PlanLint {
+    pub(crate) fn defects(&self) -> usize {
+        self.report.defects()
+    }
+
+    /// [`Report::defect_listing`] for this lint: every track named is the
+    /// plan's, by its index in the routing file.
+    pub(crate) fn listing(&self, listed: usize) -> serde_json::Value {
+        self.report
+            .defect_listing(&self.segments[..self.plan_tracks], listed)
+    }
+}
+
+/// A segment's identity for telling a board track the plan repeats: net,
+/// layer and its two ends in whole nanometres, in either order.
+fn repeat_key(s: &Segment) -> (&str, &str, [(i64, i64); 2]) {
+    let nm = |p: (f64, f64)| {
+        (
+            (p.0 * 1_000_000.0).round() as i64,
+            (p.1 * 1_000_000.0).round() as i64,
+        )
+    };
+    let mut ends = [nm(s.a), nm(s.b)];
+    ends.sort_unstable();
+    (s.net.as_str(), s.layer.as_str(), ends)
+}
+
+/// Lint a plan's tracks as they will sit on the board: the one verdict a
+/// route job reports for the plan it writes and `apply_route_plan` refuses
+/// a plan by.
+///
+/// `board` is the board's straight tracks (any nets and layers; copper the
+/// plan replaces left out). Those of the plan's nets on the plan's layers
+/// join the lint so that a joint is read as the board will hold it: a plan
+/// bend where a board track also ends is a three-way junction, not the bend
+/// of a jog or hairpin, which is how the router's optimizer reads it when it
+/// accepts an edit there. A board track the plan repeats exactly (a plan
+/// already applied, or the fanout applied before the main plan) is set
+/// aside.
+///
+/// A finding counts against the plan only when every track in it is the
+/// plan's. What needs a board track to exist (a plan track meeting a board
+/// track at a sharp angle, a track of one ending on the middle of a track
+/// of the other) is a property of the junction with copper the plan does
+/// not hold: no edit of the plan's file mends the board's track, and the
+/// router does not shape its copper against same-net board tracks, so such
+/// a finding would refuse plans the router cannot draw otherwise. They are
+/// `lint_board_geometry`'s to report on the board.
+pub(crate) fn lint_on_board(plan: Vec<Segment>, board: &[Segment], limits: &Limits) -> PlanLint {
+    let plan_tracks = plan.len();
+    let mut segments = plan;
+    {
+        let groups: std::collections::BTreeSet<(&str, &str)> = segments
+            .iter()
+            .map(|s| (s.net.as_str(), s.layer.as_str()))
+            .collect();
+        let repeated: std::collections::HashSet<_> = segments.iter().map(repeat_key).collect();
+        let context: Vec<Segment> = board
+            .iter()
+            .filter(|s| {
+                groups.contains(&(s.net.as_str(), s.layer.as_str()))
+                    && !repeated.contains(&repeat_key(s))
+            })
+            .cloned()
+            .collect();
+        drop(groups);
+        drop(repeated);
+        segments.extend(context);
+    }
+    let mut report = lint(&segments, limits);
+    report
+        .findings
+        .retain(|f| f.segments.iter().all(|&i| i < plan_tracks));
+    PlanLint {
+        report,
+        segments,
+        plan_tracks,
+    }
+}
+
 /// Parse `geometry_check` and its limits from tool arguments.
 pub(crate) fn parse_args(
     args: &serde_json::Value,
@@ -635,6 +742,129 @@ mod tests {
             seg((5.0, 0.08), (9.0, 0.08)),
         ];
         assert!(kinds(&s).is_empty());
+    }
+
+    #[test]
+    fn the_strict_limits_are_the_ones_the_router_accepts_its_own_copper_by() {
+        use konnect_route::api::{LayerId, NetId};
+        use konnect_route::optimize::lint::{STRICT_JOG_LENGTH_NM, STRICT_MIN_BEND_ANGLE_DEG};
+        use konnect_route::optimize::{lint_limits, OptimizeOptions};
+        use konnect_route::synthetic::UniformRules;
+        let strict = Limits::strict();
+        // What the optimizer's gate uses on a board whose rules set no
+        // angle or length of their own.
+        let rules = UniformRules {
+            min_track_angle_deg: None,
+            ..UniformRules::default()
+        };
+        let router = lint_limits(&rules, &OptimizeOptions::default(), NetId(0), LayerId(0));
+        assert_eq!(strict.min_bend_angle_deg, router.min_bend_angle_deg);
+        assert_eq!(
+            strict.jog_length_mm,
+            konnect_geom::nm_to_mm(i64::from(router.jog_length_nm))
+        );
+        // Both read the one definition; every other lint starts from it.
+        assert_eq!(strict.min_bend_angle_deg, STRICT_MIN_BEND_ANGLE_DEG);
+        assert_eq!(
+            strict.jog_length_mm,
+            konnect_geom::nm_to_mm(i64::from(STRICT_JOG_LENGTH_NM))
+        );
+        assert_eq!(Limits::default(), strict);
+    }
+
+    fn on_board(plan: Vec<Segment>, board: &[Segment]) -> PlanLint {
+        lint_on_board(plan, board, &Limits::strict())
+    }
+
+    fn defect_kinds(lint: &PlanLint) -> Vec<&'static str> {
+        lint.report
+            .findings
+            .iter()
+            .filter(|f| f.kind != "collinear_vertex")
+            .map(|f| f.kind)
+            .collect()
+    }
+
+    #[test]
+    fn a_plan_bend_where_a_board_track_also_ends_is_a_junction_not_a_jog() {
+        // Alone, the 0.08 mm step between two bends is a jog.
+        let plan = vec![
+            seg((0.0, 0.0), (5.0, 0.0)),
+            seg((5.0, 0.0), (5.0, 0.08)),
+            seg((5.0, 0.08), (9.0, 0.08)),
+        ];
+        assert_eq!(defect_kinds(&on_board(plan.clone(), &[])), ["short_jog"]);
+        // On a board where a track of the net carries on from the first
+        // bend, that bend is a three-way junction and the step a branch.
+        let board = [seg((5.0, 0.0), (5.0, -3.0))];
+        let lint = on_board(plan.clone(), &board);
+        assert!(defect_kinds(&lint).is_empty(), "{:?}", lint.report);
+        assert_eq!((lint.plan_tracks, lint.segments.len()), (3, 4));
+        // A track of another net or layer there changes nothing.
+        let mut other_net = board.clone();
+        other_net[0].net = "M".into();
+        assert_eq!(
+            defect_kinds(&on_board(plan.clone(), &other_net)),
+            ["short_jog"]
+        );
+        let mut other_layer = board;
+        other_layer[0].layer = "B.Cu".into();
+        let lint = on_board(plan, &other_layer);
+        assert_eq!(defect_kinds(&lint), ["short_jog"]);
+        assert_eq!(lint.segments.len(), 3);
+    }
+
+    #[test]
+    fn a_defect_that_needs_a_board_track_is_the_junctions_and_not_the_plans() {
+        // A plan track leaving a board track's end at 34 degrees: an acute
+        // bend on the board, between copper the plan holds and copper it
+        // does not.
+        let sharp = vec![seg((5.0, 0.0), (2.0, 2.0))];
+        let run = [seg((0.0, 0.0), (5.0, 0.0))];
+        let mut together = sharp.clone();
+        together.extend(run.iter().cloned());
+        assert_eq!(kinds(&together), ["acute_bend"]);
+        let lint = on_board(sharp, &run);
+        assert!(defect_kinds(&lint).is_empty(), "{:?}", lint.report);
+        // A track of one ending on the middle of a track of the other,
+        // either way round.
+        let branch = vec![seg((2.0, 0.0), (2.0, 3.0))];
+        assert!(defect_kinds(&on_board(branch.clone(), &run)).is_empty());
+        assert!(defect_kinds(&on_board(run.to_vec(), &branch)).is_empty());
+        // Both the plan's: counted as ever, by their indices in the file.
+        let mut both = run.to_vec();
+        both.extend(branch);
+        let lint = on_board(both, &[seg((9.0, 0.0), (9.0, 5.0))]);
+        assert_eq!(defect_kinds(&lint), ["unsplit_t_junction"]);
+        let listing = lint.listing(10);
+        let indices: Vec<u64> = listing["defects"][0]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(indices, [1, 0], "{listing}");
+    }
+
+    #[test]
+    fn board_tracks_the_plan_repeats_are_set_aside_and_board_defects_are_not_the_plans() {
+        // The plan already on the board (or its fanout, applied first):
+        // linted once, not as a zero degree bend against itself. The ends
+        // may be in either order.
+        let plan = vec![seg((0.0, 0.0), (5.0, 0.0)), seg((5.0, 0.0), (5.0, 4.0))];
+        let board = [seg((5.0, 0.0), (0.0, 0.0)), seg((5.0, 0.0), (5.0, 4.0))];
+        let once = on_board(plan.clone(), &board);
+        assert!(defect_kinds(&once).is_empty(), "{:?}", once.report);
+        assert_eq!(once.segments.len(), 2);
+        // A hairpin among board tracks alone, away from the plan, is the
+        // board's own.
+        let hairpin = [
+            seg((20.0, 0.0), (25.0, 0.0)),
+            seg((25.0, 0.0), (25.0, 0.1)),
+            seg((25.0, 0.1), (20.0, 0.1)),
+        ];
+        assert!(!lint(&hairpin, &Limits::strict()).findings.is_empty());
+        assert!(defect_kinds(&on_board(plan, &hairpin)).is_empty());
     }
 
     #[test]

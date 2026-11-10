@@ -461,8 +461,8 @@ async fn a_strict_refusal_names_each_defect_and_the_plan_tracks_behind_it() {
     assert!(r.is_error, "{said}");
     let body: Value = serde_json::from_str(&said).unwrap();
     assert!(
-        body["message"].as_str().unwrap().contains(
-            "the plan has 2 geometry defect(s) under geometry_check strict (2 short_jog)"
+        body["message"].as_str().unwrap().starts_with(
+            "Nothing was created: the plan has 2 geometry defect(s) under geometry_check strict (2 short_jog)"
         ),
         "{said}"
     );
@@ -508,6 +508,65 @@ async fn a_strict_refusal_names_each_defect_and_the_plan_tracks_behind_it() {
         detail["note"].as_str().unwrap().contains("1 of 2"),
         "{detail}"
     );
+}
+
+#[tokio::test]
+async fn a_strict_refusal_judges_the_plan_among_the_saved_boards_tracks_and_says_what_it_left() {
+    let f = files();
+    // The saved board holds a SIG track on F.Cu from (20, 10.5) to
+    // (25, 10.5). This plan comes up to that track's end, steps 0.08 mm
+    // sideways and carries on: a jog on its own, but on the board the
+    // first bend is a three-way junction with the board track.
+    let plan = write_plan(
+        &f,
+        "step.json",
+        vec![
+            t("SIG", "F.Cu", (25.0, 14.0), (25.0, 10.5)),
+            t("SIG", "F.Cu", (25.0, 10.5), (25.08, 10.5)),
+            t("SIG", "F.Cu", (25.08, 10.5), (25.08, 7.0)),
+        ],
+    );
+    let ledger = f.path("ledger.json");
+    let mut args = json!({ "board": f.board(), "routing_file": plan, "ledger_output": ledger });
+    // No KiCad here. The lint passes among the saved tracks, so what is
+    // missing is the open board, not a geometry defect.
+    let r = handle_apply_route_plan(&args, &ctx()).await.unwrap();
+    let said = text(&r);
+    assert!(r.is_error && !said.contains("geometry defect"), "{said}");
+
+    // A plan that replaces that board track is judged without it: the step
+    // is a jog, and the refusal says the copper to replace was left too,
+    // and that the verdict is the saved file's.
+    let met = f.path("met.replaces.json");
+    std::fs::write(&met, r#"["00000000-0000-0000-0000-000000000010"]"#).unwrap();
+    args["replaces_file"] = json!(met);
+    let r = handle_apply_route_plan(&args, &ctx()).await.unwrap();
+    let said = text(&r);
+    assert!(r.is_error, "{said}");
+    let body: Value = serde_json::from_str(&said).unwrap();
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "Nothing was deleted or created: the plan has 1 geometry defect(s) under geometry_check strict (1 short_jog)"
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("judged among the tracks saved in") && message.contains("demo.kicad_pcb"),
+        "{message}"
+    );
+    let defect = &body["geometry"]["defects"][0];
+    assert_eq!(defect["kind"], "short_jog", "{said}");
+    assert_eq!(defect["tracks"][1]["index"], 1, "{said}");
+
+    // Replacing some other copper leaves the junction, and the plan passes.
+    let other = f.path("other.replaces.json");
+    std::fs::write(&other, r#"["00000000-0000-0000-0000-000000000011"]"#).unwrap();
+    args["replaces_file"] = json!(other);
+    let r = handle_apply_route_plan(&args, &ctx()).await.unwrap();
+    let said = text(&r);
+    assert!(r.is_error && !said.contains("geometry defect"), "{said}");
+    assert!(!Path::new(&ledger).exists());
 }
 
 #[tokio::test]

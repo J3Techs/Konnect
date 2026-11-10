@@ -3,8 +3,10 @@
 //!
 //! A [`RoutePlan`] can hold more than the 20,000 items one `CreateItems`
 //! call may carry. [`apply_plan`] preflights the whole plan first (member
-//! checks, the strict geometry lint over every track, every net name
-//! resolved), so nothing is written unless all of it can be; then it creates
+//! checks, the strict geometry lint over every track as it will sit among
+//! the board's own tracks ([`strict_lint`], the verdict a route job reports
+//! for the plan it writes), every net name resolved), so nothing is written
+//! unless all of it can be; then it creates
 //! one net-whole chunk ([`RoutePlan::chunks_by_net`]) at a time and records
 //! the KIID KiCad gave each item ([`ApplyLedger`]). A failure part-way is
 //! reported as [`ApplyOutcome::Partial`] with the chunks already created, so
@@ -148,6 +150,9 @@ pub(crate) enum ApplyRefusal {
     ReplacedLocked(Vec<String>),
     /// The copper could not be read or deleted, or was still there after.
     ReplaceFailed(String),
+    /// The board's copper could not be read for the geometry lint; nothing
+    /// was deleted or created.
+    BoardUnread(String),
 }
 
 impl ApplyRefusal {
@@ -196,6 +201,10 @@ impl std::fmt::Display for ApplyRefusal {
                 listed(u)
             ),
             ApplyRefusal::ReplaceFailed(e) => write!(f, "deleting the replaced copper: {e}"),
+            ApplyRefusal::BoardUnread(e) => write!(
+                f,
+                "the board's tracks could not be read for the geometry lint: {e}"
+            ),
         }
     }
 }
@@ -230,22 +239,89 @@ pub(crate) fn batch_of(plan: &RoutePlan, locked: bool) -> Batch {
 
 /// What a strict refusal says: every defect by kind, net, layer, position
 /// and plan track index (at most `listed` of them), and the remedy.
-pub(crate) fn strict_detail(
-    report: &route_geometry::Report,
-    segments: &[route_geometry::Segment],
-    listed: usize,
-) -> serde_json::Value {
-    let mut detail = report.defect_listing(segments, listed);
+pub(crate) fn strict_detail(lint: &route_geometry::PlanLint, listed: usize) -> serde_json::Value {
+    let mut detail = lint.listing(listed);
     detail["remedy"] = json!(route_geometry::STRICT_REMEDY);
     detail
 }
 
+/// The strict geometry lint of `plan` as its copper will sit on a board
+/// whose straight tracks are `board` (copper the plan replaces left out):
+/// [`route_geometry::lint_on_board`] at [`route_geometry::Limits::strict`].
+/// A route job calls this on the plan it writes and [`preflight`] calls it
+/// before anything is created, so the two cannot disagree about a plan on
+/// the same board.
+pub(crate) fn strict_lint(
+    plan: &RoutePlan,
+    board: &[route_geometry::Segment],
+) -> route_geometry::PlanLint {
+    route_geometry::lint_on_board(
+        batch_of(plan, false).segments(),
+        board,
+        &route_geometry::Limits::strict(),
+    )
+}
+
+/// The straight tracks among `copper` (what [`ItemSink::copper`] read from
+/// the open board), without those named in `replaced`: the board side of
+/// [`strict_lint`]. Arcs and vias shape no joint the lint reads.
+pub(crate) fn board_tracks(
+    copper: &[routing_batch::CopperItem],
+    replaced: &BTreeSet<String>,
+) -> Vec<route_geometry::Segment> {
+    let gone: BTreeSet<String> = replaced.iter().map(|u| u.to_ascii_lowercase()).collect();
+    copper
+        .iter()
+        .filter(|c| c.kind == "track" && c.points.len() == 2)
+        .filter(|c| !gone.contains(&c.id.to_ascii_lowercase()))
+        .map(|c| route_geometry::Segment {
+            net: c.net.clone(),
+            layer: c.layer.clone(),
+            width: 0.0,
+            a: c.points[0],
+            b: c.points[1],
+        })
+        .collect()
+}
+
+/// The straight tracks of a saved board as [`strict_lint`] takes them,
+/// without those whose UUID is in `replaced`: what a route job judges its
+/// plan among, and what `apply_route_plan` falls back to when no open board
+/// can be reached. The same tracks [`board_tracks`] reads from the open one
+/// when the board is saved.
+pub(crate) fn saved_board_tracks(
+    board: &konnect_route::board::RouteBoard,
+    replaced: &BTreeSet<String>,
+) -> Vec<route_geometry::Segment> {
+    let gone: BTreeSet<String> = replaced.iter().map(|u| u.to_ascii_lowercase()).collect();
+    let mm = |v: konnect_geom::Coord| konnect_geom::nm_to_mm(i64::from(v));
+    board
+        .tracks
+        .iter()
+        .filter(|t| {
+            !t.uuid
+                .as_ref()
+                .is_some_and(|u| gone.contains(&u.to_ascii_lowercase()))
+        })
+        .filter_map(|t| {
+            Some(route_geometry::Segment {
+                net: board.net(t.net?).name.clone(),
+                layer: board.layers.name(t.layer).to_string(),
+                width: mm(t.seg.width),
+                a: (mm(t.seg.a.x), mm(t.seg.a.y)),
+                b: (mm(t.seg.b.x), mm(t.seg.b.y)),
+            })
+        })
+        .collect()
+}
+
 /// Everything that can be checked before the first write, with the geometry
-/// lint either refusing (`strict`, listing at most `listed` defects) or only
-/// counted. Returns the chunks and the lint's defect count.
+/// lint ([`strict_lint`] against `board`, the board's tracks) either
+/// refusing (`strict`, listing at most `listed` defects) or only counted.
+/// Returns the chunks and the lint's defect count.
 pub(crate) fn preflight(
     plan: &RoutePlan,
-    limits: &route_geometry::Limits,
+    board: &[route_geometry::Segment],
     strict: bool,
     max_items: usize,
     listed: usize,
@@ -259,17 +335,16 @@ pub(crate) fn preflight(
             reason: other.to_string(),
         },
     })?;
-    let segments = batch_of(plan, false).segments();
-    let report = route_geometry::lint(&segments, limits);
-    if strict && report.defects() > 0 {
+    let lint = strict_lint(plan, board);
+    if strict && lint.defects() > 0 {
         return Err(ApplyRefusal::Geometry {
-            defects: report.defects(),
-            detail: strict_detail(&report, &segments, listed),
+            defects: lint.defects(),
+            detail: strict_detail(&lint, listed),
         });
     }
     Ok((
         plan.chunks_by_net(max_items.clamp(1, routing_batch::MAX_ITEMS)),
-        report.defects(),
+        lint.defects(),
     ))
 }
 
@@ -343,7 +418,6 @@ fn created_keys(created: &[prost_types::Any]) -> Vec<(String, ItemKey)> {
 pub(crate) fn apply_plan(
     plan: &RoutePlan,
     locked: bool,
-    limits: &route_geometry::Limits,
     max_items: usize,
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
@@ -351,7 +425,6 @@ pub(crate) fn apply_plan(
     apply_plan_with(
         plan,
         locked,
-        limits,
         true,
         max_items,
         route_geometry::DEFECTS_LISTED_DEFAULT as usize,
@@ -362,23 +435,38 @@ pub(crate) fn apply_plan(
 
 /// [`apply_plan`], with the geometry lint refusing (`strict_geometry`) or
 /// only counted in [`ApplyLedger::geometry_defects`]. A refusal lists at
-/// most `listed` defects.
-#[allow(clippy::too_many_arguments)]
+/// most `listed` defects. The board's tracks are read first: the lint
+/// judges the plan among them.
 pub(crate) fn apply_plan_with(
     plan: &RoutePlan,
     locked: bool,
-    limits: &route_geometry::Limits,
     strict_geometry: bool,
     max_items: usize,
     listed: usize,
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
 ) -> Result<ApplyOutcome, ApplyRefusal> {
-    let (chunks, geometry_defects) = preflight(plan, limits, strict_geometry, max_items, listed)?;
+    let copper = sink
+        .copper()
+        .map_err(|e| ApplyRefusal::BoardUnread(format!("{e:#}")))?;
+    let board = board_tracks(&copper, &BTreeSet::new());
+    let (chunks, geometry_defects) = preflight(plan, &board, strict_geometry, max_items, listed)?;
+    create_chunks(plan, locked, &chunks, geometry_defects, codes, sink)
+}
+
+/// Create the preflighted `chunks` of `plan`, one request each.
+fn create_chunks(
+    plan: &RoutePlan,
+    locked: bool,
+    chunks: &[PlanChunk],
+    geometry_defects: usize,
+    codes: &BTreeMap<String, i32>,
+    sink: &mut dyn ItemSink,
+) -> Result<ApplyOutcome, ApplyRefusal> {
     // Every chunk's items are built before the first is sent, so a missing
     // net refuses the whole plan.
     let mut built = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
+    for chunk in chunks {
         match batch_of(&chunk.plan, locked).items(codes) {
             Ok(items) => built.push(items),
             Err(missing) => {
@@ -508,37 +596,33 @@ fn delete_replaced(
 /// the create step can refuse is checked first, then exactly the items in
 /// `replaces` are deleted ([`delete_replaced`]), then the plan is created.
 /// Returns what was deleted with the outcome of the create step. A strict
-/// lint refusal (listing at most `listed` defects) comes before any delete.
+/// lint refusal (listing at most `listed` defects) comes before any delete;
+/// the lint judges the plan among the board's tracks without the replaced
+/// ones, as the board will be once they are gone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_plan_replacing(
     plan: &RoutePlan,
     replaces: &BTreeSet<String>,
     locked: bool,
-    limits: &route_geometry::Limits,
     strict_geometry: bool,
     max_items: usize,
     listed: usize,
     codes: &BTreeMap<String, i32>,
     sink: &mut dyn ItemSink,
 ) -> Result<(Vec<ReplacedItem>, ApplyOutcome), ApplyRefusal> {
-    let (chunks, _) = preflight(plan, limits, strict_geometry, max_items, listed)?;
+    let copper = sink
+        .copper()
+        .map_err(|e| ApplyRefusal::BoardUnread(format!("{e:#}")))?;
+    let board = board_tracks(&copper, replaces);
+    let (chunks, geometry_defects) = preflight(plan, &board, strict_geometry, max_items, listed)?;
     for chunk in &chunks {
         if let Err(missing) = batch_of(&chunk.plan, locked).items(codes) {
             return Err(ApplyRefusal::MissingNets(missing));
         }
     }
     let replaced = delete_replaced(replaces, sink)?;
-    apply_plan_with(
-        plan,
-        locked,
-        limits,
-        strict_geometry,
-        max_items,
-        listed,
-        codes,
-        sink,
-    )
-    .map(|outcome| (replaced, outcome))
+    create_chunks(plan, locked, &chunks, geometry_defects, codes, sink)
+        .map(|outcome| (replaced, outcome))
 }
 
 /// One DRC item, followed back to the plan where it can be.
@@ -786,7 +870,6 @@ mod tests {
             &plan(),
             &uuids(replaces),
             false,
-            &limits(),
             true,
             20_000,
             50,
@@ -851,7 +934,6 @@ mod tests {
             &plan(),
             &uuids(&["t-1"]),
             false,
-            &limits(),
             true,
             20_000,
             50,
@@ -884,17 +966,7 @@ mod tests {
         ];
         let replaces = uuids(&["t-1"]);
         let run = |strict: bool, kicad: &mut FakeKiCad| {
-            apply_plan_replacing(
-                &jog,
-                &replaces,
-                false,
-                &limits(),
-                strict,
-                20_000,
-                50,
-                &codes(),
-                kicad,
-            )
+            apply_plan_replacing(&jog, &replaces, false, strict, 20_000, 50, &codes(), kicad)
         };
         // Strict: the refusal is the one a plain apply gives, with the
         // defect's plan tracks, and the copper to replace is still there.
@@ -913,6 +985,182 @@ mod tests {
         assert_eq!(replaced.len(), 1);
         assert!(matches!(outcome, ApplyOutcome::Complete(_)));
         assert!(kicad.ids().is_empty());
+    }
+
+    /// A straight board track of `net` on F.Cu, as KiCad reports it.
+    fn board_track(id: &str, net: &str, a: (f64, f64), b: (f64, f64)) -> routing_batch::CopperItem {
+        routing_batch::CopperItem {
+            id: id.to_string(),
+            kind: "track",
+            net: net.to_string(),
+            layer: "F.Cu".to_string(),
+            points: vec![a, b],
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn a_bend_between_89_and_90_degrees_gets_one_verdict_from_the_optimizer_and_the_apply() {
+        use konnect_route::api::{Generation, LayerId};
+        use konnect_route::optimize::lint::interior_angle_deg;
+        use konnect_route::optimize::{geometry_defects, optimize_with, OptimizeOptions};
+        use konnect_route::plan::{RoutedCopper, RoutedTrack};
+        use konnect_route::synthetic::{BoardBuilder, UniformRules};
+        let mut b = BoardBuilder::new(30.0, 30.0, &["F.Cu", "B.Cu"]);
+        for (i, at) in [(5.0, 5.0), (14.9, 15.0)].into_iter().enumerate() {
+            let u = b.footprint(&format!("U{i}"), at);
+            b.smd_pad(u, "1", "SIG", at, (0.5, 0.5), "F.Cu");
+        }
+        let board = b.build();
+        let rules = UniformRules {
+            min_track_angle_deg: None,
+            ..UniformRules::default()
+        };
+        let net = board.net_by_name("SIG").unwrap();
+        let p = |x: f64, y: f64| konnect_geom::Point::from_mm(x, y).unwrap();
+        let track = |a, b| RoutedTrack {
+            net,
+            layer: LayerId(0),
+            seg: konnect_geom::Segment::new(a, b, 150_000),
+            gen: Generation(1),
+        };
+        // What the optimizer says of copper (its lint mirror at its default
+        // limits, the kinds the lint has) and what the apply says of the
+        // plan made from it.
+        let router = |c: &RoutedCopper| {
+            geometry_defects(&rules, &OptimizeOptions::default(), c)
+                .iter()
+                .filter(|(_, _, d)| d.kind.is_lint_kind())
+                .count()
+        };
+        let apply = |c: &RoutedCopper| {
+            let plan = RoutePlan::from_routed(&board, c).unwrap();
+            match preflight(&plan, &[], true, 20_000, 50) {
+                Ok(_) => 0,
+                Err(ApplyRefusal::Geometry { defects, detail }) => {
+                    assert_eq!(detail["by_kind"]["acute_bend"], json!(defects), "{detail}");
+                    defects
+                }
+                Err(other) => panic!("{other}"),
+            }
+        };
+        // 10 mm along x, then 10 mm up leaning 0.1 mm back: 89.43 degrees,
+        // on whole nanometres.
+        let corner = p(15.0, 5.0);
+        let leaning = RoutedCopper {
+            tracks: vec![track(p(5.0, 5.0), corner), track(corner, p(14.9, 15.0))],
+            vias: vec![],
+        };
+        let angle = interior_angle_deg(corner, p(5.0, 5.0), p(14.9, 15.0));
+        assert!(angle > 89.0 && angle < 90.0, "{angle}");
+        assert_eq!((router(&leaning), apply(&leaning)), (1, 1));
+        // Whatever the optimizer makes of it, the two still agree.
+        let mut optimized = leaning.clone();
+        optimize_with(
+            &board,
+            &rules,
+            &mut optimized,
+            &OptimizeOptions::default(),
+            &mut konnect_route::telemetry::Telemetry::default(),
+        );
+        assert_eq!(router(&optimized), apply(&optimized), "{optimized:?}");
+        // The same corner square on: accepted by both.
+        let square = RoutedCopper {
+            tracks: vec![track(p(5.0, 5.0), corner), track(corner, p(15.0, 15.0))],
+            vias: vec![],
+        };
+        assert_eq!((router(&square), apply(&square)), (0, 0));
+    }
+
+    #[test]
+    fn a_board_track_at_a_plan_bend_makes_it_a_junction_and_the_jog_is_not_refused() {
+        let mut jog = plan();
+        jog.tracks = vec![
+            track("A", 0.0, 5.0, 0.0),
+            PlanTrack {
+                x1: 5.0,
+                y1: 0.0,
+                x2: 5.0,
+                y2: 0.08,
+                ..track("A", 0.0, 0.0, 0.0)
+            },
+            track("A", 5.0, 9.0, 0.08),
+        ];
+        jog.vias.clear();
+        let mut alone = FakeKiCad::default();
+        let refused = apply_plan(&jog, false, 20_000, &codes(), &mut alone).unwrap_err();
+        assert!(matches!(refused, ApplyRefusal::Geometry { defects: 1, .. }));
+        let mut kicad = FakeKiCad {
+            copper: vec![board_track("t-1", "A", (5.0, 0.0), (5.0, -3.0))],
+            ..FakeKiCad::default()
+        };
+        let outcome = apply_plan(&jog, false, 20_000, &codes(), &mut kicad).unwrap();
+        let ApplyOutcome::Complete(ledger) = outcome else {
+            panic!("expected a complete apply")
+        };
+        assert_eq!(ledger.geometry_defects, 0);
+        assert_eq!(kicad.calls, vec![3]);
+        // A plan that replaces that board track is judged without it, as
+        // the board will be: the step is a jog again, and nothing is
+        // deleted.
+        let mut kicad = FakeKiCad {
+            copper: vec![board_track("t-1", "A", (5.0, 0.0), (5.0, -3.0))],
+            ..FakeKiCad::default()
+        };
+        let refused = apply_plan_replacing(
+            &jog,
+            &uuids(&["T-1"]),
+            false,
+            true,
+            20_000,
+            50,
+            &codes(),
+            &mut kicad,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, ApplyRefusal::Geometry { defects: 1, .. }),
+            "{refused:?}"
+        );
+        assert!(kicad.log.is_empty(), "{:?}", kicad.log);
+        assert_eq!(kicad.ids(), ["t-1"]);
+        // The same track on another net, or meeting the plan at a sharp
+        // angle elsewhere, changes no verdict: only the plan's own shapes
+        // are judged.
+        let mut kicad = FakeKiCad {
+            copper: vec![
+                board_track("t-2", "C", (5.0, 0.0), (5.0, -3.0)),
+                board_track("t-3", "A", (9.0, 0.08), (6.0, 2.0)),
+            ],
+            ..FakeKiCad::default()
+        };
+        let refused = apply_plan(&jog, false, 20_000, &codes(), &mut kicad).unwrap_err();
+        assert!(
+            matches!(refused, ApplyRefusal::Geometry { defects: 1, .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_whose_tracks_cannot_be_read_is_left_alone() {
+        struct Blind;
+        impl ItemSink for Blind {
+            fn create(
+                &mut self,
+                _items: Vec<prost_types::Any>,
+            ) -> anyhow::Result<Vec<prost_types::Any>> {
+                panic!("nothing may be created")
+            }
+        }
+        let refused = apply_plan(&plan(), false, 20_000, &codes(), &mut Blind).unwrap_err();
+        assert!(
+            matches!(refused, ApplyRefusal::BoardUnread(_)),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("could not be read"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -964,17 +1212,10 @@ mod tests {
             .collect()
     }
 
-    fn limits() -> route_geometry::Limits {
-        route_geometry::Limits {
-            min_bend_angle_deg: 89.0,
-            ..route_geometry::Limits::default()
-        }
-    }
-
     #[test]
     fn a_plan_is_created_in_net_whole_chunks_and_every_item_gets_its_kiid() {
         let mut kicad = FakeKiCad::default();
-        let outcome = apply_plan(&plan(), false, &limits(), 3, &codes(), &mut kicad).unwrap();
+        let outcome = apply_plan(&plan(), false, 3, &codes(), &mut kicad).unwrap();
         let ApplyOutcome::Complete(ledger) = outcome else {
             panic!("expected a complete apply")
         };
@@ -1017,7 +1258,7 @@ mod tests {
             reverse: true,
             ..FakeKiCad::default()
         };
-        let outcome = apply_plan(&plan, false, &limits(), 100, &codes(), &mut kicad).unwrap();
+        let outcome = apply_plan(&plan, false, 100, &codes(), &mut kicad).unwrap();
         let ApplyOutcome::Complete(ledger) = outcome else {
             panic!("expected a complete apply")
         };
@@ -1049,7 +1290,7 @@ mod tests {
         let mut kicad = FakeKiCad::default();
         let mut few = codes();
         few.remove("C");
-        let err = apply_plan(&plan(), false, &limits(), 3, &few, &mut kicad).unwrap_err();
+        let err = apply_plan(&plan(), false, 3, &few, &mut kicad).unwrap_err();
         assert_eq!(err, ApplyRefusal::MissingNets(vec!["C".to_string()]));
         assert!(kicad.calls.is_empty());
 
@@ -1065,7 +1306,7 @@ mod tests {
             },
             track("A", 5.0, 9.0, 0.08),
         ];
-        let err = apply_plan(&jog, false, &limits(), 3, &codes(), &mut kicad).unwrap_err();
+        let err = apply_plan(&jog, false, 3, &codes(), &mut kicad).unwrap_err();
         assert!(
             matches!(err, ApplyRefusal::Geometry { defects: 1, .. }),
             "{err}"
@@ -1101,7 +1342,7 @@ mod tests {
             fail_on_call: Some(1),
             ..FakeKiCad::default()
         };
-        let outcome = apply_plan(&plan(), true, &limits(), 3, &codes(), &mut kicad).unwrap();
+        let outcome = apply_plan(&plan(), true, 3, &codes(), &mut kicad).unwrap();
         let ApplyOutcome::Partial {
             ledger,
             failed_chunk,
@@ -1143,7 +1384,7 @@ mod tests {
         let mut kicad = FakeKiCad::default();
         let p = plan();
         let ApplyOutcome::Complete(ledger) =
-            apply_plan(&p, false, &limits(), 3, &codes(), &mut kicad).unwrap()
+            apply_plan(&p, false, 3, &codes(), &mut kicad).unwrap()
         else {
             panic!()
         };
@@ -1341,10 +1582,7 @@ mod tests {
         let mut telemetry = konnect_route::telemetry::Telemetry::default();
         let report = optimize_with(&board, &rules, &mut optimized, &opts, &mut telemetry);
         let plan = RoutePlan::from_routed(&board, &optimized).unwrap();
-        let limits = route_geometry::Limits {
-            min_bend_angle_deg: 89.0,
-            ..route_geometry::Limits::default()
-        };
+        let limits = route_geometry::Limits::strict();
         for (name, p) in [("as routed", &as_routed), ("optimized", &plan)] {
             let t = Instant::now();
             let lint = route_geometry::lint(&batch_of(p, false).segments(), &limits);
@@ -1380,22 +1618,19 @@ mod tests {
             .map(|(i, n)| (n.name.clone(), i as i32 + 1))
             .collect();
         // The strict lint refuses any defect, so a plan with some left is
-        // applied here with the lint relaxed, to measure the write path.
-        let apply_limits = if lint.defects() == 0 {
-            limits
-        } else {
+        // applied here with the lint only counting, to measure the write
+        // path.
+        let strict = lint.defects() == 0;
+        if !strict {
             println!(
-                "note: {} defects remain; apply measured with the lint relaxed",
+                "note: {} defects remain; apply measured with the lint not refusing",
                 lint.defects()
             );
-            route_geometry::Limits {
-                min_bend_angle_deg: 0.0,
-                jog_length_mm: 1e-6,
-            }
-        };
+        }
         let mut kicad = FakeKiCad::default();
         let t = Instant::now();
-        let outcome = apply_plan(&plan, false, &apply_limits, 20_000, &codes, &mut kicad).unwrap();
+        let outcome =
+            apply_plan_with(&plan, false, strict, 20_000, 50, &codes, &mut kicad).unwrap();
         let ApplyOutcome::Complete(applied) = outcome else {
             panic!("fake apply failed")
         };
