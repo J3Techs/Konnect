@@ -3,6 +3,48 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: delete_zones works on a closed board and can select every zone
+
+`delete_zones` required the board open in KiCad, while `add_zones` also writes
+a closed board, and it had no way to select every pour. Removing the outer
+pours before a router run and adding them back afterwards could not be done on
+a saved board.
+
+With no live KiCad on the board the tool now takes a saved-file path. It first
+proves the board closed (KiCad unreachable or answering that the board is not
+open, and no sibling lock), for a dry run too and again before the write; any
+other answer is a refusal and the file is not touched. The selected zones are
+cut from the file as whole blocks in one atomic write, and the persisted board
+is read back: every byte outside the removed blocks is unchanged, the board
+zones left are exactly the ones not selected, and the zones that belong to
+footprints are the ones it had. A zone whose UUID is named elsewhere in the
+board, such as a group's member list, is refused rather than left dangling.
+Results carry `source: "file"`, `board_closure`, `fallback_reason`,
+`footprint_zones_kept` and, for a write, `write`, `warning` and
+`refilled: false`: the zones left keep their saved fills until KiCad refills
+them.
+
+New selectors, on both paths:
+
+- `all: true` selects every copper zone of the board. It is given alone or
+  with `kinds`, never with another filter.
+- `uuids` selects by UUID. Every UUID must be a zone of the board itself, or
+  the call is refused and nothing is deleted.
+- `layers` is `layer` for several layers: a zone on any of them matches. Give
+  one or the other.
+- `kinds` restricts any selection to `copper`, `rule_area`, `teardrop` or
+  `graphical` zones. Without it, `names`, `nets`, `layer`, `layers` and
+  `uuids` match zones of every kind as before, and `all` matches copper zones
+  only, so a rule area (keepout) is deleted by `all` only when `kinds` names
+  `rule_area`.
+
+Only zones of the board itself are candidates. A zone that belongs to a
+footprint is never listed or deleted, and naming one in `uuids` refuses the
+call. Each listed zone now also carries `uuid`, equal to `id`. Existing calls
+on an open board behave as before; a call that used to fail because KiCad was
+not running now plans against the saved file, still as a dry run unless
+`dry_run` is false.
+
 ## Unreleased: JLCPCB part results and lookups agree on `lcsc_id`
 
 `search_jlcpcb_parts` and `suggest_jlcpcb_alternatives` named a part's LCSC

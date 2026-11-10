@@ -373,18 +373,26 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "delete_zones",
-            "Delete zones (copper pours, rule areas) from the board KiCad holds open, selected \
-             by name, net and/or layer; every filter given must match. Locked zones are kept and \
-             counted unless include_locked is set. Defaults to a dry run listing each zone's \
-             name, net, layers, priority and outline size; apply needs expected_count equal to \
-             that dry run's count, re-reads the board and refuses if the selection changed, and \
-             deletes in one DeleteItems (one undo step), then proves the zones gone. Replacing a \
-             zone is delete_zones then add_zone. Tracks, vias, pads and footprints are never \
-             touched.",
+            "Delete board zones (copper pours, rule areas), selected by names, nets, layer or \
+             layers, and/or uuids (every filter given must match), or all: true for every copper \
+             zone. \
+             kinds narrows any selection to copper, rule_area, teardrop or graphical zones; \
+             all without kinds never takes a rule area. Only zones of the board itself are \
+             candidates: a zone that belongs to a footprint is never deleted, and naming one in \
+             uuids refuses the call. Locked zones are kept and counted unless include_locked is \
+             set. Defaults to a dry run listing each zone's uuid, kind, name, net, layers, \
+             priority and outline size; apply needs expected_count equal to that dry run's \
+             count and refuses if the selection changed. With KiCad live on this board the \
+             zones go in one DeleteItems (one undo step) and are proven gone. With no live \
+             KiCad the board must be provably closed: the zone blocks are cut from the saved \
+             file in one atomic write and read back (every other byte unchanged, footprint \
+             zones kept), a zone a group lists is refused rather than left dangling, and that \
+             path carries add_zone's file-edit warning. Replacing a zone is delete_zones then \
+             add_zone. Tracks, vias, pads and footprints are never touched.",
             delete_zones_schema(),
             |args, ctx| async move { handle_delete_zones(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "route_differential_pair",
             "Route a differential pair (two parallel traces with a specified gap).",
@@ -821,10 +829,14 @@ fn delete_zones_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "board": { "type": "string", "description": "Path to the .kicad_pcb KiCad holds open" },
+            "board": { "type": "string", "description": "Path to the .kicad_pcb file" },
             "names": { "type": "array", "items": { "type": "string" }, "description": "Only zones with one of these names (exact)" },
             "nets": { "type": "array", "items": { "type": "string" }, "description": "Only copper zones on one of these nets" },
-            "layer": { "type": "string", "description": "Only zones on this layer (e.g. 'In4.Cu')" },
+            "layer": { "type": "string", "description": "Only zones on this layer (e.g. 'In4.Cu'); a rule area on the layer matches too unless kinds excludes it" },
+            "layers": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Only zones on one of these layers (e.g. ['F.Cu', 'B.Cu'] for the outer pours); give layer or layers, not both" },
+            "uuids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Only the zones with these UUIDs; every one must be a zone of the board itself (not of a footprint) or nothing is deleted. Alone or with the other filters (every filter must match)" },
+            "all": { "type": "boolean", "default": false, "description": "Select every zone of the board: copper zones only, unless kinds names other kinds. Not combined with names, nets, layer, layers or uuids" },
+            "kinds": { "type": "array", "items": { "type": "string", "enum": ["copper", "rule_area", "teardrop", "graphical"] }, "minItems": 1, "description": "Only zones of these kinds. Default: every kind for names, nets, layer, layers and uuids; copper only for all" },
             "include_locked": { "type": "boolean", "default": false, "description": "Also delete locked zones; otherwise they are kept and counted" },
             "dry_run": { "type": "boolean", "default": true },
             "expected_count": { "type": "integer", "minimum": 1, "description": "Required to apply: the count a dry run of the same selection returned" }
@@ -833,20 +845,21 @@ fn delete_zones_schema() -> serde_json::Value {
     })
 }
 
-/// One zone as KiCad reports it, for selection and the dry-run listing.
+/// One zone of the board, as KiCad reports it live or as the saved file
+/// holds it, for selection and the dry-run listing.
 #[derive(Debug, Clone)]
-struct ZoneInfo {
-    id: String,
-    name: String,
-    kind: &'static str,
+pub(crate) struct ZoneInfo {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
     /// None when KiCad did not say (a rule area, or a copper zone whose net
     /// the API left out).
-    net: Option<String>,
-    layers: Vec<String>,
-    priority: u32,
-    locked: bool,
-    outline_points: usize,
-    holes: usize,
+    pub(crate) net: Option<String>,
+    pub(crate) layers: Vec<String>,
+    pub(crate) priority: u32,
+    pub(crate) locked: bool,
+    pub(crate) outline_points: usize,
+    pub(crate) holes: usize,
 }
 
 impl ZoneInfo {
@@ -899,87 +912,252 @@ impl ZoneInfo {
         })
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         json!({
-            "id": self.id, "name": self.name, "kind": self.kind, "net": self.net,
+            "id": self.id, "uuid": self.id, "name": self.name, "kind": self.kind, "net": self.net,
             "layers": self.layers, "priority": self.priority, "locked": self.locked,
             "outline_points": self.outline_points, "holes": self.holes
         })
     }
 }
 
+/// The zone kinds `kinds` may name.
+const ZONE_KINDS: [&str; 4] = ["copper", "rule_area", "teardrop", "graphical"];
+
 /// The selection a delete_zones call names: every filter given must match.
-struct ZoneSelection {
+#[derive(Debug, Clone)]
+pub(crate) struct ZoneSelection {
     names: Vec<String>,
     nets: Vec<String>,
-    layer: Option<String>,
+    /// `layer`, or `layers`: a zone on any one of them matches.
+    layers: Vec<String>,
+    /// Lower-cased.
+    uuids: Vec<String>,
+    all: bool,
+    kinds: Option<Vec<String>>,
     include_locked: bool,
 }
 
 impl ZoneSelection {
-    fn parse(args: &serde_json::Value) -> Result<Self, (String, String)> {
+    pub(crate) fn parse(args: &serde_json::Value) -> Result<Self, (String, String)> {
+        let refuse = |key: &str, reason: &str| (key.to_string(), reason.to_string());
         let list = |key: &str| -> Result<Vec<String>, (String, String)> {
             match args.get(key) {
                 None | Some(serde_json::Value::Null) => Ok(Vec::new()),
                 Some(serde_json::Value::Array(items)) => items
                     .iter()
                     .map(|item| {
-                        item.as_str().map(str::to_string).ok_or_else(|| {
-                            (key.to_string(), "must be a list of strings".to_string())
-                        })
+                        item.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| refuse(key, "must be a list of strings"))
                     })
                     .collect(),
-                Some(_) => Err((key.to_string(), "must be a list of strings".to_string())),
+                Some(_) => Err(refuse(key, "must be a list of strings")),
+            }
+        };
+        let flag = |key: &str| -> Result<bool, (String, String)> {
+            match args.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(false),
+                Some(serde_json::Value::Bool(value)) => Ok(*value),
+                Some(_) => Err(refuse(key, "must be true or false")),
+            }
+        };
+        let mut layers = list("layers")?;
+        if layers.iter().any(|layer| layer.trim().is_empty()) {
+            return Err(refuse("layers", "must hold layer names"));
+        }
+        match args.get("layer") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(_) if !layers.is_empty() => {
+                return Err(refuse("layers", "give layer or layers, not both"))
+            }
+            Some(serde_json::Value::String(layer)) if !layer.trim().is_empty() => {
+                layers.push(layer.clone())
+            }
+            Some(_) => return Err(refuse("layer", "must be a layer name")),
+        }
+        let uuids: Vec<String> = list("uuids")?
+            .iter()
+            .map(|uuid| uuid.trim().to_ascii_lowercase())
+            .collect();
+        if uuids.iter().any(String::is_empty) {
+            return Err(refuse("uuids", "must not hold an empty UUID"));
+        }
+        if args.get("uuids").is_some_and(|v| !v.is_null()) && uuids.is_empty() {
+            return Err(refuse("uuids", "must list at least one UUID"));
+        }
+        let kinds = match args.get("kinds") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => {
+                let kinds = list("kinds")?;
+                if kinds.is_empty() || kinds.iter().any(|k| !ZONE_KINDS.contains(&k.as_str())) {
+                    return Err(refuse(
+                        "kinds",
+                        "must list some of copper, rule_area, teardrop and graphical",
+                    ));
+                }
+                Some(kinds)
             }
         };
         let selection = Self {
             names: list("names")?,
             nets: list("nets")?,
-            layer: args
-                .get("layer")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            include_locked: args
-                .get("include_locked")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            layers,
+            uuids,
+            all: flag("all")?,
+            kinds,
+            include_locked: flag("include_locked")?,
         };
-        if selection.names.is_empty() && selection.nets.is_empty() && selection.layer.is_none() {
-            return Err((
-                "names".to_string(),
-                "give names, nets or layer: delete_zones never selects every zone by default"
-                    .to_string(),
+        let filtered = !selection.names.is_empty()
+            || !selection.nets.is_empty()
+            || !selection.layers.is_empty()
+            || !selection.uuids.is_empty();
+        if selection.all && filtered {
+            return Err(refuse(
+                "all",
+                "selects every zone; give it alone or with kinds, not with names, nets, layer, layers or uuids",
+            ));
+        }
+        if !selection.all && !filtered {
+            return Err(refuse(
+                "names",
+                "give names, nets, layer, layers or uuids, or all: true: delete_zones never selects every zone by default",
             ));
         }
         Ok(selection)
     }
 
-    fn matches(&self, zone: &ZoneInfo) -> bool {
-        (self.names.is_empty() || self.names.contains(&zone.name))
-            && (self.nets.is_empty()
-                || zone.net.as_ref().is_some_and(|net| self.nets.contains(net)))
-            && self
-                .layer
-                .as_ref()
-                .is_none_or(|layer| zone.layers.contains(layer))
+    fn filters_nets(&self) -> bool {
+        !self.nets.is_empty()
     }
 
-    /// (picked, locked zones kept)
-    fn pick<'a>(&self, zones: &'a [ZoneInfo]) -> (Vec<&'a ZoneInfo>, usize) {
+    fn matches(&self, zone: &ZoneInfo) -> bool {
+        let kind = match &self.kinds {
+            Some(kinds) => kinds.iter().any(|kind| kind == zone.kind),
+            // Every zone of the board means every pour: a rule area goes only
+            // when the call names that kind.
+            None => !self.all || zone.kind == "copper",
+        };
+        kind && (self.names.is_empty() || self.names.contains(&zone.name))
+            && (self.nets.is_empty()
+                || zone.net.as_ref().is_some_and(|net| self.nets.contains(net)))
+            && (self.layers.is_empty()
+                || zone.layers.iter().any(|layer| self.layers.contains(layer)))
+            && (self.uuids.is_empty() || self.uuids.contains(&zone.id.to_ascii_lowercase()))
+    }
+
+    /// (picked, locked zones kept). `zones` are the board's own zones;
+    /// `footprint_zone_uuids` those of its footprints, when the source knows
+    /// them, only to say why such a UUID is refused. A UUID that is not a
+    /// zone of the board refuses the whole selection.
+    pub(crate) fn pick<'a>(
+        &self,
+        zones: &'a [ZoneInfo],
+        footprint_zone_uuids: &[String],
+    ) -> Result<(Vec<&'a ZoneInfo>, usize), (String, String)> {
+        for uuid in &self.uuids {
+            if zones.iter().any(|zone| zone.id.eq_ignore_ascii_case(uuid)) {
+                continue;
+            }
+            let reason = if footprint_zone_uuids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(uuid))
+            {
+                format!(
+                    "'{uuid}' is a zone that belongs to a footprint, which delete_zones never deletes; nothing was deleted"
+                )
+            } else {
+                format!(
+                    "'{uuid}' is not a zone of the board itself (a zone that belongs to a footprint is never a candidate); nothing was deleted"
+                )
+            };
+            return Err(("uuids".to_string(), reason));
+        }
         let matched = zones.iter().filter(|zone| self.matches(zone));
         let (locked, unlocked): (Vec<_>, Vec<_>) = matched.partition(|zone| zone.locked);
-        if self.include_locked {
+        Ok(if self.include_locked {
             (locked.into_iter().chain(unlocked).collect(), 0)
         } else {
             (unlocked, locked.len())
+        })
+    }
+}
+
+/// `delete_zones` against the board KiCad holds open as `document`.
+fn delete_zones_live(
+    c: &konnect_ipc::client::KiCadIpcClient,
+    document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    selection: &ZoneSelection,
+    dry_run: bool,
+    expected: Option<u64>,
+) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as K;
+    let read = |c: &konnect_ipc::client::KiCadIpcClient| -> anyhow::Result<Vec<ZoneInfo>> {
+        c.get_items_of_types_in(document.clone(), &[K::KotPcbZone])?
+            .iter()
+            .map(ZoneInfo::decode)
+            .collect()
+    };
+    let zones = read(c)?;
+    if selection.filters_nets() {
+        let silent = zones
+            .iter()
+            .filter(|zone| zone.kind == "copper" && zone.net.is_none())
+            .count();
+        if silent > 0 {
+            return Ok(Err(CallToolResult::error(format!(
+                "KiCad did not report the net of {silent} copper zone(s), so a net filter could miss them; select by name, layer or uuids instead. Nothing was deleted."
+            ))));
         }
     }
+    let (picked, kept_locked) = match selection.pick(&zones, &[]) {
+        Ok(picked) => picked,
+        Err((field, reason)) => return Ok(Err(crate::tools::invalid_arg(&field, &reason))),
+    };
+    let listing: Vec<serde_json::Value> = picked.iter().map(|zone| zone.to_json()).collect();
+    let ids: Vec<String> = picked.iter().map(|zone| zone.id.clone()).collect();
+    let mut body = json!({
+        "count": listing.len(),
+        "zones": listing,
+        "dry_run": dry_run,
+        "deleted": false,
+        "locked_kept": kept_locked,
+        "source": "ipc"
+    });
+    if dry_run {
+        body["next"] = json!("Apply with dry_run false and expected_count set to this count.");
+        return Ok(Ok(body));
+    }
+    if Some(ids.len() as u64) != expected {
+        return Ok(Err(CallToolResult::error(format!(
+            "The selection now matches {} zone(s), not the expected {}; nothing was deleted. Run a fresh dry run.",
+            ids.len(),
+            expected.unwrap_or(0)
+        ))));
+    }
+    c.delete_items_in(document.clone(), ids.clone())?;
+    // KiCad 10 leaves DeleteItems' per-item results empty: prove absence by readback
+    let survivors = read(c)?
+        .iter()
+        .filter(|zone| ids.contains(&zone.id))
+        .count();
+    if survivors > 0 {
+        return Ok(Err(CallToolResult::error(format!(
+            "KiCad accepted the delete but {survivors} of {} selected zone(s) are still on the board.",
+            ids.len()
+        ))));
+    }
+    body["deleted"] = json!(true);
+    body["next"] = json!("Run refill_zones, then run_drc.");
+    Ok(Ok(body))
 }
 
 async fn handle_delete_zones(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
+    let board = get_path(args, "board")?;
     let selection = match ZoneSelection::parse(args) {
         Ok(s) => s,
         Err((field, reason)) => return Ok(crate::tools::invalid_arg(&field, &reason)),
@@ -997,71 +1175,18 @@ async fn handle_delete_zones(
             "apply requires the count a dry run of this selection returned",
         ));
     }
-    let outcome = ipc!(ctx, args, |c, document| {
-        use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as K;
-        let read = |c: &konnect_ipc::client::KiCadIpcClient| -> anyhow::Result<Vec<ZoneInfo>> {
-            c.get_items_of_types_in(document.clone(), &[K::KotPcbZone])?
-                .iter()
-                .map(ZoneInfo::decode)
-                .collect()
-        };
-        let zones = read(c)?;
-        if !selection.nets.is_empty() {
-            let silent = zones
-                .iter()
-                .filter(|zone| zone.kind == "copper" && zone.net.is_none())
-                .count();
-            if silent > 0 {
-                return Ok(Err(format!(
-                    "KiCad did not report the net of {silent} copper zone(s), so a net filter could miss them; select by name or layer instead. Nothing was deleted."
-                )));
-            }
-        }
-        let (picked, kept_locked) = selection.pick(&zones);
-        let listing: Vec<serde_json::Value> = picked.iter().map(|zone| zone.to_json()).collect();
-        let ids: Vec<String> = picked.iter().map(|zone| zone.id.clone()).collect();
-        if dry_run {
-            return Ok(Ok((listing, kept_locked, false)));
-        }
-        if Some(ids.len() as u64) != expected {
-            return Ok(Err(format!(
-                "The selection now matches {} zone(s), not the expected {}; nothing was deleted. Run a fresh dry run.",
-                ids.len(),
-                expected.unwrap_or(0)
-            )));
-        }
-        c.delete_items_in(document.clone(), ids.clone())?;
-        // KiCad 10 leaves DeleteItems' per-item results empty: prove absence by readback
-        let survivors = read(c)?
-            .iter()
-            .filter(|zone| ids.contains(&zone.id))
-            .count();
-        if survivors > 0 {
-            return Ok(Err(format!(
-                "KiCad accepted the delete but {survivors} of {} selected zone(s) are still on the board.",
-                ids.len()
-            )));
-        }
-        Ok(Ok((listing, kept_locked, true)))
-    });
-    match outcome {
-        Err(message) => Ok(CallToolResult::error(message)),
-        Ok((listing, kept_locked, deleted)) => {
-            let mut body = json!({
-                "count": listing.len(),
-                "zones": listing,
-                "dry_run": dry_run,
-                "deleted": deleted,
-                "locked_kept": kept_locked,
-                "source": "ipc"
-            });
-            if dry_run {
-                body["next"] =
-                    json!("Apply with dry_run false and expected_count set to this count.");
-            } else {
-                body["next"] = json!("Run refill_zones, then run_drc.");
-            }
-            Ok(CallToolResult::json(&body))
+    let (live_board, live_selection) = (board.clone(), selection.clone());
+    let attempt = attempt_ipc_write(ctx, &board, "zone deletion", move |c| {
+        let document = c.find_open_board(&live_board)?;
+        delete_zones_live(c, document, &live_selection, dry_run, expected)
+    })
+    .await?;
+    match attempt {
+        BoardWrite::Ipc(Ok(body)) => Ok(CallToolResult::json(&body)),
+        BoardWrite::Ipc(Err(refusal)) | BoardWrite::Refused(refusal) => Ok(refusal),
+        BoardWrite::File(reason) => {
+            super::zone_delete::handle_closed(ctx, &board, &selection, dry_run, expected, &reason)
+                .await
         }
     }
 }
@@ -2059,6 +2184,40 @@ mod delete_trace_tests {
         assert_eq!(
             (by_net["count"].clone(), by_net["locked_kept"].clone()),
             (json!(0), json!(1))
+        );
+
+        let every = body(
+            &handle_delete_zones(&json!({ "board": board, "all": true }), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            (every["count"].clone(), every["locked_kept"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(every["source"], json!("ipc"));
+        let by_uuid = body(
+            &handle_delete_zones(
+                &json!({ "board": board, "uuids": ["Z-CORE"], "layers": ["In4.Cu", "F.Cu"] }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(by_uuid["zones"][0]["uuid"], json!("z-core"));
+        assert_eq!(by_uuid["count"], json!(1));
+        let unknown = handle_delete_zones(
+            &json!({ "board": board, "uuids": ["z-core", "z-absent"], "dry_run": false, "expected_count": 2 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(unknown.is_error);
+        assert_eq!(body(&unknown)["error"]["field"], json!("uuids"));
+        assert_eq!(
+            alive.lock().unwrap().len(),
+            3,
+            "an unknown UUID deletes nothing"
         );
 
         let wrong = handle_delete_zones(

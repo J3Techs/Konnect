@@ -750,6 +750,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_found",
         "unavailable",
         "ambiguous",
+        // A value of delete_zones' `kinds` argument, not a callable tool.
+        "rule_area",
     ];
 
     let mut phantom = Vec::new();

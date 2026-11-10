@@ -426,6 +426,26 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
   limitation. A board observed live earlier in this server session fails with
   `unsafe_file_fallback` instead of writing the file.
 
+### delete_zones
+
+`pcb_routing` toolset. Removes board zones, for example the outer pours
+before a router run (add them back with `add_zone` afterwards).
+
+```
+delete_zones(board, names? | nets? | layer? | layers? | uuids? | all?,
+             kinds?, include_locked?, dry_run?, expected_count?)
+```
+
+- Every filter given must match; `all: true` stands alone (or with `kinds`)
+  and selects every copper zone. A rule area (keepout) goes with `all` only
+  when `kinds` names rule areas (`kinds: ["rule_area"]`)
+- A zone that belongs to a footprint is never deleted
+- Dry run by default, listing each zone; apply with `dry_run: false` and
+  `expected_count` set to that dry run's count
+- Works live (one undo step) or, with no live KiCad, on a board proven
+  closed: the zone blocks are cut from the saved file (`source: file`).
+  A zone a group lists is refused on the closed path
+
 ### refill_zones
 
 **Must call `refill_zones` after any change that affects copper pour:**
