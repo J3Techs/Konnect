@@ -1346,6 +1346,16 @@ impl Draft {
     }
 }
 
+/// `footprint`, a library footprint about to sit unrotated at `position`,
+/// with its child zones moved there. Everything else in a placed footprint is
+/// relative to its root `(at …)`; a child zone is saved in board coordinates
+/// (see `pcb_components::child_zones`).
+fn carry_child_zones(footprint: &str, position: Point) -> anyhow::Result<String> {
+    crate::tools::pcb_components::child_zones::map_child_zones(footprint, &|x, y| {
+        (x + position.x, y + position.y)
+    })
+}
+
 /// The edits that make `template` the instance `expected` describes.
 fn draft(
     template: &Template,
@@ -1633,6 +1643,11 @@ fn build(
             let body = draft.text(template, None);
             let node = konnect_sexp::parse_sexp(&body)
                 .map_err(|error| format!("the instance does not parse: {error}"))?;
+            // A child zone is saved in board coordinates, so it is moved to
+            // the parked position with the footprint; one that cannot be is
+            // refused here, before any position is chosen.
+            carry_child_zones(&body, Point { x: 0.0, y: 0.0 })
+                .map_err(|error| format!("its child zone cannot be placed: {error:#}"))?;
             let extent = konnect_sexp::bounds::footprint_parking_extent(&node)
                 .map_err(|reason| format!("its extent cannot be measured: {reason}"))?;
             Ok((draft, parking::LocalBox::from_bbox(extent)))
@@ -1688,7 +1703,11 @@ fn build(
     }
     for ((draft, expected), position) in drafts.iter_mut().zip(&positions) {
         expected.position = *position;
-        blocks.push(draft.text(&templates[&expected.footprint_id], Some(*position)));
+        let text = draft.text(&templates[&expected.footprint_id], Some(*position));
+        blocks.push(
+            carry_child_zones(&text, *position)
+                .expect("child zones were checked when the instance was drafted"),
+        );
     }
 
     // Insert after the board's last item, so the file keeps its own closing
@@ -2100,7 +2119,13 @@ fn verify_instance(
             Some("uuid" | "tstamp") => template.root_id.is_none(),
             _ => true,
         })
-        .map(|child| restore_library_field(child, template, instance))
+        .map(|child| {
+            restore_library_field(
+                &zone_points_from(child, Point { x: 0.0, y: 0.0 }),
+                template,
+                instance,
+            )
+        })
         .collect::<Vec<_>>();
     let instance_children = node
         .children()
@@ -2121,7 +2146,12 @@ fn verify_instance(
                     .and_then(SexpNode::as_str)
                     .is_some_and(|name| instance.added.contains_key(name)))
         })
-        .map(|child| restore_library_field(&map_back(child, &inverse), template, instance))
+        .map(|child| {
+            // A child zone was moved to the parked position; taken back, it
+            // must be the library's outline.
+            let child = zone_points_from(&map_back(child, &inverse), instance.position);
+            restore_library_field(&child, template, instance)
+        })
         .collect::<Vec<_>>();
     if library_children != instance_children {
         let first = library_children
@@ -2171,6 +2201,36 @@ fn verify_instance(
         Ok((netted, preserved))
     } else {
         Err(problems)
+    }
+}
+
+/// A footprint child with, when it is a `(zone …)`, every outline and fill
+/// point restated relative to `origin` in one spelling, so a library zone and
+/// its placed copy compare equal exactly when the copy is the library outline
+/// moved to the footprint's position.
+fn zone_points_from(child: &SexpNode, origin: Point) -> SexpNode {
+    fn shift(node: &SexpNode, origin: Point) -> SexpNode {
+        let SexpNode::List(children) = node else {
+            return node.clone();
+        };
+        if let (Some("xy" | "start" | "mid" | "end"), 3, Some(x), Some(y)) = (
+            node.head(),
+            children.len(),
+            node.get_f64(1),
+            node.get_f64(2),
+        ) {
+            return SexpNode::List(vec![
+                children[0].clone(),
+                SexpNode::Atom(mm(x - origin.x)),
+                SexpNode::Atom(mm(y - origin.y)),
+            ]);
+        }
+        SexpNode::List(children.iter().map(|child| shift(child, origin)).collect())
+    }
+    if child.head() == Some("zone") {
+        shift(child, origin)
+    } else {
+        child.clone()
     }
 }
 
@@ -3029,6 +3089,78 @@ mod tests {
 
     /// Every input change invalidates a reviewed revision, and the board is
     /// never written on a stale one.
+    /// KiCad saves a placed footprint's child zone in board coordinates
+    /// (pcbnew 10.0.7 writes the Tag-Connect keepout `(xy 1.27 -0.635) …` as
+    /// `(xy 51.27 49.365) …` on a footprint at `(at 50 50)`), so each
+    /// imported instance's zone sits on its parked position, and the readback
+    /// holds it to the library outline moved there.
+    #[tokio::test]
+    async fn a_library_child_zone_is_imported_at_each_instances_position() {
+        let project = Project::new(BOARD, &netlist("2026-10-15T01:02:03"));
+        let zoned = BGA.replacen(
+            "	(embedded_fonts no)",
+            "	(zone
+		(net 0)
+		(net_name \"\")
+		(layer \"F.Cu\")
+		(uuid \"5d0a6a10-0000-4000-8000-000000000040\")
+		(hatch full 0.508)
+		(keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints not_allowed))
+		(polygon
+			(pts
+				(xy 1.27 -0.635) (xy -1.27 -0.635) (xy -1.27 0.635) (xy 1.27 0.635)
+			)
+		)
+	)
+	(embedded_fonts no)",
+            1,
+        );
+        assert_ne!(zoned, BGA);
+        std::fs::write(project.dir.join("Parts.pretty/Bga4.kicad_mod"), &zoned).unwrap();
+        let ctx = project.ctx("");
+
+        let plan = project.dry_run(&ctx).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["report"]["planned_readback"]["verified"], true);
+        let (is_error, applied) = project.apply(&ctx, &plan["plan_revision"]).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["write"]["persisted_readback"]["verified"], true);
+
+        let written = project.board_text();
+        let root = konnect_sexp::parse_sexp(&written).unwrap();
+        let mut positions = Vec::new();
+        for reference in ["U1", "U2"] {
+            let placed = footprint(&root, reference);
+            let at = placed.find("at").unwrap();
+            let (x, y) = (at.get_f64(1).unwrap(), at.get_f64(2).unwrap());
+            positions.push((x, y));
+            let points = placed
+                .find("zone")
+                .and_then(|zone| zone.find("polygon"))
+                .and_then(|polygon| polygon.find("pts"))
+                .unwrap()
+                .find_all("xy")
+                .into_iter()
+                .map(|xy| (xy.get_f64(1).unwrap(), xy.get_f64(2).unwrap()))
+                .collect::<Vec<_>>();
+            let expected = [
+                (1.27, -0.635),
+                (-1.27, -0.635),
+                (-1.27, 0.635),
+                (1.27, 0.635),
+            ];
+            assert_eq!(points.len(), expected.len());
+            for (got, want) in points.iter().zip(expected) {
+                assert!(
+                    (got.0 - (x + want.0)).abs() < 1e-6 && (got.1 - (y + want.1)).abs() < 1e-6,
+                    "{reference} at ({x}, {y}): zone point {got:?}, library {want:?}"
+                );
+            }
+        }
+        assert_ne!(positions[0], positions[1], "two instances, two zones");
+        assert_ne!(positions[0], (0.0, 0.0), "parked away from the origin");
+    }
+
     #[tokio::test]
     async fn a_changed_library_schematic_or_board_invalidates_the_revision() {
         for change in ["library", "schematic", "board"] {
