@@ -13,6 +13,12 @@
 //! [`map_drc`] then follows KiCad's verdict back to the router: DRC item
 //! UUID → KIID → plan item → net. The nets it names are the only ones to
 //! penalise and reroute.
+//!
+//! A plan from a `rip_up: unlocked` run replaces board copper: its
+//! `replaces_file` lists the UUIDs. [`apply_plan_replacing`] deletes exactly
+//! those (refusing, before anything is touched, when one is missing or
+//! locked on the open board, or when the plan itself would be refused) and
+//! then creates the plan.
 
 use super::cli::DrcReport;
 use super::route_geometry;
@@ -27,6 +33,16 @@ pub(crate) trait ItemSink {
     /// Create `items` in one request, returning the created items as KiCad
     /// echoes them (with the KIIDs it assigned).
     fn create(&mut self, items: Vec<prost_types::Any>) -> anyhow::Result<Vec<prost_types::Any>>;
+
+    /// The board's tracks, arcs and vias as it holds them now.
+    fn copper(&mut self) -> anyhow::Result<Vec<routing_batch::CopperItem>> {
+        anyhow::bail!("this sink cannot read the board's copper")
+    }
+
+    /// Delete the items with these KIIDs.
+    fn delete(&mut self, _ids: Vec<String>) -> anyhow::Result<()> {
+        anyhow::bail!("this sink cannot delete items")
+    }
 }
 
 /// The live sink: one `CreateItems` per chunk on the bound document.
@@ -40,6 +56,28 @@ impl ItemSink for IpcSink<'_> {
         self.client
             .create_items_in_returning(self.document.clone(), items)
     }
+
+    fn copper(&mut self) -> anyhow::Result<Vec<routing_batch::CopperItem>> {
+        use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as K;
+        routing_batch::decode_copper(&self.client.get_items_of_types_in(
+            self.document.clone(),
+            &[K::KotPcbTrace, K::KotPcbArc, K::KotPcbVia],
+        )?)
+    }
+
+    fn delete(&mut self, ids: Vec<String>) -> anyhow::Result<()> {
+        self.client.delete_items_in(self.document.clone(), ids)
+    }
+}
+
+/// One board item deleted because the plan replaces it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReplacedItem {
+    pub uuid: String,
+    /// `track`, `arc` or `via`, as KiCad reported it.
+    pub kind: String,
+    pub net: String,
+    pub layer: String,
 }
 
 /// One created item and where it came from.
@@ -103,6 +141,33 @@ pub(crate) enum ApplyRefusal {
         detail: serde_json::Value,
     },
     MissingNets(Vec<String>),
+    /// UUIDs the plan replaces that are no track, arc or via of the open
+    /// board.
+    ReplacedMissing(Vec<String>),
+    /// UUIDs the plan replaces that are locked on the open board.
+    ReplacedLocked(Vec<String>),
+    /// The copper could not be read or deleted, or was still there after.
+    ReplaceFailed(String),
+}
+
+impl ApplyRefusal {
+    /// The argument a refusal is about.
+    pub(crate) fn field(&self) -> &'static str {
+        match self {
+            ApplyRefusal::ReplacedMissing(_)
+            | ApplyRefusal::ReplacedLocked(_)
+            | ApplyRefusal::ReplaceFailed(_) => "replaces_file",
+            _ => "routing_file",
+        }
+    }
+}
+
+fn listed(uuids: &[String]) -> String {
+    let shown: Vec<&str> = uuids.iter().take(20).map(String::as_str).collect();
+    match uuids.len() - shown.len() {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
 }
 
 impl std::fmt::Display for ApplyRefusal {
@@ -116,6 +181,21 @@ impl std::fmt::Display for ApplyRefusal {
             ApplyRefusal::MissingNets(n) => {
                 write!(f, "{} net(s) not on the board: {}", n.len(), n.join(", "))
             }
+            ApplyRefusal::ReplacedMissing(u) => write!(
+                f,
+                "{} UUID(s) the plan replaces are not tracks, arcs or vias of the open board \
+                 (the board changed since the plan was made): {}",
+                u.len(),
+                listed(u)
+            ),
+            ApplyRefusal::ReplacedLocked(u) => write!(
+                f,
+                "{} item(s) the plan replaces are locked on the open board; locked copper is \
+                 never deleted: {}",
+                u.len(),
+                listed(u)
+            ),
+            ApplyRefusal::ReplaceFailed(e) => write!(f, "deleting the replaced copper: {e}"),
         }
     }
 }
@@ -367,6 +447,100 @@ pub(crate) fn apply_plan_with(
     Ok(ApplyOutcome::Complete(ledger))
 }
 
+/// Delete the board's tracks, arcs and vias named in `replaces`: all of
+/// them or none. Refused when one is not on the board or is locked.
+/// KiCad 10 leaves `DeleteItems`' per-item results empty, so absence is
+/// proved by reading the copper back.
+fn delete_replaced(
+    replaces: &BTreeSet<String>,
+    sink: &mut dyn ItemSink,
+) -> Result<Vec<ReplacedItem>, ApplyRefusal> {
+    if replaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let failed = |e: anyhow::Error| ApplyRefusal::ReplaceFailed(format!("{e:#}"));
+    let copper = sink.copper().map_err(failed)?;
+    let by_id: BTreeMap<String, &routing_batch::CopperItem> = copper
+        .iter()
+        .map(|c| (c.id.to_ascii_lowercase(), c))
+        .collect();
+    let (mut missing, mut locked, mut picked) = (Vec::new(), Vec::new(), Vec::new());
+    for uuid in replaces {
+        match by_id.get(&uuid.to_ascii_lowercase()) {
+            None => missing.push(uuid.clone()),
+            Some(c) if c.locked => locked.push(uuid.clone()),
+            Some(c) => picked.push(*c),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(ApplyRefusal::ReplacedMissing(missing));
+    }
+    if !locked.is_empty() {
+        return Err(ApplyRefusal::ReplacedLocked(locked));
+    }
+    let ids: Vec<String> = picked.iter().map(|c| c.id.clone()).collect();
+    sink.delete(ids.clone()).map_err(failed)?;
+    let gone: BTreeSet<String> = ids.iter().map(|i| i.to_ascii_lowercase()).collect();
+    let survivors = sink
+        .copper()
+        .map_err(failed)?
+        .iter()
+        .filter(|c| gone.contains(&c.id.to_ascii_lowercase()))
+        .count();
+    if survivors > 0 {
+        return Err(ApplyRefusal::ReplaceFailed(format!(
+            "KiCad accepted the delete but {survivors} of {} item(s) are still on the board",
+            ids.len()
+        )));
+    }
+    Ok(picked
+        .into_iter()
+        .map(|c| ReplacedItem {
+            uuid: c.id.clone(),
+            kind: c.kind.to_string(),
+            net: c.net.clone(),
+            layer: c.layer.clone(),
+        })
+        .collect())
+}
+
+/// [`apply_plan_with`] for a plan that replaces board copper: everything
+/// the create step can refuse is checked first, then exactly the items in
+/// `replaces` are deleted ([`delete_replaced`]), then the plan is created.
+/// Returns what was deleted with the outcome of the create step. A strict
+/// lint refusal (listing at most `listed` defects) comes before any delete.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_plan_replacing(
+    plan: &RoutePlan,
+    replaces: &BTreeSet<String>,
+    locked: bool,
+    limits: &route_geometry::Limits,
+    strict_geometry: bool,
+    max_items: usize,
+    listed: usize,
+    codes: &BTreeMap<String, i32>,
+    sink: &mut dyn ItemSink,
+) -> Result<(Vec<ReplacedItem>, ApplyOutcome), ApplyRefusal> {
+    let (chunks, _) = preflight(plan, limits, strict_geometry, max_items, listed)?;
+    for chunk in &chunks {
+        if let Err(missing) = batch_of(&chunk.plan, locked).items(codes) {
+            return Err(ApplyRefusal::MissingNets(missing));
+        }
+    }
+    let replaced = delete_replaced(replaces, sink)?;
+    apply_plan_with(
+        plan,
+        locked,
+        limits,
+        strict_geometry,
+        max_items,
+        listed,
+        codes,
+        sink,
+    )
+    .map(|outcome| (replaced, outcome))
+}
+
 /// One DRC item, followed back to the plan where it can be.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct MappedItem {
@@ -524,6 +698,12 @@ mod tests {
         fail_on_call: Option<usize>,
         /// Echo each call's items in reverse order.
         reverse: bool,
+        /// The board's tracks, arcs and vias.
+        copper: Vec<routing_batch::CopperItem>,
+        /// Every request, in order: `delete N` or `create N`.
+        log: Vec<String>,
+        /// Accept a delete and keep the items.
+        deaf_to_deletes: bool,
     }
 
     impl ItemSink for FakeKiCad {
@@ -535,6 +715,7 @@ mod tests {
                 anyhow::bail!("KiCad created 0 of {} requested items", items.len());
             }
             self.calls.push(items.len());
+            self.log.push(format!("create {}", items.len()));
             let mut out = Vec::new();
             for any in items {
                 self.next += 1;
@@ -556,6 +737,194 @@ mod tests {
             }
             Ok(out)
         }
+
+        fn copper(&mut self) -> anyhow::Result<Vec<routing_batch::CopperItem>> {
+            Ok(self.copper.clone())
+        }
+
+        fn delete(&mut self, ids: Vec<String>) -> anyhow::Result<()> {
+            self.log.push(format!("delete {}", ids.len()));
+            if !self.deaf_to_deletes {
+                self.copper.retain(|c| !ids.contains(&c.id));
+            }
+            Ok(())
+        }
+    }
+
+    impl FakeKiCad {
+        fn with_copper(items: &[(&str, &'static str, &str, bool)]) -> Self {
+            FakeKiCad {
+                copper: items
+                    .iter()
+                    .map(|(id, kind, net, locked)| routing_batch::CopperItem {
+                        id: id.to_string(),
+                        kind,
+                        net: net.to_string(),
+                        layer: "F.Cu".to_string(),
+                        points: vec![(0.0, 0.0)],
+                        locked: *locked,
+                    })
+                    .collect(),
+                ..FakeKiCad::default()
+            }
+        }
+
+        fn ids(&self) -> Vec<&str> {
+            self.copper.iter().map(|c| c.id.as_str()).collect()
+        }
+    }
+
+    fn uuids(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn replacing(
+        kicad: &mut FakeKiCad,
+        replaces: &[&str],
+    ) -> Result<(Vec<ReplacedItem>, ApplyOutcome), ApplyRefusal> {
+        apply_plan_replacing(
+            &plan(),
+            &uuids(replaces),
+            false,
+            &limits(),
+            true,
+            20_000,
+            50,
+            &codes(),
+            kicad,
+        )
+    }
+
+    #[test]
+    fn a_plan_that_replaces_copper_deletes_exactly_those_items_before_it_creates() {
+        let mut kicad = FakeKiCad::with_copper(&[
+            ("t-1", "track", "B", false),
+            ("t-2", "track", "B", false),
+            ("v-1", "via", "B", false),
+            ("t-9", "track", "C", false),
+        ]);
+        // KIIDs compare without case.
+        let (replaced, outcome) = replacing(&mut kicad, &["T-1", "v-1"]).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Complete(_)));
+        assert_eq!(kicad.log, ["delete 2", "create 5"]);
+        assert_eq!(kicad.ids(), ["t-2", "t-9"]);
+        let listed: Vec<(&str, &str, &str, &str)> = replaced
+            .iter()
+            .map(|i| {
+                (
+                    i.uuid.as_str(),
+                    i.kind.as_str(),
+                    i.net.as_str(),
+                    i.layer.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [("t-1", "track", "B", "F.Cu"), ("v-1", "via", "B", "F.Cu")]
+        );
+    }
+
+    #[test]
+    fn replaced_copper_that_is_gone_or_locked_refuses_the_apply_with_nothing_touched() {
+        let mut kicad =
+            FakeKiCad::with_copper(&[("t-1", "track", "B", false), ("t-2", "track", "B", true)]);
+        let gone = replacing(&mut kicad, &["t-1", "t-7"]).unwrap_err();
+        assert_eq!(gone, ApplyRefusal::ReplacedMissing(vec!["t-7".to_string()]));
+        assert_eq!(gone.field(), "replaces_file");
+        let locked = replacing(&mut kicad, &["t-1", "t-2"]).unwrap_err();
+        assert_eq!(
+            locked,
+            ApplyRefusal::ReplacedLocked(vec!["t-2".to_string()])
+        );
+        assert!(locked.to_string().contains("never deleted"), "{locked}");
+        assert!(kicad.log.is_empty(), "{:?}", kicad.log);
+        assert_eq!(kicad.ids(), ["t-1", "t-2"]);
+    }
+
+    #[test]
+    fn a_plan_that_would_be_refused_deletes_nothing() {
+        let mut kicad = FakeKiCad::with_copper(&[("t-1", "track", "B", false)]);
+        let mut codes = codes();
+        codes.remove("C");
+        let refused = apply_plan_replacing(
+            &plan(),
+            &uuids(&["t-1"]),
+            false,
+            &limits(),
+            true,
+            20_000,
+            50,
+            &codes,
+            &mut kicad,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, ApplyRefusal::MissingNets(_)),
+            "{refused:?}"
+        );
+        assert!(kicad.log.is_empty());
+        assert_eq!(kicad.ids(), ["t-1"]);
+    }
+
+    #[test]
+    fn a_replacing_plan_the_strict_lint_refuses_names_its_defects_and_deletes_nothing() {
+        let mut kicad = FakeKiCad::with_copper(&[("t-1", "track", "B", false)]);
+        let mut jog = plan();
+        jog.tracks = vec![
+            track("A", 0.0, 5.0, 0.0),
+            PlanTrack {
+                x1: 5.0,
+                y1: 0.0,
+                x2: 5.0,
+                y2: 0.08,
+                ..track("A", 0.0, 0.0, 0.0)
+            },
+            track("A", 5.0, 9.0, 0.08),
+        ];
+        let replaces = uuids(&["t-1"]);
+        let run = |strict: bool, kicad: &mut FakeKiCad| {
+            apply_plan_replacing(
+                &jog,
+                &replaces,
+                false,
+                &limits(),
+                strict,
+                20_000,
+                50,
+                &codes(),
+                kicad,
+            )
+        };
+        // Strict: the refusal is the one a plain apply gives, with the
+        // defect's plan tracks, and the copper to replace is still there.
+        let refused = run(true, &mut kicad).unwrap_err();
+        let ApplyRefusal::Geometry { defects, detail } = &refused else {
+            panic!("{refused:?}")
+        };
+        assert_eq!(*defects, 1);
+        assert_eq!(detail["by_kind"]["short_jog"], 1, "{detail}");
+        assert_eq!(detail["defects"][0]["tracks"][1]["index"], 1, "{detail}");
+        assert_eq!(refused.field(), "routing_file");
+        assert!(kicad.log.is_empty(), "{:?}", kicad.log);
+        assert_eq!(kicad.ids(), ["t-1"]);
+        // Under warn the same plan replaces and is created.
+        let (replaced, outcome) = run(false, &mut kicad).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert!(matches!(outcome, ApplyOutcome::Complete(_)));
+        assert!(kicad.ids().is_empty());
+    }
+
+    #[test]
+    fn a_delete_kicad_accepts_but_does_not_perform_stops_before_anything_is_created() {
+        let mut kicad = FakeKiCad::with_copper(&[("t-1", "track", "B", false)]);
+        kicad.deaf_to_deletes = true;
+        let refused = replacing(&mut kicad, &["t-1"]).unwrap_err();
+        let ApplyRefusal::ReplaceFailed(why) = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(why.contains("still on the board"), "{why}");
+        assert_eq!(kicad.log, ["delete 1"]);
     }
 
     fn track(net: &str, x1: f64, x2: f64, y: f64) -> PlanTrack {

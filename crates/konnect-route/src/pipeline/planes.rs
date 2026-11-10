@@ -130,6 +130,26 @@ pub fn split_left_to_planes(
     (renumber(keep), renumber(left))
 }
 
+/// The open connections `report` counts on `board`, less those of plane nets
+/// that `policy` leaves to their planes: what routing could still join.
+pub fn open_connection_count(
+    board: &RouteBoard,
+    report: &ConnectivityReport,
+    policy: &PlaneTracks,
+) -> usize {
+    let all = report.connection_count();
+    if *policy == PlaneTracks::All {
+        return all;
+    }
+    let planes: BTreeSet<NetId> = zone_nets(board).into_iter().collect();
+    let left = report
+        .connections(board)
+        .iter()
+        .filter(|c| planes.contains(&c.net) && !policy.routes(c.net))
+        .count();
+    all.saturating_sub(left)
+}
+
 /// The plane nets of the scope, read from `conn`, the connectivity of
 /// `work` (the board with the fanout as locked copper). `plan` is the
 /// fanout as kept; `out_of_scope` holds the pads whose sites the scope

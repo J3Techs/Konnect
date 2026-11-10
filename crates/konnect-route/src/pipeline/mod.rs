@@ -44,6 +44,7 @@ pub mod allowances;
 pub mod backend;
 pub mod coverage;
 pub mod planes;
+pub mod rip_up;
 
 pub use allowances::{
     default_excluded_classes, AllowanceError, AllowanceReport, LayerFallbackSpec, NeckDownSpec,
@@ -51,8 +52,10 @@ pub use allowances::{
 };
 pub use backend::KernelBackend;
 pub use planes::{
-    crossed_zones, split_left_to_planes, PlaneNetReport, PlaneOpenReason, PlaneTracks, ZoneCrossing,
+    crossed_zones, open_connection_count, split_left_to_planes, PlaneNetReport, PlaneOpenReason,
+    PlaneTracks, ZoneCrossing,
 };
+pub use rip_up::{without_ripped, RipUp, RipUpReport, RipUpSettings, RippedItem};
 
 use crate::access::{compute_pin_access_with, AccessSettings, AccessStats, PadAccess};
 use crate::api::{
@@ -143,6 +146,11 @@ pub struct PipelineSettings {
     /// those that lost a negotiation. Off saves about a third of the
     /// rescue time for a few connections.
     pub rescue_retry_unreachable: bool,
+    /// Rip-up and retry after the rescue rounds and the class fallback
+    /// ([`rip_up`]): the nets whose copper fences a still open connection
+    /// in are ripped whole, the connection is routed first and the nets
+    /// again, kept only when fewer connections are open afterwards.
+    pub rip_up: RipUpSettings,
     pub global: GlobalSettings,
     pub layer_policy: LayerPolicy,
     pub negotiation: NegotiationSettings,
@@ -197,6 +205,7 @@ impl Default for PipelineSettings {
             rescue_iterations: 6,
             rescue_neighbours: 2,
             rescue_retry_unreachable: true,
+            rip_up: RipUpSettings::default(),
             // Measured on the same board: corridors planned on 70 % of the
             // packed-track capacity leave detail fewer conflicts and route
             // more, faster, than planning on all of it.
@@ -347,6 +356,15 @@ pub struct PipelineResult {
     pub global: GlobalResult,
     /// Negotiation's account; its copper is moved to [`Self::routed`].
     pub detail: DetailResult,
+    /// What the rip-up stage did (empty when it did not run). When it
+    /// ripped board copper ([`RipUpReport::ripped`]), every later stage and
+    /// [`Self::plan`], [`Self::check`] and [`Self::connections_after`] are
+    /// against the board without it ([`without_ripped`]); the task list
+    /// ([`Self::connections`], with [`Self::left_to_planes`],
+    /// [`Self::excluded`] and [`Self::connection_widths`]) is then the one
+    /// of that board, and [`Self::global`] keeps its statistics but no
+    /// corridors.
+    pub rip_up: RipUpReport,
     pub optimize: Option<OptimizeReport>,
     /// Nets the guard put back to their routed copper.
     pub optimize_reverted: Vec<NetId>,
@@ -429,6 +447,7 @@ fn run(
     let tel = &mut telemetry;
     tel.threads = rayon::current_num_threads() as u32;
     let policy = ArcPolicy::default();
+    let loaded = board;
 
     // 1. Connectivity of the board as loaded.
     let t = Instant::now();
@@ -653,6 +672,60 @@ fn run(
         tel.count("pipeline_fallback_routed", rescued as u64);
         tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
     }
+    // 6b. Rip-up and retry for what is still open. Board copper it rips is
+    // gone from the working board and from the board everything after is
+    // checked and planned against.
+    let mut without: Option<RouteBoard> = None;
+    if settings.rip_up.mode != RipUp::None && !detail.failure_details.is_empty() {
+        let t = Instant::now();
+        let outcome = rip_up::rip_up(
+            &work,
+            rules,
+            scope,
+            settings,
+            &negotiation,
+            &inputs,
+            &routed,
+            backend,
+            tel,
+        );
+        outcome.report.record(tel);
+        if let Some((ripped_work, copper)) = outcome.changed {
+            work = ripped_work;
+            routed = copper;
+            let old = out.connections.clone();
+            if !outcome.report.ripped.is_empty() {
+                without = Some(without_ripped(board, &outcome.report.ripped));
+                let conn = ConnectivityReport::build(&work, &policy);
+                let selected = select_connections(
+                    &work,
+                    conn.connections(&work),
+                    scope.nets.as_ref(),
+                    scope.region,
+                );
+                let (routable, excluded) =
+                    split_excluded(rules, selected, &settings.excluded_classes);
+                out.excluded = excluded;
+                // As in step 3: plane nets stay with their planes, and the
+                // width entries are matched to the list that results.
+                (out.connections, out.left_to_planes) =
+                    split_left_to_planes(&work, routable, &settings.plane_tracks);
+                out.connection_widths = match_connection_widths(
+                    &work,
+                    &conn,
+                    &out.connections,
+                    &settings.connection_widths,
+                );
+                global.corridors.clear();
+                global.failed.clear();
+            }
+            rejudge(&work, &old, &out.connections, &routed, &mut detail);
+        }
+        out.rip_up = outcome.report;
+        tel.count("pipeline_rip_up_us", t.elapsed().as_micros() as u64);
+        tel.add_stage_time(Stage::Detail, t.elapsed().as_micros() as u64);
+    }
+    let board: &RouteBoard = without.as_ref().unwrap_or(board);
     // 7. Optimize, guarded by the S7 checker, then by the reference planes.
     let negotiated = if settings.optimize.is_some() && has_reference(&settings.class_fallback) {
         Some(routed.clone())
@@ -731,8 +804,23 @@ fn run(
     }
     let mut applied = board.clone();
     add_locked(&mut applied, &combined);
-    out.connections_after = ConnectivityReport::build(&applied, &policy).connection_count();
+    let after = ConnectivityReport::build(&applied, &policy);
+    out.connections_after = after.connection_count();
     tel.add_stage_time(Stage::Plan, t.elapsed().as_micros() as u64);
+    // The rip-up stage never leaves more open than it found, but S6 and the
+    // clear stage work on different copper after it. Should they leave more
+    // open than the stage started with, the run is done again without it.
+    // Counted as the stage counts: without what is left to the planes.
+    let open_after = open_connection_count(&applied, &after, &settings.plane_tracks);
+    drop(after);
+    if out.rip_up.changed() && open_after > out.rip_up.open_before {
+        let mut plain = settings.clone();
+        plain.rip_up.mode = RipUp::None;
+        let mut again = run(loaded, rules, scope, &plain, backend)?;
+        again.rip_up = out.rip_up.restored();
+        again.telemetry.count("pipeline_rip_up_restored", 1);
+        return Ok(again);
+    }
 
     global.corridors.shrink_to_fit();
     out.failed = detail.failed.clone();
@@ -742,6 +830,66 @@ fn run(
     out.routed = routed;
     out.telemetry = telemetry;
     Ok(out)
+}
+
+/// After the rip-up stage changed the copper (and, when it ripped board
+/// copper, the task list): bring `detail` to what is joined. A connection is
+/// routed when its two terminals are joined on `work` plus `routed`; one
+/// still open keeps the reason it failed with before (matched by net and
+/// terminals in `old`, the task list before the stage), or is
+/// [`DetailFailure::Unreachable`]. The per-item owners are dropped: the
+/// copper is no longer the one negotiation returned.
+fn rejudge(
+    work: &RouteBoard,
+    old: &[Connection],
+    connections: &[Connection],
+    routed: &RoutedCopper,
+    detail: &mut DetailResult,
+) {
+    let same_list = old == connections;
+    let reasons: BTreeMap<(NetId, ItemRef, ItemRef), DetailFailure> =
+        std::mem::take(&mut detail.failure_details)
+            .into_iter()
+            .filter_map(|(id, f)| {
+                let c = old.get(id.index())?;
+                // Ids of another task list mean nothing in this one.
+                let f = match f {
+                    DetailFailure::Congestion { iterations, .. } if !same_list => {
+                        DetailFailure::Congestion {
+                            iterations,
+                            against: Vec::new(),
+                        }
+                    }
+                    f => f,
+                };
+                Some(((c.net, c.from, c.to), f))
+            })
+            .collect();
+    let every: BTreeSet<ConnectionId> = connections.iter().map(|c| c.id).collect();
+    let now = joined(work, routed, connections, &every);
+    detail.failure_details = connections
+        .iter()
+        .filter(|c| !now.contains(&c.id))
+        .map(|c| {
+            let f = reasons
+                .get(&(c.net, c.from, c.to))
+                .cloned()
+                .unwrap_or(DetailFailure::Unreachable);
+            (c.id, f)
+        })
+        .collect();
+    detail.routed = now.into_iter().collect();
+    detail.failed = detail
+        .failure_details
+        .iter()
+        .map(|(c, f)| (*c, f.reason()))
+        .collect();
+    detail.track_owner.clear();
+    detail.via_users.clear();
+    detail.short_segments.clear();
+    if !same_list {
+        detail.congestion_lost.clear();
+    }
 }
 
 /// The open connections a run works on: those of `nets` (all when `None`)

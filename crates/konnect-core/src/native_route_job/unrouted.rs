@@ -12,6 +12,7 @@ use konnect_geom::BBox;
 use konnect_route::api::{ClassId, Connection, ItemRef, NetId};
 use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::detail::negotiate::DetailFailure;
+use konnect_route::pipeline::rip_up::{Blocker, StillOpen};
 use konnect_route::pipeline::{
     select_connections, split_excluded, split_left_to_planes, PlaneTracks,
 };
@@ -280,6 +281,22 @@ pub struct OpenConnection {
     /// The clear stage also took copper of this net out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub net_cleared: bool,
+    /// What the rip-up stage found in the way of exactly this pad pair
+    /// when it ended (the entry's `blocked_by` in the report's
+    /// `rip_up.still_open`): each blocking net, why it was not ripped
+    /// (`locked`, `board_copper_not_requested`, `plane_net`, `zone_fill`,
+    /// `out_of_scope`, `excluded_class`, `no_uuid`,
+    /// `ripping_did_not_help`) and the board items' UUIDs. Empty: no path
+    /// was found even with every nearby track, via and fill out. Absent:
+    /// the stage did not run, or left another pad pair of the net open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<Vec<Blocker>>,
+}
+
+/// An end as the rip-up stage labels it (`REF.PAD`); pads only.
+fn rip_up_label(e: &Endpoint) -> Option<String> {
+    let pad = e.pad.as_ref().filter(|_| e.kind == "pad")?;
+    Some(format!("{}.{pad}", e.reference.as_deref().unwrap_or("?")))
 }
 
 /// What a run leaves open.
@@ -311,6 +328,8 @@ pub struct Account<'a> {
     /// Whether the run routed (source native) rather than took copper.
     pub routed_here: bool,
     pub failures: &'a [RouteFailure],
+    /// The connections the rip-up stage left open, with what blocks each.
+    pub still_open: &'a [StillOpen],
     /// Nets the clear stage took copper from.
     pub cleared: &'a [NetId],
     /// Nets that lost copper to the reference-plane check.
@@ -359,7 +378,17 @@ pub fn unrouted(applied: &RouteBoard, rules: &dyn RuleTable, account: &Account<'
             against_total: None,
             failed_tasks: Vec::new(),
             net_cleared: account.cleared.contains(&c.net),
+            blocked_by: None,
         };
+        if let (Some(a), Some(b)) = (rip_up_label(&row.from), rip_up_label(&row.to)) {
+            row.blocked_by = account
+                .still_open
+                .iter()
+                .find(|s| {
+                    s.net == row.net && ((s.from == a && s.to == b) || (s.from == b && s.to == a))
+                })
+                .map(|s| s.blocked_by.clone());
+        }
         let exact = account
             .failures
             .iter()
@@ -506,6 +535,7 @@ mod tests {
             plane_tracks: &PlaneTracks::All,
             routed_here: true,
             failures,
+            still_open: &[],
             cleared: &none.1,
             off_reference: &none.1,
         }

@@ -13,6 +13,8 @@
 //! - `checkpoint.json`: the routed copper after each completed stage, so a
 //!   killed run resumes where it stopped (`resume: true`);
 //! - `report.json`: the final report, with telemetry;
+//! - `<output_plan stem>.replaces.json`, beside the plan: the board copper
+//!   a `rip_up: unlocked` run took out, for the plan's apply to delete;
 //! - `stop`: created by `stop_native_route_job`; the runner stops at the
 //!   next stage boundary and keeps its checkpoint;
 //! - `runner.log`: the runner's own stderr.
@@ -27,8 +29,8 @@ use konnect_route::connectivity::ConnectivityReport;
 use konnect_route::optimize::exact::{CheckerOptions, ExactChecker};
 use konnect_route::optimize::{OptimizeOptions, OptimizeReport};
 use konnect_route::pipeline::{
-    AllowanceError, AllowanceReport, ClassFallback, PipelineSettings, ReferenceReport,
-    RoutingAllowances,
+    without_ripped, AllowanceError, AllowanceReport, ClassFallback, PipelineSettings,
+    ReferenceReport, RipUp, RipUpReport, RoutingAllowances,
 };
 use konnect_route::plan::{RoutedCopper, ADD_ROUTING_MAX_ITEMS};
 use konnect_route::telemetry::Telemetry;
@@ -149,6 +151,27 @@ pub struct NativeJobSpec {
     /// leads `output_plan`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout_plan: Option<PathBuf>,
+    /// Rip-up and retry for connections still open after negotiation
+    /// ([`konnect_route::pipeline::rip_up`]), native routing only. `own`
+    /// (the default) reroutes only copper this run routed; `unlocked` may
+    /// also take out the board's unlocked tracks, arcs and vias, which are
+    /// then listed in the report and written to
+    /// [`replaces_path_for`]`(output_plan)` for the apply to delete; `none`
+    /// skips the stage.
+    #[serde(default, skip_serializing_if = "RipUp::is_default")]
+    pub rip_up: RipUp,
+}
+
+/// Where a run that ripped board copper lists it: `<output_plan
+/// stem>.replaces.json` beside the plan (`build_route`'s convention), an
+/// object whose `delete_uuids` is what `delete_routing`'s `uuids_file`,
+/// the `replaces_file` arguments and `apply_route_plan` read.
+pub fn replaces_path_for(output_plan: &Path) -> PathBuf {
+    let stem = output_plan
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plan".to_string());
+    output_plan.with_file_name(format!("{stem}.replaces.json"))
 }
 
 fn yes() -> bool {
@@ -364,6 +387,19 @@ impl NativeJobSpec {
             }
         }
         self.region()?;
+        if self.rip_up != RipUp::default() && self.source != CopperSource::Native {
+            bail!("rip_up applies only to native routing (source native)");
+        }
+        if self.rip_up == RipUp::Unlocked {
+            let replaces = replaces_path_for(&self.output_plan);
+            if replaces.exists() {
+                bail!(
+                    "{} already exists; choose a new output_plan (a rip_up unlocked run writes \
+                     its deletions there, and files are never replaced)",
+                    replaces.display()
+                );
+            }
+        }
         if self.threads == Some(0) {
             bail!("threads must be at least 1");
         }
@@ -469,6 +505,14 @@ pub struct PipelineReport {
     /// left unconnected, a refill the plan depends on.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// What the rip-up stage of a native run did: rounds, what was ripped
+    /// and routed again, and what is still open and why.
+    #[serde(default)]
+    pub rip_up: Option<RipUpReport>,
+    /// The deletions file written beside the plan when the run ripped
+    /// board copper ([`replaces_path_for`]).
+    #[serde(default)]
+    pub replaces_path: Option<PathBuf>,
     pub telemetry: Telemetry,
 }
 
@@ -571,6 +615,10 @@ pub struct Checkpoint {
     /// The route stage's plane-net account, kept for a resumed run.
     #[serde(default)]
     pub plane_nets: Vec<PlaneNetSummary>,
+    /// The rip-up stage's report: a resumed run takes the board copper it
+    /// ripped off the board again.
+    #[serde(default)]
+    pub rip_up: Option<RipUpReport>,
     pub optimize: Option<OptimizeReport>,
     pub check: Option<CheckSummary>,
     pub written_unix: u64,
@@ -714,6 +762,8 @@ struct NativeRoute {
     /// under ([`konnect_route::pipeline::PipelineResult::connection_widths`]).
     connections: Vec<Connection>,
     connection_widths: BTreeMap<ConnectionId, usize>,
+    /// The rip-up stage's report, when it ran.
+    rip_up: Option<RipUpReport>,
     telemetry: Telemetry,
 }
 
@@ -730,6 +780,7 @@ impl NativeRoute {
             failures: Vec::new(),
             connections: Vec::new(),
             connection_widths: BTreeMap::new(),
+            rip_up: None,
             telemetry: Telemetry::default(),
         }
     }
@@ -777,8 +828,14 @@ fn route_native(
         "excluded_by_policy": excluded,
         "left_to_planes": r.left_to_planes.len(),
         "fallback_routed": r.telemetry.counters.get("pipeline_fallback_routed").copied().unwrap_or(0),
+        "rip_up": { "rounds": r.rip_up.rounds, "open_before": r.rip_up.open_before,
+                    "open_after": r.rip_up.open_after, "ripped_items": r.rip_up.ripped.len(),
+                    "rerouted_nets": r.rip_up.rerouted_nets.len(), "stopped": r.rip_up.stopped },
     });
-    // The stage's tasks name items of the board with its fanout appended.
+    // The stage's tasks name items of the board they were listed on: the
+    // board less what the rip-up stage took out, with the fanout appended.
+    let without = (!r.rip_up.ripped.is_empty()).then(|| without_ripped(board, &r.rip_up.ripped));
+    let board = without.as_ref().unwrap_or(board);
     let own_from = (board.tracks.len(), board.vias.len());
     let mut routed_on = board.clone();
     konnect_route::pipeline::add_locked(&mut routed_on, &r.fanout_copper);
@@ -797,6 +854,7 @@ fn route_native(
         detail,
         connections: r.connections,
         connection_widths: r.connection_widths,
+        rip_up: (r.rip_up.rounds > 0).then_some(r.rip_up),
         telemetry: r.telemetry,
     })
 }
@@ -916,6 +974,7 @@ pub fn run_pipeline(
         fanout: RoutedCopper::default(),
         route_failures: Vec::new(),
         plane_nets: Vec::new(),
+        rip_up: None,
         optimize: None,
         check: None,
         written_unix: 0,
@@ -936,6 +995,7 @@ pub fn run_pipeline(
         clear_findings: false,
         ..PipelineSettings::default()
     };
+    settings.rip_up.mode = spec.rip_up;
     if spec.source != CopperSource::Native && !spec.allowances.is_default() {
         report.stop(
             StopKind::InputError,
@@ -979,7 +1039,7 @@ pub fn run_pipeline(
     let t = Instant::now();
     // Said when connections fail behind fills nobody declared crossable.
     let mut zone_hint: Option<String> = None;
-    let (mut work, frozen, fanout, route_failures) = if let Some(cp) =
+    let (mut work, frozen, fanout, route_failures, rip_up) = if let Some(cp) =
         resume.as_ref().filter(|_| done("route"))
     {
         // The board still holds the copper the source took; take it off
@@ -1003,6 +1063,7 @@ pub fn run_pipeline(
             cp.frozen.clone(),
             cp.fanout.clone(),
             cp.route_failures.clone(),
+            cp.rip_up.clone(),
         )
     } else {
         observer.event("route", "start", &json!({ "source": spec.source }));
@@ -1058,7 +1119,7 @@ pub fn run_pipeline(
                 // Copper outside the region or nets is frozen as board
                 // copper: an obstacle and terminal, never edited or planned.
                 let (work, frozen) = r.routed.partition(nets.as_ref(), region);
-                (work, frozen, r.fanout, r.failures)
+                (work, frozen, r.fanout, r.failures, r.rip_up)
             }
             Err(e) => {
                 record(
@@ -1074,6 +1135,14 @@ pub fn run_pipeline(
             }
         }
     };
+    // Board copper the rip-up stage took out is gone for every later stage:
+    // the copper is optimized, checked and planned against the board as it
+    // will be once the plan's deletions are applied.
+    if let Some(rip) = rip_up.as_ref().filter(|r| !r.ripped.is_empty()) {
+        board = without_ripped(&board, &rip.ripped);
+    }
+    checkpoint.rip_up = rip_up.clone();
+    report.rip_up = rip_up;
     // Copper past these counts is the run's own: what a native run routed
     // and planned, or the work a taking run took.
     let mut own_from = (board.tracks.len(), board.vias.len());
@@ -1208,6 +1277,43 @@ pub fn run_pipeline(
         }
     }
 
+    // The rip-up stage keeps an attempt only when fewer connections are open
+    // after it, but S6 and the clear stage then work on other copper than
+    // they would have. Should they leave more open than the stage started
+    // with, the whole run is done again without it: never worse for asking.
+    if let Some(rip) = report.rip_up.clone().filter(RipUpReport::changed) {
+        let t = Instant::now();
+        let mut applied = board.clone();
+        work.freeze_into(&mut applied);
+        // Counted as the stage counts: without what is left to the planes.
+        let after = ConnectivityReport::build(&applied, &konnect_geom::ArcPolicy::default());
+        let open = konnect_route::pipeline::open_connection_count(
+            &applied,
+            &after,
+            &settings.plane_tracks,
+        );
+        let restore = open > rip.open_before;
+        record(
+            &mut report,
+            observer,
+            "rip_up",
+            if restore { "restored" } else { "done" },
+            t,
+            json!({ "rounds": rip.rounds, "open_before": rip.open_before,
+                    "open_after": rip.open_after, "open_after_optimize_and_clear": open,
+                    "ripped_items": rip.ripped.len(), "rerouted_nets": rip.rerouted_nets }),
+        );
+        if restore {
+            let plain = NativeJobSpec {
+                rip_up: RipUp::None,
+                ..spec.clone()
+            };
+            let mut again = run_pipeline(&plain, None, observer)?;
+            again.rip_up = Some(rip.restored());
+            return Ok(again);
+        }
+    }
+
     // What stays open with this copper on the board, by pad and reason.
     {
         let t = Instant::now();
@@ -1225,6 +1331,7 @@ pub fn run_pipeline(
                 plane_tracks: &settings.plane_tracks,
                 routed_here: spec.source == CopperSource::Native,
                 failures: &route_failures,
+                still_open: report.rip_up.as_ref().map_or(&[], |r| &r.still_open),
                 cleared: report.cleared.as_ref().map_or(&none, |c| &c.nets),
                 off_reference: report.reference.as_ref().map_or(&none, |r| &r.dropped_nets),
             },
@@ -1329,6 +1436,17 @@ pub fn run_pipeline(
     let plan =
         RoutePlan::from_routed(&board, &planned).map_err(|e| anyhow::anyhow!("plan: {e}"))?;
     let chunks = plan.chunks_by_net(ADD_ROUTING_MAX_ITEMS).len();
+    // The board copper the plan replaces, for its apply to delete. Written
+    // first: a plan that needs deletions never exists without their list.
+    if let Some(rip) = report.rip_up.as_ref().filter(|r| !r.ripped.is_empty()) {
+        let path = replaces_path_for(&spec.output_plan);
+        let mut uuids: Vec<&str> = rip.ripped.iter().map(|i| i.uuid.as_str()).collect();
+        uuids.sort_unstable();
+        let body = json!({ "delete_uuids": uuids, "routing_file": spec.output_plan,
+                           "ripped": rip.ripped });
+        write_new_atomic(&path, &serde_json::to_vec_pretty(&body)?)?;
+        report.replaces_path = Some(path);
+    }
     write_new_atomic(&spec.output_plan, plan.to_routing_file_json().as_bytes())?;
     report
         .telemetry
@@ -1341,7 +1459,8 @@ pub fn run_pipeline(
     let detail = json!({ "items": plan.item_count(), "add_routing_calls": chunks,
                          "path": spec.output_plan, "fanout_plan": report.fanout_plan_path,
                          "strict_lint_defects": lint.total,
-                         "fanout_strict_lint_defects": report.fanout_plan_lint.as_ref().map(|l| l.total) });
+                         "fanout_strict_lint_defects": report.fanout_plan_lint.as_ref().map(|l| l.total),
+                         "replaces_file": report.replaces_path });
     report.plan_lint = Some(lint);
     record(&mut report, observer, "plan", "done", t, detail);
     Ok(report)
@@ -1610,6 +1729,7 @@ fn report_listing(dir: &Path, status: &JobStatus, listed: usize) -> Value {
             "net_classes": r["net_classes"], "allowances": r["allowances"],
             "excluded_by_policy": r["excluded_by_policy"], "reference": r["reference"],
             "plane_nets": r["plane_nets"], "refill": r["refill"], "warnings": r["warnings"],
+            "rip_up": r["rip_up"], "replaces_file": r["replaces_path"],
             "stage_wall_us": r["telemetry"]["stages"], "threads": r["telemetry"]["threads"],
         });
         if r["unrouted"].is_object() {

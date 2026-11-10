@@ -3,6 +3,75 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the native router rips up and retries copper that fences a connection in
+
+A native route job never moved copper once negotiation and its rescue rounds
+were over, and never moved copper the board already held, locked or not. A
+track along a pin row that sealed the next pin in left that pin's connection
+`unreachable`, and a second job on the board with the first plan applied
+found the same wall and routed nothing.
+
+`start_native_route_job` and `route_native_region` now end native routing
+with a rip-up and retry stage, set by the new `rip_up` argument:
+
+- `own` (the default): copper this run routed may be ripped. Copper the
+  saved board holds is left alone, as before.
+- `unlocked`: the saved board's unlocked tracks, arcs and vias may be ripped
+  too. Locked copper, pads, zones, nets that have a zone, excluded classes
+  and nets outside `nets` or `region` never are.
+- `none`: the stage is skipped (the earlier behaviour).
+
+For each connection still open the stage finds the nets whose copper its
+path would have to cross, rips those nets whole, routes the stuck connection
+first and then the ripped nets (and, when that does not pay, once more with
+all of them negotiated as one batch). A try is kept only when the whole
+board has fewer open connections after it; otherwise nothing of it stays. A rip set
+already tried for the same connections is not tried again, and the stage
+runs at most four rounds. Should the optimizer and the clear stage then leave
+more connections open than the stage started with, the job is done again
+without it, so asking for rip-up never ends with more open connections.
+
+The job report (`get_native_route_job`'s `report.rip_up`, and
+`route_native_region`'s `rip_up`) gives `rounds`, `open_before`,
+`open_after`, `attempts` (the nets ripped, for which stuck nets, in which
+`order`, the nets left open and whether the try was kept), `rerouted_nets`, `ripped` and `still_open`: each
+connection left open with the nets blocking it and why they were not ripped
+(`locked`, `board_copper_not_requested`, `plane_net`, `out_of_scope`,
+`excluded_class`, `zone_fill`, or `ripping_did_not_help`). `zone_fill` names
+another net's filled zone: a pour refilled around the tracks already on the
+board walls in whatever was not routed before the refill, and no rip-up
+moves it. Route such a board with the pour unfilled, or the zone carved.
+
+The stage works with the run's other options. A connection of a plane net
+left to its plane is not a stuck connection: it is never routed or ripped
+for, and `open_before`, `open_after` and each attempt's counts leave such
+connections out, so they are lower than `unrouted.total` by the connections
+listed there as `left_to_plane`. A net with a zone is never ripped,
+`plane_nets_as_tracks` or not. A net routed again keeps its `track_widths`
+width, by net or by connection. After a try that ripped board copper,
+`unrouted` and the route stage's `failed` counts describe the board without
+that copper. In `unrouted`, a connection the stage left open carries the
+stage's `blocked_by` for exactly that pad pair beside its `reason`
+(`rip_up.still_open` lists them all), and the plan is linted
+(`plan_lint`) like any other.
+
+A plan cannot hold deletions (`add_routing` reads only `tracks` and `vias`),
+so an `unlocked` run that ripped board copper writes
+`<output_plan stem>.replaces.json` beside the plan, the file `build_route`
+already writes: `delete_uuids`, plus `ripped` with each item's UUID, kind,
+net, layer and reason. The report names it as `replaces_file`; a job is
+refused when that file already exists. `apply_route_plan` takes it as the
+new `replaces_file` argument: after the plan's own checks it deletes exactly
+those items and then creates the plan, and its result lists them in
+`replaced`. It refuses, with nothing deleted or created, when one of them is
+no longer a track, arc or via of the open board or is locked there.
+`check_route_rules` and `delete_routing` read the same file as before.
+
+Callers that depend on a job's plan never touching earlier copper need no
+change: the default rips only what the same run drew. A native run that
+leaves connections open takes longer than before, because the stage probes
+them; pass `rip_up: "none"` to skip it.
+
 ## Unreleased: the native router takes a track width per net or per connection
 
 The native router drew every track of a net at its net class width (or a

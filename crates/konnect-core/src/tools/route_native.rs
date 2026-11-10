@@ -108,6 +108,8 @@ fn job_props() -> Value {
                              "description": "Native routing: classes left unrouted (zones or hand copper); their connections are reported as excluded_by_policy, not as failures. Default: every class whose track width is at least 0.5 mm. [] routes every class" },
         "net_classes": { "type": "string", "enum": ["auto", "kicad", "project"], "default": "auto",
                          "description": "Where net classes come from: kicad (KiCad's effective class per net over IPC; the board must be open), project (the .kicad_pro patterns, resolved as KiCad does), auto (kicad when KiCad has the board open, else project)" },
+        "rip_up": { "type": "string", "enum": ["none", "own", "unlocked"], "default": "own",
+                    "description": "Native routing: rip-up and retry for connections still open after negotiation because other copper fences them in. The nets whose copper blocks such a connection are ripped whole, the connection is routed first and those nets again; a try is kept only when fewer connections are open after it, so the result is never worse than without. own: only copper this run routed may be ripped. unlocked: also the saved board's unlocked tracks, arcs and vias (never locked copper, pads, zones, nets with a zone, or nets outside nets/region); what was taken out is listed in the report's rip_up.ripped (UUID, net, layer, reason) and written beside the plan as <output_plan stem>.replaces.json for apply_route_plan's replaces_file. none: skip the stage" },
         "fanout_plan": { "type": "string", "description": "Native routing: write the plane fanout (S2) to this new routing_file, to apply with locked: true, and leave it out of output_plan" },
         "fanout_share_within_mm": { "type": "number", "minimum": 0, "description": "Native routing: a plane pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" }
     })
@@ -379,7 +381,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_native_region",
-            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed), at most max_listed of them. plan_lint (and fanout_plan_lint) in the result is the strict geometry lint apply_route_plan will run on the written file: passes_strict, total, by_kind and at most 50 defects with their plan track indices. track_widths draws named nets, or single connections named by two pads, at a width of their own instead of the net class width; the report lists each as an override of its class. Use start_native_route_job for a whole board. Native routing leaves a net that owns a copper zone to its plane: it gets fanout vias, no tracks (plane_nets_as_tracks opts a net in), and plane_nets lists per net the pads the plane joins, the pads the fanout joined, the pads still needing a via or a track and the connections left unrouted. A saved fill is an obstacle to other nets unless its zone is declared crossable (carve_zones, carve_zone_nets) because a refill will carve it; refill then names the zones the plan crosses, and such a plan shorts to their saved fill until the zones are refilled: refill before DRC or fabrication. warnings holds what must not be missed: a plane net with no fill in the saved file, plane pads or plane pieces left unconnected, a plan that depends on a refill.",
+            "Run the native pipeline on one region of the saved board in this process (at most 60 mm a side) and write the result as an add_routing routing_file: route (or take existing copper), optimize with exact checks, check, plan. unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed) and, when the rip-up stage left that pad pair open, blocked_by: the nets in its way and why they were not ripped, at most max_listed of them. plan_lint (and fanout_plan_lint) in the result is the strict geometry lint apply_route_plan will run on the written file: passes_strict, total, by_kind and at most 50 defects with their plan track indices. track_widths draws named nets, or single connections named by two pads, at a width of their own instead of the net class width; the report lists each as an override of its class. Use start_native_route_job for a whole board. Native routing leaves a net that owns a copper zone to its plane: it gets fanout vias, no tracks (plane_nets_as_tracks opts a net in), and plane_nets lists per net the pads the plane joins, the pads the fanout joined, the pads still needing a via or a track and the connections left unrouted. A saved fill is an obstacle to other nets unless its zone is declared crossable (carve_zones, carve_zone_nets) because a refill will carve it; refill then names the zones the plan crosses, and such a plan shorts to their saved fill until the zones are refilled: refill before DRC or fabrication. warnings holds what must not be missed: a plane net with no fill in the saved file, plane pads or plane pieces left unconnected, a plan that depends on a refill.",
             {
                 let mut s = with_props(job_props(), &["board", "output_plan", "region"]);
                 s["properties"]["region"]["description"] = json!("The region to work on, mm (required here)");
@@ -401,7 +403,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_native_route_job",
-            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished (with plane_nets, refill and warnings: read warnings first), and whether the plan and a checkpoint exist. report.unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed), at most max_listed of them with the total, the counts by reason and the path of report.json, which holds them all; report.stages keeps the route stage's failed counts. The report's plan_lint (and fanout_plan_lint) says whether the written plan passes apply_route_plan's strict geometry lint: passes_strict, total, by_kind and at most 50 defects with their plan track indices; report.json in the job directory lists them all. Reads the job directory only.",
+            "Report a job started by start_native_route_job: state (RUNNING, COMPLETED, STOPPED_ON_REQUEST, STOPPED_AT_TIME_LIMIT, STAGE_UNAVAILABLE, FAILED, or RUNNER_LOST when the runner stopped writing its heartbeat), the current stage, the report when finished (with plane_nets, refill and warnings: read warnings first), and whether the plan and a checkpoint exist. report.unrouted lists the connections still open with the plan applied (what KiCad's DRC will report unconnected): each with its net, the closest pads of the two parts it would join (reference, pad number, position, layers) and the reason (the route stage's failure with the walled-in terminal of a no_access or the connections a congestion lost to; or net_not_joined, cleared, excluded_by_policy, left_to_plane for a plane net's connection left to its plane, outside_scope, not_routed) and, when the rip-up stage left that pad pair open, blocked_by: the nets in its way and why they were not ripped, at most max_listed of them with the total, the counts by reason and the path of report.json, which holds them all; report.stages keeps the route stage's failed counts. The report's plan_lint (and fanout_plan_lint) says whether the written plan passes apply_route_plan's strict geometry lint: passes_strict, total, by_kind and at most 50 defects with their plan track indices; report.json in the job directory lists them all. Reads the job directory only.",
             json!({
                 "type": "object",
                 "properties": {
@@ -414,13 +416,14 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "apply_route_plan",
-            "Create a routing_file's tracks and vias in the board KiCad holds open, however many there are: every member, net name and (with geometry_check strict) the geometry lint is checked before anything is written, then the plan goes in as net-whole CreateItems chunks of at most 20,000 items. A strict refusal lists every defect (kind, net, layer, x, y and the tracks involved by their index in the routing_file's tracks array, with their ends; at most max_listed, with total and by_kind) and the remedy, and needs no open board. Writes a ledger (the KIID KiCad gave each plan item) to ledger_output for map_route_plan_drc. A failure part-way reports the chunks already created. Does not save, refill or run DRC.",
+            "Create a routing_file's tracks and vias in the board KiCad holds open, however many there are: every member, net name and (with geometry_check strict) the geometry lint is checked before anything is written, then the plan goes in as net-whole CreateItems chunks of at most 20,000 items. A strict refusal lists every defect (kind, net, layer, x, y and the tracks involved by their index in the routing_file's tracks array, with their ends; at most max_listed, with total and by_kind) and the remedy, and needs no open board. With replaces_file (written by a rip_up unlocked route job, or by build_route) the board tracks, arcs and vias it names are deleted first, exactly those: the call is refused, with nothing deleted or created, when one is no longer on the open board or is locked, and the result lists each deleted item (UUID, kind, net, layer, and the reason the plan gave). Writes a ledger (the KIID KiCad gave each plan item) to ledger_output for map_route_plan_drc. A failure part-way reports the chunks already created. Does not save, refill or run DRC.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "The .kicad_pcb KiCad holds open" },
                     "routing_file": { "type": "string", "description": "add_routing routing_file (a native plan) to create" },
                     "ledger_output": { "type": "string", "description": "New JSON ledger to write; an existing file is never replaced" },
+                    "replaces_file": { "type": "string", "description": "A JSON file of UUIDs of board tracks, arcs and vias the plan replaces: an array, or an object whose delete_uuids or uuids holds one (a route job's <output_plan stem>.replaces.json). They are deleted before the plan is created; locked items are never deleted" },
                     "locked": { "type": "boolean", "default": false, "description": "Create every item locked" },
                     "geometry_check": { "type": "string", "enum": ["strict", "warn"], "default": "strict",
                                         "description": "strict refuses a plan with any geometry lint defect, listing each one; warn counts them and applies" },
@@ -726,6 +729,7 @@ pub(crate) fn base_spec(
         allowances: Default::default(),
         net_classes: None,
         fanout_plan: None,
+        rip_up: Default::default(),
     }))
 }
 
@@ -802,6 +806,17 @@ fn job_spec(args: &Value) -> anyhow::Result<Result<NativeJobSpec, Refusal>> {
             ));
         }
         spec.fanout_plan = opt_path(args, "fanout_plan")?;
+        spec.rip_up = match args.get("rip_up") {
+            None | Some(Value::Null) => Default::default(),
+            Some(v) => {
+                let mode: konnect_route::pipeline::RipUp = serde_json::from_value(v.clone())
+                    .map_err(|_| invalid("rip_up", "must be none, own or unlocked"))?;
+                if spec.source != CopperSource::Native {
+                    return Err(invalid("rip_up", "applies only when source is native"));
+                }
+                mode
+            }
+        };
         spec.time_limit_seconds = match args.get("time_limit_seconds") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_u64() {
@@ -1931,7 +1946,16 @@ async fn handle_route_native_region(
         }),
         "plan_lint": report.plan_lint.as_ref().map(|l| l.bounded(native_route_job::PLAN_LINT_LISTED, None)),
         "fanout_plan_lint": report.fanout_plan_lint.as_ref().map(|l| l.bounded(native_route_job::PLAN_LINT_LISTED, None)),
-        "next": "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones. A plan whose plan_lint.passes_strict is false is refused under geometry_check strict: see its defects and remedy first.",
+        "rip_up": report.rip_up,
+        "replaces_file": report.replaces_path,
+        "next": format!(
+            "{} A plan whose plan_lint.passes_strict is false is refused under geometry_check strict: see its defects and remedy first.",
+            if report.replaces_path.is_some() {
+                "The plan replaces board copper (rip_up.ripped): apply it with apply_route_plan and replaces_file set to the replaces_file above, which deletes exactly those items first. Apply the fanout plan (if written) locked before it; then one run_drc with sync_live_board and refill_zones."
+            } else {
+                "Apply the fanout plan (if written) locked, then the plan, with apply_route_plan; then one run_drc with sync_live_board and refill_zones."
+            }
+        ),
     })))
 }
 
@@ -2044,11 +2068,44 @@ struct LedgerFile {
     locked: bool,
     complete: bool,
     ledger: route_native_apply::ApplyLedger,
+    /// Board copper deleted because the plan replaces it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replaced: Vec<route_native_apply::ReplacedItem>,
+}
+
+/// The copper a plan replaces, from `replaces_file`: the UUIDs, and the
+/// reason the plan gave for each (a route job's `ripped` list).
+struct Replaces {
+    uuids: std::collections::BTreeSet<String>,
+    reasons: BTreeMap<String, String>,
+}
+
+fn replaces_file_arg(args: &Value) -> Result<Option<Replaces>, Refusal> {
+    let Some(path) = opt_path(args, "replaces_file")? else {
+        return Ok(None);
+    };
+    file_must_exist(&path, "replaces_file")?;
+    let uuids = super::routing_batch::uuids_in_file(&args["replaces_file"], "replaces_file")
+        .map_err(|(f, r)| invalid(&f, &r))?;
+    let body: Value = read_json(&path, "replaces_file")?;
+    let reasons = body["ripped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            Some((
+                i["uuid"].as_str()?.to_ascii_lowercase(),
+                i["reason"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    Ok(Some(Replaces { uuids, reasons }))
 }
 
 /// The validated arguments of `apply_route_plan`.
 struct ApplyArgs {
     plan: RoutePlan,
+    replaces: Option<Replaces>,
     locked: bool,
     strict: bool,
     max_items: usize,
@@ -2057,6 +2114,7 @@ struct ApplyArgs {
 
 fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
     let plan: RoutePlan = read_json(&required_path(args, "routing_file")?, "routing_file")?;
+    let replaces = replaces_file_arg(args)?;
     let locked = opt_bool(args, "locked", false)?;
     let strict = match args.get("geometry_check").and_then(Value::as_str) {
         None | Some("strict") => true,
@@ -2098,6 +2156,7 @@ fn apply_args(args: &Value, ledger_path: &Path) -> Result<ApplyArgs, Refusal> {
     }
     Ok(ApplyArgs {
         plan,
+        replaces,
         locked,
         strict,
         max_items,
@@ -2148,6 +2207,7 @@ async fn handle_apply_route_plan(
     let t = std::time::Instant::now();
     let applied = {
         let plan = a.plan.clone();
+        let replaces = a.replaces.as_ref().map(|r| r.uuids.clone());
         let (locked, strict, max_items, listed) = (a.locked, a.strict, a.max_items, a.listed);
         super::with_bound_board_ipc_classified(ctx, &board, move |client, document| {
             let codes: BTreeMap<String, i32> = client
@@ -2156,9 +2216,15 @@ async fn handle_apply_route_plan(
                 .map(|n| (n.name, n.netcode))
                 .collect();
             let mut sink = IpcSink { client, document };
-            Ok(route_native_apply::apply_plan_with(
-                &plan, locked, &limits, strict, max_items, listed, &codes, &mut sink,
-            ))
+            Ok(match &replaces {
+                Some(uuids) => route_native_apply::apply_plan_replacing(
+                    &plan, uuids, locked, &limits, strict, max_items, listed, &codes, &mut sink,
+                ),
+                None => route_native_apply::apply_plan_with(
+                    &plan, locked, &limits, strict, max_items, listed, &codes, &mut sink,
+                )
+                .map(|outcome| (Vec::new(), outcome)),
+            })
         })
         .await?
     };
@@ -2180,36 +2246,55 @@ async fn handle_apply_route_plan(
         }
     };
     let elapsed_ms = t.elapsed().as_millis() as u64;
-    let (ledger, complete, failure) = match outcome {
+    let (ledger, complete, failure, replaced) = match outcome {
         Err(route_native_apply::ApplyRefusal::Geometry { defects, detail }) => {
             return Ok(geometry_refusal(defects, &detail))
+        }
+        Err(refusal @ route_native_apply::ApplyRefusal::ReplaceFailed(_)) => {
+            return Ok(CallToolResult::error(format!(
+                "Nothing was created; {refusal}. Some of the replaced copper may be gone: \
+                 inspect the board before retrying."
+            )))
         }
         Err(refusal) => {
             return Ok(CallToolResult::error_kind(
                 ToolErrorKind::InvalidArgument {
-                    field: "routing_file".to_string(),
+                    field: refusal.field().to_string(),
                     reason: refusal.to_string(),
                 },
-                format!("Nothing was created: {refusal}"),
+                format!("Nothing was deleted or created: {refusal}"),
             ))
         }
-        Ok(ApplyOutcome::Complete(ledger)) => (ledger, true, Value::Null),
-        Ok(ApplyOutcome::Partial {
-            ledger,
-            failed_chunk,
-            error,
-        }) => (
+        Ok((replaced, ApplyOutcome::Complete(ledger))) => (ledger, true, Value::Null, replaced),
+        Ok((
+            replaced,
+            ApplyOutcome::Partial {
+                ledger,
+                failed_chunk,
+                error,
+            },
+        )) => (
             ledger,
             false,
             json!({ "failed_chunk": failed_chunk, "error": error }),
+            replaced,
         ),
     };
+    let reasons = a.replaces.as_ref().map(|r| &r.reasons);
+    let replaced_listing: Vec<Value> = replaced
+        .iter()
+        .map(|i| {
+            json!({ "uuid": i.uuid, "kind": i.kind, "net": i.net, "layer": i.layer,
+                    "reason": reasons.and_then(|r| r.get(&i.uuid.to_ascii_lowercase())) })
+        })
+        .collect();
     let summary = route_native_apply::ledger_summary(&ledger);
     let record = LedgerFile {
         routing_file,
         locked: a.locked,
         complete,
         ledger,
+        replaced,
     };
     let written = serde_json::to_vec(&record)
         .map_err(anyhow::Error::from)
@@ -2220,6 +2305,8 @@ async fn handle_apply_route_plan(
         "failure": failure,
         "applied": summary,
         "locked": a.locked,
+        "replaced_count": replaced_listing.len(),
+        "replaced": replaced_listing,
         "plan_tracks": a.plan.tracks.len(),
         "plan_vias": a.plan.vias.len(),
         "ledger_output": if written.is_ok() { json!(ledger_path) } else { Value::Null },
