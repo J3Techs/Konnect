@@ -105,20 +105,24 @@ update. It overwrites `different` files, so save any edits you made first.
 Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
 `check_kicad_ui`, …) needs the IPC socket address.
 
-**At startup** — once, and only then — Konnect resolves it in order: the
-`ipc_address` in your config, then `KICAD_API_SOCKET` (set only for plugins
-KiCad launches itself), then the platform default — `<temp dir>/kicad/api.sock`,
-used only if something is actually listening there. The startup log on stderr
-says which it picked, and warns when nothing was found.
+**At startup** Konnect resolves it in order: the `ipc_address` in your config,
+then `KICAD_API_SOCKET` (set only for plugins KiCad launches itself), then the
+platform default — `<temp dir>/kicad/api.sock`, used only if something is
+actually listening there. The startup log on stderr says which it picked, and
+warns when nothing was found.
 
 So **if KiCad is already running with the API enabled when Konnect starts**,
-no configuration is needed on any platform. That order matters and is easy to
-get wrong: an MCP client normally launches the Konnect server itself, before
-you open KiCad. Konnect does not re-probe afterwards, so a server started first
-stays unresolved for its whole life no matter what you open later. Start KiCad
-first, or restart the Konnect server (in most clients, reconnect the MCP
-server) once KiCad is up — or set `ipc_address` explicitly, which never depends
-on ordering.
+no configuration is needed on any platform. The other order works too: an MCP
+client normally launches the Konnect server itself, before you open KiCad, and
+a server that found nothing at startup looks at the platform default again
+whenever a tool needs KiCad (at most once a second, without connecting), so a
+KiCad started later is reached by the next call and the server log records
+`KiCad IPC endpoint found after startup`. Only the default path is looked at:
+a KiCad listening elsewhere still needs `ipc_address` or `KICAD_API_SOCKET`,
+and an address known at startup is never replaced. Before this, a server
+started first stayed unresolved for its whole life and had to be restarted
+once KiCad was up; on a Konnect older than the fix, do that or set
+`ipc_address` explicitly.
 
 Where the probe looks differs by platform, because the endpoint does. On Linux
 and macOS the socket is a filesystem entry and its metadata is read. On Windows

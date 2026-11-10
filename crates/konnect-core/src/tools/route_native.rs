@@ -913,7 +913,7 @@ async fn kicad_classes(
     if mode == ClassMode::Project || spec.source != CopperSource::Native {
         return Ok(Ok(json!({ "source": "project_patterns" })));
     }
-    let why_not = if ctx.config.ipc_address.is_empty() {
+    let why_not = if ctx.ipc_address().is_empty() {
         "no KiCad IPC address is configured".to_string()
     } else {
         let bound = super::with_bound_board_ipc_classified(ctx, &spec.board, |client, document| {

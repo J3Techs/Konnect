@@ -137,6 +137,14 @@ impl McpHandler {
         let _ = self.ctx.guidance.set(probe);
     }
 
+    /// Let tool calls look for KiCad's default IPC endpoint when startup
+    /// found none (see `ToolContext::ipc_address`). Only a server entry point
+    /// whose startup resolution came back empty calls this.
+    pub fn enable_ipc_discovery(&self) {
+        self.ctx
+            .enable_ipc_discovery(Arc::new(konnect_ipc::detect_ipc_address));
+    }
+
     pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
         self.reload.take()
     }

@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a server started before KiCad reaches it without a restart
+
+The KiCad IPC address was resolved once, at startup: `ipc_address`, then
+`KICAD_API_SOCKET`, then KiCad's default endpoint if something was listening
+there. A server started with no KiCad running found nothing and kept a blank
+address for its whole life. An editor opened afterwards was never reached:
+live-only tools kept failing as unconfigured, and the hybrid tools kept
+editing the saved file of a board that editor now held, where only KiCad's
+sibling lock stood between the edit and the editor's next save. The remedy was
+to restart the server.
+
+A server whose startup resolution found nothing now looks at KiCad's default
+endpoint again when a tool call needs KiCad. Looking reads the pipe namespace
+(Windows) or the socket's metadata (Linux, macOS) and never connects; a look
+that finds nothing is not repeated for one second, so calls made with no KiCad
+running cost about a millisecond once a second; an address, once found, is
+kept, and the server log records it. Nothing changes for a server that had an
+address at startup, whatever its source: it is used as it is and nothing is
+looked for. Only the default path is looked at, so a KiCad listening elsewhere
+still needs `ipc_address` or `KICAD_API_SOCKET`.
+
+No tool's arguments or results change shape. What changes is which path a
+call takes after KiCad starts: the tools that prefer a live editor use it,
+`check_kicad_ui` and `open_project` report the editor and the address found,
+and `run_closed_board_edit` can find the editor it reopened. In
+`get_installation_info`, `ipc` still describes the startup resolution.
+
 ## Unreleased: a board KiCad reports as not open is not edited beside its lock
 
 When a reachable KiCad answered that the requested board is not among its open

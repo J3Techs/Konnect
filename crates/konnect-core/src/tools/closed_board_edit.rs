@@ -735,7 +735,7 @@ impl Stage for LiveStage {
     }
 
     fn ipc_configured(&self) -> bool {
-        !self.ctx.config.ipc_address.is_empty()
+        !self.ctx.ipc_address().is_empty()
     }
 
     fn other_endpoint(&self, pid: u32) -> Option<String> {
@@ -749,7 +749,7 @@ impl Stage for LiveStage {
             .filter_map(|default| Some(default.parent()?.join(format!("api-{pid}.sock"))))
             .find(|path| path.exists())
             .map(|path| format!("ipc://{}", path.display()))
-            .filter(|address| *address != self.ctx.config.ipc_address)
+            .filter(|address| *address != self.ctx.ipc_address())
     }
 
     async fn pause(&self) {

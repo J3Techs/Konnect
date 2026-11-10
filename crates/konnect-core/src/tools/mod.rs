@@ -296,7 +296,31 @@ pub struct ToolContext {
     /// Reads installed guidance for drift. Set once by the standalone binary,
     /// which owns the bundle; absent in embedded and test contexts (#728).
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
+    /// Looks for KiCad's IPC endpoint when startup found none; see
+    /// [`ToolContext::ipc_address`]. Absent unless the server entry point
+    /// enables it, so a context built with a blank address (every test that
+    /// means "no KiCad") never goes looking for a real one.
+    ipc_discovery: std::sync::OnceLock<IpcDiscovery>,
+    late_ipc: std::sync::Mutex<LateIpc>,
 }
+
+/// Looks for KiCad's endpoint without dialling it.
+pub type IpcDiscovery = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// What looking for the endpoint after startup has found so far.
+#[derive(Debug, Default)]
+struct LateIpc {
+    /// The endpoint, once one was found. KiCad's default address does not
+    /// change between its runs, so it is kept.
+    address: Option<String>,
+    /// When the last look found nothing.
+    last_miss: Option<std::time::Instant>,
+}
+
+/// How long a look that found nothing stands before the next one. A burst of
+/// calls with no KiCad running then costs one look, not one each; an editor
+/// takes longer than this to start listening.
+const IPC_DISCOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl ToolContext {
     /// Construct a context with an in-memory-only observer (no JSONL). Used by
@@ -310,6 +334,8 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            ipc_discovery: std::sync::OnceLock::new(),
+            late_ipc: std::sync::Mutex::default(),
         }
     }
 
@@ -328,6 +354,71 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            ipc_discovery: std::sync::OnceLock::new(),
+            late_ipc: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Let a server that found no KiCad endpoint at startup find one later.
+    ///
+    /// Startup resolves the address once: the configuration, then
+    /// `KICAD_API_SOCKET`, then KiCad's default endpoint if one is there. With
+    /// no KiCad running the last finds nothing, and the blank address used to
+    /// stand for the life of the process, so an editor started afterwards was
+    /// never reached and every hybrid tool edited the saved file beside it.
+    /// With `discover` set, a blank address is looked for again when a call
+    /// needs it. A second call is ignored.
+    pub fn enable_ipc_discovery(&self, discover: IpcDiscovery) {
+        let _ = self.ipc_discovery.set(discover);
+    }
+
+    /// The KiCad IPC address to dial now, or blank when there is none.
+    ///
+    /// An address known at startup (configured, from the environment, or
+    /// detected then) is returned as it is and nothing is looked for: this
+    /// changes nothing for a server that had one. Otherwise, where
+    /// [`Self::enable_ipc_discovery`] was called, KiCad's default endpoint is
+    /// looked for. Looking only reads the pipe namespace or the socket's
+    /// metadata and never connects (see `konnect_ipc::detect_ipc_address`),
+    /// and a look that finds nothing is not repeated for
+    /// [`IPC_DISCOVERY_RETRY`]. Once found, the address is kept.
+    pub fn ipc_address(&self) -> String {
+        self.ipc_address_at(std::time::Instant::now())
+    }
+
+    fn ipc_address_at(&self, now: std::time::Instant) -> String {
+        if !self.config.ipc_address.is_empty() {
+            return self.config.ipc_address.clone();
+        }
+        let Some(discover) = self.ipc_discovery.get() else {
+            return String::new();
+        };
+        let mut late = self
+            .late_ipc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(address) = &late.address {
+            return address.clone();
+        }
+        if late
+            .last_miss
+            .is_some_and(|miss| now.saturating_duration_since(miss) < IPC_DISCOVERY_RETRY)
+        {
+            return String::new();
+        }
+        match discover().filter(|address| !address.trim().is_empty()) {
+            Some(address) => {
+                tracing::info!(
+                    ipc_address = %konnect_ipc::redact_endpoint(&address),
+                    "KiCad IPC endpoint found after startup; live tools will use it"
+                );
+                late.address = Some(address.clone());
+                address
+            }
+            None => {
+                late.last_miss = Some(now);
+                String::new()
+            }
         }
     }
 
@@ -754,7 +845,7 @@ where
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
+    with_ipc_classified(ctx.ipc_address(), move |client| {
         let document = match client.find_open_board(&requested) {
             Ok(document) => document,
             // Classified by the typed status in the chain, never by message
@@ -3092,5 +3183,111 @@ mod ipc_failure_evidence_tests {
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+    }
+}
+
+#[cfg(test)]
+mod ipc_discovery_tests {
+    use super::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::pcb_board::{attempt_ipc_write, BoardWrite, NoLiveBoard};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// A discovery that answers from `found` and counts how often it looked.
+    fn discovery(found: Arc<Mutex<Option<String>>>, looks: Arc<AtomicUsize>) -> IpcDiscovery {
+        Arc::new(move || {
+            looks.fetch_add(1, Ordering::SeqCst);
+            found.lock().unwrap().clone()
+        })
+    }
+
+    /// The defect: a server started with no KiCad running kept its blank
+    /// address for life, so an editor started later was never reached and the
+    /// hybrid tools went on editing the saved file beside it. The same
+    /// context now takes the file path while nothing listens and the live
+    /// path once KiCad does, with no restart in between.
+    #[tokio::test]
+    async fn a_kicad_started_after_the_server_is_reached_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("late.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let found = Arc::new(Mutex::new(None));
+        let looks = Arc::new(AtomicUsize::new(0));
+        let ctx = ctx_talking_to(String::new());
+        ctx.enable_ipc_discovery(discovery(found.clone(), looks.clone()));
+
+        assert!(matches!(
+            attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                .await
+                .unwrap(),
+            BoardWrite::File(NoLiveBoard::Unreachable)
+        ));
+
+        // KiCad starts and opens the board.
+        let kicad = spawn_kicad_holding_board(&board, |_| None);
+        *found.lock().unwrap() = Some(kicad.address().to_string());
+        // The look that found nothing stands for a moment; step past it.
+        let later = Instant::now() + IPC_DISCOVERY_RETRY + Duration::from_millis(1);
+        assert_eq!(ctx.ipc_address_at(later), kicad.address());
+
+        assert!(matches!(
+            attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                .await
+                .unwrap(),
+            BoardWrite::Ipc(())
+        ));
+        // Found once, and kept: no further look.
+        let before = looks.load(Ordering::SeqCst);
+        assert_eq!(ctx.ipc_address(), kicad.address());
+        assert_eq!(looks.load(Ordering::SeqCst), before);
+    }
+
+    /// With no KiCad anywhere, a burst of calls costs one look, and the next
+    /// look waits out the retry interval.
+    #[test]
+    fn a_look_that_found_nothing_is_not_repeated_for_every_call() {
+        let looks = Arc::new(AtomicUsize::new(0));
+        let ctx = ctx_talking_to(String::new());
+        ctx.enable_ipc_discovery(discovery(Arc::default(), looks.clone()));
+        let start = Instant::now();
+
+        for _ in 0..50 {
+            assert_eq!(ctx.ipc_address_at(start), "");
+        }
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            ctx.ipc_address_at(start + IPC_DISCOVERY_RETRY - Duration::from_millis(1)),
+            ""
+        );
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.ipc_address_at(start + IPC_DISCOVERY_RETRY), "");
+        assert_eq!(looks.load(Ordering::SeqCst), 2);
+    }
+
+    /// An address the server started with is used as it is, whatever its
+    /// source, and nothing is ever looked for; and a context nobody enabled
+    /// discovery on (every test that means "no KiCad" by a blank address)
+    /// stays blank.
+    #[test]
+    fn a_known_address_is_never_replaced_and_discovery_is_opt_in() {
+        let looks = Arc::new(AtomicUsize::new(0));
+        let elsewhere = Arc::new(Mutex::new(Some("ipc://detected-later.sock".to_string())));
+
+        let configured = ctx_talking_to("ipc://configured.sock".to_string());
+        configured.enable_ipc_discovery(discovery(elsewhere.clone(), looks.clone()));
+        assert_eq!(configured.ipc_address(), "ipc://configured.sock");
+        assert_eq!(looks.load(Ordering::SeqCst), 0);
+
+        let plain = ctx_talking_to(String::new());
+        assert_eq!(plain.ipc_address(), "");
+
+        // The first discovery set is the one kept.
+        let first = ctx_talking_to(String::new());
+        first.enable_ipc_discovery(discovery(elsewhere, looks.clone()));
+        first.enable_ipc_discovery(discovery(Arc::default(), looks.clone()));
+        assert_eq!(first.ipc_address(), "ipc://detected-later.sock");
     }
 }
