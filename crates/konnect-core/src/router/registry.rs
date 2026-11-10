@@ -112,9 +112,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "placement",
-        description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
+        description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement, reference-designator placement",
         category: "pcb",
-        tool_count: 6,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "pcb_export",

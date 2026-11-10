@@ -314,6 +314,19 @@ text rules: move a label into clear space first, hide one (`visible: false`)
 only when it has no clear position, and do not lower the minimum height.
 Re-run DRC afterwards.
 
+To find those positions for a whole board, call
+`plan_reference_designator_placement` (`placement` toolset) on the saved
+board. It writes nothing: for each footprint it tries the designator beside the
+courtyard on each side and takes the first position whose text box touches no
+pad, other courtyard, silkscreen text or artwork and keeps off the board edge;
+one with no such position is planned hidden, and one already clear is kept.
+Read the per-footprint rows (`rejected` says what each candidate touched), then
+pass the result's `fields`, or its `plan_file` as `fields_file`, to
+`set_reference_field_presentations`. The same board and options always give
+the same plan. Its text box is an estimate of KiCad's ink, so KiCad DRC (its
+silkscreen overlap, silkscreen over copper and silkscreen edge clearance
+rules) is still the check.
+
 ### Routing Tools
 
 | Tool                      | Use Case                                    |
