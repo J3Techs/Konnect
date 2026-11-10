@@ -1153,6 +1153,24 @@ struct RecoveryWindow {
     deadline: Option<std::time::Instant>,
 }
 
+/// The wait one sent command was given for its reply, as the client set it
+/// on the socket. Tests read these to check the recovery budget against the
+/// client's own clock rather than against how fast the machine ran.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ReceiveWait {
+    command: String,
+    /// When the wait began: the instant lateness and the shared deadline are
+    /// both measured from.
+    started: std::time::Instant,
+    /// The receive timeout the socket was given for this reply.
+    bound: std::time::Duration,
+    /// Whether the command was sent inside a recovery batch.
+    budgeted: bool,
+    /// The shared recovery deadline in force when the command was sent.
+    deadline: Option<std::time::Instant>,
+}
+
 impl std::fmt::Display for IpcFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.message())
@@ -1165,6 +1183,8 @@ pub struct KiCadIpcClient {
     client_name: String,
     bound_board: std::sync::Mutex<Option<BoundBoardTarget>>,
     recovery: Option<std::sync::Mutex<RecoveryWindow>>,
+    #[cfg(test)]
+    receive_waits: Option<std::sync::Arc<std::sync::Mutex<Vec<ReceiveWait>>>>,
 }
 
 #[derive(Clone)]
@@ -1195,6 +1215,8 @@ impl KiCadIpcClient {
             client_name: format!("konnect-{}", std::process::id()),
             bound_board: std::sync::Mutex::new(None),
             recovery: None,
+            #[cfg(test)]
+            receive_waits: None,
         }
     }
 
@@ -1353,6 +1375,28 @@ impl KiCadIpcClient {
                 recv_timeout
             };
             socket.set_opt::<nng::options::RecvTimeout>(Some(timeout))?;
+            #[cfg(test)]
+            if let Some(waits) = &self.receive_waits {
+                let deadline = match &self.recovery {
+                    Some(window) => {
+                        window
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?
+                            .deadline
+                    }
+                    None => None,
+                };
+                waits
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("receive wait log poisoned"))?
+                    .push(ReceiveWait {
+                        command: type_name.rsplit('.').next().unwrap_or(type_name).into(),
+                        started: receive_started,
+                        bound: timeout,
+                        budgeted: self.recovery.is_some(),
+                        deadline,
+                    });
+            }
             Ok(())
         })();
         receive_config.map_err(|error| {
@@ -1500,6 +1544,8 @@ impl KiCadIpcClient {
                 budget,
                 deadline: None,
             })),
+            #[cfg(test)]
+            receive_waits: self.receive_waits.clone(),
         };
         scoped.run_commit(description, operation)
     }
@@ -5948,7 +5994,136 @@ mod recovery_tests {
         BeginLate,
     }
 
-    fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Duration) {
+    /// The two limits a recovery batch runs under: how long a reply may take
+    /// before it counts as late, and the budget every later command shares.
+    #[derive(Clone, Copy, Debug)]
+    struct Limits {
+        receive_timeout: Duration,
+        budget: Duration,
+    }
+
+    impl Limits {
+        /// The longest any command of the batch may wait, and the whole of the
+        /// time left to the batch once a reply has come in late.
+        fn window(self) -> Duration {
+            self.receive_timeout + self.budget
+        }
+    }
+
+    /// How far past the receive timeout the mock holds a reply it means to be
+    /// late. Any amount would do; this only keeps the scenarios short.
+    const LATE_BY: Duration = Duration::from_millis(80);
+
+    /// The receive timeout for a scenario in which replies the mock does not
+    /// delay must count as on time. Whether a reply is late is a wall-clock
+    /// judgement by nature, so this is the one allowance for a slow machine
+    /// left in these tests; no assertion measures elapsed time.
+    const ROOMY_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn limits(scenario: Scenario) -> Limits {
+        let (receive_timeout, budget) = match scenario {
+            // Nothing is delayed, so nothing may be judged late.
+            Scenario::Success => (Duration::from_secs(30), Duration::from_millis(400)),
+            // BeginCommit must be on time, and the rollback that follows the
+            // late reply must fit in the budget.
+            Scenario::Late => (ROOMY_RECEIVE_TIMEOUT, Duration::from_secs(10)),
+            // Everything before the publish must be on time.
+            Scenario::PublishLate => (ROOMY_RECEIVE_TIMEOUT, Duration::from_millis(400)),
+            // The rest end without a confirmed rollback whichever reply is
+            // late, so a reply slowed by the machine changes nothing asserted.
+            _ => (Duration::from_millis(60), Duration::from_millis(400)),
+        };
+        Limits {
+            receive_timeout,
+            budget,
+        }
+    }
+
+    /// The command whose reply the mock holds back past the receive timeout
+    /// and lets the batch go on from, if the scenario has one.
+    fn late_command(scenario: Scenario) -> Option<&'static str> {
+        match scenario {
+            Scenario::Late
+            | Scenario::DropFailed
+            | Scenario::Changed
+            | Scenario::TargetChanged
+            | Scenario::Malformed
+            | Scenario::CleanupSlow
+            | Scenario::WrongSnapshot
+            | Scenario::ObserveFailed => Some("Ping"),
+            _ => None,
+        }
+    }
+
+    /// The budget, read off the waits the client actually set rather than off
+    /// how long the run took: elapsed time also counts the unbudgeted setup
+    /// and every moment the machine spent elsewhere.
+    ///
+    /// Until a reply is late, each command may wait one receive timeout plus
+    /// the budget and no longer. The first late reply fixes a deadline that
+    /// far from when its own wait began, and from then on no command starts
+    /// at or after it, none is given a wait that could outlast it, and it is
+    /// never moved.
+    fn assert_waits_honour_the_budget(scenario: Scenario, limits: Limits, waits: &[ReceiveWait]) {
+        let waits: Vec<_> = waits.iter().filter(|wait| wait.budgeted).collect();
+        let mut shared = None;
+        for (index, wait) in waits.iter().enumerate() {
+            let Some(deadline) = wait.deadline else {
+                assert!(
+                    shared.is_none(),
+                    "{scenario:?}: {} was sent without the shared deadline: {waits:#?}",
+                    wait.command
+                );
+                assert_eq!(
+                    wait.bound,
+                    limits.window(),
+                    "{scenario:?}: {} may wait for the receive timeout and the budget, no longer",
+                    wait.command
+                );
+                continue;
+            };
+            let opened_by = *shared.get_or_insert_with(|| {
+                let late = index
+                    .checked_sub(1)
+                    .map(|previous| waits[previous])
+                    .unwrap_or_else(|| panic!("{scenario:?}: a deadline with no late reply"));
+                late.started + limits.window()
+            });
+            assert_eq!(
+                deadline, opened_by,
+                "{scenario:?}: the deadline is the late reply's wait plus the budget, and is \
+                 shared rather than renewed: {waits:#?}"
+            );
+            assert!(
+                wait.started < deadline,
+                "{scenario:?}: {} was sent after the budget was spent",
+                wait.command
+            );
+            assert!(
+                wait.started + wait.bound <= deadline,
+                "{scenario:?}: {} was given {:?}, which outlasts the shared deadline by {:?}",
+                wait.command,
+                wait.bound,
+                (wait.started + wait.bound).duration_since(deadline)
+            );
+        }
+        if let Some(late) = late_command(scenario) {
+            if let Some(at) = waits.iter().position(|wait| wait.command == late) {
+                for wait in &waits[at + 1..] {
+                    assert!(
+                        wait.deadline.is_some(),
+                        "{scenario:?}: {} followed the late {late} reply with no deadline",
+                        wait.command
+                    );
+                }
+            }
+        }
+    }
+
+    fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Vec<ReceiveWait>) {
+        let limits = limits(scenario);
+        let waits = Arc::new(Mutex::new(Vec::<ReceiveWait>::new()));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let address = format!(
             "inproc://bounded-recovery-{}",
@@ -5973,10 +6148,38 @@ mod recovery_tests {
             ),
         };
         let target = document.clone();
+        let client_waits = waits.clone();
+        let client_finished = finished.clone();
         let worker = std::thread::spawn(move || {
             let mut mutated = false;
             let mut dropped = false;
+            let mut received = 0;
+            // The mock times its delays from the client's own record of when
+            // each wait began, never from its own clock: a reply held until
+            // `started + receive_timeout` is late by the client's measure
+            // however the two threads were scheduled.
+            let wait_of = |index: usize| loop {
+                if let Some(wait) = client_waits.lock().unwrap().get(index) {
+                    return Some(wait.clone());
+                }
+                if client_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let hold_until = |instant: Option<Instant>| {
+                if let Some(instant) = instant {
+                    std::thread::sleep(instant.saturating_duration_since(Instant::now()));
+                }
+            };
+            let hold_until_late = |index: usize| {
+                hold_until(
+                    wait_of(index).map(|wait| wait.started + limits.receive_timeout + LATE_BY),
+                )
+            };
             while let Ok(request) = server.recv() {
+                let index = received;
+                received += 1;
                 let request = kiapi::common::ApiRequest::decode(request.as_slice()).unwrap();
                 let message = request.message.unwrap();
                 let name = message.type_url.rsplit('.').next().unwrap().to_string();
@@ -6038,7 +6241,7 @@ mod recovery_tests {
                     }
                     "BeginCommit" => {
                         if matches!(scenario, Scenario::BeginLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            hold_until_late(index);
                         }
                         response.message = Some(pack_any(
                             &kiapi::common::commands::BeginCommitResponse {
@@ -6051,12 +6254,14 @@ mod recovery_tests {
                     }
                     "Ping" => {
                         mutated = true;
-                        if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
-                            std::thread::sleep(if matches!(scenario, Scenario::Exhausted) {
-                                Duration::from_millis(800)
-                            } else {
-                                Duration::from_millis(140)
-                            });
+                        if matches!(scenario, Scenario::Exhausted) {
+                            // Not within the receive timeout, and not within
+                            // the budget after it either.
+                            hold_until(
+                                wait_of(index).map(|wait| wait.started + limits.window() + LATE_BY),
+                            );
+                        } else if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
+                            hold_until_late(index);
                         }
                         if matches!(scenario, Scenario::Malformed) {
                             response.status = None;
@@ -6072,10 +6277,14 @@ mod recovery_tests {
                             .unwrap()
                             .push(format!("action:{}", command.action));
                         if matches!(scenario, Scenario::PublishLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            hold_until_late(index);
                         }
                         if matches!(scenario, Scenario::CleanupSlow) {
-                            std::thread::sleep(Duration::from_millis(480));
+                            // The drop is answered only once the deadline it
+                            // was sent under has passed.
+                            hold_until(wait_of(index).map(|wait| {
+                                wait.deadline.unwrap_or(wait.started + limits.window()) + LATE_BY
+                            }));
                         }
                         if matches!(scenario, Scenario::DropFailed) {
                             response.status.as_mut().unwrap().status =
@@ -6097,8 +6306,9 @@ mod recovery_tests {
                 }
             }
         });
-        let started = Instant::now();
-        let result = KiCadIpcClient::new(address).run_commit_recovering_with_limits(
+        let mut client = KiCadIpcClient::new(address);
+        client.receive_waits = Some(waits.clone());
+        let result = client.run_commit_recovering_with_limits(
             document,
             "test",
             |client| {
@@ -6108,14 +6318,16 @@ mod recovery_tests {
                 )?;
                 Ok(())
             },
-            Duration::from_millis(60),
-            Duration::from_millis(400),
+            limits.receive_timeout,
+            limits.budget,
         );
-        let elapsed = started.elapsed();
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
         control.close();
         worker.join().unwrap();
         let calls = calls.lock().unwrap().clone();
-        (result, calls, elapsed)
+        let waits = waits.lock().unwrap().clone();
+        assert_waits_honour_the_budget(scenario, limits, &waits);
+        (result, calls, waits)
     }
 
     #[test]
@@ -6165,12 +6377,13 @@ mod recovery_tests {
             Scenario::ObserveFailed,
             Scenario::BeginLate,
         ] {
-            let (result, calls, elapsed) = exercise(scenario);
+            // `exercise` has already held every wait of the batch to the
+            // shared budget; what is left is what the batch concluded.
+            let (result, calls, _) = exercise(scenario);
             let failure = IpcFailure::from_error(result.unwrap_err());
-            assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
             assert!(
-                elapsed < Duration::from_millis(650),
-                "shared budget exceeded: {elapsed:?}"
+                matches!(failure, IpcFailure::Uncertain(_)),
+                "{scenario:?}: {failure:?}"
             );
             if matches!(
                 scenario,
