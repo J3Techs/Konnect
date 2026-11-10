@@ -3,6 +3,46 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: live footprint field edits and legacy repairs refuse footprints with pad fabrication properties
+
+KiCad 10's `Pad` protobuf has no fabrication-property field and
+`FOOTPRINT::Deserialize` re-creates a footprint's pads from it, so a live
+whole-footprint update drops `pad_prop_heatsink`, `pad_prop_bga` and the rest
+without any readback being able to show it. The guard that already covers the
+placement, value, graphic, model, library-refresh and schematic-sync tools was
+missing from three tools that send a whole footprint back through
+`UpdateItems`. They now run it before anything is sent, on the dry run as well
+as the apply, and refuse any footprint whose saved-board copy or library
+footprint carries a pad fabrication property, or for which neither can be read
+(a board never saved, with an unresolvable library):
+
+- `edit_footprint_fields` returns `plan_blocked`. The tool is live only, so
+  there is no closed-board path of its own. With the board saved and closed,
+  `set_footprint_field_values` sets, creates or removes field values and
+  `edit_component` with `reference_field` (or `set_reference_field_presentations`)
+  changes the Reference field's presentation, both in the saved file with every
+  pad clause kept. Other field presentation changes on such a footprint have to
+  be made in KiCad itself.
+- `set_footprint_field_values`, on a board KiCad holds open, returns
+  `plan_blocked` for the whole batch when any footprint it would change is such
+  a footprint. Save the board, close it in KiCad and repeat the request, or
+  nest the request in `run_closed_board_edit`, which saves, closes and reopens
+  the editor around it: the closed-board path changes only the named values. A
+  footprint the request names but would not change is not sent and does not
+  block the batch.
+- `repair_corrupted_footprints` reports each such footprint as a
+  `fabrication_property_rebuild_refused` diagnostic with status `conflict` and
+  `applied: false`, and repairs nothing, as for its other diagnostics. This is
+  new for a property the saved board carries and the library footprint does
+  not, and for a footprint neither source can speak for; a property in the
+  library footprint itself already stopped the repair as
+  `library_pad_parse_failed`, and still does.
+
+A request these tools used to accept can therefore now be refused; nothing
+else about their arguments or results changes. A footprint whose pads carry no
+fabrication property is edited as before, provided the board has been saved at
+least once or its footprint library resolves.
+
 ## Unreleased: the native router rips up and retries copper that fences a connection in
 
 A native route job never moved copper once negotiation and its rescue rounds

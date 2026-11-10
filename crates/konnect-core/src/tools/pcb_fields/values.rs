@@ -13,6 +13,7 @@
 use super::*;
 use crate::mcp::error::ToolErrorKind;
 use crate::tools::closed_board;
+use crate::tools::footprint_fabrication::{check_live_rebuild, RebuildTarget, Remedy};
 use crate::tools::pcb_components::{
     check_single_board_form, footprint_reference, sexp_block_tokens, sexp_token_value,
 };
@@ -547,7 +548,11 @@ pub(crate) fn tool() -> ToolDef {
          mandatory one). The board KiCad holds open is edited over live IPC in one commit and \
          read back; a board KiCad provably does not hold (and has no sibling lock) is edited in \
          the saved file with one revision-checked atomic write that changes only the named \
-         values. Dry run by default: it returns plan_revision, which an apply must repeat in \
+         values. A footprint whose pads carry a fabrication property (pad_prop_heatsink, \
+         pad_prop_bga, …) is refused live, plan and apply, because KiCad 10's typed update \
+         re-creates pads without it; save and close the board, by hand or by nesting this \
+         call in run_closed_board_edit, and the file path edits it. Dry run by default: it \
+         returns plan_revision, which an apply must repeat in \
          expected_revision. One bad edit refuses the whole batch.",
         json!({
             "type": "object",
@@ -578,7 +583,7 @@ pub(crate) fn tool() -> ToolDef {
     .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback)
 }
 
-async fn handle_set_footprint_field_values(
+pub(super) async fn handle_set_footprint_field_values(
     args: &Value,
     ctx: &ToolContext,
 ) -> Result<CallToolResult> {
@@ -645,16 +650,27 @@ async fn handle_set_footprint_field_values(
         let changed: Vec<usize> = (0..updated.len())
             .filter(|&i| updated[i] != before[i])
             .collect();
+        // Each changed footprint is sent back whole, and KiCad re-creates its
+        // pads without any pad fabrication property: refuse the plan and the
+        // apply alike, all or nothing. The closed-board path keeps every pad.
+        let targets: Vec<RebuildTarget> = changed
+            .iter()
+            .map(|&i| RebuildTarget::from_instance(&before[i]))
+            .collect();
+        if let Err(refusal) = check_live_rebuild(&path, OPERATION, &targets, Remedy::ClosedBoardPath)
+        {
+            return Ok(Err(refusal));
+        }
         if dry_run || changed.is_empty() {
-            return Ok(json!({
+            return Ok(Ok(json!({
                 "status": if changed.is_empty() { "noop" } else { "ready" },
                 "applied": false, "source": "ipc", "plan_revision": rev,
                 "footprints": live_edits.len(), "changed": changed.len(), "changes": changes,
-            }));
+            })));
         }
         if live_expected.as_deref() != Some(rev.as_str()) {
-            return Ok(json!({ "status": "stale_revision", "applied": false, "source": "ipc",
-                              "diagnostic": "expected_revision does not match the live footprints and request; rerun the dry run" }));
+            return Ok(Ok(json!({ "status": "stale_revision", "applied": false, "source": "ipc",
+                              "diagnostic": "expected_revision does not match the live footprints and request; rerun the dry run" })));
         }
         let packed: Vec<_> = changed
             .iter()
@@ -678,7 +694,7 @@ async fn handle_set_footprint_field_values(
                 }
                 Ok(())
             });
-        Ok(match outcome {
+        Ok(Ok(match outcome {
             Ok(()) => json!({
                 "status": "complete", "applied": true, "source": "ipc", "saved": false,
                 "plan_revision": rev, "footprints": live_edits.len(), "changed": changed.len(),
@@ -690,11 +706,12 @@ async fn handle_set_footprint_field_values(
                 "diagnostic": format!("{e:#}"),
                 "recovery": "Inspect the live footprints before retrying; no rollback was attempted",
             }),
-        })
+        }))
     })
     .await?;
     match attempt {
-        BoardWrite::Ipc(body) => return Ok(CallToolResult::json(&body)),
+        BoardWrite::Ipc(Ok(body)) => return Ok(CallToolResult::json(&body)),
+        BoardWrite::Ipc(Err(refusal)) => return Ok(refusal.into_result()),
         BoardWrite::Refused(r) => return Ok(r),
         BoardWrite::File(_) => {}
     }
