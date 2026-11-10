@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: JLCPCB part results and lookups agree on `lcsc_id`
+
+`search_jlcpcb_parts` and `suggest_jlcpcb_alternatives` named a part's LCSC
+number `lcsc`, while `get_jlcpcb_part` and `get_datasheet_url` take `lcsc_id`
+and refuse an argument they do not declare, so a result's key could not be
+passed to the lookup. `lcsc_id` is the name the naming conventions give an
+LCSC part number and is canonical on both sides.
+
+Every part result (search, suggestion and `get_jlcpcb_part`) now carries
+`lcsc_id`, and keeps `lcsc` with the same value for callers that read it.
+`get_jlcpcb_part` and `get_datasheet_url` accept `lcsc` as an alias of
+`lcsc_id`. Giving both with different values is refused as an invalid `lcsc`
+argument; the same value in both is accepted. `get_jlcpcb_part` no longer
+lists `lcsc_id` as required in its schema, because either name satisfies it;
+a call with neither is refused as an invalid `lcsc_id` argument. Existing
+calls and existing readers of `lcsc` need no change.
+
 ## Unreleased: imported SVG artwork is mirrored on back layers, keeps its holes and reports skipped text
 
 `import_svg_logo` placed artwork on a `B.*` layer exactly as on a front layer,
