@@ -142,10 +142,13 @@ pub struct OptimizeOptions {
     /// every new segment is octilinear. Off, a shortcut is one straight
     /// piece at whatever angle.
     pub octilinear: bool,
-    /// The geometry gate's minimum interior bend angle. The rule table's
+    /// The geometry gate's minimum interior bend angle
+    /// ([`lint::STRICT_MIN_BEND_ANGLE_DEG`] by default: what
+    /// `apply_route_plan` refuses a plan under). The rule table's
     /// `track_angle` minimum applies too, whichever is larger.
     pub min_bend_angle_deg: f64,
-    /// The geometry gate's jog length (`route_geometry`'s default 0.25 mm).
+    /// The geometry gate's jog length ([`lint::STRICT_JOG_LENGTH_NM`] by
+    /// default).
     pub jog_length_nm: Coord,
     /// Most segments one pull-tight replacement spans.
     pub window: usize,
@@ -153,7 +156,7 @@ pub struct OptimizeOptions {
     /// may be one straight piece at its own angle rather than a dogleg.
     /// 0 (the default) allows only exact octilinear pieces: a skewed run
     /// meeting a right-angle bend makes an interior angle just under 90°,
-    /// which an 89° `track_angle` rule refuses.
+    /// which the strict lint refuses.
     pub max_skew_deg: f64,
     /// Passes of the whole edit sequence per net.
     pub max_passes: u32,
@@ -171,9 +174,10 @@ pub struct OptimizeOptions {
 }
 
 impl Default for OptimizeOptions {
-    /// Everything on; 89° bends (the plan's strict-lint setting), 0.25 mm
-    /// jogs, 48-segment windows, exact octilinear shortcuts, three passes,
-    /// two commit rounds.
+    /// Everything on; the strict lint's bend angle and jog length (the
+    /// limits `apply_route_plan` judges the plan by, so no edit is taken
+    /// that it would refuse), 48-segment windows, exact octilinear
+    /// shortcuts, three passes, two commit rounds.
     fn default() -> Self {
         OptimizeOptions {
             split_junctions: true,
@@ -186,8 +190,8 @@ impl Default for OptimizeOptions {
             square_junctions: true,
             prune_stubs: true,
             octilinear: true,
-            min_bend_angle_deg: 89.0,
-            jog_length_nm: 250_000,
+            min_bend_angle_deg: lint::STRICT_MIN_BEND_ANGLE_DEG,
+            jog_length_nm: lint::STRICT_JOG_LENGTH_NM,
             window: 48,
             max_skew_deg: 0.0,
             max_passes: 3,

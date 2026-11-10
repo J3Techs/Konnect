@@ -35,6 +35,27 @@ const HAIRPIN_DEG: f64 = 135.0;
 /// Groups larger than this find T-junction candidates through an R-tree.
 const INDEXED_GROUP: usize = 48;
 
+/// The strict lint's smallest interior bend angle, in degrees: the one
+/// definition both the router and `apply_route_plan` judge a plan by. The
+/// optimizer accepts no edit that leaves a sharper bend
+/// ([`crate::optimize::OptimizeOptions::default`]), a route job lints the
+/// plan it writes at it, and `apply_route_plan` refuses a plan with a
+/// sharper one under `geometry_check: strict` (`route_geometry::Limits::strict`
+/// in `konnect-core`).
+///
+/// It is 90, the default of every other geometry lint (`add_routing`,
+/// `lint_board_geometry`, `build_route`) and what the lattice search
+/// already keeps to when the board has no `track_angle` rule
+/// ([`crate::detail::search::turn_set`]). On integer nanometres every
+/// octilinear piece the router and the optimizer draw is exact, so a right
+/// angle measures 90 to within the lint's 1e-9 tolerance; a bend a hair
+/// under 90 can only come from copper off the octilinear directions, and
+/// that is what the lint is there to refuse.
+pub const STRICT_MIN_BEND_ANGLE_DEG: f64 = 90.0;
+/// The strict lint's jog length (nm): a shorter segment between two bends
+/// is a jog or a hairpin. Shared as [`STRICT_MIN_BEND_ANGLE_DEG`] is.
+pub const STRICT_JOG_LENGTH_NM: Coord = 250_000;
+
 /// The lint's limits in nanometres, plus the rule table's segment minimum.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LintLimits {
@@ -49,11 +70,12 @@ pub struct LintLimits {
 }
 
 impl Default for LintLimits {
-    /// The lint's defaults: 0.25 mm jogs, 90 degree bends.
+    /// The strict lint's limits ([`STRICT_JOG_LENGTH_NM`],
+    /// [`STRICT_MIN_BEND_ANGLE_DEG`]) and no segment minimum.
     fn default() -> Self {
         LintLimits {
-            jog_length_nm: 250_000,
-            min_bend_angle_deg: 90.0,
+            jog_length_nm: STRICT_JOG_LENGTH_NM,
+            min_bend_angle_deg: STRICT_MIN_BEND_ANGLE_DEG,
             min_segment_length_nm: None,
         }
     }
@@ -366,7 +388,7 @@ mod tests {
         assert_eq!(kinds(&sharp), [DefectKind::AcuteBend]);
         let t = [s((0, 0), (2 * MM, 0)), s((MM, 0), (MM, MM))];
         assert_eq!(kinds(&t), [DefectKind::UnsplitTJunction]);
-        // A right angle passes at 90 and at 89 degrees.
+        // A right angle passes at the strict 90 degrees.
         let right = [s((0, 0), (MM, 0)), s((MM, 0), (MM, MM))];
         assert!(kinds(&right).is_empty());
     }

@@ -640,7 +640,28 @@ fn a_junction_on_a_diagonal_run_is_squared_only_when_the_branch_stays_octilinear
         assert!(is_octilinear(t.seg.b - t.seg.a), "{t:?}");
     }
     // Off the lattice the T is a hair under 90 degrees: a new acute bend
-    // under a 90 degree rule (refused), legal under an 89 degree one.
+    // under the strict lint, so it is refused even when new copper may
+    // leave the octilinear directions and the board has no track_angle
+    // rule: the plan would not be applied.
+    let no_rule = UniformRules {
+        min_track_angle_deg: None,
+        ..UniformRules::default()
+    };
+    let mut any_angle = start.clone();
+    let r = optimize_with(
+        &board,
+        &no_rule,
+        &mut any_angle,
+        &OptimizeOptions {
+            octilinear: false,
+            ..only_squaring
+        },
+        &mut Telemetry::default(),
+    );
+    assert_eq!(r.junctions_squared, 0, "{r:?}");
+    assert_eq!(any_angle, start);
+    // It is taken only by a caller that asks for a looser bend limit, on
+    // a board whose rules allow it.
     let rules = UniformRules {
         min_track_angle_deg: Some(89.0),
         ..UniformRules::default()
@@ -652,12 +673,51 @@ fn a_junction_on_a_diagonal_run_is_squared_only_when_the_branch_stays_octilinear
         &mut loose,
         &OptimizeOptions {
             octilinear: false,
+            min_bend_angle_deg: 89.0,
             ..only_squaring
         },
         &mut Telemetry::default(),
     );
     assert_eq!(r.junctions_squared, 1, "{r:?}");
     assert_eq!(islands(&board, &loose), 0);
+}
+
+#[test]
+fn a_bend_between_89_and_90_degrees_is_a_defect_to_the_optimizer_by_default() {
+    // 10 mm along x, then 10 mm up leaning 0.1 mm over: 89.43 degrees on
+    // whole nanometres. The strict lint refuses it, so the optimizer's own
+    // verdict on its result must too.
+    let board = pads_board(&[
+        ("SIG", (5.0, 5.0), (0.5, 0.5)),
+        ("SIG", (14.9, 15.0), (0.5, 0.5)),
+    ]);
+    // No track_angle rule: the limit is the optimizer's own.
+    let rules = UniformRules {
+        min_track_angle_deg: None,
+        ..UniformRules::default()
+    };
+    let net = board.net_by_name("SIG").unwrap();
+    let copper = RoutedCopper {
+        tracks: vec![
+            track(net, 0, p(5.0, 5.0), p(15.0, 5.0)),
+            track(net, 0, p(15.0, 5.0), p(14.9, 15.0)),
+        ],
+        vias: vec![],
+    };
+    let angle = lint::interior_angle_deg(p(15.0, 5.0), p(5.0, 5.0), p(14.9, 15.0));
+    assert!(angle > 89.0 && angle < 90.0, "{angle}");
+    let defects = geometry_defects(&rules, &OptimizeOptions::default(), &copper);
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    assert_eq!(defects[0].2.kind, lint::DefectKind::AcuteBend);
+    // The default is the shared strict limit, not a private copy of it.
+    assert_eq!(
+        OptimizeOptions::default().min_bend_angle_deg,
+        lint::STRICT_MIN_BEND_ANGLE_DEG
+    );
+    assert_eq!(
+        OptimizeOptions::default().jog_length_nm,
+        lint::STRICT_JOG_LENGTH_NM
+    );
 }
 
 fn three_pads(middle: (f64, f64)) -> RouteBoard {

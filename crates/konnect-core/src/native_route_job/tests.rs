@@ -498,12 +498,15 @@ fn a_fanout_plan_must_be_a_new_file_of_its_own() {
     }
 }
 
-/// What `apply_route_plan` says about a written plan under strict.
-fn strict_apply_defects(path: &Path) -> usize {
-    use crate::tools::{route_geometry, route_native_apply};
-    let plan: RoutePlan = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    match route_native_apply::preflight(&plan, &route_geometry::Limits::default(), true, 20_000, 0)
-    {
+/// What `apply_route_plan` says about a written plan under strict, on the
+/// board the run routed on.
+fn strict_apply_defects(spec: &NativeJobSpec) -> usize {
+    use crate::tools::route_native_apply;
+    let plan: RoutePlan =
+        serde_json::from_str(&std::fs::read_to_string(&spec.output_plan).unwrap()).unwrap();
+    let (board, _) = konnect_route::load_board_file(&spec.board, &LoadOptions::default()).unwrap();
+    let tracks = route_native_apply::saved_board_tracks(&board, &BTreeSet::new());
+    match route_native_apply::preflight(&plan, &tracks, true, 20_000, 0) {
         Ok(_) => 0,
         Err(route_native_apply::ApplyRefusal::Geometry { defects, .. }) => defects,
         Err(other) => panic!("{other}"),
@@ -521,7 +524,7 @@ fn a_native_run_lints_its_own_plan_as_apply_route_plan_will() {
     let lint = report.plan_lint.expect("a written plan is linted");
     assert_eq!(lint.path, s.output_plan);
     // The report and the apply tool agree, whatever the router drew.
-    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert_eq!(lint.total, strict_apply_defects(&s));
     assert_eq!(lint.passes_strict, lint.total == 0);
     assert_eq!(lint.defects.len(), lint.total);
     // This board's routes are clean, and the tools say so.
@@ -545,7 +548,7 @@ fn a_plan_the_strict_lint_will_refuse_is_reported_with_its_tracks_before_it_is_a
     let lint = report.plan_lint.expect("a written plan is linted");
     assert!(!lint.passes_strict);
     assert!(lint.total > PLAN_LINT_LISTED, "{}", lint.total);
-    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert_eq!(lint.total, strict_apply_defects(&s));
     assert_eq!(lint.by_kind.get("short_jog"), Some(&lint.total), "{lint:?}");
     // The report file lists every defect, each with its plan tracks.
     assert_eq!(lint.defects.len(), lint.total);
@@ -568,6 +571,17 @@ fn a_plan_the_strict_lint_will_refuse_is_reported_with_its_tracks_before_it_is_a
     let body = status_of(&s.output_plan);
     let shown = &body["report"]["plan_lint"];
     assert_eq!(shown["passes_strict"], false);
+    // The copper stays in the plan, and a warning says why and what the
+    // apply will do with it.
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let warning = &report.warnings[0];
+    assert!(
+        warning.contains("apply_route_plan will refuse this plan")
+            && warning.contains(&format!("{} short_jog", lint.total))
+            && warning.contains("optimize is off"),
+        "{warning}"
+    );
+    assert!(report.lint_repair.is_none());
     assert_eq!(shown["total"], json!(lint.total));
     assert_eq!(shown["listed"], json!(PLAN_LINT_LISTED));
     assert_eq!(shown["defects"].as_array().unwrap().len(), PLAN_LINT_LISTED);
@@ -576,6 +590,75 @@ fn a_plan_the_strict_lint_will_refuse_is_reported_with_its_tracks_before_it_is_a
         shown["note"].as_str().unwrap().contains(REPORT_FILE),
         "{shown}"
     );
+}
+
+#[test]
+fn a_net_the_guard_put_back_is_repaired_where_the_strict_lint_finds_a_defect() {
+    use konnect_route::api::LayerId;
+    use konnect_route::plan::RoutedTrack;
+    let f = fixture();
+    let s = spec(&f.root, "repair.json", CopperSource::Native);
+    let (board, _, rules) = s.load_inputs().unwrap();
+    let layer = LayerId(
+        (0..board.layer_count())
+            .position(|l| board.layers.name(LayerId(l as u8)) == "F.Cu")
+            .unwrap() as u8,
+    );
+    let p = |x: f64, y: f64| konnect_geom::Point::from_mm(x, y).unwrap();
+    let track = |net: &str, a, b| RoutedTrack {
+        net: board.net_by_name(net).unwrap(),
+        layer,
+        seg: konnect_geom::Segment::new(a, b, 200_000),
+        gen: Generation(1),
+    };
+    // In open board: a D+ branch ending on the middle of a D+ run (no
+    // vertex there), and a D- run with the same defect.
+    let routed = RoutedCopper {
+        tracks: vec![
+            track("D+", p(5.0, 30.0), p(15.0, 30.0)),
+            track("D+", p(10.0, 30.0), p(10.0, 34.0)),
+            track("D-", p(5.0, 36.0), p(15.0, 36.0)),
+            track("D-", p(10.0, 36.0), p(10.0, 38.0)),
+        ],
+        vias: vec![],
+    };
+    let opts = OptimizeOptions {
+        sliver_floor_nm: konnect_route::optimize::sliver_floor(&board, &rules),
+        ..OptimizeOptions::default()
+    };
+    let lint = |c: &RoutedCopper| copper_lint(&board, None, c).unwrap();
+    let (dp, dm) = (
+        board.net_by_name("D+").unwrap(),
+        board.net_by_name("D-").unwrap(),
+    );
+    assert_eq!(lint(&routed), (2, BTreeSet::from([dp, dm])));
+
+    // No net put back: nothing is repaired, whatever the lint finds.
+    let mut work = routed.clone();
+    let mut telemetry = Telemetry::default();
+    assert!(repair_reverted(&board, &rules, None, &mut work, &[], &opts, &mut telemetry).is_none());
+    assert_eq!(work, routed);
+
+    // D+ put back by the guard: its defect is repaired, D- is not touched.
+    let repair = repair_reverted(
+        &board,
+        &rules,
+        None,
+        &mut work,
+        &[dp],
+        &opts,
+        &mut telemetry,
+    )
+    .expect("a put-back net with a defect is repaired");
+    assert_eq!(repair.nets, ["D+"]);
+    assert_eq!((repair.defects_before, repair.defects_after), (2, 1));
+    assert!(repair.kept);
+    assert_eq!(lint(&work), (1, BTreeSet::from([dm])));
+    let of = |c: &RoutedCopper, net| -> Vec<RoutedTrack> {
+        c.tracks.iter().filter(|t| t.net == net).copied().collect()
+    };
+    assert_eq!(of(&work, dm), of(&routed, dm));
+    assert_ne!(of(&work, dp), of(&routed, dp));
 }
 
 /// The demo board with its GND plane's fill taken out of the saved file.
@@ -1458,7 +1541,7 @@ fn after_a_kept_rip_the_report_lists_exactly_what_is_open_with_its_blockers_and_
     // apply tool agrees with the report.
     let lint = report.plan_lint.as_ref().expect("a written plan is linted");
     assert_eq!(lint.path, s.output_plan);
-    assert_eq!(lint.total, strict_apply_defects(&s.output_plan));
+    assert_eq!(lint.total, strict_apply_defects(&s));
     assert!(lint.passes_strict, "{lint:?}");
     assert_eq!(view["report"]["plan_lint"]["passes_strict"], true);
     assert_eq!(report.check.as_ref().unwrap().violations, 0);

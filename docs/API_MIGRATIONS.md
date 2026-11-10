@@ -3,6 +3,75 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the native router and `apply_route_plan` judge a plan by one strict lint, on the board
+
+`apply_route_plan` under `geometry_check: strict` and the native router did
+not judge copper the same way, so a route job could write a plan its own apply
+refused. Three differences are closed.
+
+**One bend limit.** The optimizer accepted an edit that left a bend of 89
+degrees or more; the apply refused anything under 90. The strict limits (bends
+of 90 degrees or more, 0.25 mm jogs) now have one definition that both read,
+so the optimizer takes no edit the apply refuses. 90 is what every other
+geometry lint defaults to (`add_routing`, `lint_board_geometry`,
+`build_route`) and what the router's search already kept to on a board with no
+`track_angle` rule. A plan with a bend between 89 and 90 degrees was refused
+before and still is; what changes is that the router no longer draws one.
+
+**The plan's joints are read on the board.** The apply linted the routing
+file alone, while the optimizer accepted its edits with the board's tracks of
+the same net in view. Where a board track ends on a plan bend the two read the
+copper differently: the optimizer saw a three-way junction, the apply a bend,
+and a short plan track beside it was refused as a `short_jog` or `hairpin`
+that is not one on the board. The lint now takes the board's straight tracks
+of the plan's nets and layers into account when it forms the joints (without
+those `replaces_file` names, and without tracks the plan repeats exactly), so
+such a plan is accepted.
+
+What counts against a plan is unchanged in kind: shapes made of the plan's own
+tracks. A defect that needs a board track to exist (a plan track meeting a
+board track at a sharp angle, a track of one ending on the middle of a track
+of the other) is not a strict-lint defect, as it was not before: no edit of
+the routing file mends the board's track, and the router does not shape its
+copper against same-net board tracks. `lint_board_geometry` reports those on
+the board. The shape of `geometry` and of each defect is unchanged.
+
+The open board is what the plan is judged among, so the strict refusal is now
+made after KiCad has been asked for the board's tracks (and still before
+anything is deleted or created). A plan that will be refused is still refused
+with no open board: when none is reached, the same lint runs among the tracks
+of the saved board file and the message says the verdict is the saved file's.
+A plan that passes there gets the usual error for the missing board. The
+refusal message now says "Nothing was deleted or created" when `replaces_file`
+was given, and "Nothing was created" otherwise; both were always true.
+
+`plan_lint` and `fanout_plan_lint` of `route_native_region` and of a finished
+`start_native_route_job` are that same lint, at the same limits, among the
+saved board's tracks (the board without the copper a `rip_up: unlocked` run
+replaces). With the board saved and unchanged between the run and the apply,
+`passes_strict` and the apply's verdict are the same function on the same
+input.
+
+**Copper no optimizer pass judged.** With `optimize: false`, and for a net
+the optimizer's guard put back as routed, copper reached the plan without any
+lint. It is still written: nothing in the router redraws it safely. When the
+guard puts nets back and the strict lint finds a defect in one, the
+optimizer's repair passes (junction splitting, stub pruning, junction
+squaring, pad-entry trimming, jog smoothing; no pull-tight, corner cuts or via
+removal) now run on those nets alone, behind the same gates and guard, and
+are kept only when the plan then has fewer defects. The report says what that
+did in the new `lint_repair` (`nets`, `defects_before`, `defects_after`,
+`kept`; `null` when it did not run) and a `lint_repair` stage record. Whenever
+the written plan does not pass, `warnings` now carries a line saying that the
+apply will refuse it, how many defects of which kinds, and why they are there;
+`plan_lint` lists them as before. `optimize: false` is honoured: such a plan
+is reported, not repaired.
+
+Callers that passed plans with bends between 89 and 90 degrees see no change
+(they were refused). No plan that was accepted is now refused; a plan applied
+onto a board that already holds tracks of the same nets may be accepted where
+it was refused as a jog or hairpin.
+
 ## Unreleased: `edit_component` moves a misplaced footprint zone back with `library_zones`
 
 `edit_component` gains a fourth closed-board aspect, `library_zones`, beside

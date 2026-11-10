@@ -450,6 +450,11 @@ pub struct PipelineReport {
     /// Nets S6's guard put back to their routed copper.
     #[serde(default)]
     pub optimize_reverted: usize,
+    /// What the repair of those nets did, when the strict lint found
+    /// defects in copper the guard had put back (`None` when it did not
+    /// run).
+    #[serde(default)]
+    pub lint_repair: Option<LintRepair>,
     /// What the clear stage took out (`None` when it did not run).
     #[serde(default)]
     pub cleared: Option<konnect_route::pipeline::ClearReport>,
@@ -516,10 +521,143 @@ pub struct PipelineReport {
     pub telemetry: Telemetry,
 }
 
+/// The repair of nets the optimizer's guard put back as routed, when the
+/// strict lint found defects in them: the optimizer's own repair passes
+/// (junction splitting, stub pruning, junction squaring, pad-entry
+/// trimming, jog smoothing and the merges they need; no pull-tight, no
+/// corner cuts, no via removal), every edit behind the same gates, the
+/// result behind the same S7 guard, and kept only when the plan then has
+/// fewer defects. Copper it cannot repair stays as routed and stays in
+/// `plan_lint`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LintRepair {
+    /// The nets repaired: put back by the guard, with a defect.
+    pub nets: Vec<String>,
+    /// Strict lint defects in the plan's copper before and after.
+    pub defects_before: usize,
+    pub defects_after: usize,
+    /// Whether the repaired copper was kept (it was not when it left as
+    /// many defects, or the guard put every net back again).
+    pub kept: bool,
+}
+
+/// The strict lint of the copper a plan would hold (`fanout` unless it goes
+/// to a file of its own, then `work`) on `board`: the defect count and the
+/// nets with a defect. `None` when no plan can be built from it.
+fn copper_lint(
+    board: &RouteBoard,
+    fanout: Option<&RoutedCopper>,
+    work: &RoutedCopper,
+) -> Option<(usize, BTreeSet<NetId>)> {
+    use crate::tools::route_native_apply;
+    let copper = RoutedCopper {
+        tracks: fanout
+            .iter()
+            .flat_map(|f| &f.tracks)
+            .chain(&work.tracks)
+            .copied()
+            .collect(),
+        vias: Vec::new(),
+    };
+    let plan = RoutePlan::from_routed(board, &copper).ok()?;
+    let tracks = route_native_apply::saved_board_tracks(board, &BTreeSet::new());
+    let lint = route_native_apply::strict_lint(&plan, &tracks);
+    let nets = lint
+        .report
+        .findings
+        .iter()
+        .filter(|f| f.kind != "collinear_vertex")
+        .filter_map(|f| board.net_by_name(&f.net))
+        .collect();
+    Some((lint.defects(), nets))
+}
+
+/// Repair the strict-lint defects of the nets in `reverted` (those S6's
+/// guard put back as routed) with the optimizer's repair passes
+/// ([`LintRepair`]). `work` is changed only for those nets, and only when
+/// the plan then has fewer defects. `None` when none of them has a defect.
+pub(crate) fn repair_reverted(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    fanout: Option<&RoutedCopper>,
+    work: &mut RoutedCopper,
+    reverted: &[NetId],
+    opts: &OptimizeOptions,
+    telemetry: &mut Telemetry,
+) -> Option<LintRepair> {
+    let (defects_before, defective) = copper_lint(board, fanout, work)?;
+    let targets: BTreeSet<NetId> = reverted
+        .iter()
+        .copied()
+        .filter(|n| defective.contains(n))
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    // One commit round: every edit is then checked against the other nets'
+    // copper as it stands, which is the copper they keep.
+    let repair = OptimizeOptions {
+        pull_tight: false,
+        corner_cuts: false,
+        remove_vias: false,
+        rounds: 1,
+        ..*opts
+    };
+    let before = work.clone();
+    let mut repaired = before.clone();
+    let (_, put_back) = konnect_route::pipeline::optimize_guarded(
+        board,
+        rules,
+        &mut repaired,
+        &repair,
+        true,
+        telemetry,
+    );
+    let taken: BTreeSet<NetId> = targets
+        .iter()
+        .copied()
+        .filter(|n| !put_back.contains(n))
+        .collect();
+    // The other nets keep their copper; each repaired net's takes the place
+    // of its first item.
+    let mut tracks = Vec::with_capacity(before.tracks.len());
+    let mut emitted: BTreeSet<NetId> = BTreeSet::new();
+    for t in &before.tracks {
+        if !taken.contains(&t.net) {
+            tracks.push(*t);
+        } else if emitted.insert(t.net) {
+            tracks.extend(repaired.tracks.iter().filter(|r| r.net == t.net).copied());
+        }
+    }
+    let mut vias = Vec::with_capacity(before.vias.len());
+    let mut emitted: BTreeSet<NetId> = BTreeSet::new();
+    for v in &before.vias {
+        if !taken.contains(&v.net) {
+            vias.push(*v);
+        } else if emitted.insert(v.net) {
+            vias.extend(repaired.vias.iter().filter(|r| r.net == v.net).copied());
+        }
+    }
+    let candidate = RoutedCopper { tracks, vias };
+    let defects_after = copper_lint(board, fanout, &candidate).map_or(defects_before, |l| l.0);
+    let kept = !taken.is_empty() && defects_after < defects_before;
+    if kept {
+        *work = candidate;
+    }
+    Some(LintRepair {
+        nets: targets.iter().map(|n| board.net(*n).name.clone()).collect(),
+        defects_before,
+        defects_after: if kept { defects_after } else { defects_before },
+        kept,
+    })
+}
+
 /// The geometry lint of a plan the run wrote: the very check
-/// `apply_route_plan` makes under `geometry_check: strict`, run on the file's
-/// own contents, so a run says before anything is applied whether its plan
-/// will be refused, and for which tracks.
+/// `apply_route_plan` makes under `geometry_check: strict`
+/// ([`crate::tools::route_native_apply::strict_lint`], the same function at
+/// the same limits), run on the file's own contents among the tracks of the
+/// board it was routed on, so a run says before anything is applied whether
+/// its plan will be refused, and for which tracks.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlanLint {
     /// The routing file linted.
@@ -535,16 +673,20 @@ pub struct PlanLint {
 }
 
 impl PlanLint {
-    /// Lint `plan`, written to `path`.
-    pub(crate) fn of(path: &Path, plan: &RoutePlan) -> Self {
-        use crate::tools::{route_geometry, route_native_apply};
-        let segments = route_native_apply::batch_of(plan, false).segments();
-        let report = route_geometry::lint(&segments, &route_geometry::Limits::default());
-        let listing = report.defect_listing(&segments, usize::MAX);
+    /// Lint `plan`, written to `path`, as it will sit on `board`: the saved
+    /// board the run routed on, without the copper the plan replaces. Board
+    /// tracks the plan repeats (the fanout, frozen into the board for the
+    /// run) are set aside by the lint; a fanout written to its own file is
+    /// board copper to the main plan, as it is once applied before it.
+    pub(crate) fn of(path: &Path, plan: &RoutePlan, board: &RouteBoard) -> Self {
+        use crate::tools::route_native_apply;
+        let tracks = route_native_apply::saved_board_tracks(board, &BTreeSet::new());
+        let lint = route_native_apply::strict_lint(plan, &tracks);
+        let listing = lint.listing(usize::MAX);
         PlanLint {
             path: path.to_path_buf(),
-            passes_strict: report.defects() == 0,
-            total: report.defects(),
+            passes_strict: lint.defects() == 0,
+            total: lint.defects(),
             by_kind: serde_json::from_value(listing["by_kind"].clone()).unwrap_or_default(),
             defects: listing["defects"].as_array().cloned().unwrap_or_default(),
         }
@@ -1208,6 +1350,29 @@ pub fn run_pipeline(
             )
         });
         report.telemetry.count("optimize_index_us", index_us);
+        // A net the guard put back is as the router drew it, which no lint
+        // has judged: where the strict lint finds a defect in one, the
+        // optimizer's repair passes are run on it alone.
+        if !reverted.is_empty() {
+            let t = Instant::now();
+            let separate_fanout = spec.fanout_plan.is_some() && spec.source == CopperSource::Native;
+            let repair = pool.install(|| {
+                repair_reverted(
+                    &board,
+                    &rules,
+                    (!separate_fanout).then_some(&fanout),
+                    &mut work,
+                    &reverted,
+                    &opts,
+                    &mut report.telemetry,
+                )
+            });
+            if let Some(repair) = repair {
+                let detail = serde_json::to_value(&repair).unwrap_or_default();
+                report.lint_repair = Some(repair);
+                record(&mut report, observer, "lint_repair", "done", t, detail);
+            }
+        }
         // Then the reference planes: a fallback class's track S6 moved off
         // its reference goes back, or its net's copper goes.
         if let Some(before) = &negotiated {
@@ -1405,7 +1570,7 @@ pub fn run_pipeline(
                 .map_err(|e| anyhow::anyhow!("fanout plan: {e}"))?;
             write_new_atomic(path, plan.to_routing_file_json().as_bytes())?;
             report.fanout_plan_path = Some(path.clone());
-            report.fanout_plan_lint = Some(PlanLint::of(path, &plan));
+            report.fanout_plan_lint = Some(PlanLint::of(path, &plan, &board));
         }
     }
     let all_copper = RoutedCopper {
@@ -1455,7 +1620,16 @@ pub fn run_pipeline(
     report.plan_chunks = Some(chunks);
     report.plan_path = Some(spec.output_plan.clone());
     // The lint apply_route_plan will run, so the run says now what it finds.
-    let lint = PlanLint::of(&spec.output_plan, &plan);
+    // Copper that fails it is left in the plan (nothing here can redraw it
+    // safely): the report lists it and a warning says so.
+    let lint = PlanLint::of(&spec.output_plan, &plan, &board);
+    if !lint.passes_strict {
+        report.warnings.push(strict_lint_warning(
+            &lint,
+            spec.optimize,
+            report.optimize_reverted,
+        ));
+    }
     let detail = json!({ "items": plan.item_count(), "add_routing_calls": chunks,
                          "path": spec.output_plan, "fanout_plan": report.fanout_plan_path,
                          "strict_lint_defects": lint.total,
@@ -1464,6 +1638,33 @@ pub fn run_pipeline(
     report.plan_lint = Some(lint);
     record(&mut report, observer, "plan", "done", t, detail);
     Ok(report)
+}
+
+/// The warning for a written plan the strict lint will refuse.
+fn strict_lint_warning(lint: &PlanLint, optimized: bool, reverted: usize) -> String {
+    let kinds = lint
+        .by_kind
+        .iter()
+        .map(|(kind, n)| format!("{n} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let why = if !optimized {
+        "optimize is off, so the copper is written as it was routed and nothing repaired it"
+            .to_string()
+    } else if reverted > 0 {
+        format!(
+            "the optimizer's guard put {reverted} net(s) back as routed, and its repair passes \
+             could not mend what is left"
+        )
+    } else {
+        "the optimizer's repair passes could not mend them".to_string()
+    };
+    format!(
+        "apply_route_plan will refuse this plan under geometry_check strict: {} geometry \
+         defect(s) ({kinds}); {why}. plan_lint lists each one with its plan tracks and the \
+         remedy; the copper was left in the plan.",
+        lint.total
+    )
 }
 
 // ─── Job directory ───────────────────────────────────────────────────────
