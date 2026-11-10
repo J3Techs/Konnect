@@ -269,9 +269,9 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
-| `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
-| `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
+| `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content, writes the footprint's child zones at its position as KiCad saves them, and rejects duplicate references. |
+| `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that carries the footprint's child zones with it. |
+| `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles and turns the footprint's child zones with it. |
 | `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. On a closed board a placement may name `layer` (`F.Cu`/`B.Cu`): that footprint is mirrored by the closed-board flip first, then placed; an unsupported footprint or an open board refuses the whole batch. |
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu. On a board open in KiCad 10.0.6+, uses KiCad's native FlipItems IPC command, including the 3D-model transform. Falls back to a revision-aware file edit only when no live KiCad holds the board; an older reachable KiCad returns `unsupported_capability`. The file path refuses unsupported 3D-model geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |

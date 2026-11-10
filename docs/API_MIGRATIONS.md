@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: saved-file footprint edits carry child zones in board coordinates
+
+KiCad saves a placed footprint's child zone (the via keepout under a
+Tag-Connect header, for example) in board coordinates, unlike its pads,
+graphics and fields, which are relative to the footprint. Konnect's saved-file
+paths copied the library outline as it was and moved only the root `(at …)`,
+so on a closed board:
+
+- `place_component` and `update_pcb_from_schematic` with
+  `backend: "closed_initial"` wrote the zone around the board origin instead
+  of at the footprint;
+- `move_component`, `rotate_component` and `set_component_placements` left the
+  zone where it was.
+
+Each now moves every outline and fill point of every child zone with the
+footprint, to the coordinates KiCad 10.0.7 saves for the same placement, move
+or rotation. `closed_initial`'s readback holds each imported zone to the
+library outline at the instance's position. A zone with a coordinate these
+paths cannot account for (a Bezier outline entry, an unknown clause holding
+points) refuses the edit and nothing is written. Arguments and results are
+unchanged.
+
+A board edited by an earlier Konnect may hold a child zone in the wrong place;
+these paths move it with its footprint from wherever it is and do not correct
+it.
+
 ## Unreleased: delete_zones works on a closed board and can select every zone
 
 `delete_zones` required the board open in KiCad, while `add_zones` also writes

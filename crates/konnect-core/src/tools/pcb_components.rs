@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 mod attributes;
+pub(crate) mod child_zones;
 pub(crate) mod pad_fabrication;
 pub(crate) mod reference_field;
 mod saved_graphics;
@@ -1144,6 +1145,14 @@ fn board_footprint_sexp(
     if rotation != 0.0 {
         out = apply_rotation_to_children(&out, rotation);
     }
+    // A library zone's points are the footprint's own frame; on a board they
+    // are board coordinates (see `child_zones`).
+    out = child_zones::map_child_zones(&out, &|dx, dy| {
+        konnect_sexp::geometry::rotate_about(dx, dy, x, y, rotation)
+    })
+    .map_err(|error| {
+        format!("footprint '{lib_id}' cannot be placed in the board file: {error:#}")
+    })?;
     if let Some(reference) = reference {
         replace_reference(&mut out, reference).map_err(|error| error.to_string())?;
     }
@@ -1301,18 +1310,22 @@ fn normalize_root_angle(degrees: f64) -> f64 {
     }
 }
 
+/// One coordinate or angle as KiCad's writer spells it: at most six decimals,
+/// trailing zeros trimmed, never `-0`.
+fn format_mm(value: f64) -> String {
+    let s = format!("{value:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
-    let n = |v: f64| {
-        let s = format!("{v:.6}");
-        let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-        if s == "-0" {
-            "0".to_string()
-        } else {
-            s
-        }
-    };
+    let n = format_mm;
     if angle == 0.0 {
         format!("(at {} {})", n(x), n(y))
     } else {
@@ -1862,6 +1875,17 @@ fn update_footprint_placement(
         | FootprintPlacementUpdate::Set { rotation, .. } => {
             apply_rotation_to_children(&updated, rotation - old_rotation)
         }
+    };
+    // Child zones are saved in board coordinates, so they do not follow the
+    // root `(at …)` on their own: carry each point through the same motion.
+    let turn = rotation - old_rotation;
+    let updated = if x == old_x && y == old_y && turn == 0.0 {
+        updated
+    } else {
+        child_zones::map_child_zones(&updated, &|zx, zy| {
+            konnect_sexp::geometry::rotate_about(zx - old_x, zy - old_y, x, y, turn)
+        })
+        .context("the footprint's child zone cannot be carried along")?
     };
     let parsed = konnect_sexp::parse_sexp(&updated)?;
     if parsed.head() != Some("footprint") {
@@ -6206,6 +6230,196 @@ mod tests {
         assert!(written.contains("(at 40 50 30)"), "{written}");
         assert!(written.contains("(pad \"1\" smd roundrect"), "{written}");
         assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    /// The Tag-Connect TC2030 keepout outline, as its library footprint has it.
+    const LIBRARY_ZONE: &str = "	(zone
+		(net 0)
+		(net_name \"\")
+		(layer \"F.Cu\")
+		(hatch full 0.508)
+		(keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints not_allowed))
+		(polygon
+			(pts
+				(xy 1.27 -0.635) (xy -1.27 -0.635) (xy -1.27 0.635) (xy 1.27 0.635)
+			)
+		)
+	)
+";
+
+    /// The outline of the child zone of `reference`, as the board file has it.
+    fn child_zone_points(board: &Path, reference: &str) -> Vec<(f64, f64)> {
+        let root = konnect_sexp::parse_sexp(&std::fs::read_to_string(board).unwrap()).unwrap();
+        root.find_all("footprint")
+            .into_iter()
+            .find(|footprint| footprint_reference(footprint).as_deref() == Some(reference))
+            .and_then(|footprint| footprint.find("zone"))
+            .and_then(|zone| zone.find("polygon"))
+            .and_then(|polygon| polygon.find("pts"))
+            .expect("the footprint keeps its child zone")
+            .find_all("xy")
+            .into_iter()
+            .map(|xy| (xy.get_f64(1).unwrap(), xy.get_f64(2).unwrap()))
+            .collect()
+    }
+
+    fn assert_points(got: &[(f64, f64)], want: &[(f64, f64)]) {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (got, want) in got.iter().zip(want) {
+            assert!(
+                (got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3,
+                "zone point {got:?}, KiCad has {want:?}"
+            );
+        }
+    }
+
+    /// A placed footprint's child zone is saved in board coordinates. Every
+    /// expected outline here is what pcbnew 10.0.7 saved after the same
+    /// placement, move and rotation of the Tag-Connect TC2030 footprint.
+    #[tokio::test]
+    async fn a_child_zone_is_placed_moved_and_rotated_with_its_footprint_as_kicad_saves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let library = library_footprint();
+        let end = library.rfind(')').unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("Resistor_SMD.pretty")
+                .join("R_0805_2012Metric.kicad_mod"),
+            format!("{}{LIBRARY_ZONE}{}", &library[..end], &library[end..]),
+        )
+        .unwrap();
+        let board_arg = board.to_string_lossy().to_string();
+        let place = |reference: &'static str, x: f64, y: f64, rotation: f64| {
+            let board_arg = board_arg.clone();
+            async move {
+                let placed = handle_place_component(
+                    &json!({
+                        "board": board_arg, "footprint": "Resistor_SMD:R_0805_2012Metric",
+                        "reference": reference, "x": x, "y": y, "rotation": rotation,
+                    }),
+                    &test_ctx(),
+                )
+                .await
+                .unwrap();
+                assert!(!placed.is_error, "{:?}", placed.content);
+            }
+        };
+        place("J1", 50.0, 50.0, 0.0).await;
+        place("J2", 80.0, 60.0, 90.0).await;
+        place("J3", 20.0, 20.0, 0.0).await;
+        assert_points(
+            &child_zone_points(&board, "J1"),
+            &[
+                (51.27, 49.365),
+                (48.73, 49.365),
+                (48.73, 50.635),
+                (51.27, 50.635),
+            ],
+        );
+        assert_points(
+            &child_zone_points(&board, "J2"),
+            &[
+                (79.365, 58.73),
+                (79.365, 61.27),
+                (80.635, 61.27),
+                (80.635, 58.73),
+            ],
+        );
+
+        let moved = handle_move_component(
+            &json!({ "board": board_arg, "reference": "J3", "x": 30.0, "y": 45.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!moved.is_error, "{:?}", moved.content);
+        assert_points(
+            &child_zone_points(&board, "J3"),
+            &[
+                (31.27, 44.365),
+                (28.73, 44.365),
+                (28.73, 45.635),
+                (31.27, 45.635),
+            ],
+        );
+        let rotated = handle_rotate_component(
+            &json!({ "board": board_arg, "reference": "J3", "rotation": -45.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!rotated.is_error, "{:?}", rotated.content);
+        assert_points(
+            &child_zone_points(&board, "J3"),
+            &[
+                (31.347, 45.449),
+                (29.551, 43.653),
+                (28.653, 44.551),
+                (30.449, 46.347),
+            ],
+        );
+
+        let set = handle_set_component_placements(
+            &json!({
+                "board": board_arg,
+                "placements": [{ "reference": "J1", "x": 55.0, "y": 52.0, "rotation": 180.0 }],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!set.is_error, "{:?}", set.content);
+        assert_points(
+            &child_zone_points(&board, "J1"),
+            &[
+                (53.73, 52.635),
+                (56.27, 52.635),
+                (56.27, 51.365),
+                (53.73, 51.365),
+            ],
+        );
+        // J2 was not touched by any of the later edits.
+        assert_points(
+            &child_zone_points(&board, "J2"),
+            &[
+                (79.365, 58.73),
+                (79.365, 61.27),
+                (80.635, 61.27),
+                (80.635, 58.73),
+            ],
+        );
+    }
+
+    /// A zone this code cannot fully carry stops the move; the footprint and
+    /// its zone stay together where they were.
+    #[tokio::test]
+    async fn a_child_zone_that_cannot_be_carried_refuses_the_move_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+        let placed = std::fs::read_to_string(&board).unwrap();
+        let end = placed.rfind(')').unwrap();
+        let footprint_end = placed[..end].rfind(')').unwrap();
+        let with_zone = format!(
+            "{} (zone (layer \"F.Cu\") (polygon (pts (xy 9 19) (bezier 1 2 3 4) (xy 11 21)))){}",
+            &placed[..footprint_end],
+            &placed[footprint_end..]
+        );
+        std::fs::write(&board, &with_zone).unwrap();
+
+        let moved = handle_move_component(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1", "x": 40.0, "y": 50.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(moved.is_error, "{:?}", moved.content);
+        assert!(
+            result_text(&moved).contains("child zone"),
+            "{:?}",
+            moved.content
+        );
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), with_zone);
     }
 
     #[tokio::test]
