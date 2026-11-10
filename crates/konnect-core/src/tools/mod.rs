@@ -16,6 +16,7 @@ mod board_source_contract_tests;
 mod board_stackup;
 pub mod cli;
 pub(crate) mod closed_board;
+pub(crate) mod closed_board_edit;
 pub mod config;
 pub(crate) mod cross_probe;
 mod custom_rules;
@@ -541,6 +542,15 @@ macro_rules! tool {
             let args = args.clone();
             let ctx = ctx.clone();
             Box::pin(async move { ($handler)(&args, &*ctx).await })
+        });
+        $crate::tools::ToolDef::new($name, $desc, $schema, h)
+    }};
+    // For a handler that runs another tool and so needs the shared context
+    // itself, not a borrow of it.
+    (@shared $name:expr, $desc:expr, $schema:expr, $handler:expr) => {{
+        let h: $crate::tools::ToolHandlerFn = std::sync::Arc::new(move |args, ctx| {
+            let args = args.clone();
+            Box::pin(async move { ($handler)(&args, ctx).await })
         });
         $crate::tools::ToolDef::new($name, $desc, $schema, h)
     }};

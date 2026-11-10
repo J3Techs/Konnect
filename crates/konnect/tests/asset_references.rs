@@ -752,6 +752,13 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "ambiguous",
         // A value of delete_zones' `kinds` argument, not a callable tool.
         "rule_area",
+        // `run_closed_board_edit` result fields and status values, not
+        // callable tools.
+        "tool_result",
+        "next_action",
+        "editor_not_closed",
+        "save_failed",
+        "board_state_unknown",
     ];
 
     let mut phantom = Vec::new();

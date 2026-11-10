@@ -376,113 +376,7 @@ impl McpHandler {
         }
 
         if let Some(tool_def) = tool_def {
-            // Nothing validated `required` before this: the schema is
-            // advertised to the client and was never enforced server-side, so
-            // a handler reading an absent argument with `unwrap_or` ran with a
-            // substituted value and reported success. 25 sites across 18 tools
-            // did exactly that (#218); each is now fixed in its own handler,
-            // and this stops the next one being written.
-            //
-            // Presence only. A wrong *type* still reaches the handler, which
-            // is where the `require_*` helpers name the field — this is a net
-            // beneath them, not a replacement for them.
-            if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
-                let reason = "missing".to_string();
-                return (
-                    CallToolResult::error_kind(
-                        ToolErrorKind::InvalidArgument {
-                            field: missing.clone(),
-                            reason: reason.clone(),
-                        },
-                        format!("Argument '{missing}' is invalid: {reason}"),
-                    ),
-                    CallStatus::Error,
-                    Some("invalid_argument".to_string()),
-                );
-            }
-            if let Err(error) = tool_def.input_validator.validate(args) {
-                return schema_argument_error(&error);
-            }
-            return match (tool_def.handler)(args, self.ctx.clone()).await {
-                Ok(result) => {
-                    let status = call_status(&result);
-                    // Structured errors carry their own kind in the body; plain-text
-                    // errors fall back to "handler_error" via extract_error_kind.
-                    let error_kind = extract_error_kind(&result);
-                    (result, status, error_kind)
-                }
-                // A missing argument is the caller's mistake, not the tool
-                // failing, and the two call for different reactions: retry with
-                // the argument, versus conclude the operation is broken. The
-                // `require_*` helpers already draw that line; `get_path` could
-                // not, because returning a structured result would change 171
-                // call sites — so it carries the distinction in the error chain
-                // instead, and this is where it is read back out (#194).
-                Err(e) if crate::tools::MissingArgument::field_in(&e).is_some() => {
-                    let field = crate::tools::MissingArgument::field_in(&e)
-                        .expect("guard matched")
-                        .to_string();
-                    let reason = "missing or not a string".to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::InvalidArgument {
-                                field: field.clone(),
-                                reason: reason.clone(),
-                            },
-                            format!("Argument '{field}' is invalid: {reason}"),
-                        ),
-                        CallStatus::Error,
-                        Some("invalid_argument".to_string()),
-                    )
-                }
-                Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
-                    let path = locked.display().to_string();
-                    if locked
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
-                    {
-                        let reason = kicad_board_lock_reason(&e).to_string();
-                        (
-                            CallToolResult::error_kind(
-                                ToolErrorKind::UnsafeFileFallback {
-                                    path: path.clone(),
-                                    reason: reason.clone(),
-                                },
-                                format!(
-                                    "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Konnect did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
-                                ),
-                            ),
-                            CallStatus::Error,
-                            Some("unsafe_file_fallback".to_string()),
-                        )
-                    } else {
-                        (
-                            CallToolResult::error_kind(
-                                ToolErrorKind::Conflict {
-                                    paths: vec![path.clone()],
-                                },
-                                format!(
-                                    "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
-                                ),
-                            ),
-                            CallStatus::Error,
-                            Some("conflict".to_string()),
-                        )
-                    }
-                }
-                Err(e) => {
-                    warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
-                    let kind = ToolErrorKind::HandlerError {
-                        reason: e.to_string(),
-                    };
-                    (
-                        CallToolResult::error_kind(kind, format!("Tool error: {}", e)),
-                        CallStatus::Error,
-                        Some("handler_error".to_string()),
-                    )
-                }
-            };
+            return run_loaded_tool(&tool_def, name, args, self.ctx.clone()).await;
         }
 
         // Not loaded — try to give an actionable hint.
@@ -542,6 +436,126 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+/// Run one loaded domain tool exactly as the served dispatch does: the
+/// advertised schema is enforced first, then the handler runs, and a handler
+/// error becomes the same structured result. Shared with tools that run
+/// another tool on the caller's behalf, so a nested call cannot skip a check
+/// a direct call would have met.
+pub(crate) async fn run_loaded_tool(
+    tool_def: &crate::tools::ToolDef,
+    name: &str,
+    args: &Value,
+    ctx: Arc<crate::tools::ToolContext>,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    // Nothing validated `required` before this: the schema is
+    // advertised to the client and was never enforced server-side, so
+    // a handler reading an absent argument with `unwrap_or` ran with a
+    // substituted value and reported success. 25 sites across 18 tools
+    // did exactly that (#218); each is now fixed in its own handler,
+    // and this stops the next one being written.
+    //
+    // Presence only. A wrong *type* still reaches the handler, which
+    // is where the `require_*` helpers name the field — this is a net
+    // beneath them, not a replacement for them.
+    if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
+        let reason = "missing".to_string();
+        return (
+            CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: missing.clone(),
+                    reason: reason.clone(),
+                },
+                format!("Argument '{missing}' is invalid: {reason}"),
+            ),
+            CallStatus::Error,
+            Some("invalid_argument".to_string()),
+        );
+    }
+    if let Err(error) = tool_def.input_validator.validate(args) {
+        return schema_argument_error(&error);
+    }
+    return match (tool_def.handler)(args, ctx).await {
+        Ok(result) => {
+            let status = call_status(&result);
+            // Structured errors carry their own kind in the body; plain-text
+            // errors fall back to "handler_error" via extract_error_kind.
+            let error_kind = extract_error_kind(&result);
+            (result, status, error_kind)
+        }
+        // A missing argument is the caller's mistake, not the tool
+        // failing, and the two call for different reactions: retry with
+        // the argument, versus conclude the operation is broken. The
+        // `require_*` helpers already draw that line; `get_path` could
+        // not, because returning a structured result would change 171
+        // call sites — so it carries the distinction in the error chain
+        // instead, and this is where it is read back out (#194).
+        Err(e) if crate::tools::MissingArgument::field_in(&e).is_some() => {
+            let field = crate::tools::MissingArgument::field_in(&e)
+                .expect("guard matched")
+                .to_string();
+            let reason = "missing or not a string".to_string();
+            (
+                CallToolResult::error_kind(
+                    ToolErrorKind::InvalidArgument {
+                        field: field.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("Argument '{field}' is invalid: {reason}"),
+                ),
+                CallStatus::Error,
+                Some("invalid_argument".to_string()),
+            )
+        }
+        Err(e) if kicad_editor_locked_path(&e).is_some() => {
+            let locked = kicad_editor_locked_path(&e).expect("guard matched");
+            let path = locked.display().to_string();
+            if locked
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+            {
+                let reason = kicad_board_lock_reason(&e).to_string();
+                (
+                    CallToolResult::error_kind(
+                        ToolErrorKind::UnsafeFileFallback {
+                            path: path.clone(),
+                            reason: reason.clone(),
+                        },
+                        format!(
+                            "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Konnect did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
+                        ),
+                    ),
+                    CallStatus::Error,
+                    Some("unsafe_file_fallback".to_string()),
+                )
+            } else {
+                (
+                    CallToolResult::error_kind(
+                        ToolErrorKind::Conflict {
+                            paths: vec![path.clone()],
+                        },
+                        format!(
+                            "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                        ),
+                    ),
+                    CallStatus::Error,
+                    Some("conflict".to_string()),
+                )
+            }
+        }
+        Err(e) => {
+            warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
+            let kind = ToolErrorKind::HandlerError {
+                reason: e.to_string(),
+            };
+            (
+                CallToolResult::error_kind(kind, format!("Tool error: {}", e)),
+                CallStatus::Error,
+                Some("handler_error".to_string()),
+            )
+        }
+    };
 }
 
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {

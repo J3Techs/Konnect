@@ -32,6 +32,19 @@ live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
 the structured error **unsupported_capability**; every reachable rejection stays closed instead of racing
 the editor with a file edit.
 
+When a closed-board tool is needed while KiCad has the board open in the standalone
+PCB editor, call `run_closed_board_edit` (`verification` toolset) with the tool's name
+and arguments instead of asking the user to close and reopen KiCad. It saves the board
+through IPC, asks the editor to close, waits for KiCad's lock to go, runs the tool under
+its normal closed-board check, restarts the editor and waits until it answers; read
+`status`, `tool_result` and `next_action` in its result. It never forces a close: on
+`editor_not_closed` (KiCad is showing a prompt), `save_failed` or `board_state_unknown`
+nothing was edited, so relay `next_action` to the user. It refuses a PCB editor that is
+a window of the KiCad project manager; that setup still needs the editor closed by hand. A
+dry run and its apply are two calls with a KiCad save between them, which can change
+the bytes a revision covers: pass `reopen: "never"` on the dry run, apply directly
+while the board is closed, and pass `reopen: "always"` on the last edit.
+
 `unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
 earlier in the current server session but IPC is now unreachable, so the saved file may
 be older than lost editor state. Pause mutation work, tell the user that Konnect left
@@ -68,7 +81,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
+load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode; run_closed_board_edit)
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.

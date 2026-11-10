@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **24 toolsets** organized into 10 categories
-- **283 registered tools** + **7 always-visible meta-tools** = **290 total**
+- **284 registered tools** + **7 always-visible meta-tools** = **291 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -468,7 +468,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 12 tools
+### `verification` · 13 tools
 **Purpose:** DRC, design rules, layer constraints, conditional custom rules, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
@@ -481,6 +481,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
+| `run_closed_board_edit` | Run one closed-board tool on a board KiCad has open: save through IPC, ask the standalone PCB editor to close as its close button does, wait for it to exit and release KiCad's lock, run `tool` with `arguments` through the normal dispatch (it must still prove the board closed itself), start the standalone PCB editor on the board again and wait until it answers. Returns every step with timings and the nested tool's result. `tool` must have a closed-board file path (board access closed-only, live-preferred with fallback, or apply-mode dependent). Board not open: the tool is just run. Never forces: an editor that does not close (a prompt), a failed save or an unsettled KiCad stops with nothing edited; a failing nested tool still gets the editor reopened; a failed reopen leaves the edit standing. Refuses when the PCB editor is a window of the project manager. `reopen`: `if_was_open` (default), `always`, `never`. Tested on Windows; Linux (`wmctrl`) and macOS (`osascript`) window handling untested. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
 | `set_custom_rule` | Create, replace or remove one named rule in the sibling `.kicad_dru`: optional KiCad condition expression, optional layer (`outer`, `inner` or a layer name) and numeric min/opt/max constraints in mm. Checks the rule's shape; `run_drc` afterwards makes KiCad parse the condition. Use with `set_design_rules` for an exception below a board floor, such as small vias under one BGA. |
