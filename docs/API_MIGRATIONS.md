@@ -3,6 +3,86 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: the rip-up stage spends no try behind a zone fill, reports its progress and can be stopped
+
+No argument changes. What changes is how long the native router's rip-up
+and retry stage (`rip_up`, default `own`) takes on a board whose pours are
+filled around its tracks, what it reports there, and what a caller sees
+while it runs.
+
+On such a board the saved fill is a wall to every other net, and each
+negotiation over it is slow: the router paints every fill polygon into its
+search rasters, node by node. The stage ran several of them (a probe, up to
+five tries a round, two more probes to name blockers) for connections whose
+only way was across the fill, which no rip-up moves. Measured on a 44 x 30 mm
+four-layer board with both outer pours filled, four threads:
+
+| Run | Stage before (whole job) | Stage after (whole job) |
+| --- | --- | --- |
+| First job, `rip_up: own` | 2076 s (2890 s) | 14 s (910 s) |
+| Second job on the routed board, `rip_up: unlocked` | 1534 s (2010 s) | 7 s (655 s) |
+| One net (`nets`), `rip_up: own` | 108 s (227 s) | 2 s (134 s) |
+
+The first job takes 812 s with `rip_up: none`, the second 504 s: the stage
+now adds seconds to a job, not minutes. No run ends with more open
+connections than before: each whole-board run joins one more (a path the
+probe found that nothing blocks, see below; KiCad's DRC counts one
+unconnected item fewer and no new violation with the plan applied), the
+one-net run the same. With the pours unfilled the same jobs take a few
+seconds either way, and their plans are byte for byte what they were.
+
+What is different:
+
+- **A connection behind a fill gets no try.** The stage's probe now reads
+  another net's saved fill as crossable, like a zone named in `carve_zones`,
+  and checks its paths against the real fill afterwards. A connection whose
+  probe path crosses a fill is reported in `rip_up.still_open` (and in
+  `unrouted`) with `blocked_by` naming the fill's net as `zone_fill`, and
+  nothing is ripped or routed for it. Before, such a connection was tried
+  when a way around the fill existed that crossed only copper the stage may
+  rip; that way is no longer looked for. Declare the zone crossable
+  (`carve_zones`, `carve_zone_nets`) when it will be refilled, and the stage
+  works across it as on any other board. A fill that is no wall to the
+  router (on a layer it does not route on, or declared crossable) is never
+  named a blocker; before, the widest probe could name a plane a via passes
+  through.
+- **A new reason, `not_tried`.** In `blocked_by`, copper the stage may rip
+  read `ripping_did_not_help` even when no try had ripped it for that
+  connection (another of its blockers was locked, a fill, or out of scope).
+  It now reads `not_tried` then, and `ripping_did_not_help` only for a net
+  a try really ripped for that connection.
+- **A path nothing blocks is kept, not searched for again.** When the probe
+  finds a path for an open connection that collides with nothing, the stage
+  keeps that path if it passes the exact check and the board then has fewer
+  open connections. It is listed in `rip_up.attempts` with `order`
+  `probe_path` and no `ripped_nets`. Before, the connection was routed again
+  from scratch (`order` `stuck_first` with no `ripped_nets`).
+- **Progress.** While the stage runs, the job's `stage` reads `rip_up`
+  instead of `route`, and `progress.jsonl` gets events of stage `rip_up`:
+  `start` (`mode`, `open`, `stuck`), `probe` per round (`round`, `stuck`,
+  `rippable`, `unblocked`, `behind_zone_fill`, `no_path`), `attempt`
+  (`round`, `order`, `stuck_nets`, `ripped_nets`, `open_before`) and
+  `attempt_done` (`round`, `order`, `open_after`, `accepted`) per try, and
+  `stopped` (`rounds`, `open_before`, `open_after`, `stopped`) when it ends.
+  The `rip_up` event `done` or `restored` after the clear stage is as
+  before.
+- **Stopping.** `stop_native_route_job` and `time_limit_seconds` still stop
+  a job at its next stage boundary, and the route stage as a whole is not
+  interrupted. Its rip-up stage now ends at its next probe or try once a
+  stop is asked for or the limit has passed: what it has kept so far stays,
+  `rip_up.stopped` reads `stop_requested`, and the job then stops after the
+  route stage as before. `route_native_region` runs in the calling process
+  and is not stoppable.
+
+For code that links the router: `pipeline::route_board_hooked` takes a
+`RunHooks` (`rip_up`: told each `RipUpEvent`; `stop`: asked before each
+probe and try); `route_board` and `route_board_with` are unchanged. The
+telemetry counter `pipeline_rip_up_routes` counts the negotiations the
+stage ran, probes included.
+
+The slow negotiation itself is not changed here: a job on a board with
+filled outer pours still takes minutes in the stages before this one.
+
 ## Unreleased: the native router and `apply_route_plan` judge a plan by one strict lint, on the board
 
 `apply_route_plan` under `geometry_check: strict` and the native router did

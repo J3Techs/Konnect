@@ -472,3 +472,321 @@ fn a_net_ripped_and_routed_again_keeps_the_width_its_connection_was_given() {
     let task = r.connections.iter().find(|c| c.net == b).unwrap();
     assert_eq!(r.connection_widths.get(&task.id), Some(&0));
 }
+
+fn counter(r: &PipelineResult, name: &str) -> u64 {
+    r.telemetry.counters.get(name).copied().unwrap_or(0)
+}
+
+/// [`sealed_pin`] with a filled zone of net Z over the columns `x0..x1`,
+/// from edge to edge.
+fn sealed_pin_and_a_pour(x0: f64, x1: f64) -> RouteBoard {
+    let mut b = BoardBuilder::new(20.0, 12.0, &["F.Cu"]);
+    let f = b.footprint("U1", (10.0, 6.0));
+    b.smd_pad(f, "1", "A", (5.0, 6.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(f, "2", "A", (15.0, 6.0), (0.6, 0.6), "F.Cu");
+    ring(&mut b, f, "B", (5.0, 6.0), false);
+    b.zone("Z", "F.Cu", (x0, 0.5, x1, 11.5));
+    with_uuids(b.build())
+}
+
+#[test]
+fn a_connection_behind_a_pour_gets_one_probe_and_no_attempt_though_a_net_that_may_be_ripped_fences_it_too(
+) {
+    // B's ring seals A's pad and may be ripped, but Z's fill then still
+    // stands between A's pads: ripping B cannot join A.
+    let board = sealed_pin_and_a_pour(9.0, 11.0);
+    let r = run(&board, &settings(RipUp::Unlocked));
+    let plain = run(&board, &settings(RipUp::None));
+    assert!(r.rip_up.attempts.is_empty(), "{:?}", r.rip_up.attempts);
+    assert!(r.rip_up.ripped.is_empty() && !r.rip_up.changed());
+    assert_eq!(r.rip_up.stopped, "nothing_to_rip");
+    assert_eq!(r.routed, plain.routed);
+    assert_eq!(r.connections_after, 1);
+    // One negotiation, over a board whose fills are open: the probe.
+    assert_eq!(counter(&r, "pipeline_rip_up_routes"), 1);
+    let open = &r.rip_up.still_open;
+    assert_eq!(open.len(), 1, "{open:?}");
+    let by: Vec<(&str, &str, bool)> = open[0]
+        .blocked_by
+        .iter()
+        .map(|b| (b.net.as_str(), b.reason.as_str(), b.uuids.is_empty()))
+        .collect();
+    assert_eq!(by, [("B", "not_tried", false), ("Z", "zone_fill", true)]);
+}
+
+#[test]
+fn a_pour_that_is_not_in_the_way_does_not_keep_a_fenced_pin_from_being_opened() {
+    // The same ring, and Z's fill beyond A's far pad: no path crosses it.
+    let board = sealed_pin_and_a_pour(16.5, 19.0);
+    let r = run(&board, &settings(RipUp::Unlocked));
+    assert_eq!((r.rip_up.open_before, r.rip_up.open_after), (1, 0));
+    assert_eq!(r.rip_up.rerouted_nets, ["B"]);
+    assert_eq!(r.rip_up.ripped.len(), 4);
+    assert_eq!(r.connections_after, 0);
+    assert!(r.check.violations.is_empty(), "{:?}", r.check.violations);
+}
+
+#[test]
+fn a_fill_the_router_does_not_take_for_a_wall_is_never_named_a_blocker() {
+    // A's pad is fenced in by locked copper, so only the widest probe finds
+    // a path, across the fence. It also crosses Z's fill, which is declared
+    // crossable: a refill carves it, so it blocks nothing. W's fill is a
+    // wall, so fills are checked, but no path crosses it.
+    let mut b = BoardBuilder::new(20.0, 12.0, &["F.Cu"]);
+    let f = b.footprint("U1", (10.0, 6.0));
+    b.smd_pad(f, "1", "A", (5.0, 6.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(f, "2", "A", (15.0, 6.0), (0.6, 0.6), "F.Cu");
+    ring(&mut b, f, "B", (5.0, 6.0), true);
+    b.zone("Z", "F.Cu", (9.0, 0.5, 11.0, 11.5));
+    b.zone("W", "F.Cu", (16.5, 0.5, 19.0, 11.5));
+    let mut board = with_uuids(b.build());
+    let z = board.net_by_name("Z");
+    for piece in board.zones.iter_mut().filter(|p| p.net == z) {
+        piece.crossable = true;
+    }
+    let r = run(&board, &settings(RipUp::Unlocked));
+    let open = &r.rip_up.still_open;
+    assert_eq!(open.len(), 1, "{open:?}");
+    let by: Vec<(&str, &str)> = open[0]
+        .blocked_by
+        .iter()
+        .map(|b| (b.net.as_str(), b.reason.as_str()))
+        .collect();
+    assert_eq!(by, [("B", "locked")]);
+}
+
+fn run_hooked(
+    board: &RouteBoard,
+    settings: &PipelineSettings,
+    hooks: &RunHooks<'_>,
+) -> PipelineResult {
+    crate::pipeline::route_board_hooked(
+        board,
+        &UniformRules::default(),
+        &PipelineScope::default(),
+        settings,
+        hooks,
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_stage_tells_a_listener_its_probe_and_each_attempt_as_it_goes() {
+    let board = sealed_pin(false);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let tell = |e: &RipUpEvent| seen.lock().unwrap().push(e.clone());
+    let hooks = RunHooks {
+        rip_up: Some(&tell),
+        stop: None,
+    };
+    let r = run_hooked(&board, &settings(RipUp::Unlocked), &hooks);
+    assert_eq!(r.rip_up.open_after, 0);
+    let seen = seen.into_inner().unwrap();
+    let names: Vec<&str> = seen.iter().map(RipUpEvent::name).collect();
+    assert_eq!(
+        names,
+        ["start", "probe", "attempt", "attempt_done", "stopped"]
+    );
+    assert_eq!(
+        seen[0],
+        RipUpEvent::Start {
+            mode: RipUp::Unlocked,
+            open: 1,
+            stuck: 1
+        }
+    );
+    assert_eq!(
+        seen[1],
+        RipUpEvent::Probe {
+            round: 1,
+            stuck: 1,
+            rippable: 1,
+            unblocked: 0,
+            behind_zone_fill: 0,
+            no_path: 0
+        }
+    );
+    assert_eq!(
+        seen[2],
+        RipUpEvent::Attempt {
+            round: 1,
+            order: "stuck_first".to_string(),
+            stuck_nets: vec!["A".to_string()],
+            ripped_nets: vec!["B".to_string()],
+            open_before: 1
+        }
+    );
+    assert_eq!(
+        seen[4],
+        RipUpEvent::Stopped {
+            rounds: 1,
+            open_before: 1,
+            open_after: 0,
+            stopped: "complete".to_string()
+        }
+    );
+    // An event is serialised as its fields.
+    assert_eq!(
+        serde_json::to_value(&seen[3]).unwrap(),
+        serde_json::json!({ "round": 1, "order": "stuck_first", "open_after": 0, "accepted": true })
+    );
+}
+
+#[test]
+fn a_probe_counts_the_connections_behind_a_fill_for_its_listener() {
+    let board = sealed_pin_and_a_pour(9.0, 11.0);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let tell = |e: &RipUpEvent| seen.lock().unwrap().push(e.clone());
+    let hooks = RunHooks {
+        rip_up: Some(&tell),
+        stop: None,
+    };
+    run_hooked(&board, &settings(RipUp::Unlocked), &hooks);
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(
+        seen[1],
+        RipUpEvent::Probe {
+            round: 1,
+            stuck: 1,
+            rippable: 0,
+            unblocked: 0,
+            behind_zone_fill: 1,
+            no_path: 0
+        }
+    );
+}
+
+#[test]
+fn a_stage_told_to_stop_makes_no_further_attempt_and_leaves_the_run_as_it_was() {
+    let board = sealed_pin(false);
+    let plain = run(&board, &settings(RipUp::None));
+    // Asked before the probe (go on) and before the first attempt (stop).
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+    let hooks = RunHooks {
+        rip_up: None,
+        stop: Some(&stop),
+    };
+    let r = run_hooked(&board, &settings(RipUp::Unlocked), &hooks);
+    assert_eq!(r.rip_up.stopped, "stop_requested");
+    assert!(r.rip_up.attempts.is_empty(), "{:?}", r.rip_up.attempts);
+    assert!(r.rip_up.ripped.is_empty() && !r.rip_up.changed());
+    assert_eq!((r.rip_up.open_before, r.rip_up.open_after), (1, 1));
+    assert_eq!(r.rip_up.rounds, 1);
+    assert_eq!(counter(&r, "pipeline_rip_up_routes"), 1, "the probe only");
+    assert_eq!(r.routed, plain.routed);
+    assert_eq!(r.plan, plain.plan);
+    assert_eq!(r.connections_after, 1);
+    // What the probe learned is still reported; B was not ripped for A.
+    let open = &r.rip_up.still_open;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].blocked_by.len(), 1, "{open:?}");
+    assert_eq!(
+        (
+            open[0].blocked_by[0].net.as_str(),
+            open[0].blocked_by[0].reason.as_str()
+        ),
+        ("B", "not_tried")
+    );
+}
+
+#[test]
+fn a_stage_told_to_stop_before_it_probes_lists_what_is_open_without_blockers() {
+    let board = sealed_pin(false);
+    let stop = || true;
+    let hooks = RunHooks {
+        rip_up: None,
+        stop: Some(&stop),
+    };
+    let r = run_hooked(&board, &settings(RipUp::Unlocked), &hooks);
+    assert_eq!(r.rip_up.stopped, "stop_requested");
+    assert_eq!(r.rip_up.rounds, 0);
+    assert_eq!(counter(&r, "pipeline_rip_up_routes"), 0);
+    let open = &r.rip_up.still_open;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!((open[0].net.as_str(), open[0].from.as_str()), ("A", "U1.1"));
+    assert!(open[0].blocked_by.is_empty(), "{open:?}");
+}
+
+/// Net A's two pads, and net B's two pads below them, on an empty board;
+/// with `between`, a pad of net C on the line between B's.
+fn two_open_nets(between: bool) -> RouteBoard {
+    let mut b = BoardBuilder::new(20.0, 12.0, &["F.Cu"]);
+    let f = b.footprint("U1", (10.0, 6.0));
+    b.smd_pad(f, "1", "A", (5.0, 4.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(f, "2", "A", (15.0, 4.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(f, "3", "B", (5.0, 8.0), (0.6, 0.6), "F.Cu");
+    b.smd_pad(f, "4", "B", (15.0, 8.0), (0.6, 0.6), "F.Cu");
+    if between {
+        b.smd_pad(f, "5", "C", (10.0, 8.0), (0.6, 0.6), "F.Cu");
+    }
+    b.build()
+}
+
+/// A straight probe path of `net` between two points (mm) on the first layer.
+fn path(board: &RouteBoard, net: &str, from: (f64, f64), to: (f64, f64)) -> RoutedCopper {
+    let nm = |v: f64| (v * 1e6).round() as Coord;
+    let point = |p: (f64, f64)| konnect_geom::Point::new(nm(p.0), nm(p.1));
+    RoutedCopper {
+        tracks: vec![crate::plan::RoutedTrack {
+            net: board.net_by_name(net).unwrap(),
+            layer: board.layers.all().iter().next().unwrap(),
+            seg: konnect_geom::Segment::new(point(from), point(to), 150_000),
+            gen: crate::api::Generation(0),
+        }],
+        vias: Vec::new(),
+    }
+}
+
+/// [`keep_paths`] on `board` with nothing routed yet: the open connections
+/// before, and the state after.
+fn kept(board: &RouteBoard, paths: &[&RoutedCopper]) -> (usize, State) {
+    let s = settings(RipUp::Own);
+    let (rules, scope) = (UniformRules::default(), PipelineScope::default());
+    let (inputs, hooks) = (NegotiationInputs::default(), RunHooks::default());
+    let ctx = Ctx {
+        rules: &rules,
+        scope: &scope,
+        settings: &s,
+        negotiation: &s.negotiation,
+        inputs: &inputs,
+        hooks: &hooks,
+    };
+    let none = RoutedCopper::default();
+    let (open, stuck) = open_connections(&ctx, board, &none);
+    let state = State {
+        board: board.clone(),
+        routed: none,
+        ripped: Vec::new(),
+        rerouted: BTreeSet::new(),
+        open,
+        stuck,
+    };
+    (open, keep_paths(&ctx, &state, paths))
+}
+
+#[test]
+fn probe_paths_nothing_blocks_are_kept_as_they_are_and_join_their_connections() {
+    let board = two_open_nets(false);
+    let a = path(&board, "A", (5.0, 4.0), (15.0, 4.0));
+    let b = path(&board, "B", (5.0, 8.0), (15.0, 8.0));
+    let (open, next) = kept(&board, &[&a, &b]);
+    assert_eq!((open, next.open), (2, 0));
+    assert!(next.stuck.is_empty());
+    assert_eq!(next.routed.tracks, [a.tracks[0], b.tracks[0]]);
+    assert!(next.ripped.is_empty() && next.rerouted.is_empty());
+}
+
+#[test]
+fn a_kept_probe_path_the_exact_check_refuses_is_taken_out_and_joins_nothing() {
+    // B's path runs over C's pad: the check names it, so only A's stays.
+    let board = two_open_nets(true);
+    let a = path(&board, "A", (5.0, 4.0), (15.0, 4.0));
+    let b = path(&board, "B", (5.0, 8.0), (15.0, 8.0));
+    let (open, next) = kept(&board, &[&a, &b]);
+    assert_eq!((open, next.open), (2, 1));
+    assert_eq!(next.routed.tracks, [a.tracks[0]]);
+    let open_nets: Vec<NetId> = next.stuck.iter().map(|c| c.net).collect();
+    assert_eq!(open_nets, [board.net_by_name("B").unwrap()]);
+}

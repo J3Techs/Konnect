@@ -285,7 +285,7 @@ pub struct OpenConnection {
     /// when it ended (the entry's `blocked_by` in the report's
     /// `rip_up.still_open`): each blocking net, why it was not ripped
     /// (`locked`, `board_copper_not_requested`, `plane_net`, `zone_fill`,
-    /// `out_of_scope`, `excluded_class`, `no_uuid`,
+    /// `out_of_scope`, `excluded_class`, `no_uuid`, `not_tried`,
     /// `ripping_did_not_help`) and the board items' UUIDs. Empty: no path
     /// was found even with every nearby track, via and fill out. Absent:
     /// the stage did not run, or left another pad pair of the net open.
@@ -558,7 +558,9 @@ mod tests {
             clear_findings: false,
             ..PipelineSettings::default()
         };
-        let routed = super::super::route_native(&board, &rules, None, None, &settings).unwrap();
+        let routed =
+            super::super::route_native(&board, &rules, None, None, &settings, &Default::default())
+                .unwrap();
         assert_eq!(routed.failures.len(), 1, "{:?}", routed.detail);
         let failure = &routed.failures[0];
         // The counts the stage record keeps are the same failures.
