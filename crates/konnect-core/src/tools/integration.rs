@@ -2307,8 +2307,14 @@ mod datasheet_enrichment_tests {
 async fn run_java_command(
     command: &mut tokio::process::Command,
 ) -> Result<std::process::Output, String> {
-    command.kill_on_drop(true);
-    match tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await {
+    // `output()` with the child reachable, so it can be tied to this process.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = crate::child_guard::spawn(command).map_err(|error| error.to_string())?;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("Java command timed out after 10 seconds".to_string()),

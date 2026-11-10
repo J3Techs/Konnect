@@ -32,6 +32,11 @@ pub struct Config {
     #[serde(default = "default_http_address")]
     pub http_address: String,
 
+    /// How long a stopping HTTP server waits for the requests it is already
+    /// handling, in seconds. 0 stops without waiting.
+    #[serde(default = "default_http_shutdown_grace_seconds")]
+    pub http_shutdown_grace_seconds: u64,
+
     /// JLCPCB database cache path
     #[serde(default)]
     pub jlcpcb_db_path: Option<PathBuf>,
@@ -137,6 +142,13 @@ fn default_kicad_binary() -> String {
 
 fn default_http_address() -> String {
     "127.0.0.1:3000".to_string()
+}
+
+/// Long enough for an export or a check to finish and be answered, short
+/// enough to fit the stop timeouts of the usual service managers. A router
+/// run of minutes does not fit; that is what the route jobs are for.
+fn default_http_shutdown_grace_seconds() -> u64 {
+    10
 }
 
 fn default_log_level() -> String {
@@ -253,6 +265,7 @@ impl Default for Config {
             ipc_address: String::new(),
             transport: TransportMode::default(),
             http_address: default_http_address(),
+            http_shutdown_grace_seconds: default_http_shutdown_grace_seconds(),
             jlcpcb_db_path: None,
             log_level: default_log_level(),
             auto_load_toolsets: false,
@@ -401,6 +414,7 @@ mod tests {
         let d = Config::default();
         assert_eq!(c.kicad_cli, d.kicad_cli);
         assert_eq!(c.http_address, d.http_address);
+        assert_eq!(c.http_shutdown_grace_seconds, 10);
         assert_eq!(c.log_level, d.log_level);
         assert!(matches!(c.transport, TransportMode::Stdio));
     }

@@ -47,14 +47,22 @@ impl HttpServer {
         write!(config, r#"{{"transport":"http","http_address":"{addr}"}}"#).unwrap();
         config.flush().unwrap();
 
-        let child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        command
             .arg("--config")
             .arg(config.path())
             .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn konnect binary");
+            .stderr(Stdio::null());
+        // Its own process group, so `request_stop` can send Ctrl+Break to the
+        // server alone and not to the test runner.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = command.spawn().expect("failed to spawn konnect binary");
 
         let mut server = HttpServer {
             child,
@@ -146,6 +154,59 @@ impl Drop for HttpServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Ask the server to stop the way a service manager does: SIGTERM.
+#[cfg(unix)]
+fn request_stop(child: &Child) -> bool {
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Ask the server to stop the way a console does: Ctrl+Break to its process
+/// group. False when this test process has no console to send it through.
+#[cfg(windows)]
+fn request_stop(child: &Child) -> bool {
+    extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
+    }
+    const CTRL_BREAK_EVENT: u32 = 1;
+    // SAFETY: a plain Win32 call taking two integers; the group id is the pid
+    // of a child created with CREATE_NEW_PROCESS_GROUP.
+    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) != 0 }
+}
+
+/// Before the transport handled stop signals this exit was the signal's own:
+/// status 0xC000013A on Windows, killed by SIGTERM on Unix.
+#[test]
+fn a_stop_signal_ends_the_http_server_with_a_clean_exit() {
+    let mut server = HttpServer::spawn();
+    let (status, _, _) = server.post_mcp(&initialize_msg());
+    assert_eq!(status, 200);
+
+    if !request_stop(&server.child) {
+        eprintln!("skipped: the stop signal could not be sent from this process");
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(exit) = server.child.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server was still running 30 s after the stop signal"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit.success(), "the server exited with {exit}");
+    assert!(
+        server.raw_request("GET", "/health", &[], None).is_err(),
+        "a stopped server still answered"
+    );
 }
 
 fn initialize_msg() -> Value {

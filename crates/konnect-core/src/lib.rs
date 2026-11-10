@@ -1,3 +1,4 @@
+pub mod child_guard;
 pub mod config_resolution;
 pub mod design_hash;
 pub mod freerouting_job;

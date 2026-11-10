@@ -67,8 +67,32 @@ fn classify(args: &[String]) -> Cli<'_> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// How long a stopped HTTP server waits for its runtime to let go. Tool calls
+/// that outlived the grace period are dropped here, which ends the child
+/// processes they own; work on a blocking thread cannot be interrupted and is
+/// left behind when the process exits.
+const RUNTIME_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn main() -> Result<()> {
+    // What `#[tokio::main]` builds. Owned here so that a stopped HTTP server
+    // can bound the runtime's shutdown; dropping it waits without limit.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let http_stop = runtime.block_on(run())?;
+    if let Some(stop) = http_stop {
+        if matches!(stop, transport::http::HttpStop::Abandoned { .. }) {
+            konnect_core::child_guard::end_children();
+        }
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_WAIT);
+        info!("Konnect stopped");
+    }
+    Ok(())
+}
+
+/// Everything the process does. `Some` when an HTTP transport was stopped by
+/// a signal; `None` for every other way of finishing.
+async fn run() -> Result<Option<transport::http::HttpStop>> {
     // ─── CLI argument parsing (minimal, no clap dependency) ─────────
     let args: Vec<String> = std::env::args().collect();
 
@@ -76,40 +100,42 @@ async fn main() -> Result<()> {
     match classify(&args) {
         Cli::Help(subcommand) => {
             print_help_for(subcommand);
-            return Ok(());
+            return Ok(None);
         }
         Cli::Version => {
             println!("konnect {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return Ok(None);
         }
         Cli::Subcommand("init") => {
             let client = install::client_from_args(&args[2..])?;
-            return install::run_install(client);
+            return install::run_install(client).map(|()| None);
         }
         Cli::Subcommand("uninstall") => {
             let client = install::client_from_args(&args[2..])?;
-            return install::run_uninstall(client);
+            return install::run_uninstall(client).map(|()| None);
         }
         Cli::Subcommand("status") => {
             let client = install::client_from_args(&args[2..])?;
-            return install::print_status(client);
+            return install::print_status(client).map(|()| None);
         }
         Cli::Subcommand("skill") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
-            return install::print_skill_content(name);
+            return install::print_skill_content(name).map(|()| None);
         }
         Cli::Subcommand("hook") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
-            return install::print_hook_output(name);
+            return install::print_hook_output(name).map(|()| None);
         }
-        Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
+        Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]).map(|()| None),
         // Internal: started by start_specctra_route_job, not by users.
         Cli::Subcommand(konnect_core::freerouting_job::RUNNER_SUBCOMMAND) => {
-            return konnect_core::freerouting_job::run_runner(&args[2..]).await;
+            return konnect_core::freerouting_job::run_runner(&args[2..])
+                .await
+                .map(|()| None);
         }
         // Internal: started by start_native_route_job, not by users.
         Cli::Subcommand(konnect_core::native_route_job::RUNNER_SUBCOMMAND) => {
-            return konnect_core::native_route_job::run_runner(&args[2..]);
+            return konnect_core::native_route_job::run_runner(&args[2..]).map(|()| None);
         }
         Cli::Subcommand(_) | Cli::Server => {}
     }
@@ -118,7 +144,7 @@ async fn main() -> Result<()> {
     // If stdin is a terminal (user double-clicked the .exe), run friendly install.
     // If stdin is piped (Claude launched us as MCP server), start server.
     if std::io::stdin().is_terminal() {
-        return install::run_double_click_install();
+        return install::run_double_click_install().map(|()| None);
     }
 
     // Keep accepting the public `--client` option, but MCP startup is
@@ -197,7 +223,8 @@ async fn main() -> Result<()> {
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
 
-    match config.transport {
+    let http_grace = std::time::Duration::from_secs(config.http_shutdown_grace_seconds);
+    let http_stop = match config.transport {
         TransportMode::Stdio => {
             handler.enable_stdio_reload();
             match transport::stdio::run_stdio(handler).await? {
@@ -211,17 +238,19 @@ async fn main() -> Result<()> {
                     exec_reload(plan)?;
                 }
             }
+            None
         }
-        TransportMode::Http => {
-            transport::http::run_http(handler, &config.http_address).await?;
-        }
+        TransportMode::Http => Some(
+            transport::http::run_http_until_stopped(handler, &config.http_address, http_grace)
+                .await?,
+        ),
         TransportMode::Both => {
             let handler_http = handler.clone();
             let http_addr = config.http_address.clone();
             let http_task = tokio::spawn(async move {
-                transport::http::run_http(handler_http, &http_addr)
+                transport::http::run_http_until_stopped(handler_http, &http_addr, http_grace)
                     .await
-                    .expect("HTTP transport failed");
+                    .expect("HTTP transport failed")
             });
             let stdio_task = tokio::spawn(async move {
                 transport::stdio::run_stdio(handler)
@@ -229,13 +258,13 @@ async fn main() -> Result<()> {
                     .expect("STDIO transport failed");
             });
             tokio::select! {
-                _ = http_task => {},
-                _ = stdio_task => {},
+                stop = http_task => stop.ok(),
+                _ = stdio_task => None,
             }
         }
-    }
+    };
 
-    Ok(())
+    Ok(http_stop)
 }
 
 /// Replace the standalone process through the platform-specific validated

@@ -209,8 +209,11 @@ described here, so its path does not answer "which file configured the server".
 `--config <path>` loads an explicit file and bypasses the search entirely; the
 list above is not consulted, and `get_installation_info` reports
 `source: "explicit_path"` with no skipped candidates. Relevant fields include `kicad_cli`,
-`kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
-`log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
+`kicad_binary`, `ipc_address`, `transport`, `http_address`,
+`http_shutdown_grace_seconds` (how long a stopping HTTP server waits for
+requests in flight, default 10; see
+[Stopping the HTTP server](TROUBLESHOOTING.md#stopping-the-http-server)),
+`jlcpcb_db_path`, `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
 With `transport = "http"` the server is a foreground process that ends with

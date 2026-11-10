@@ -697,8 +697,9 @@ impl LocalMcpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
+        // Through the guard: a killed server must not leave this `java`
+        // routing on its own.
+        let mut child = crate::child_guard::spawn(&mut command)
             .context("start local Freerouting MCP server")?;
         #[cfg(test)]
         if let Some(pid) = child.id() {
