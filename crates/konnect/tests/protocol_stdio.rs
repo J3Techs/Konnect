@@ -15,18 +15,28 @@ struct McpProcess {
     next_id: i64,
     /// The handshake's `initialize` response.
     initialized: Value,
+    /// The empty directory `spawn` runs the server in. Dropped after `Drop`
+    /// has stopped the child.
+    _isolated: Option<tempfile::TempDir>,
 }
 
 impl McpProcess {
+    /// Spawn with no configuration file: the working directory and the
+    /// platform config directory are a fresh empty directory, so the server
+    /// runs on its defaults whatever the developer's own Konnect config says
+    /// (`eager_toolsets = true` there used to fail the baseline tests).
     fn spawn() -> Self {
-        Self::spawn_in_dir(None)
+        let isolated = tempfile::tempdir().unwrap();
+        let mut p = Self::spawn_configured(Some(isolated.path()), true);
+        p._isolated = Some(isolated);
+        p
     }
 
     /// Spawn with the process working directory set to `dir`, so
     /// the config search's first path (`konnect.toml` in cwd) picks up
     /// a test config file placed there.
-    fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
-        Self::spawn_configured(dir, false)
+    fn spawn_in_dir(dir: &std::path::Path) -> Self {
+        Self::spawn_configured(Some(dir), true)
     }
 
     /// Spawn with the working directory set to `dir` and, when `isolate_home`,
@@ -75,6 +85,7 @@ impl McpProcess {
             reader,
             next_id: 1,
             initialized: Value::Null,
+            _isolated: None,
         };
         // MCP handshake
         let init = p.request(
@@ -223,7 +234,7 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
         "ipc_address = \"ipc://diagnostic-test.sock?token=secret#fragment\"\n",
     )
     .unwrap();
-    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+    let mut p = McpProcess::spawn_in_dir(tmp.path());
 
     let list = p.request("tools/list", json!({}));
     assert!(list["result"]["tools"]
@@ -458,7 +469,7 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
         "auto_load_toolsets = true\n",
     )
     .unwrap();
-    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+    let mut p = McpProcess::spawn_in_dir(tmp.path());
 
     // route_trace is in pcb_routing, not loaded at startup. With auto-load on,
     // the toolset loads, a list_changed notification fires, and the call gets
