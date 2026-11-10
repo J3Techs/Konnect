@@ -236,7 +236,7 @@ impl NoLiveBoard {
             }),
             Self::NotOpen(answer) => json!({
                 "kind": "board_not_open",
-                "message": answer
+                "message": format!("{answer}; no exact-board sibling lock was present.")
             }),
             Self::NoPcbEditor(answer) => json!({
                 "kind": "no_pcb_editor_at_endpoint",
@@ -255,7 +255,9 @@ impl NoLiveBoard {
             Self::Unreachable => {
                 "KiCad IPC was unreachable, so Konnect could not contact a live editor; no exact-board sibling lock was present.".to_string()
             }
-            Self::NotOpen(answer) => format!("KiCad was reachable, and {answer}"),
+            Self::NotOpen(answer) => format!(
+                "KiCad was reachable, and {answer}; no exact-board sibling lock was present."
+            ),
             Self::NoPcbEditor(_) => {
                 "KiCad was reachable and has no PCB editor at its IPC endpoint (the project \
                  manager is running without one); no exact-board sibling lock was present."
@@ -288,8 +290,13 @@ impl NoLiveBoard {
 ///   board live, or when a previously observed exact-board lock has vanished
 ///   after a clean editor close.
 /// * A reachable KiCAD that does not hold this board is a third answer, not a
-///   refusal: it has no unsaved state for a board it never opened, so the file
-///   is authoritative and the edit proceeds there.
+///   refusal: it has no unsaved state for a board it never opened. But it
+///   speaks for itself only. Another KiCad process can hold the board without
+///   being the one that answered (a second instance: on Windows they share
+///   one pipe name and the first keeps it), and the only evidence of that one
+///   is the sibling lock it creates. So the edit proceeds in the file unless
+///   that lock is present or cannot be inspected, the rule the unreachable
+///   and no-PCB-editor answers already follow.
 /// * A KiCad whose endpoint has no PCB editor at all (`AS_UNHANDLED`: the
 ///   project manager with no board open) holds no board either, but says
 ///   nothing about a standalone PCB editor that could not claim the endpoint.
@@ -330,7 +337,12 @@ where
                  board open, so editing the file directly could be silently overwritten."
                 )))
             }
-            LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+            // The answering KiCad does not hold the board; a lock says another
+            // process may.
+            LiveBoard::NotOpen { message, .. } => match board_lock_refusal(board_path) {
+                Some(refusal) => BoardWrite::Refused(refusal),
+                None => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+            },
             LiveBoard::Unresolved(error) => {
                 BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
             }
@@ -485,10 +497,14 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
                 observed_live,
                 ..
             } => no_pcb_editor_verdict(ctx, board_path, observed_live),
+            // The answering KiCad proved it does not hold this board. Another
+            // KiCad process still may, and its sibling lock is the evidence:
+            // the same verdict as `attempt_ipc_write`.
+            LiveBoard::NotOpen { .. } => board_lock_refusal(board_path),
             // KiCad answered at all, so it may hold this board; a rejection is
             // not the proof of absence this guard needs, and it is not proof of
             // presence either. It refuses nothing.
-            LiveBoard::Rejected(_) | LiveBoard::Unserved { .. } | LiveBoard::NotOpen { .. } => None,
+            LiveBoard::Rejected(_) | LiveBoard::Unserved { .. } => None,
             LiveBoard::Uncertain(message) => Some(crate::tools::ipc_uncertain_result(&message)),
             LiveBoard::Recovered(message) => Some(crate::tools::ipc_recovered_result(&message)),
             LiveBoard::Unresolved(error) => Some(crate::tools::ipc_target_error_result(&error)),
@@ -3421,6 +3437,59 @@ mod open_document_ambiguity_tests {
 
         assert!(matches!(outcome, BoardWrite::File(NoLiveBoard::NotOpen(_))));
         assert!(!entered, "there was no board to address over IPC");
+    }
+
+    /// "Not open" is the answering process speaking for itself. A second
+    /// KiCad that could not claim the endpoint holds its board unreachably,
+    /// and its sibling lock is the only evidence of it: both write gates
+    /// refuse beside one, and edit the file once it is gone.
+    #[tokio::test]
+    async fn a_board_kicad_reports_not_open_is_not_edited_beside_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        let reason = |result: &CallToolResult| serde_json::to_value(result).unwrap().to_string();
+
+        // KiCad holding another board, and KiCad holding none.
+        for documents in [vec![board_document(&other.to_string_lossy())], vec![]] {
+            let server = spawn_kicad_reporting_documents(documents, |_| None);
+            let ctx = ctx_talking_to(server.address().to_string());
+
+            std::fs::write(&lock, r#"{"username":"test","hostname":"host"}"#).unwrap();
+            let BoardWrite::Refused(refusal) =
+                attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                    .await
+                    .unwrap()
+            else {
+                panic!("a sibling lock must refuse the file edit of a board reported not open")
+            };
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+                Some("unsafe_file_fallback")
+            );
+            assert!(reason(&refusal).contains("kicad_lock_present"));
+            let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "file-only test write")
+                .await
+                .unwrap()
+                .expect("the file-only gate must honor the same lock");
+            assert!(reason(&guarded).contains("kicad_lock_present"));
+
+            std::fs::remove_file(&lock).unwrap();
+            assert!(matches!(
+                attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                    .await
+                    .unwrap(),
+                BoardWrite::File(NoLiveBoard::NotOpen(_))
+            ));
+            assert!(
+                refuse_if_board_open_in_kicad(&ctx, &board, "file-only test write")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     /// The file-only guard reaches the same verdict from the same evidence.

@@ -3,6 +3,52 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a board KiCad reports as not open is not edited beside its lock
+
+When a reachable KiCad answered that the requested board is not among its open
+documents, the mutating board tools edited the saved file on that answer
+alone. The answer speaks only for the process that gave it. A second KiCad
+process can hold the board without being the one that answered: two
+standalone PCB editors, or an editor started beside one that already owns the
+IPC address, share one address and the first keeps it, so the second holds its
+board unreachably. KiCad's sibling lock (`~<board>.kicad_pcb.lck`) is the only
+evidence of that editor, and the file was edited beside it; the editor's next
+save then discarded the edit.
+
+The unreachable-KiCad and project-manager-only answers already required that
+lock to be absent. "Not open" now follows the same rule in both write gates: a
+lock present or uninspectable refuses with `unsafe_file_fallback`
+(`kicad_lock_present` / `kicad_lock_unreadable`) and the file is not touched.
+Without a lock the edit proceeds as before, and `fallback_reason` stays
+`board_not_open`; its message and the warning now say that no lock was
+present. No argument changes.
+
+Tools that newly refuse in that state, where they used to edit the file:
+
+- the hybrid tools with a saved-file path: `place_component`,
+  `move_component`, `rotate_component`, `flip_component`,
+  `set_component_placements`, `add_mounting_hole`, `add_board_outline`,
+  `set_board_size`, `add_board_text`, `add_board_graphics`,
+  `delete_graphics`, `import_svg_logo`, `add_zone`, `add_copper_pour`,
+  `add_zones` and `delete_zones`;
+- the file-only tools behind the open-board guard: `create_netclass`,
+  `assign_net_to_class`, `remove_netclass_patterns`, `set_design_rules`,
+  `set_predefined_sizes`, `place_decoupling_caps` and
+  `refine_placement_force_directed`.
+
+The live-only tools that go through the same gate (`edit_footprint_fields`,
+`update_footprints_from_library`, `update_pcb_from_schematic`,
+`repair_corrupted_footprints`, the footprint graphic tools) never edited the
+file; beside a lock they now answer with this refusal instead of their "board
+is not open" one. Tools behind the closed-board proof (`set_closed_board_stackup`,
+`set_pad_fabrication_properties`, `set_footprint_field_values` and the other
+closed-board editors) already checked the lock themselves and are unchanged,
+as are reads: a board reported not open is still read from the saved file.
+
+If the lock is a leftover from a KiCad that crashed, open the board in KiCad
+and close it again, or delete the lock yourself once you know no editor holds
+the board.
+
 ## Unreleased: the rip-up stage spends no try behind a zone fill, reports its progress and can be stopped
 
 No argument changes. What changes is how long the native router's rip-up
