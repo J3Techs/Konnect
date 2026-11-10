@@ -33,6 +33,7 @@ mod attributes;
 pub(crate) mod pad_fabrication;
 pub(crate) mod reference_field;
 mod saved_graphics;
+pub(crate) mod saved_models;
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{

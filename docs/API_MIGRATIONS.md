@@ -3,6 +3,31 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: placed-footprint 3D models can be edited on a closed board
+
+`set_placed_footprint_models` required the board open in KiCad, and refused
+every mutation of a footprint whose pads carry a fabrication property
+(`pad_prop_heatsink`, `pad_prop_mechanical`, …) because the live update
+re-creates its pads without it. There was no supported way to change such a
+footprint's 3D models.
+
+The tool now has a saved-file path, taken when KiCad does not serve the board.
+It first proves the board closed (KiCad unreachable or answering that the board
+is not open, and no sibling lock); any other answer is a refusal and the file
+is not touched. `inspect` reads the footprint's `(model …)` blocks from the
+saved file. `append`, `replace` and `remove` take the inspected
+`expected_models_revision` as before and rewrite only that footprint's model
+blocks in one atomic write: every byte outside the planned spans is checked
+unchanged, the footprint's other clauses and its pad fabrication properties
+are checked identical, and the persisted file is read back. Results carry
+`source: "saved"`, `board_closure`, `pad_fabrication_properties` and, for a
+write, `write`.
+
+The live refusal for a footprint with pad fabrication properties now names this
+path: save the board, close it in KiCad, and repeat the request. Arguments are
+unchanged. A saved model entry with a legacy `(at …)` offset or a clause the
+reader does not know is refused rather than rewritten.
+
 ## Unreleased: a missing Datasheet field is added; a replacement can drop orphaned no-connect flags
 
 `edit_schematic_component` refused `datasheet` on a placed unit with no
