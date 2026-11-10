@@ -1045,6 +1045,25 @@ stays at 20).
     and labels each board side of a violation (`label`).
   - `routing_batch::uuids_in_file` is the shared reader of those files.
 
+### The target plane of a plane via, and fill slits
+
+- **`space::poly`.** `PolyIndex` drops the zero-width slits of a fractured
+  fill when it is built (along every line, the stretches covered by an even
+  number of edges), so a disc across a slit is inside the piece and a point
+  on one is `Inside`, not `Boundary`. Voids and outlines are unchanged.
+- **`fanout`.** `PlaneTarget { layer, zone }`, `choose_planes(board, target)
+  -> Vec<PlaneChoice { net, layer, pieces, reason, other_layers }>` and
+  `plan_plane_vias_targeting(board, rules, connectivity, settings, exclude,
+  carve_zones, target)`; the earlier entry points call it with the default
+  target. `PlaneViaPlan::planes` holds the choices. The own-plane test and
+  the spokes apply on the target layer only, and an island is unjoined
+  unless it holds a piece of the target plane (it used to be joined by any
+  piece of its net). Behaviour change: `FanoutSettings::
+  partial_plane_fallback` and `FanoutStats::partial_plane_sites` are gone
+  with the pass they served (a site inside the net's fill on one layer out
+  of several is now the rule, not a fallback).
+- **Tools.** `plan_plane_vias`: `plane_layer`, `plane_zone`; reply `planes`.
+
 ### Workspace
 
 - `rayon = "1.10"` in the workspace manifest (MIT/Apache-2.0).

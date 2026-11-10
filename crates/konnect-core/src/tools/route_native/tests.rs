@@ -266,6 +266,26 @@ async fn the_audit_and_plane_vias_run_on_the_saved_board() {
     let b = body(&r);
     assert_eq!(b["carve_zones"], json!(["GND plane"]));
     assert!(b["carving_sites"].is_array(), "{b}");
+    // Every planned net names the plane its vias reach, and why.
+    for p in b["planes"].as_array().unwrap() {
+        assert!(p["net"].is_string() && p["layer"].is_string(), "{p}");
+        assert!(p["chosen"].is_string() && p["why"].is_string(), "{p}");
+    }
+    // plane_layer / plane_zone must name filled copper of the board.
+    for (extra, field) in [
+        (json!({ "plane_layer": "Nope.Cu" }), "plane_layer"),
+        (json!({ "plane_zone": "Nope" }), "plane_zone"),
+        (json!({ "plane_zone": 3 }), "plane_zone"),
+    ] {
+        let mut a = json!({ "board": f.board(), "output_plan": f.path("y.json") });
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = handle_plan_plane_vias(&a, &ctx()).await.unwrap();
+        assert!(r.is_error, "{a} accepted");
+        assert!(text(&r).contains(field), "{}", text(&r));
+        assert!(!Path::new(&f.path("y.json")).exists());
+    }
     for names in [json!(["Nope"]), json!(["no_vias"])] {
         let r = handle_plan_plane_vias(
             &json!({ "board": f.board(), "output_plan": f.path("x.json"), "carve_zones": names }),

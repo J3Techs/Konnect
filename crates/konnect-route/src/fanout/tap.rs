@@ -129,7 +129,6 @@ pub fn plan_tap_vias_with(
     let t0 = std::time::Instant::now();
     let mut s = *settings;
     s.require_own_plane = false;
-    s.partial_plane_fallback = false;
     s.clear_of_zones_on = Some(target);
     let policy = ArcPolicy::default();
     let space = Space::new(board, rules, &policy, true);
@@ -186,6 +185,7 @@ pub fn plan_tap_vias_with(
         rules,
         settings: &s,
         carved: &carved,
+        target: &[],
         keepouts: &keepouts,
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
@@ -294,7 +294,6 @@ pub fn check_via_site(
 ) -> Result<(), ViaSiteRefusal> {
     let settings = FanoutSettings {
         require_own_plane: false,
-        partial_plane_fallback: false,
         clear_of_zones_on: None,
         ..FanoutSettings::default()
     };
@@ -306,10 +305,11 @@ pub fn check_via_site(
         rules,
         settings: &settings,
         carved: &carved,
+        target: &[],
         keepouts: &[],
     };
     let mut cache = ClearanceCache::default();
-    match check_via(&ctx, &mut cache, net, center, diameter, drill, &[], false) {
+    match check_via(&ctx, &mut cache, net, center, diameter, drill, &[]) {
         Ok(_) => Ok(()),
         Err(why) => {
             let mut out = ViaSiteRefusal {

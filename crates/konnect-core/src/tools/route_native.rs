@@ -327,11 +327,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "plan_plane_vias",
-            "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. A via must lie inside its own net's plane and outside other nets' islands on every layer, except the islands of zones named in carve_zones (a refill cuts an antipad around the via there; the reply lists the sites that carve each). Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only.",
+            "Plan one exact-checked via (and stub) per plane-net pad that is not yet joined to its plane, and write them as an add_routing routing_file. A net that pours on several layers has one target plane: the one named by plane_layer / plane_zone, else its inner layer with the most filled copper, else its larger outer pour; planes says which each net got and why. A pad is joined when copper ties it to the target plane, so a pad that only sits in a pour on another layer still gets a via. A via must lie inside the target plane (its net's pours on other layers take a through via as it comes) and outside other nets' islands on every layer, except the islands of zones named in carve_zones (a refill cuts an antipad around the via there; the reply lists the sites that carve each). Nothing is written to the board; apply the file with add_routing (locked: true keeps them from later rip-up). Reads the saved file only, with its saved zone fills.",
             with_props(json!({
                 "output_plan": { "type": "string", "description": "New routing_file to write; an existing file is never replaced" },
                 "share_within_mm": { "type": "number", "minimum": 0, "description": "A pad that gets no via of its own may share a same-net via placed for a pad within this distance (default: never)" },
                 "retry_failed": { "type": "boolean", "default": true, "description": "Give pads the first round left without a site every exit pass plus long far exits, placed against the sites already chosen" },
+                "plane_layer": { "type": "string", "minLength": 1, "description": "Copper layer of the plane the vias must reach (e.g. In1.Cu). Only nets with filled copper on it are planned. Default: per net, its inner layer with the most filled copper, else its larger outer pour" },
+                "plane_zone": { "type": "string", "minLength": 1, "description": "Exact name of the zone the vias must reach; only its net is planned. With plane_layer, the zone's copper on that layer" },
                 "carve_zones": names_prop("Zones (exact names) whose islands, on any copper layer (plane vias are through vias), may take a via: a refill cuts an antipad around it. Each must be a copper zone of the board. carving_sites lists each via that sits in a named pour, as NAME@LAYER")
             }), &["board", "output_plan"]),
             |args, ctx| async move { handle_plan_plane_vias(args, ctx).await }
@@ -1179,6 +1181,83 @@ fn audit_terminal_access_blocking(args: &Value) -> anyhow::Result<CallToolResult
     })))
 }
 
+/// `plane_layer` / `plane_zone`: the plane the vias must reach. Either must
+/// name filled copper of the saved board, and together they must leave some.
+fn plane_target_arg(
+    board: &konnect_route::RouteBoard,
+    args: &Value,
+) -> Result<konnect_route::fanout::PlaneTarget, Refusal> {
+    let text = |key: &str| -> Result<Option<String>, Refusal> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(invalid(key, "must be a non-empty string")),
+        }
+    };
+    let layer_name = text("plane_layer")?;
+    let zone = text("plane_zone")?;
+    let layer = match &layer_name {
+        None => None,
+        Some(n) => Some(board.layers.by_name(n).ok_or_else(|| {
+            invalid(
+                "plane_layer",
+                &format!("'{n}' is not a copper layer of the board"),
+            )
+        })?),
+    };
+    let netted = |z: &&konnect_route::board::ZonePiece| z.net.is_some();
+    let named = |z: &&konnect_route::board::ZonePiece| zone.as_ref() == z.zone_name.as_ref();
+    let on = |z: &&konnect_route::board::ZonePiece| layer.is_none_or(|l| z.layer == l);
+    const REFILL: &str =
+        "plane vias are planned against the saved fill: refill the zones in KiCad and save";
+    if let Some(n) = &zone {
+        if !board.zones.iter().filter(netted).any(|z| named(&z)) {
+            return Err(invalid(
+                "plane_zone",
+                &format!("no netted copper zone of the board is named '{n}'"),
+            ));
+        }
+        if !board
+            .zones
+            .iter()
+            .filter(netted)
+            .any(|z| named(&z) && on(&z))
+        {
+            return Err(invalid(
+                "plane_zone",
+                &format!(
+                    "zone '{n}' has no copper on {}",
+                    layer_name.as_deref().unwrap_or("that layer")
+                ),
+            ));
+        }
+        if !board
+            .zones
+            .iter()
+            .filter(netted)
+            .any(|z| named(&z) && on(&z) && z.filled)
+        {
+            return Err(invalid(
+                "plane_zone",
+                &format!("zone '{n}' is not filled in the saved board; {REFILL}"),
+            ));
+        }
+    } else if let Some(n) = &layer_name {
+        if !board
+            .zones
+            .iter()
+            .filter(netted)
+            .any(|z| on(&z) && z.filled)
+        {
+            return Err(invalid(
+                "plane_layer",
+                &format!("no net has filled zone copper on {n} in the saved board; {REFILL}"),
+            ));
+        }
+    }
+    Ok(konnect_route::fanout::PlaneTarget { layer, zone })
+}
+
 fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output_plan")?;
     // Absolute, as the job tools keep it, so the reply names the file.
@@ -1229,15 +1308,20 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
+    let target = match plane_target_arg(&board, args) {
+        Ok(t) => t,
+        Err(r) => return Ok(r),
+    };
     let conn = ConnectivityReport::build(&board, &konnect_geom::ArcPolicy::default());
     let plan = match guarded("fanout", || {
-        konnect_route::fanout::plan_plane_vias_carving(
+        konnect_route::fanout::plan_plane_vias_targeting(
             &board,
             &rules,
             &conn,
             &settings,
             &[],
             &carve,
+            &target,
         )
     }) {
         Ok(p) => p,
@@ -1327,6 +1411,44 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
                     "blocked_by": detail.map(|d| d.blocked_by.iter().map(|b| pad_label(*b)).collect::<Vec<_>>()).unwrap_or_default() })
         })
         .collect();
+    let planes: Vec<Value> = plan
+        .planes
+        .iter()
+        .map(|c| {
+            use konnect_route::fanout::PlaneChoiceReason as Why;
+            let mut zones: Vec<&str> = c
+                .pieces
+                .iter()
+                .filter_map(|z| board.zones[z.index()].zone_name.as_deref())
+                .collect();
+            zones.sort_unstable();
+            zones.dedup();
+            let others: Vec<&str> = c
+                .other_layers
+                .iter()
+                .map(|l| board.layers.name(*l))
+                .collect();
+            let why = match c.reason {
+                Why::Named => "named by the caller",
+                Why::OnlyLayer => "the net's only filled layer",
+                Why::LargestInnerPlane => {
+                    "the net's inner layer with the most filled copper (outer pours are cut up by pads and tracks)"
+                }
+                Why::LargestOuterPour => {
+                    "no inner layer carries the net: its outer layer with the most filled copper"
+                }
+            };
+            json!({
+                "net": board.net(c.net).name,
+                "layer": board.layers.name(c.layer),
+                "zones": zones,
+                "pieces": c.pieces.len(),
+                "chosen": c.reason,
+                "why": why,
+                "other_layers": others,
+            })
+        })
+        .collect();
     let written = routing.item_count() > 0;
     if written {
         if let Err(e) =
@@ -1350,6 +1472,7 @@ fn plan_plane_vias_blocking(args: &Value) -> anyhow::Result<CallToolResult> {
         "retried_sites": plan.stats.retried_sites,
         "failed": failed.len(),
         "failures": failed,
+        "planes": planes,
         "carve_zones": carve,
         "carves_by_zone": carves_by_zone,
         "carving_sites": carving_sites,

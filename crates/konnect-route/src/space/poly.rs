@@ -16,6 +16,7 @@
 
 use konnect_geom::{point_segment_distance_cmp, BBox, Containment, Coord, Point, Polygon};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 const OUT: u8 = 0;
 const IN: u8 = 1;
@@ -65,6 +66,100 @@ fn crossing_right_of(a: Point, b: Point, p: Point) -> bool {
     }
 }
 
+/// The boundary of the region the rings enclose, without its zero-width
+/// slits.
+///
+/// KiCad saves a zone fill fractured: one ring per piece, every void joined
+/// to the outline (or to another void) by a slit the ring runs along once in
+/// each direction. Copper lies on both sides of a slit, so it is no boundary:
+/// a disc that straddles one is still inside the fill. Along every line that
+/// carries more than one edge, the stretches covered an even number of times
+/// are dropped and those covered an odd number of times kept, which also
+/// handles a slit whose two sides are split at different vertices. Crossing
+/// parity, and so point containment off the slits, is unchanged; a point on
+/// a slit becomes inside.
+fn cancel_slits(edges: Vec<(Point, Point)>) -> Vec<(Point, Point)> {
+    fn gcd(a: i64, b: i64) -> i64 {
+        if b == 0 {
+            a.abs()
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    // Line key: reduced direction (pointing right, or up when vertical) and
+    // the line's offset; edges on it by their position along the direction.
+    type Line = (i64, i64, i128);
+    let mut lines: BTreeMap<Line, Vec<usize>> = BTreeMap::new();
+    let along = |d: (i64, i64), p: Point| -> i128 {
+        i128::from(d.0) * i128::from(p.x) + i128::from(d.1) * i128::from(p.y)
+    };
+    let dir = |(a, b): (Point, Point)| -> Option<(i64, i64)> {
+        let (dx, dy) = (
+            i64::from(b.x) - i64::from(a.x),
+            i64::from(b.y) - i64::from(a.y),
+        );
+        let g = gcd(dx, dy);
+        if g == 0 {
+            return None;
+        }
+        let (dx, dy) = (dx / g, dy / g);
+        Some(if dx < 0 || (dx == 0 && dy < 0) {
+            (-dx, -dy)
+        } else {
+            (dx, dy)
+        })
+    };
+    for (i, &e) in edges.iter().enumerate() {
+        if let Some(d) = dir(e) {
+            let c = i128::from(d.0) * i128::from(e.0.y) - i128::from(d.1) * i128::from(e.0.x);
+            lines.entry((d.0, d.1, c)).or_default().push(i);
+        }
+    }
+    if lines.values().all(|v| v.len() == 1) {
+        return edges;
+    }
+    let mut keep = vec![true; edges.len()];
+    let mut extra: Vec<(Point, Point)> = Vec::new();
+    for (&(dx, dy, _), members) in &lines {
+        if members.len() < 2 {
+            continue;
+        }
+        // Coverage changes along the line: +1 where an edge starts, -1 where
+        // it ends.
+        let mut steps: BTreeMap<i128, (Point, i32)> = BTreeMap::new();
+        for &i in members {
+            keep[i] = false;
+            let (a, b) = edges[i];
+            let (ta, tb) = (along((dx, dy), a), along((dx, dy), b));
+            let ((t0, p0), (t1, p1)) = if ta <= tb {
+                ((ta, a), (tb, b))
+            } else {
+                ((tb, b), (ta, a))
+            };
+            steps.entry(t0).or_insert((p0, 0)).1 += 1;
+            steps.entry(t1).or_insert((p1, 0)).1 -= 1;
+        }
+        let mut cover = 0i32;
+        let mut from: Option<Point> = None;
+        for (p, step) in steps.into_values() {
+            if let Some(a) = from {
+                if cover % 2 != 0 {
+                    extra.push((a, p));
+                }
+            }
+            cover += step;
+            from = Some(p);
+        }
+    }
+    let mut out: Vec<(Point, Point)> = edges
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(e, k)| k.then_some(e))
+        .collect();
+    out.extend(extra);
+    out
+}
+
 impl PolyIndex {
     /// Build with roughly `target_cells` grid cells (at least a 2 µm pitch).
     pub(crate) fn with_target(poly: &Polygon, target_cells: usize) -> Self {
@@ -75,6 +170,7 @@ impl PolyIndex {
                 edges.push((ring[i], ring[(i + 1) % n]));
             }
         }
+        let edges = cancel_slits(edges);
         let bbox = poly.bbox();
         let (w, h) = (bbox.width().max(1) as f64, bbox.height().max(1) as f64);
         let target = target_cells.max(16) as f64;
@@ -467,5 +563,55 @@ mod tests {
         assert!(idx.disc_outside(Point::new(75_000, 25_000), 5_000));
         assert!(!idx.disc_outside(Point::new(75_000, 25_000), 5_001));
         assert!(idx.disc_inside(Point::new(60_000, 20_000), 10_000));
+    }
+
+    /// A 100 µm square fill with a 20 µm void in the middle, saved as KiCad
+    /// saves it: one ring, the void joined to the left edge by a slit along
+    /// y = 50 µm whose return side is split at x = 20 µm.
+    fn fractured() -> Polygon {
+        let ring = ring(&[
+            (0, 0),
+            (100_000, 0),
+            (100_000, 100_000),
+            (0, 100_000),
+            (0, 50_000),
+            (40_000, 50_000),
+            (40_000, 60_000),
+            (60_000, 60_000),
+            (60_000, 40_000),
+            (40_000, 40_000),
+            (40_000, 50_000),
+            (20_000, 50_000),
+            (0, 50_000),
+        ]);
+        Polygon::new(ring, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn a_fracture_slit_is_copper_and_the_void_it_leads_to_is_not() {
+        for target in [16, 400, 100_000] {
+            let idx = PolyIndex::with_target(&fractured(), target);
+            // On the slit, and a disc straddling it: inside the fill.
+            assert_eq!(
+                idx.contains(Point::new(10_000, 50_000)),
+                Containment::Inside
+            );
+            assert_eq!(
+                idx.contains(Point::new(30_000, 50_000)),
+                Containment::Inside
+            );
+            assert!(idx.disc_inside(Point::new(20_000, 52_000), 15_000));
+            // The void is still a void, and its rim a boundary.
+            assert!(idx.disc_outside(Point::new(50_000, 50_000), 10_000));
+            assert!(!idx.disc_inside(Point::new(25_000, 50_000), 15_001));
+            assert!(idx.disc_inside(Point::new(25_000, 50_000), 15_000));
+            assert_eq!(
+                idx.contains(Point::new(40_000, 45_000)),
+                Containment::Boundary
+            );
+            // The outline where the slit starts is still the outline.
+            assert_eq!(idx.contains(Point::new(0, 50_000)), Containment::Boundary);
+            assert!(!idx.disc_inside(Point::new(5_000, 50_000), 5_001));
+        }
     }
 }

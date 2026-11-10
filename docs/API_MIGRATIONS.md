@@ -3,6 +3,35 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: plane vias reach one named or chosen plane, and fill slits are copper
+
+`plan_plane_vias` rejected nearly every site of a net that pours on several
+layers (a ground plane on In1.Cu plus pours on F.Cu and B.Cu) with `via:
+outside its own plane piece`. Two causes. KiCad saves a fill as one ring per
+piece, each void joined to the outline by a zero-width slit, and the
+containment test took those slits for the plane's edge, so a via whose disc
+crossed one was refused although copper lies on both sides. And a site had to
+lie inside the net's fill on every layer it pours on, which outer pours cut up
+by pads and tracks rarely allow. Slits are now copper, and each net has one
+target plane:
+
+- New `plane_layer` (a copper layer) and `plane_zone` (an exact zone name)
+  name it. Only nets with filled copper there are planned; a name that
+  matches no filled copper is refused.
+- Without them, a net's target is its inner layer with the most filled
+  copper, else (a net on the outer layers only) its larger outer pour. A net
+  on one layer is unchanged.
+- The reply adds `planes`: per planned net its `layer`, `zones`, `pieces`,
+  `chosen` (`named`, `only_layer`, `largest_inner_plane`,
+  `largest_outer_pour`), `why` and `other_layers`.
+
+A via must lie inside the target plane only. On the net's other layers a
+through via lands in that pour or in a gap of it, and the refill joins or
+clears it. A pad now counts as joined when copper ties it to the target plane:
+a pad that only sits in a pour fragment on another layer, which the earlier
+check took for joined, gets a via. To keep the earlier reading for such a
+net, name the outer pour with `plane_layer`.
+
 ## Unreleased: `run_closed_board_edit` runs a closed-board tool on a board KiCad has open
 
 A layout session alternates between tools that need the board open in KiCad
