@@ -138,7 +138,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "verification",
         description: "DRC, design rules, layer constraints, conditional custom rules, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "config",

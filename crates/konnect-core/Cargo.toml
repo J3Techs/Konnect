@@ -39,6 +39,8 @@ tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
+# The window-level close request `run_closed_board_edit` sends to a PCB editor.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove

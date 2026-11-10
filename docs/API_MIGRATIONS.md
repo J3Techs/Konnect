@@ -3,6 +3,77 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `run_closed_board_edit` runs a closed-board tool on a board KiCad has open
+
+A layout session alternates between tools that need the board open in KiCad
+and tools that edit the saved file and refuse until it is closed (net classes,
+design rules, the stackup, the closed-board paths of placement, flip, pad
+fabrication properties and placed-footprint models). Each switch meant saving,
+closing the editor by hand, calling the tool and opening the board again.
+
+New tool `run_closed_board_edit` (`verification` toolset) does that around one
+named tool:
+
+```json
+{ "board": "…/board.kicad_pcb", "tool": "set_design_rules",
+  "arguments": { "min_clearance": 0.15 } }
+```
+
+It confirms over IPC that KiCad holds exactly this board, saves it (unsaved
+editor changes are written to disk), sends the standalone PCB editor the same
+close request its close button sends, waits until the process has exited and
+KiCad has removed its own lock, runs `tool` through the normal dispatch,
+starts the standalone PCB editor on the board again and waits until the board
+answers over IPC. The result lists every step with its timing, `status`, the
+nested tool's own result under `tool_result`, `editor_reopened` and, when the
+user has something to do, `next_action`.
+
+Nothing about the closed-board check changes: the nested tool has to prove the
+board closed on its own evidence, exactly as in a direct call. The tool never
+terminates a process and never removes a lock file.
+
+| `status` | Meaning | `isError` |
+|---|---|---|
+| `complete` | The nested tool ran without error; the editor is as requested. | false |
+| `complete_editor_not_reopened` | The edit stands; the editor could not be started or did not answer in time. `next_action` says what to do. | false |
+| `tool_failed` | The nested tool returned an error (its `error` is this call's `error`). The editor was still reopened; see `editor_reopened`. | true |
+| `board_state_unknown` | KiCad did not settle whether it holds the board (busy, timed out). Nothing was changed; the tool was not run. | true |
+| `editor_not_closable` | KiCad holds the board, but the editor window could not be identified, or it is a window of the project manager. Nothing was changed. | true |
+| `save_failed` | KiCad refused the save (busy, or showing a dialog). Nothing was changed. | true |
+| `editor_not_closed` | The board was saved and the editor asked to close, but it is still open (for example behind a prompt, named in `message`) or its lock remains. Nothing was edited. | true |
+
+The last four carry `error.kind: "plan_blocked"` with the status as the
+reason.
+
+Only tools whose registered board access has a closed-board file path may be
+named: closed-only, live-preferred with file fallback, and apply-mode
+dependent. `create_netclass`, `assign_net_to_class`,
+`remove_netclass_patterns`, `set_design_rules` and `set_predefined_sizes` are
+now registered as closed-only, which they always were in behaviour; the only
+other effect is that the Claude `pre-pcb-closed` hook now also fires for them.
+The nested tool's toolset must be loaded.
+
+`reopen` is `if_was_open` (default), `always` or `never`. If KiCad does not
+hold the board there is nothing to close and the tool is simply run. A dry run
+and its apply are separate calls with a KiCad save between them; KiCad
+normalises a file Konnect edited when it saves, so a revision from the dry run
+can be stale by the apply. Use `reopen: "never"` on the dry run, apply
+directly while the board is closed, and `reopen: "always"` on the last edit.
+
+Limits. A PCB editor that is a window of the KiCad project manager is refused:
+the project manager cannot be asked over IPC to open its editor again, and a
+standalone editor started beside it is not reachable over IPC, so the board
+could not be reopened after the edit. Quit KiCad and open the board in the
+standalone PCB editor (`pcbnew <board>`), or close that editor window by hand
+and call the tool directly. The
+editor window is recognised by its English title, `<board> — PCB Editor`; with
+a translated UI only a single standalone editor is accepted. Windows is tested
+against KiCad 10.0.7. The Linux path (`wmctrl`, X11 or XWayland only) and the
+macOS path (`osascript` quit of the standalone `pcbnew` application) are
+implemented and untested. On Linux and macOS a second KiCad instance listens
+on `api-<pid>.sock`; if the reopened editor ends up there, the result names
+that endpoint, because the server resolves its IPC address once at startup.
+
 ## Unreleased: the project manager running without a PCB editor no longer blocks saved-file board edits
 
 With only KiCad's project manager running, IPC answers but refuses

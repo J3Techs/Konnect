@@ -33,6 +33,25 @@ pub fn find_gui(configured_binary: &str, configured_cli: &str) -> Option<PathBuf
         .or_else(|| gui_candidates().into_iter().find(|path| path.is_file()))
 }
 
+/// Find the standalone PCB editor of the installation [`find_gui`] selects.
+///
+/// It sits beside the project manager, except in the macOS bundle, where each
+/// editor is an application of its own under `Contents/Applications`.
+pub fn find_pcb_editor(configured_binary: &str, configured_cli: &str) -> Option<PathBuf> {
+    let gui = find_gui(configured_binary, configured_cli)?;
+    let directory = gui.parent()?;
+    let name = if cfg!(target_os = "windows") {
+        "pcbnew.exe"
+    } else {
+        "pcbnew"
+    };
+    let mut candidates = vec![directory.join(name)];
+    if let Some(contents) = directory.parent() {
+        candidates.push(contents.join("Applications/pcbnew.app/Contents/MacOS/pcbnew"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 fn cli_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {

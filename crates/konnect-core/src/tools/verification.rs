@@ -65,7 +65,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_design_rules",
             "Return the current design rule constraints defined in the sibling KiCAD project file.",
@@ -111,7 +112,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_set_predefined_sizes(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_predefined_sizes",
             "Return the PCB editor Pre-defined Sizes list from the sibling .kicad_pro: \
@@ -166,6 +168,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_launch_kicad_ui(args, ctx).await }
         ),
+        crate::tools::closed_board_edit::tool(),
         tool!(
             "copy_routing_pattern",
             "Copy a routing pattern (traces and vias) from one region of the board to another.",

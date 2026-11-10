@@ -262,7 +262,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "name"]
             }),
             |args, ctx| async move { handle_create_netclass(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "get_netclasses",
             "Read every netclass in the project's design rules, with its settings, \
@@ -318,7 +319,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "netclass"]
             }),
             |args, ctx| async move { handle_assign_net_to_class(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "remove_netclass_patterns",
             "Remove netclass_patterns entries from the sibling .kicad_pro, by their exact \
@@ -340,7 +342,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "patterns"]
             }),
             |args, ctx| async move { handle_remove_netclass_patterns(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "add_routing",
             "Add many copper tracks and through vias to the board KiCad holds open, in one \

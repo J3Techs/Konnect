@@ -2632,6 +2632,15 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Save one proven-open board document.
+    pub fn save_board_in(&self, document: kiapi::common::types::DocumentSpecifier) -> Result<()> {
+        let cmd = kiapi::common::commands::SaveDocument {
+            document: Some(document),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
+        Ok(())
+    }
+
     /// Save the open board, waiting out AS_BUSY (a zone fill in progress)
     /// for up to `timeout`. See [`retry_while_busy`].
     pub fn save_board_when_ready(&self, timeout: std::time::Duration) -> Result<()> {
@@ -5101,6 +5110,20 @@ impl KiCadIpcClient {
             );
         }
         Ok(any)
+    }
+
+    /// The full path KiCad itself reports for one of its binaries, such as
+    /// `pcbnew`. The answer comes from the running installation, so a
+    /// relaunch uses the same KiCad the user had open.
+    pub fn get_kicad_binary_path(&self, binary_name: &str) -> Result<String> {
+        let cmd = kiapi::common::commands::GetKiCadBinaryPath {
+            binary_name: binary_name.to_string(),
+        };
+        let response: kiapi::common::commands::PathResponse = unpack_required(
+            self.send_command(&cmd, "kiapi.common.commands.GetKiCadBinaryPath")?,
+            "GetKiCadBinaryPath",
+        )?;
+        Ok(response.path)
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
