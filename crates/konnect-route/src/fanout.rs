@@ -4,16 +4,28 @@
 //! choose a via site and a stub: candidates are 8 octilinear exits × a few
 //! distances from the pad edge plus corner exits; each is checked exactly
 //! (annulus and clearance on every layer, hole-to-hole, hole and edge
-//! clearance, the via floor) and must lie inside its own net's plane piece,
+//! clearance, the via floor) and must lie inside its own net's target plane,
 //! shrunk by the margin, and outside every other net's island on each plane
 //! layer the via crosses. A greedy weighted independent set per tile picks
 //! non-conflicting sites. The plan is applied locked, in its own commit.
 //!
+//! # The target plane
+//!
+//! A net may pour on several layers: a solid inner plane plus outer pours
+//! that pads, tracks and other nets' zones cut into pieces. The vias of a
+//! net reach one of them, its target plane ([`choose_planes`]): the plane
+//! the caller names ([`PlaneTarget`]), else the inner layer with the most
+//! filled copper of the net, else (a net on outer layers only) the outer
+//! layer with the most. A pad counts as joined when copper ties it to a
+//! piece of the target plane; a pad that only touches a pour of its net on
+//! another layer, which nothing ties to the target, still gets a via.
+//!
 //! # Units
 //!
 //! The unit of work is an unjoined *island*, not a pad: pads already tied
-//! together by copper (duplicate-number pads, overlapping power pads) need
-//! one via between them. Candidates come from every SMD pad of the island.
+//! together by copper (duplicate-number pads, overlapping power pads, pads
+//! in one pour that does not reach the target plane) need one via between
+//! them. Candidates come from every SMD pad of the island.
 //! Islands that already carry a track, arc or via are escaped and skipped
 //! (they belong to a deliberate escape, or to a route that still has to
 //! reach the plane), as are islands on footprints the caller excludes.
@@ -31,9 +43,12 @@
 //! - hole-to-hole to every hole, hole clearance both ways, copper-to-edge;
 //! - via and track keepouts;
 //! - the via must not overlap any SMD pad (no accidental via-in-pad);
-//! - on every plane layer that carries the net, the via disc grown by
-//!   `plane_margin` lies inside one of the net's filled pieces, and at least
-//!   `min_spokes` of four spoke directions reach plane copper;
+//! - on the net's target plane layer ([`choose_planes`]), the via disc grown
+//!   by `plane_margin` lies inside one of the net's filled pieces there, and
+//!   at least `min_spokes` of four spoke directions reach plane copper. On
+//!   the other layers the net pours on, a through via lands in that pour or
+//!   in a gap of it, and the refill joins or clears it: nothing is required
+//!   there;
 //! - on every layer, the grown disc stays outside other nets' islands
 //!   (higher-priority or flagged pieces: the small pours inside a plane),
 //!   except the islands of zones the caller names to carve
@@ -123,13 +138,6 @@ pub struct FanoutSettings {
     pub exclude_escaped_arrays: bool,
     #[serde(default = "default_array_min_pads")]
     pub array_min_pads: u32,
-    /// A third pass for islands the first two found no site for: the via
-    /// must lie inside its own net's plane piece (with spokes) on at least
-    /// one plane layer of the net instead of on every one; on the others it
-    /// perforates whatever is poured there, as any through via does (other
-    /// nets' islands are still avoided when [`Self::avoid_other_islands`]).
-    #[serde(default = "yes")]
-    pub partial_plane_fallback: bool,
     /// A retry round for islands the selection left without a site: every
     /// pass is generated for them (also when an early pass found legal
     /// candidates that all conflicted), plus [`Self::far_directions`] exits
@@ -143,7 +151,7 @@ pub struct FanoutSettings {
     /// Evenly spaced exit directions of the retry round's far exits.
     #[serde(default = "default_far_directions")]
     pub far_directions: u8,
-    /// Require the via inside its own net's plane pieces (S2 plane fanout).
+    /// Require the via inside its own net's target plane (S2 plane fanout).
     /// Off for tap vias ([`tap`]), which only have to reach a layer.
     #[serde(default = "yes")]
     pub require_own_plane: bool,
@@ -207,7 +215,6 @@ impl Default for FanoutSettings {
             snap: default_snap(),
             exclude_escaped_arrays: true,
             array_min_pads: default_array_min_pads(),
-            partial_plane_fallback: true,
             retry_failed: true,
             far_gaps: default_far_gaps(),
             far_directions: default_far_directions(),
@@ -333,9 +340,6 @@ pub struct FanoutStats {
     /// Footprints left alone as hand-escaped ball grids.
     #[serde(default)]
     pub escaped_arrays: usize,
-    /// Sites from the partial-plane pass.
-    #[serde(default)]
-    pub partial_plane_sites: usize,
     /// Islands placed by the retry round ([`FanoutSettings::retry_failed`]).
     #[serde(default)]
     pub retried_sites: usize,
@@ -353,6 +357,126 @@ pub struct PlaneViaPlan {
     pub details: Vec<FailureDetail>,
     #[serde(default)]
     pub stats: FanoutStats,
+    /// Per planned net, the plane its vias reach; in net order.
+    #[serde(default)]
+    pub planes: Vec<PlaneChoice>,
+}
+
+/// Which plane the vias of a net must reach. The default leaves the choice
+/// to [`choose_planes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaneTarget {
+    /// Only filled pieces on this layer.
+    #[serde(default)]
+    pub layer: Option<LayerId>,
+    /// Only filled pieces of the zone with this exact name.
+    #[serde(default)]
+    pub zone: Option<String>,
+}
+
+impl PlaneTarget {
+    fn is_named(&self) -> bool {
+        self.layer.is_some() || self.zone.is_some()
+    }
+
+    fn admits(&self, z: &crate::board::ZonePiece) -> bool {
+        self.layer.is_none_or(|l| z.layer == l)
+            && self
+                .zone
+                .as_ref()
+                .is_none_or(|n| z.zone_name.as_ref() == Some(n))
+    }
+}
+
+/// Why a layer is a net's target plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaneChoiceReason {
+    /// The only layer the caller's [`PlaneTarget`] admits.
+    Named,
+    /// The net pours on this layer only.
+    OnlyLayer,
+    /// The inner layer with the most filled copper of the net.
+    LargestInnerPlane,
+    /// No inner layer carries the net: the outer layer with the most filled
+    /// copper of it.
+    LargestOuterPour,
+}
+
+/// The plane the vias of one net reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaneChoice {
+    pub net: NetId,
+    pub layer: LayerId,
+    /// The target's filled pieces (`board.zones` indexes), ascending.
+    pub pieces: Vec<ZoneId>,
+    pub reason: PlaneChoiceReason,
+    /// Other layers with filled copper of the net. A through via passes
+    /// them too and lands in that pour or in a gap of it; nothing is
+    /// required of the site there.
+    pub other_layers: Vec<LayerId>,
+}
+
+/// Per plane net (a net with a filled zone piece), the plane its vias must
+/// reach, in net order.
+///
+/// Of the net's filled pieces that `target` admits (all of them by default),
+/// one layer is kept: the only one; else the inner layer whose pieces have
+/// the largest total area; else, for a net on the two outer layers only,
+/// the outer layer with the largest. Ties go to the layer nearer the front.
+/// An inner plane is preferred because outer pours are cut up by pads,
+/// tracks and other nets' zones, so few sites lie inside them. A net with
+/// no admitted piece is left out: nothing is planned for it.
+pub fn choose_planes(board: &RouteBoard, target: &PlaneTarget) -> Vec<PlaneChoice> {
+    let outer = [board.layers.front(), board.layers.back()];
+    let mut out = Vec::new();
+    for net in crate::connectivity::plane_nets(board) {
+        let own = || {
+            board
+                .zones
+                .iter()
+                .filter(move |z| z.filled && z.net == Some(net))
+        };
+        let mut area: BTreeMap<LayerId, i128> = BTreeMap::new();
+        for z in own().filter(|z| target.admits(z)) {
+            *area.entry(z.layer).or_default() += z.region.area2().abs();
+        }
+        // Largest area first; `min_by` keeps the first (front-most) of equals.
+        let largest = |inner: bool| {
+            area.iter()
+                .filter(|(l, _)| outer.contains(&Some(**l)) != inner)
+                .min_by(|a, b| b.1.cmp(a.1))
+                .map(|(l, _)| *l)
+        };
+        let (layer, reason) = match (area.len(), largest(true), largest(false)) {
+            (1, Some(l), _) | (1, None, Some(l)) => (
+                l,
+                if target.is_named() {
+                    PlaneChoiceReason::Named
+                } else {
+                    PlaneChoiceReason::OnlyLayer
+                },
+            ),
+            (_, Some(l), _) => (l, PlaneChoiceReason::LargestInnerPlane),
+            (_, None, Some(l)) => (l, PlaneChoiceReason::LargestOuterPour),
+            (_, None, None) => continue,
+        };
+        let mut other_layers: Vec<LayerId> =
+            own().map(|z| z.layer).filter(|l| *l != layer).collect();
+        other_layers.sort();
+        other_layers.dedup();
+        out.push(PlaneChoice {
+            net,
+            layer,
+            pieces: own()
+                .filter(|z| z.layer == layer && target.admits(z))
+                .map(|z| z.id)
+                .collect(),
+            reason,
+            other_layers,
+        });
+    }
+    out
 }
 
 impl PlaneViaPlan {
@@ -441,11 +565,42 @@ pub fn plan_plane_vias_carving(
     exclude: &[FootprintId],
     carve_zones: &[String],
 ) -> PlaneViaPlan {
+    plan_plane_vias_targeting(
+        board,
+        rules,
+        connectivity,
+        settings,
+        exclude,
+        carve_zones,
+        &PlaneTarget::default(),
+    )
+}
+
+/// [`plan_plane_vias_carving`], with the plane the vias must reach named by
+/// the caller ([`PlaneTarget`]; the default leaves it to [`choose_planes`]).
+/// Only nets with a filled piece the target admits are planned;
+/// [`PlaneViaPlan::planes`] says which plane each got and why.
+pub fn plan_plane_vias_targeting(
+    board: &RouteBoard,
+    rules: &dyn RuleTable,
+    connectivity: &ConnectivityReport,
+    settings: &FanoutSettings,
+    exclude: &[FootprintId],
+    carve_zones: &[String],
+    target: &PlaneTarget,
+) -> PlaneViaPlan {
     let t0 = std::time::Instant::now();
     let policy = ArcPolicy::default();
     let space = Space::new(board, rules, &policy, true);
     let carved = carve_mask(board, carve_zones);
-    let mut plan = PlaneViaPlan::default();
+    let mut plan = PlaneViaPlan {
+        planes: choose_planes(board, target),
+        ..Default::default()
+    };
+    let mut target_pieces = vec![false; board.zones.len()];
+    for z in plan.planes.iter().flat_map(|c| &c.pieces) {
+        target_pieces[z.index()] = true;
+    }
     plan.stats.index_ms = t0.elapsed().as_millis() as u64;
 
     let mut exclude = exclude.to_vec();
@@ -456,7 +611,14 @@ pub fn plan_plane_vias_carving(
         exclude.sort_unstable();
         exclude.dedup();
     }
-    let units = collect_units(board, connectivity, settings, &exclude, &mut plan);
+    let units = collect_units(
+        board,
+        connectivity,
+        settings,
+        &exclude,
+        &target_pieces,
+        &mut plan,
+    );
     plan.stats.eligible_islands = units.len();
     plan.stats.eligible_pads = units.iter().map(|u| u.pads.len()).sum();
 
@@ -466,6 +628,7 @@ pub fn plan_plane_vias_carving(
         rules,
         settings,
         carved: &carved,
+        target: &target_pieces,
         keepouts: &[],
     };
     let generated: Vec<(Vec<Cand>, Rejections)> = units
@@ -523,7 +686,6 @@ pub fn plan_plane_vias_carving(
                 let c = &cands[ui][ci];
                 plan.stats.floor_vias += usize::from(c.floor_via);
                 plan.stats.minimum_stubs += usize::from(c.min_stub);
-                plan.stats.partial_plane_sites += usize::from(c.partial);
                 plan.sites.push(PlaneViaSite {
                     pad: c.pad,
                     net: u.net,
@@ -626,6 +788,9 @@ struct Ctx<'a> {
     /// By zone piece (`board.zones` index): pieces of zones named to carve,
     /// which never reject a via site (empty: none).
     carved: &'a [bool],
+    /// By zone piece: the pieces of the nets' target planes, the only ones
+    /// the own-plane test accepts (empty: none).
+    target: &'a [bool],
     /// Regions no via or stub may touch (caller keep-out boxes).
     keepouts: &'a [Shape],
 }
@@ -633,6 +798,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn is_carved(&self, zone: ZoneId) -> bool {
         self.carved.get(zone.index()).copied().unwrap_or(false)
+    }
+
+    fn is_target(&self, zone: ZoneId) -> bool {
+        self.target.get(zone.index()).copied().unwrap_or(false)
     }
 }
 
@@ -714,15 +883,24 @@ fn collect_units(
     conn: &ConnectivityReport,
     settings: &FanoutSettings,
     exclude: &[FootprintId],
+    target_pieces: &[bool],
     plan: &mut PlaneViaPlan,
 ) -> Vec<Unit> {
-    let joins = conn.plane_joins(board);
-    plan.stats.plane_nets = joins.len();
+    let nets: Vec<NetId> = plan.planes.iter().map(|c| c.net).collect();
+    plan.stats.plane_nets = nets.len();
     let mut units = Vec::new();
-    for j in &joins {
-        let nc = &conn.nets[j.net.index()];
+    for net in nets {
+        let Some(nc) = conn.nets.get(net.index()) else {
+            continue;
+        };
         for island in &nc.islands {
-            if !island.has_pad() || island.items.iter().any(|i| matches!(i, ItemRef::Zone(_))) {
+            // Joined: copper ties the island to a piece of the target plane.
+            // A pour of the net on another layer does not count.
+            let joined = island
+                .items
+                .iter()
+                .any(|i| matches!(i, ItemRef::Zone(z) if target_pieces[z.index()]));
+            if !island.has_pad() || joined {
                 continue;
             }
             plan.stats.unjoined_islands += 1;
@@ -760,7 +938,7 @@ fn collect_units(
                 }
             }
             units.push(Unit {
-                net: j.net,
+                net,
                 anchor: board.pads[smd[0].index()].center,
                 pads: smd,
             });
@@ -784,8 +962,6 @@ struct Cand {
     cost: i64,
     floor_via: bool,
     min_stub: bool,
-    /// From the partial-plane pass.
-    partial: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1012,7 +1188,6 @@ fn try_exit(
     t_exit: i64,
     gap: Coord,
     rank: i64,
-    partial: bool,
 ) -> Result<Cand, (Point, &'static str, u8)> {
     let space = ctx.space;
     let mut last = (pp.c, "no candidate", 0u8);
@@ -1033,7 +1208,7 @@ fn try_exit(
                 continue;
             }
         }
-        let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers, partial) {
+        let via_key = match check_via(ctx, cache, net, via, diameter, drill, own_layers) {
             Ok(k) => k,
             Err(why) => {
                 last = (via, why.label(), why.class());
@@ -1078,7 +1253,6 @@ fn try_exit(
                 cost,
                 floor_via,
                 min_stub,
-                partial,
             });
         }
     }
@@ -1103,12 +1277,13 @@ fn candidates_with(
     let mut rej = Rejections::default();
     let net = u.net;
 
-    // Plane layers carrying the net (none when the via need not join one).
+    // The layer of the net's target plane (none when the via need not join
+    // one).
     let own_layers: Vec<LayerId> = {
         let mut v: Vec<LayerId> = space
             .planes
             .iter()
-            .filter(|p| s.require_own_plane && p.net == Some(net))
+            .filter(|p| s.require_own_plane && p.net == Some(net) && ctx.is_target(p.zone))
             .map(|p| p.layer)
             .collect();
         v.sort();
@@ -1122,41 +1297,21 @@ fn candidates_with(
         .collect();
 
     // Pass 1: the octilinear and corner exits at the near gaps. Pass 2, only
-    // when pass 1 found nothing: more directions, farther out. Pass 3, only
-    // when both found nothing: every gap and direction again, joining the
-    // plane on one of its layers ([`FanoutSettings::partial_plane_fallback`]).
-    let all_gaps: Vec<Coord> = s
-        .exit_gaps
-        .iter()
-        .chain(&s.fallback_gaps)
-        .copied()
-        .filter(|&g| g > 0)
-        .collect();
-    let third_dirs: u32 = if s.partial_plane_fallback && own_layers.len() > 1 {
-        u32::from(s.fallback_directions).max(8)
-    } else {
-        0
-    };
+    // when pass 1 found nothing: more directions, farther out. The far exits
+    // run in the retry round only.
     let far: Vec<Coord> = s.far_gaps.iter().copied().filter(|&g| g > 0).collect();
     let far_dirs: u32 = if exhaustive {
         s.far_directions.into()
     } else {
         0
     };
-    // (directions, corner exits, gaps, rank of the first gap, partial plane)
-    let passes: [(u32, bool, &[Coord], i64, bool); 4] = [
-        (8, s.corner_exits, &s.exit_gaps, 0, false),
-        (
-            s.fallback_directions.into(),
-            false,
-            &s.fallback_gaps,
-            3,
-            false,
-        ),
-        (far_dirs, false, &far, 6, false),
-        (third_dirs, s.corner_exits, &all_gaps, 9, true),
+    // (directions, corner exits, gaps, rank of the first gap)
+    let passes: [(u32, bool, &[Coord], i64); 3] = [
+        (8, s.corner_exits, &s.exit_gaps, 0),
+        (s.fallback_directions.into(), false, &s.fallback_gaps, 3),
+        (far_dirs, false, &far, 6),
     ];
-    for (pass, &(n_dirs, corners, gaps, rank0, partial)) in passes.iter().enumerate() {
+    for (pass, &(n_dirs, corners, gaps, rank0)) in passes.iter().enumerate() {
         if n_dirs == 0 {
             continue;
         }
@@ -1183,7 +1338,6 @@ fn candidates_with(
                         t_exit,
                         gap,
                         rank0 + gi as i64,
-                        partial,
                     ) {
                         Ok(c) => out.push(c),
                         Err((via, why, kind)) => {
@@ -1281,26 +1435,21 @@ fn check_via(
     diameter: Coord,
     drill: Coord,
     own_layers: &[LayerId],
-    partial: bool,
 ) -> Result<SubjectKey, ViaReject> {
     let space = ctx.space;
     let s = ctx.settings;
     let r = radius_of(diameter);
     let grown = r + s.plane_margin;
-    // Plane tests first: they are cheap and reject most far-off sites. A
-    // partial-plane candidate needs one own layer, the others are skipped.
-    let mut joined = 0usize;
-    let mut spokes_short = false;
+    // Plane tests first: they are cheap and reject most far-off sites. Only
+    // the target plane counts; the net's pours on other layers take the via
+    // as it comes.
     for &l in own_layers {
         let inside = space
             .planes
             .iter()
-            .filter(|p| p.net == Some(net) && p.layer == l)
+            .filter(|p| p.net == Some(net) && p.layer == l && ctx.is_target(p.zone))
             .find(|p| p.index.disc_inside(via, grown));
         let Some(piece) = inside else {
-            if partial {
-                continue;
-            }
             return Err(ViaReject::OutsideOwnPlane);
         };
         if s.min_spokes > 0 {
@@ -1320,21 +1469,9 @@ fn check_via(
                 best = best.max(n);
             }
             if best < s.min_spokes {
-                if partial {
-                    spokes_short = true;
-                    continue;
-                }
                 return Err(ViaReject::FewSpokes);
             }
         }
-        joined += 1;
-    }
-    if partial && joined == 0 {
-        return Err(if spokes_short {
-            ViaReject::FewSpokes
-        } else {
-            ViaReject::OutsideOwnPlane
-        });
     }
     // Islands of zones named to carve never reject a site: the refill cuts
     // an antipad around the via there.
@@ -2134,31 +2271,164 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_plane_site_joins_one_of_the_net_planes() {
-        // GND pours on In1 everywhere but on In2 only on the left: a pad on
-        // the right has no site inside both, but one inside In1.
+    fn the_vias_of_a_net_on_several_layers_reach_its_largest_inner_plane() {
+        // GND pours on In1 everywhere, on In2 and on F.Cu only on the left:
+        // a pad on the right has no site inside all three, but one inside
+        // In1, which is the target.
         let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        b.zone("GND", "F.Cu", (0.5, 0.5, 9.0, 9.5));
         b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
         b.zone("GND", "In2.Cu", (0.5, 0.5, 9.0, 9.5));
         let g = b.footprint("C2", (15.0, 5.0));
         b.smd_pad(g, "1", "GND", (15.0, 5.0), (0.6, 0.6), "F.Cu");
         let board = b.build();
-        let strict = plan(
+        let layer = |n: &str| board.layers.by_name(n).unwrap();
+        let p = plan(&board, &FanoutSettings::default());
+        assert_eq!(p.planes.len(), 1);
+        let choice = &p.planes[0];
+        assert_eq!(choice.layer, layer("In1.Cu"));
+        assert_eq!(choice.reason, PlaneChoiceReason::LargestInnerPlane);
+        assert_eq!(choice.pieces, vec![ZoneId(1)]);
+        assert_eq!(choice.other_layers, vec![layer("F.Cu"), layer("In2.Cu")]);
+        assert_eq!(p.sites.len(), 1, "{:?}", p.details);
+        let s = &p.sites[0];
+        // Inside the In1 pour, by the via's radius; outside the other two.
+        let r = s.via_diameter / 2;
+        assert!(s.via.x - r > 9_000_000 && s.via.x + r < 19_500_000);
+    }
+
+    fn plan_for(board: &RouteBoard, target: &PlaneTarget) -> PlaneViaPlan {
+        let rules = UniformRules::default();
+        let conn = ConnectivityReport::build(board, &ArcPolicy::default());
+        let s = FanoutSettings::default();
+        plan_plane_vias_targeting(board, &rules, &conn, &s, &[], &[], target)
+    }
+
+    #[test]
+    fn a_named_plane_layer_or_zone_replaces_the_default_choice() {
+        // As above, with the pad on the left where every pour lies.
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
+        b.zone("GND", "In2.Cu", (0.5, 0.5, 9.0, 9.5));
+        b.zone("VCC", "In2.Cu", (11.0, 0.5, 19.5, 9.5));
+        let g = b.footprint("C2", (10.0, 5.0));
+        b.smd_pad(g, "1", "GND", (10.0, 5.0), (0.6, 0.6), "F.Cu");
+        b.smd_pad(g, "2", "VCC", (10.0, 7.0), (0.6, 0.6), "F.Cu");
+        let mut board = b.build();
+        board.zones[1].zone_name = Some("GND_IN2".to_string());
+        let in2 = board.layers.by_name("In2.Cu").unwrap();
+        let gnd = board.net_by_name("GND").unwrap();
+
+        let by_layer = plan_for(
             &board,
-            &FanoutSettings {
-                partial_plane_fallback: false,
-                ..Default::default()
+            &PlaneTarget {
+                layer: Some(in2),
+                zone: None,
             },
         );
-        assert_eq!(strict.failed.len(), 1);
-        assert_eq!(strict.failed[0].1, FanoutFailure::OutsideOwnPlane);
+        // Both nets pour on In2.Cu: both are planned, each into its own.
+        assert_eq!(by_layer.planes.len(), 2);
+        assert!(by_layer
+            .planes
+            .iter()
+            .all(|c| c.layer == in2 && c.reason == PlaneChoiceReason::Named));
+        assert_eq!(by_layer.sites.len(), 2, "{:?}", by_layer.details);
+        let site = by_layer.sites.iter().find(|s| s.net == gnd).unwrap();
+        assert!(site.via.x + site.via_diameter / 2 <= 9_000_000);
+
+        let by_zone = plan_for(
+            &board,
+            &PlaneTarget {
+                layer: None,
+                zone: Some("GND_IN2".to_string()),
+            },
+        );
+        // Only the net of the named zone is planned.
+        assert_eq!(by_zone.planes.len(), 1);
+        assert_eq!(by_zone.planes[0].pieces, vec![ZoneId(1)]);
+        assert_eq!(by_zone.sites.len(), 1, "{:?}", by_zone.details);
+        assert_eq!(by_zone.sites[0].via, site.via);
+
+        // A plane nothing pours on plans nothing.
+        let none = plan_for(
+            &board,
+            &PlaneTarget {
+                layer: board.layers.by_name("B.Cu"),
+                zone: None,
+            },
+        );
+        assert!(none.planes.is_empty() && none.sites.is_empty() && none.failed.is_empty());
+    }
+
+    #[test]
+    fn a_pad_in_an_outer_pour_that_nothing_ties_to_the_target_plane_gets_a_via() {
+        // The pad sits in a GND pour on F.Cu; the plane is on In1.
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+        b.zone("GND", "F.Cu", (0.5, 0.5, 19.5, 9.5));
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
+        let g = b.footprint("C2", (10.0, 5.0));
+        b.smd_pad(g, "1", "GND", (10.0, 5.0), (0.6, 0.6), "F.Cu");
+        let board = b.build();
+        let p = plan(&board, &FanoutSettings::default());
+        assert_eq!(p.stats.unjoined_islands, 1);
+        assert_eq!(p.sites.len(), 1, "{:?}", p.details);
+        // With the outer pour as the target, the pad is already joined.
+        let f = plan_for(
+            &board,
+            &PlaneTarget {
+                layer: board.layers.front(),
+                zone: None,
+            },
+        );
+        assert_eq!(f.stats.unjoined_islands, 0);
+        assert!(f.sites.is_empty());
+    }
+
+    #[test]
+    fn a_net_on_the_outer_layers_only_targets_its_larger_pour() {
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "B.Cu"]);
+        b.zone("GND", "F.Cu", (0.5, 0.5, 5.0, 9.5));
+        b.zone("GND", "B.Cu", (0.5, 0.5, 19.5, 9.5));
+        let board = b.build();
+        let c = choose_planes(&board, &PlaneTarget::default());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].layer, board.layers.back().unwrap());
+        assert_eq!(c[0].reason, PlaneChoiceReason::LargestOuterPour);
+    }
+
+    #[test]
+    fn a_via_across_a_fracture_slit_of_its_plane_is_inside_it() {
+        // A plane saved as KiCad saves it: a void at (4..5, 4.5..5.5) joined
+        // to the left edge by a slit along y = 5, right where the pad's
+        // nearest sites are.
+        let mut b = BoardBuilder::new(20.0, 10.0, &["F.Cu", "In1.Cu", "B.Cu"]);
+        b.zone("GND", "In1.Cu", (0.5, 0.5, 19.5, 9.5));
+        let g = b.footprint("C2", (2.0, 5.0));
+        b.smd_pad(g, "1", "GND", (2.0, 5.0), (0.6, 0.6), "F.Cu");
+        let mut board = b.build();
+        let mm = |x: f64, y: f64| Point::from_mm(x, y).unwrap();
+        board.zones[0].region = konnect_geom::Polygon::new(
+            vec![
+                mm(0.5, 0.5),
+                mm(19.5, 0.5),
+                mm(19.5, 9.5),
+                mm(0.5, 9.5),
+                mm(0.5, 5.0),
+                mm(4.0, 5.0),
+                mm(4.0, 5.5),
+                mm(5.0, 5.5),
+                mm(5.0, 4.5),
+                mm(4.0, 4.5),
+                mm(4.0, 5.0),
+                mm(0.5, 5.0),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
         let p = plan(&board, &FanoutSettings::default());
         assert_eq!(p.sites.len(), 1, "{:?}", p.details);
-        assert_eq!(p.stats.partial_plane_sites, 1);
-        let s = &p.sites[0];
-        // Inside the In1 pour, by the via's radius.
-        let r = s.via_diameter / 2;
-        assert!(s.via.x - r > 500_000 && s.via.x + r < 19_500_000);
+        // The cheapest site is a straight exit along the slit.
+        assert_eq!(p.sites[0].via.y, 5_000_000);
     }
 
     #[test]
