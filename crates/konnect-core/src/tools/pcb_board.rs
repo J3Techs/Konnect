@@ -1329,7 +1329,14 @@ pub fn tools() -> Vec<ToolDef> {
             "import_svg_logo",
             "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
              graphic). Curved paths are flattened into polygon outlines since KiCAD's board \
-             format doesn't support Bezier curves in filled shapes. Tries KiCAD IPC first, \
+             format doesn't support Bezier curves in filled shapes. A shape with holes \
+             (fill-rule evenodd, or nonzero with the hole wound the other way) keeps them: each \
+             hole is joined to its outline by a zero-width slit, as KiCad stores such a polygon. \
+             Artwork on a B.* layer is mirrored left-to-right inside its placement box by \
+             default so it reads correctly from the back of the board, like back-side text; \
+             'mirror' overrides that and the result says what was done. <text> is not imported \
+             (it depends on installed fonts): the result counts the skipped elements, and an SVG \
+             with nothing else is refused; convert text to paths first. Tries KiCAD IPC first, \
              falls back to a direct file edit if KiCAD isn't running.",
             json!({
                 "type": "object",
@@ -1337,9 +1344,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "board":     { "type": "string", "description": "Path to .kicad_pcb file" },
                     "svg":       { "type": "string", "description": "Path to the .svg file to import" },
                     "width_mm":  { "type": "number", "description": "Target width in mm (aspect ratio preserved)" },
-                    "x":         { "type": "number", "description": "X position of the artwork's top-left corner in mm", "default": 0 },
+                    "x":         { "type": "number", "description": "X position of the artwork's top-left corner in mm (the left edge of its placement box, mirrored or not)", "default": 0 },
                     "y":         { "type": "number", "description": "Y position of the artwork's top-left corner in mm", "default": 0 },
-                    "layer":     { "type": "string", "description": "Target layer", "default": "F.SilkS" }
+                    "layer":     { "type": "string", "description": "Target layer", "default": "F.SilkS" },
+                    "mirror":    { "type": "boolean", "description": "Mirror the artwork left-to-right about the vertical centre line of its placement box (x .. x + width_mm), so it stays where it was placed. Default: true on a B.* layer, so the artwork reads correctly viewed from the back; false on any other layer." }
                 },
                 "required": ["board", "svg", "width_mm"]
             }),
@@ -2715,17 +2723,87 @@ async fn handle_import_svg_logo(
     let x = args["x"].as_f64().unwrap_or(0.0);
     let y = args["y"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    // Board graphics are stored as seen from the front whatever their layer,
+    // so artwork that should read correctly from the back is stored mirrored,
+    // exactly as back-side text carries `(justify mirror)`.
+    let on_back_layer = layer.starts_with("B.");
+    let (mirror, mirror_source) = match args.get("mirror") {
+        None | Some(serde_json::Value::Null) if on_back_layer => (true, "default_for_back_layer"),
+        None | Some(serde_json::Value::Null) => (false, "default_for_front_layer"),
+        Some(serde_json::Value::Bool(mirror)) => (*mirror, "argument"),
+        Some(_) => return Ok(crate::tools::invalid_arg("mirror", "must be true or false")),
+    };
 
     let svg_content = std::fs::read_to_string(&svg_path)?;
     let logo = crate::tools::svg_import::extract_polygons(&svg_content)?;
     if logo.polygons.is_empty() {
-        return Ok(CallToolResult::error(
-            "No fillable paths found in the SVG (only <path> elements are supported).",
-        ));
+        let reason = if logo.text_element_count > 0 {
+            format!(
+                "has no fillable shapes to import: its {} <text> element(s) are not imported, \
+                 because turning text into outlines depends on the fonts installed on this \
+                 machine. Convert the text to paths in the SVG editor (Inkscape: Path > Object \
+                 to Path) and import again",
+                logo.text_element_count
+            )
+        } else {
+            "has no fillable shapes to import (paths and basic shapes are imported; text and \
+             images are not)"
+                .to_string()
+        };
+        return Ok(crate::tools::invalid_arg("svg", &reason));
     }
 
-    let placed =
-        crate::tools::svg_import::scale_and_place(&logo.polygons, logo.width, width_mm, x, y);
+    let placed = crate::tools::svg_import::scale_and_place(
+        &logo.polygons,
+        logo.width,
+        width_mm,
+        x,
+        y,
+        mirror,
+    );
+
+    let mut body = json!({
+        "polygon_count": placed.len(),
+        "hole_count": logo.hole_count,
+        "layer": layer,
+        "x": x,
+        "y": y,
+        "width_mm": width_mm,
+        "height_mm": if logo.width > 0.0 {
+            ((logo.height * width_mm / logo.width) * 1e6).round() / 1e6
+        } else {
+            logo.height
+        },
+        "mirrored": mirror,
+        "mirror_source": mirror_source,
+        "mirror_note": match (mirror, on_back_layer) {
+            (true, true) => "Mirrored left-to-right inside its placement box so it reads \
+                correctly when the board is viewed from the back. Pass mirror=false to keep \
+                the SVG's orientation as seen from the front.",
+            (true, false) => "Mirrored left-to-right inside its placement box on request; \
+                on this front-side layer it reads backwards from the front.",
+            (false, true) => "Not mirrored on request: on this back-side layer it reads \
+                backwards when the board is viewed from the back.",
+            (false, false) => "Not mirrored: it reads correctly from the front. Artwork on a \
+                B.* layer is mirrored by default.",
+        },
+    });
+    if logo.text_element_count > 0 {
+        body["skipped_text_element_count"] = json!(logo.text_element_count);
+        body["skipped_text_note"] = json!(
+            "<text> elements were not imported: turning text into outlines depends on the \
+             fonts installed on this machine. Convert the text to paths in the SVG editor \
+             (Inkscape: Path > Object to Path) and import again."
+        );
+    }
+    if logo.crossing_path_count > 0 {
+        body["crossing_path_count"] = json!(logo.crossing_path_count);
+        body["crossing_path_note"] = json!(
+            "Some paths have subpaths that cross each other, so their holes could not be \
+             worked out: each of those subpaths was imported as its own filled outline. \
+             Union or flatten the path in the SVG editor to import it exactly."
+        );
+    }
 
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
@@ -2739,12 +2817,8 @@ async fn handle_import_svg_logo(
         return Ok(err);
     }
     if matches!(ipc_attempt, BoardWrite::Ipc(())) {
-        return Ok(CallToolResult::json(&json!({
-            "polygon_count": placed.len(),
-            "layer": layer,
-            "width_mm": width_mm,
-            "source": "ipc"
-        })));
+        body["source"] = json!("ipc");
+        return Ok(CallToolResult::json(&body));
     }
 
     let mut sexp = String::new();
@@ -2756,13 +2830,9 @@ async fn handle_import_svg_logo(
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, sexp)]);
     write_atomic(&board_path, &new_content)?;
 
-    Ok(CallToolResult::json(&json!({
-        "polygon_count": placed.len(),
-        "layer": layer,
-        "width_mm": width_mm,
-        "source": "file",
-        "warning": FILE_ONLY_EDIT_WARNING
-    })))
+    body["source"] = json!("file");
+    body["warning"] = json!(FILE_ONLY_EDIT_WARNING);
+    Ok(CallToolResult::json(&body))
 }
 
 #[cfg(test)]
@@ -4078,6 +4148,161 @@ mod svg_logo_tests {
 
         let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
         assert!(result.is_error);
+    }
+
+    /// Import `svg` onto a blank board with no KiCad running: 10 mm wide at
+    /// (2, 3), plus `extra` arguments. Returns the result body, whether it is
+    /// an error, and the board file afterwards.
+    async fn import(svg: &str, extra: serde_json::Value) -> (serde_json::Value, bool, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board_path = dir.path().join("board.kicad_pcb");
+        let svg_path = dir.path().join("logo.svg");
+        std::fs::write(&board_path, blank_board()).unwrap();
+        std::fs::write(&svg_path, svg).unwrap();
+        let mut args = json!({
+            "board": board_path.to_str().unwrap(),
+            "svg": svg_path.to_str().unwrap(),
+            "width_mm": 10.0,
+            "x": 2.0,
+            "y": 3.0
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        let result = handle_import_svg_logo(&args, &test_ctx()).await.unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let body = serde_json::from_str(&text).unwrap();
+        let board = std::fs::read_to_string(&board_path).unwrap();
+        (body, result.is_error, board)
+    }
+
+    /// A triangle against the left edge of a 100-unit-wide SVG. Unmirrored it
+    /// lands on (2,3) (4,3) (4,8); mirrored in its 2..12 box, on (12,3)
+    /// (10,3) (10,8).
+    fn left_triangle_svg() -> &'static str {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <path d="M0 0 L20 0 L20 50 Z" fill="black"/>
+        </svg>"##
+    }
+
+    const UNMIRRORED: [&str; 3] = ["(xy 2 3)", "(xy 4 3)", "(xy 4 8)"];
+    const MIRRORED: [&str; 3] = ["(xy 12 3)", "(xy 10 3)", "(xy 10 8)"];
+
+    #[tokio::test]
+    async fn artwork_on_a_back_layer_is_mirrored_inside_its_box_by_default() {
+        let (body, is_error, board) =
+            import(left_triangle_svg(), json!({ "layer": "B.SilkS" })).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["mirrored"], json!(true));
+        assert_eq!(body["mirror_source"], json!("default_for_back_layer"));
+        assert!(body["mirror_note"].as_str().unwrap().contains("back"));
+        assert_eq!(body["height_mm"], json!(10.0));
+        for point in MIRRORED {
+            assert!(board.contains(point), "{point} missing from {board}");
+        }
+        assert!(board.contains("(layer \"B.SilkS\")"));
+    }
+
+    #[tokio::test]
+    async fn artwork_on_a_front_layer_is_not_mirrored_by_default() {
+        let (body, is_error, board) = import(left_triangle_svg(), json!({})).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["mirrored"], json!(false));
+        assert_eq!(body["mirror_source"], json!("default_for_front_layer"));
+        for point in UNMIRRORED {
+            assert!(board.contains(point), "{point} missing from {board}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mirror_argument_overrides_the_layer_default_either_way() {
+        let (body, _, board) = import(
+            left_triangle_svg(),
+            json!({ "layer": "B.SilkS", "mirror": false }),
+        )
+        .await;
+        assert_eq!(body["mirrored"], json!(false));
+        assert_eq!(body["mirror_source"], json!("argument"));
+        for point in UNMIRRORED {
+            assert!(board.contains(point), "{point} missing from {board}");
+        }
+
+        let (body, _, board) = import(left_triangle_svg(), json!({ "mirror": true })).await;
+        assert_eq!(body["mirrored"], json!(true));
+        assert_eq!(body["mirror_source"], json!("argument"));
+        for point in MIRRORED {
+            assert!(board.contains(point), "{point} missing from {board}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mirror_argument_that_is_not_a_boolean_is_refused_before_any_write() {
+        let (body, is_error, board) = import(left_triangle_svg(), json!({ "mirror": "yes" })).await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"));
+        assert_eq!(body["error"]["field"], json!("mirror"));
+        assert_eq!(board, blank_board());
+    }
+
+    #[tokio::test]
+    async fn an_svg_holding_only_text_is_refused_and_says_to_convert_it_to_paths() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40">
+            <text x="5" y="30" font-family="Arial" font-size="24">Yoshi</text>
+        </svg>"##;
+        let (body, is_error, board) = import(svg, json!({})).await;
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"));
+        assert_eq!(body["error"]["field"], json!("svg"));
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("1 <text> element"), "{reason}");
+        assert!(reason.contains("Convert the text to paths"), "{reason}");
+        assert_eq!(board, blank_board(), "nothing is written");
+    }
+
+    #[tokio::test]
+    async fn text_beside_importable_shapes_is_counted_as_skipped_in_the_result() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <path d="M0 0 L20 0 L20 50 Z" fill="black"/>
+            <text x="5" y="80">REV A</text>
+            <text x="5" y="95">J3</text>
+        </svg>"##;
+        let (body, is_error, board) = import(svg, json!({})).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["polygon_count"], json!(1));
+        assert_eq!(body["skipped_text_element_count"], json!(2));
+        assert!(body["skipped_text_note"]
+            .as_str()
+            .unwrap()
+            .contains("Convert the text to paths"));
+        assert_eq!(board.matches("(gr_poly").count(), 1);
+
+        // No text, no such keys.
+        let (body, _, _) = import(left_triangle_svg(), json!({})).await;
+        assert!(body.get("skipped_text_element_count").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shape_with_a_hole_is_written_as_one_outline_with_a_slit() {
+        // A 10 mm square with a 4 mm square hole, both wound the same way.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <path fill-rule="evenodd" fill="black"
+                  d="M0 0 L100 0 L100 100 L0 100 Z M30 30 L70 30 L70 70 L30 70 Z"/>
+        </svg>"##;
+        let (body, is_error, board) = import(svg, json!({ "x": 0.0, "y": 0.0 })).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["polygon_count"], json!(1));
+        assert_eq!(body["hole_count"], json!(1));
+        assert_eq!(board.matches("(gr_poly").count(), 1);
+        // The slit leaves the hole's right side at x = 7 and lands on the
+        // outline's right side at x = 10, on the same row, there and back.
+        for point in ["(xy 3 3)", "(xy 7 7)", "(xy 3 7)"] {
+            assert!(board.contains(point), "{point} missing from {board}");
+        }
+        assert_eq!(board.matches("(xy 10 3)").count(), 2, "{board}");
+        assert_eq!(board.matches("(xy 7 3)").count(), 2, "{board}");
     }
 
     #[tokio::test]

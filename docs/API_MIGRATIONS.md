@@ -3,6 +3,43 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: imported SVG artwork is mirrored on back layers, keeps its holes and reports skipped text
+
+`import_svg_logo` placed artwork on a `B.*` layer exactly as on a front layer,
+so it read backwards from the back of the board, while `add_board_graphics`
+mirrors back-side text. New `mirror` (boolean) flips the artwork left-to-right
+about the vertical centre line of its placement box (`x` to `x + width_mm`), so
+it stays where it was placed. It defaults to true on a `B.*` layer and false on
+any other. **This changes the default result on back layers:** a caller that
+mirrored its SVG by hand before importing to `B.SilkS` must stop, or pass
+`mirror: false`. The result carries `mirrored`, `mirror_source`
+(`default_for_back_layer`, `default_for_front_layer` or `argument`) and a
+`mirror_note` saying how the artwork reads, plus `x`, `y` and `height_mm`.
+
+A filled shape with a hole was imported as two filled polygons, the hole
+painted over. Each path is now resolved under its own `fill-rule`: with
+`evenodd` a nested subpath is a hole, with `nonzero` it is one when wound
+against its outline, and an island inside a hole is its own polygon. KiCad
+stores a filled graphic polygon as a single outline, so each hole is joined to
+its outline by a zero-width slit, the same shape KiCad writes itself.
+`polygon_count` now counts outlines after holes are joined and `hole_count`
+is new. A path whose subpaths cross each other cannot be resolved this way:
+its subpaths are imported as separate filled outlines, as before, and the
+result says so in `crossing_path_count` and `crossing_path_note`.
+
+`<text>` was dropped without a word. It is still not imported, because turning
+text into outlines depends on the fonts installed on the machine, but the
+result now carries `skipped_text_element_count` and `skipped_text_note`, and an
+SVG with no shape other than text is refused with `invalid_argument` on `svg`
+instead of the previous unstructured error. Convert text to paths in the SVG
+editor first.
+
+Path coordinates now follow the SVG's `viewBox` and every enclosing `transform`.
+They were read untransformed, so artwork drawn in a `viewBox` of a different
+size than the SVG's `width`, or inside a transformed group, was imported at the
+wrong size or place. Coordinates are rounded to the nanometre, and a subpath
+that encloses no area (an open line) is no longer written as a polygon.
+
 ## Unreleased: placed-footprint 3D models can be edited on a closed board
 
 `set_placed_footprint_models` required the board open in KiCad, and refused
