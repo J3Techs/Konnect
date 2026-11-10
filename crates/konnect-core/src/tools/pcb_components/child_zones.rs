@@ -35,18 +35,19 @@ fn point(block: &str, tag: &str, map: &dyn Fn(f64, f64) -> (f64, f64)) -> anyhow
     let node = konnect_sexp::parse_sexp(block)?;
     let coordinate = |index: usize| {
         node.get_f64(index)
-            .with_context(|| format!("a zone ({tag} …) point has an unreadable coordinate"))
+            .with_context(|| format!("a ({tag} …) point has an unreadable coordinate"))
     };
     if node.children().map_or(0, <[SexpNode]>::len) != 3 {
-        anyhow::bail!("a zone ({tag} …) point does not hold exactly two coordinates");
+        anyhow::bail!("a ({tag} …) point does not hold exactly two coordinates");
     }
     let (x, y) = map(coordinate(1)?, coordinate(2)?);
     Ok(format!("({tag} {} {})", format_mm(x), format_mm(y)))
 }
 
 /// One `(pts …)` list: `(xy …)` vertices and `(arc (start …) (mid …) (end …))`
-/// entries.
-fn map_pts(pts: &str, map: &dyn Fn(f64, f64) -> (f64, f64)) -> anyhow::Result<String> {
+/// entries. Also the outline of a footprint polygon or a custom pad's
+/// primitive, which are written the same way.
+pub(crate) fn map_pts(pts: &str, map: &dyn Fn(f64, f64) -> (f64, f64)) -> anyhow::Result<String> {
     let mut edits = Vec::new();
     for (start, end, tag) in direct_children_with_tags(pts, "pts")? {
         let entry = &pts[start..end];
@@ -56,7 +57,7 @@ fn map_pts(pts: &str, map: &dyn Fn(f64, f64) -> (f64, f64)) -> anyhow::Result<St
                 let mut arc_edits = Vec::new();
                 for (s, e, part) in direct_children_with_tags(entry, "arc")? {
                     if !matches!(part.as_str(), "start" | "mid" | "end") {
-                        anyhow::bail!("a zone outline arc holds an unsupported ({part} …) clause");
+                        anyhow::bail!("an outline arc holds an unsupported ({part} …) clause");
                     }
                     arc_edits.push(SexpEdit::replace(s, e, point(&entry[s..e], &part, map)?));
                 }
@@ -66,7 +67,7 @@ fn map_pts(pts: &str, map: &dyn Fn(f64, f64) -> (f64, f64)) -> anyhow::Result<St
                     apply_edits(entry.to_string(), arc_edits),
                 ));
             }
-            other => anyhow::bail!("a zone outline holds an unsupported ({other} …) entry"),
+            other => anyhow::bail!("an outline holds an unsupported ({other} …) entry"),
         }
     }
     Ok(apply_edits(pts.to_string(), edits))

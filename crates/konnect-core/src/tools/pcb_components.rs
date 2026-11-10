@@ -1709,6 +1709,29 @@ fn update_closed_board_footprints_on_sides(
 > {
     let content =
         read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
+    // A flip that cannot be done refuses the whole batch, so the refusal
+    // names every footprint that blocks it, not only the first one met.
+    let blocked = placements
+        .iter()
+        .zip(sides)
+        .filter_map(|(placement, side)| {
+            match prepare_closed_board_footprint_side(
+                &content,
+                &placement.reference,
+                side.as_ref()?,
+            ) {
+                Err(ClosedBoardError::Unusable(reason)) => Some(reason),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if blocked.len() > 1 {
+        return Err(ClosedBoardError::Unusable(format!(
+            "{} footprints in this batch cannot be moved to the other side on a closed board — {}",
+            blocked.len(),
+            blocked.join("; ")
+        )));
+    }
     let mut updated = content.clone();
     let mut layers = Vec::with_capacity(placements.len());
     for (placement, side) in placements.iter().zip(sides) {
@@ -1871,6 +1894,16 @@ fn update_footprint_placement(
     );
     let updated = match update {
         FootprintPlacementUpdate::Move { .. } => updated,
+        // An unchanged angle turns nothing. Passing it on would still rewrite
+        // text angles to their readable form, which KiCad does not do: after
+        // a flip it leaves a field at 270, and setting the footprint to the
+        // rotation it already has keeps it there.
+        FootprintPlacementUpdate::Rotate { rotation }
+        | FootprintPlacementUpdate::Set { rotation, .. }
+            if (rotation - old_rotation).rem_euclid(360.0) == 0.0 =>
+        {
+            updated
+        }
         FootprintPlacementUpdate::Rotate { rotation }
         | FootprintPlacementUpdate::Set { rotation, .. } => {
             apply_rotation_to_children(&updated, rotation - old_rotation)
@@ -1987,7 +2020,22 @@ fn normalize_angle_180(angle: f64) -> f64 {
     }
 }
 
-fn flipped_layer(layer: &str) -> anyhow::Result<String> {
+/// The layer `layer` lands on when its footprint changes side.
+/// `inner_copper` is the board's inner copper layers, front to back: KiCad
+/// reverses them, so on a four-layer board `In1.Cu` and `In2.Cu` exchange.
+fn flipped_layer(layer: &str, inner_copper: &[String]) -> anyhow::Result<String> {
+    let is_inner = layer
+        .strip_prefix("In")
+        .and_then(|rest| rest.strip_suffix(".Cu"))
+        .is_some_and(|index| index.parse::<u32>().is_ok());
+    if is_inner {
+        return Ok(match inner_copper.iter().position(|name| name == layer) {
+            Some(index) => inner_copper[inner_copper.len() - 1 - index].clone(),
+            // Not a layer of this board, so there is nothing on it to
+            // exchange.
+            None => layer.to_string(),
+        });
+    }
     const SIDE_PAIRS: &[(&str, &str)] = &[
         ("F.Cu", "B.Cu"),
         ("F.Adhes", "B.Adhes"),
@@ -2011,7 +2059,7 @@ fn flipped_layer(layer: &str) -> anyhow::Result<String> {
     Ok(layer.to_string())
 }
 
-fn flip_layer_block(block: &str) -> anyhow::Result<String> {
+fn flip_layer_block(block: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let layer = konnect_sexp::parse_sexp(block)?;
     let name = layer
         .get(1)
@@ -2019,11 +2067,11 @@ fn flip_layer_block(block: &str) -> anyhow::Result<String> {
         .context("(layer ...) has no layer name")?;
     Ok(format!(
         "(layer {})",
-        quote_sexp_string(&flipped_layer(name)?)
+        quote_sexp_string(&flipped_layer(name, inner_copper)?)
     ))
 }
 
-fn flip_layers_block(block: &str) -> anyhow::Result<String> {
+fn flip_layers_block(block: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let layers = konnect_sexp::parse_sexp(block)?;
     let names = layers
         .children()
@@ -2034,7 +2082,7 @@ fn flip_layers_block(block: &str) -> anyhow::Result<String> {
             let name = child
                 .as_str()
                 .context("(layers ...) contains a non-atomic layer name")?;
-            flipped_layer(name).map(|flipped| quote_sexp_string(&flipped))
+            flipped_layer(name, inner_copper).map(|flipped| quote_sexp_string(&flipped))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(format!("(layers {})", names.join(" ")))
@@ -2083,7 +2131,7 @@ fn toggle_text_mirror(effects: &str) -> anyhow::Result<String> {
     }
 }
 
-fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
+fn flip_text_block(block: &str, tag: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let (at_start, at_end) = exactly_one_direct_child(block, tag, "at")?;
     let (x, y, angle, suffix) = at_components(&block[at_start..at_end])?;
     let (layer_start, layer_end) = exactly_one_direct_child(block, tag, "layer")?;
@@ -2093,7 +2141,7 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
         .get(1)
         .and_then(konnect_sexp::SexpNode::as_str)
         .context("(layer ...) has no layer name")?;
-    let flipped_layer_name = flipped_layer(layer_name)?;
+    let flipped_layer_name = flipped_layer(layer_name, inner_copper)?;
     let (effects_start, effects_end) = exactly_one_direct_child(block, tag, "effects")?;
     let effects = if flipped_layer_name == layer_name {
         block[effects_start..effects_end].to_string()
@@ -2118,7 +2166,7 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
     ))
 }
 
-fn flip_graphic_block(block: &str, tag: &str) -> anyhow::Result<String> {
+fn flip_graphic_block(block: &str, tag: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let point_tags: &[&str] = match tag {
         "fp_line" | "fp_rect" => &["start", "end"],
         "fp_circle" => &["center", "end"],
@@ -2159,26 +2207,18 @@ fn flip_graphic_block(block: &str, tag: &str) -> anyhow::Result<String> {
     edits.push(SexpEdit::replace(
         layer_start,
         layer_end,
-        flip_layer_block(&block[layer_start..layer_end])?,
+        flip_layer_block(&block[layer_start..layer_end], inner_copper)?,
     ));
     Ok(apply_edits(block.to_string(), edits))
 }
 
-fn flip_poly_block(block: &str) -> anyhow::Result<String> {
-    let (pts_start, pts_end) = exactly_one_direct_child(block, "fp_poly", "pts")?;
-    let pts = &block[pts_start..pts_end];
-    let mut point_edits = Vec::new();
-    for (start, end, tag) in direct_children_with_tags(pts, "pts")? {
-        if tag != "xy" {
-            anyhow::bail!("fp_poly contains unsupported point block '{tag}'");
-        }
-        let point = konnect_sexp::parse_sexp(&pts[start..end])?;
-        let x = point.get_f64(1).context("(xy ...) has an invalid X")?;
-        let y = point.get_f64(2).context("(xy ...) has an invalid Y")?;
-        point_edits.push(SexpEdit::replace(start, end, format_xy("xy", x, -y)));
-    }
-    let mirrored_pts = apply_edits(pts.to_string(), point_edits);
-    let (layer_start, layer_end) = exactly_one_direct_child(block, "fp_poly", "layer")?;
+/// Mirror an `fp_poly` outline or an `fp_curve`'s control points: `(xy …)`
+/// vertices and `(arc …)` entries alike.
+fn flip_poly_block(block: &str, tag: &str, inner_copper: &[String]) -> anyhow::Result<String> {
+    let (pts_start, pts_end) = exactly_one_direct_child(block, tag, "pts")?;
+    let mirrored_pts = child_zones::map_pts(&block[pts_start..pts_end], &|x, y| (x, -y))
+        .with_context(|| format!("{tag} outline cannot be mirrored"))?;
+    let (layer_start, layer_end) = exactly_one_direct_child(block, tag, "layer")?;
     Ok(apply_edits(
         block.to_string(),
         vec![
@@ -2186,50 +2226,321 @@ fn flip_poly_block(block: &str) -> anyhow::Result<String> {
             SexpEdit::replace(
                 layer_start,
                 layer_end,
-                flip_layer_block(&block[layer_start..layer_end])?,
+                flip_layer_block(&block[layer_start..layer_end], inner_copper)?,
             ),
         ],
     ))
 }
 
-fn contains_descendant_tag(node: &konnect_sexp::SexpNode, tag: &str) -> bool {
-    node.children().is_some_and(|children| {
+/// Mirror `(tag x y)` point clauses of `item` across the X axis. Each pair
+/// is the clause to write and the clause whose point it takes: an arc's
+/// `start` takes its `end`, because a mirror reverses the arc's direction.
+fn mirror_point_clauses(
+    item: &str,
+    parent: &str,
+    clauses: &[(&str, &str)],
+) -> anyhow::Result<String> {
+    let mut edits = Vec::new();
+    for (tag, source) in clauses {
+        let (start, end) = exactly_one_direct_child(item, parent, tag)?;
+        let (source_start, source_end) = exactly_one_direct_child(item, parent, source)?;
+        let point = konnect_sexp::parse_sexp(&item[source_start..source_end])?;
+        let x = point
+            .get_f64(1)
+            .with_context(|| format!("({source} …) has an invalid X"))?;
+        let y = point
+            .get_f64(2)
+            .with_context(|| format!("({source} …) has an invalid Y"))?;
+        edits.push(SexpEdit::replace(start, end, format_xy(tag, x, -y)));
+    }
+    Ok(apply_edits(item.to_string(), edits))
+}
+
+/// Mirror a `(pts …)` outline that is a direct child of `item`.
+fn mirror_pts_clause(item: &str, parent: &str) -> anyhow::Result<String> {
+    let (start, end) = exactly_one_direct_child(item, parent, "pts")?;
+    let mirrored = child_zones::map_pts(&item[start..end], &|x, y| (x, -y))?;
+    Ok(apply_edits(
+        item.to_string(),
+        vec![SexpEdit::replace(start, end, mirrored)],
+    ))
+}
+
+/// Mirror a custom pad's `(primitives …)`. They are in the pad's own frame,
+/// and KiCad's flip negates each point's Y there: pcbnew 10.0.7 turns the
+/// solder jumper's `(gr_poly (pts (xy 0.5 0.75) (xy 0 0.75) (xy 0 -0.75)
+/// (xy 0.5 -0.75)))` into `(xy 0.5 -0.75) (xy 0 -0.75) (xy 0 0.75) (xy 0.5 0.75)`.
+fn flip_primitives_block(block: &str) -> anyhow::Result<String> {
+    let mut edits = Vec::new();
+    for (start, end, tag) in direct_children_with_tags(block, "primitives")? {
+        let item = &block[start..end];
+        let mirrored = match tag.as_str() {
+            "gr_line" | "gr_rect" => {
+                mirror_point_clauses(item, &tag, &[("start", "start"), ("end", "end")])?
+            }
+            "gr_circle" => {
+                mirror_point_clauses(item, &tag, &[("center", "center"), ("end", "end")])?
+            }
+            "gr_arc" => mirror_point_clauses(
+                item,
+                &tag,
+                &[("start", "end"), ("mid", "mid"), ("end", "start")],
+            )?,
+            "gr_poly" | "gr_curve" => mirror_pts_clause(item, &tag)?,
+            other => anyhow::bail!("its ({other} …) primitive cannot be mirrored"),
+        };
+        edits.push(SexpEdit::replace(start, end, mirrored));
+    }
+    Ok(apply_edits(block.to_string(), edits))
+}
+
+/// `(chamfer top_left …)` with top and bottom exchanged, as a mirror across
+/// the X axis leaves the corners, in the order KiCad writes them.
+fn flip_chamfer_block(block: &str) -> anyhow::Result<String> {
+    const ORDER: [&str; 4] = ["top_left", "top_right", "bottom_left", "bottom_right"];
+    let chamfer = konnect_sexp::parse_sexp(block)?;
+    let mut corners = chamfer
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .map(|corner| {
+            Ok(match corner.as_str() {
+                Some("top_left") => "bottom_left",
+                Some("top_right") => "bottom_right",
+                Some("bottom_left") => "top_left",
+                Some("bottom_right") => "top_right",
+                other => anyhow::bail!("its (chamfer …) names an unknown corner {other:?}"),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    corners.sort_by_key(|corner| ORDER.iter().position(|name| name == corner));
+    Ok(format!("(chamfer {})", corners.join(" ")))
+}
+
+/// A clause that names the board's two sides, `(tenting (front yes) (back
+/// no))` or the older `(tenting front)`, with the sides exchanged.
+fn swap_front_and_back(clause: &str, tag: &str) -> anyhow::Result<String> {
+    let children = direct_children_with_tags(clause, tag)?;
+    let side = |name: &str| {
         children
             .iter()
-            .any(|child| child.head() == Some(tag) || contains_descendant_tag(child, tag))
-    })
+            .find(|(_, _, child)| child == name)
+            .map(|(start, end, _)| (*start, *end))
+    };
+    // What follows the side's name, closing parenthesis included.
+    let body = |(start, end): (usize, usize), name: &str| &clause[start + 1 + name.len()..end];
+    let edits = match (side("front"), side("back")) {
+        (Some(front), Some(back)) => vec![
+            SexpEdit::replace(front.0, front.1, format!("(front{}", body(back, "back"))),
+            SexpEdit::replace(back.0, back.1, format!("(back{}", body(front, "front"))),
+        ],
+        (Some(front), None) => vec![SexpEdit::replace(
+            front.0,
+            front.1,
+            format!("(back{}", body(front, "front")),
+        )],
+        (None, Some(back)) => vec![SexpEdit::replace(
+            back.0,
+            back.1,
+            format!("(front{}", body(back, "back")),
+        )],
+        (None, None) => {
+            // The side names are bare atoms.
+            let node = konnect_sexp::parse_sexp(clause)?;
+            let sides = node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(1)
+                .map(|child| match child.as_str() {
+                    Some("front") => Ok("back"),
+                    Some("back") => Ok("front"),
+                    Some("none") => Ok("none"),
+                    _ => anyhow::bail!("its ({tag} …) is not in a form this flip can mirror"),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if sides.len() != 1 {
+                // Both sides, or neither: the same either way round.
+                return Ok(clause.to_string());
+            }
+            return Ok(format!("({tag} {})", sides[0]));
+        }
+    };
+    Ok(apply_edits(clause.to_string(), edits))
 }
 
-fn flip_pad_block(block: &str) -> anyhow::Result<String> {
+fn flip_pad_block(block: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let pad = konnect_sexp::parse_sexp(block)?;
-    if pad.get(3).and_then(konnect_sexp::SexpNode::as_str) == Some("custom") {
-        anyhow::bail!("custom pads are not supported by closed-board footprint flipping");
-    }
-    for unsupported in ["offset", "rect_delta", "chamfer_ratio", "primitives"] {
-        if contains_descendant_tag(&pad, unsupported) {
-            anyhow::bail!(
-                "pad geometry containing ({unsupported} ...) is not supported by closed-board footprint flipping"
-            );
-        }
-    }
+    let number = pad
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .unwrap_or_default()
+        .to_string();
+    flip_pad_clauses(block, inner_copper)
+        .with_context(|| format!("pad '{number}' cannot be flipped"))
+}
+
+fn flip_pad_clauses(block: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let (at_start, at_end) = exactly_one_direct_child(block, "pad", "at")?;
     let (x, y, angle, suffix) = at_components(&block[at_start..at_end])?;
-    let (layers_start, layers_end) = exactly_one_direct_child(block, "pad", "layers")?;
-    Ok(apply_edits(
-        block.to_string(),
-        vec![
-            SexpEdit::replace(
-                at_start,
-                at_end,
-                format_at_with_suffix(x, -y, normalize_angle(-angle), &suffix),
-            ),
-            SexpEdit::replace(
-                layers_start,
-                layers_end,
-                flip_layers_block(&block[layers_start..layers_end])?,
-            ),
-        ],
-    ))
+    let mut edits = vec![SexpEdit::replace(
+        at_start,
+        at_end,
+        format_at_with_suffix(x, -y, normalize_angle(-angle), &suffix),
+    )];
+    let mut layers = 0;
+    for (start, end, tag) in direct_children_with_tags(block, "pad")? {
+        let clause = &block[start..end];
+        let replacement = match tag.as_str() {
+            "layers" => {
+                layers += 1;
+                flip_layers_block(clause, inner_copper)?
+            }
+            "primitives" => flip_primitives_block(clause)?,
+            // The pad shape's offset from its hole, in the pad's frame.
+            "drill" if has_direct_child(clause, "drill", "offset") => {
+                mirror_point_clauses(clause, "drill", &[("offset", "offset")])?
+            }
+            // A trapezoid's taper: the Y component reverses with the mirror.
+            "rect_delta" => {
+                let delta = konnect_sexp::parse_sexp(clause)?;
+                let dx = delta
+                    .get_f64(1)
+                    .context("(rect_delta …) has an invalid X")?;
+                let dy = delta
+                    .get_f64(2)
+                    .context("(rect_delta …) has an invalid Y")?;
+                format_xy("rect_delta", dx, -dy)
+            }
+            "chamfer" => flip_chamfer_block(clause)?,
+            "tenting" => swap_front_and_back(clause, "tenting")?,
+            // A per-layer pad stack would have to exchange its front and back
+            // shapes; that is not done here.
+            "padstack" => anyhow::bail!("its custom (padstack …) cannot be mirrored"),
+            // KiCad records here which zone layers the pad joins; what its
+            // flip does with a non-empty list has not been observed.
+            "zone_layer_connections"
+                if konnect_sexp::parse_sexp(clause)?
+                    .children()
+                    .is_some_and(|children| children.len() > 1) =>
+            {
+                anyhow::bail!("its non-empty (zone_layer_connections …) cannot be mirrored")
+            }
+            // Any other clause that tells the board's sides apart (a back
+            // drill, post-machining) would have to exchange them.
+            other
+                if other.starts_with("front_")
+                    || other.starts_with("back_")
+                    || other == "backdrill"
+                    || has_direct_child(clause, other, "front")
+                    || has_direct_child(clause, other, "back") =>
+            {
+                anyhow::bail!("its side-specific ({other} …) cannot be mirrored")
+            }
+            _ => continue,
+        };
+        edits.push(SexpEdit::replace(start, end, replacement));
+    }
+    if layers != 1 {
+        anyhow::bail!("it must contain exactly one direct (layers …) block");
+    }
+    Ok(apply_edits(block.to_string(), edits))
+}
+
+/// Mirror one child `(zone …)` of a footprint at board Y `footprint_y`.
+///
+/// A child zone is saved in board coordinates (see `child_zones`), and KiCad
+/// flips it about the footprint's position: pcbnew 10.0.7 turns the
+/// Tag-Connect keepout `(xy 79.365 58.73) (xy 79.365 61.27) …` on a footprint
+/// at `(at 80 60 90)` into `(xy 79.365 61.27) (xy 79.365 58.73) …` on `B.Cu`.
+fn flip_zone_block(
+    block: &str,
+    footprint_y: f64,
+    inner_copper: &[String],
+) -> anyhow::Result<String> {
+    let mirrored = child_zones::map_zone(block, &|x, y| (x, 2.0 * footprint_y - y))?;
+    let flip_names = |clause: &str| -> anyhow::Result<String> {
+        let node = konnect_sexp::parse_sexp(clause)?;
+        let head = node.head().unwrap_or_default().to_string();
+        let names = node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .skip(1)
+            .map(|child| {
+                child
+                    .as_str()
+                    .context("a zone layer clause holds a non-atomic layer name")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let flipped = names
+            .iter()
+            .map(|name| flipped_layer(name, inner_copper))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // The same set of layers is written as it was: a zone on every
+        // copper layer stays byte for byte.
+        let (mut before, mut after) = (
+            names.clone(),
+            flipped.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        before.sort_unstable();
+        after.sort_unstable();
+        if before == after {
+            return Ok(clause.to_string());
+        }
+        Ok(format!(
+            "({head} {})",
+            flipped
+                .iter()
+                .map(|name| quote_sexp_string(name))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ))
+    };
+    let mut edits = Vec::new();
+    let mut layers_changed = false;
+    let mut fill = None;
+    for (start, end, tag) in direct_children_with_tags(&mirrored, "zone")? {
+        let clause = &mirrored[start..end];
+        match tag.as_str() {
+            "layer" | "layers" => {
+                let flipped = flip_names(clause)?;
+                layers_changed |= flipped != clause;
+                edits.push(SexpEdit::replace(start, end, flipped));
+            }
+            "fill" => fill = Some((start, end)),
+            // Each fill names the layer it is on.
+            "filled_polygon" => {
+                let (s, e) = exactly_one_direct_child(clause, "filled_polygon", "layer")?;
+                edits.push(SexpEdit::replace(
+                    start + s,
+                    start + e,
+                    flip_names(&clause[s..e])?,
+                ));
+            }
+            _ => {}
+        }
+    }
+    // KiCad marks a zone whose layers changed as no longer filled, while
+    // keeping the mirrored fill: `(fill yes …)` is saved as `(fill …)`.
+    if let (true, Some((start, end))) = (layers_changed, fill) {
+        if let Some(rest) = mirrored[start..end]
+            .strip_prefix("(fill")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix("yes"))
+            .filter(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == ')'))
+        {
+            let rest = rest.trim_start();
+            let separator = if rest.starts_with(')') { "" } else { " " };
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("(fill{separator}{rest}"),
+            ));
+        }
+    }
+    Ok(apply_edits(mirrored, edits))
 }
 
 /// Refuse a `(model …)` whose placement a flip would have to move.
@@ -2276,7 +2587,17 @@ fn refuse_model_a_flip_would_move(block: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// [`flip_footprint_block_on`] for a footprint whose board is not known: a
+/// child zone naming an inner copper layer keeps that layer.
+#[cfg(test)]
 fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
+    flip_footprint_block_on(footprint, &[])
+}
+
+/// Mirror one placed footprint to the other side of the board, as KiCad's
+/// own flip (top to bottom, about the footprint's position) does.
+/// `inner_copper` is the board's inner copper layers, front to back.
+fn flip_footprint_block_on(footprint: &str, inner_copper: &[String]) -> anyhow::Result<String> {
     let root = konnect_sexp::parse_sexp(footprint)?;
     if root.head() != Some("footprint") {
         anyhow::bail!("expected a footprint root");
@@ -2294,7 +2615,7 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
         SexpEdit::replace(
             root_layer_start,
             root_layer_end,
-            flip_layer_block(&footprint[root_layer_start..root_layer_end])?,
+            flip_layer_block(&footprint[root_layer_start..root_layer_end], inner_copper)?,
         ),
     ];
 
@@ -2315,17 +2636,25 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
             // synthetic fixture has only positioned properties, so nothing
             // offline could have caught it.
             "property" if !has_direct_child(block, "property", "at") => None,
-            "property" | "fp_text" => Some(flip_text_block(block, &tag)?),
+            "property" | "fp_text" => Some(flip_text_block(block, &tag, inner_copper)?),
             "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" => {
-                Some(flip_graphic_block(block, &tag)?)
+                Some(flip_graphic_block(block, &tag, inner_copper)?)
             }
-            "fp_poly" => Some(flip_poly_block(block)?),
-            "pad" => Some(flip_pad_block(block)?),
+            "fp_poly" | "fp_curve" => Some(flip_poly_block(block, &tag, inner_copper)?),
+            "pad" => Some(flip_pad_block(block, inner_copper)?),
+            "zone" => Some(
+                flip_zone_block(block, y, inner_copper)
+                    .context("a child zone cannot be flipped")?,
+            ),
             "model" => {
                 refuse_model_a_flip_would_move(block)?;
                 None
             }
-            unsupported if unsupported.starts_with("fp_") || unsupported == "zone" => {
+            // Children with geometry this flip does not mirror.
+            unsupported
+                if unsupported.starts_with("fp_")
+                    || matches!(unsupported, "dimension" | "image" | "table" | "barcode") =>
+            {
                 anyhow::bail!(
                     "unsupported footprint child '{unsupported}' prevents a safe closed-board flip"
                 )
@@ -2343,6 +2672,33 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
         anyhow::bail!("flip changed the footprint root");
     }
     Ok(flipped)
+}
+
+/// The board's inner copper layers, front to back, from its `(layers …)`
+/// table. Empty when the table cannot be read.
+fn board_inner_copper(content: &str) -> Vec<String> {
+    let Ok((start, end)) = exactly_one_direct_child(content, "kicad_pcb", "layers") else {
+        return Vec::new();
+    };
+    let Ok(table) = konnect_sexp::parse_sexp(&content[start..end]) else {
+        return Vec::new();
+    };
+    let mut inner = table
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|layer| layer.get(1)?.as_str())
+        .filter_map(|name| {
+            let index = name
+                .strip_prefix("In")?
+                .strip_suffix(".Cu")?
+                .parse::<u32>()
+                .ok()?;
+            Some((index, name.to_string()))
+        })
+        .collect::<Vec<_>>();
+    inner.sort();
+    inner.into_iter().map(|(_, name)| name).collect()
 }
 
 fn footprint_layer(footprint: &str) -> anyhow::Result<String> {
@@ -2391,8 +2747,8 @@ fn prepare_closed_board_footprint_side(
     if current_layer == target_layer {
         return Ok((content.to_string(), false));
     }
-    let flipped = flip_footprint_block(block)
-        .map_err(|error| ClosedBoardError::Unusable(format!("{error:#}")))?;
+    let flipped = flip_footprint_block_on(block, &board_inner_copper(content))
+        .map_err(|error| ClosedBoardError::Unusable(format!("'{reference}': {error:#}")))?;
     if footprint_layer(&flipped).map_err(ClosedBoardError::Io)? != target_layer {
         return Err(ClosedBoardError::Unusable(format!(
             "flipping '{reference}' did not produce target layer '{target_layer}'"
@@ -2566,7 +2922,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "x": { "type": "number", "description": "Target X coordinate in millimetres" },
                                 "y": { "type": "number", "description": "Target Y coordinate in millimetres" },
                                 "rotation": { "type": "number", "description": "Target absolute rotation in degrees" },
-                                "layer": { "type": "string", "enum": ["F.Cu", "B.Cu"], "description": "Optional target side, closed board only: a footprint on the other side is first mirrored by the closed-board flip (which refuses custom pads, pad offsets/primitives, moving 3D models and unsupported children), then set to x/y/rotation. Any layer in the batch refuses the whole batch while KiCad holds the board." }
+                                "layer": { "type": "string", "enum": ["F.Cu", "B.Cu"], "description": "Optional target side, closed board only: a footprint on the other side is first mirrored by the closed-board flip (pads including custom pads, child zones, graphics and fields, as KiCad's own flip does; it refuses a custom pad stack or other side-specific pad clause, a 3D model the flip would move, and text boxes, dimensions and images inside the footprint, naming every footprint that blocks the batch and its reason), then set to x/y/rotation. Any layer in the batch refuses the whole batch while KiCad holds the board." }
                             },
                             "required": ["reference", "x", "y", "rotation"]
                         }
@@ -7357,25 +7713,396 @@ mod tests {
         assert_ne!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
+    /// KiCad's own flip of the solder jumper's custom pad, placed at 30° and
+    /// flipped top to bottom by pcbnew 10.0.7: the pad's angle negates and
+    /// every primitive point's Y negates in the pad's frame.
     #[test]
-    fn flip_refuses_custom_pad_geometry_instead_of_corrupting_it() {
-        let custom = FLIP_FOOTPRINT.replace("roundrect (at 2 3 50)", "custom (at 2 3 50)");
-
-        let error = flip_footprint_block(&custom).unwrap_err();
-
-        assert!(error.to_string().contains("custom pads"));
+    fn flip_mirrors_a_custom_pad_and_its_primitives_as_kicad_does() {
+        let front = r#"(footprint "Jumper:SolderJumper-2_P1.3mm_Open_RoundedPad1.0x1.5mm"
+	(layer "F.Cu")
+	(at 70 70 30)
+	(pad "1" smd custom
+		(at -0.65 0 30)
+		(size 1 0.5)
+		(layers "F.Cu" "F.Mask")
+		(zone_connect 2)
+		(thermal_bridge_angle 45)
+		(options
+			(clearance outline)
+			(anchor rect)
+		)
+		(primitives
+			(gr_circle
+				(center 0 0.25)
+				(end 0.5 0.25)
+				(width 0)
+				(fill yes)
+			)
+			(gr_poly
+				(pts
+					(xy 0.5 0.75) (xy 0 0.75) (xy 0 -0.75) (xy 0.5 -0.75)
+				)
+				(width 0)
+				(fill yes)
+			)
+			(gr_line (start 0 0.1) (end 0.2 0.3) (width 0.1))
+			(gr_arc (start 0 0.1) (mid 0.1 0.2) (end 0.2 0.1) (width 0.1))
+			(gr_rect (start -0.1 -0.2) (end 0.1 0.3) (width 0) (fill yes))
+		)
+	)
+)"#;
+        let back = flip_footprint_block(front).unwrap();
+        assert!(back.contains("(at 70 70 -30)"), "{back}");
+        assert!(back.contains("(at -0.65 0 330)"), "{back}");
+        assert!(back.contains("(layers \"B.Cu\" \"B.Mask\")"), "{back}");
+        assert!(
+            back.contains("(center 0 -0.25)\n\t\t\t\t(end 0.5 -0.25)"),
+            "{back}"
+        );
+        assert!(
+            back.contains("(xy 0.5 -0.75) (xy 0 -0.75) (xy 0 0.75) (xy 0.5 0.75)"),
+            "{back}"
+        );
+        assert!(back.contains("(gr_line (start 0 -0.1) (end 0.2 -0.3) (width 0.1))"));
+        // A mirror reverses an arc, so KiCad exchanges its start and end.
+        assert!(back.contains("(gr_arc (start 0.2 -0.1) (mid 0.1 -0.2) (end 0 -0.1) (width 0.1))"));
+        assert!(back.contains("(gr_rect (start -0.1 0.2) (end 0.1 -0.3) (width 0) (fill yes))"));
+        // The anchor, clearance mode and thermal settings have no handedness.
+        assert!(back.contains("(thermal_bridge_angle 45)"));
+        assert!(back.contains("(anchor rect)"));
+        // Flipping back restores every primitive.
+        let again = flip_footprint_block(&back).unwrap();
+        assert!(again.contains("(xy 0.5 0.75) (xy 0 0.75) (xy 0 -0.75) (xy 0.5 -0.75)"));
+        assert!(again.contains("(at -0.65 0 30)"), "{again}");
     }
 
+    /// Each expectation is what pcbnew 10.0.7 saved after flipping a pad
+    /// carrying the clause: `(offset 0.3 0.2)` became `(offset 0.3 -0.2)`,
+    /// with a drill and without one; `(rect_delta 0 0.3)` became
+    /// `(rect_delta 0 -0.3)` and `(rect_delta 0.4 0)` stayed;
+    /// `(chamfer top_left bottom_right)` became
+    /// `(chamfer top_right bottom_left)`; and
+    /// `(tenting (front yes) (back no))` became
+    /// `(tenting (front no) (back yes))`.
     #[test]
-    fn flip_refuses_nested_drill_offsets_instead_of_mirroring_only_part_of_the_padstack() {
+    fn flip_mirrors_a_drill_offset_a_trapezoid_and_chamfered_corners_as_kicad_does() {
+        let smd_offset = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (drill (offset 0.3 0.2))",
+        );
+        let flipped = flip_footprint_block(&smd_offset).unwrap();
+        assert!(flipped.contains("(drill (offset 0.3 -0.2))"), "{flipped}");
+
+        let tented = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (tenting\n      (front yes)\n      (back no)\n    )",
+        );
+        let flipped = flip_footprint_block(&tented).unwrap();
+        assert!(
+            flipped.contains("(tenting\n      (front no)\n      (back yes)\n    )"),
+            "{flipped}"
+        );
+        let one_side = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (tenting front)",
+        );
+        let flipped = flip_footprint_block(&one_side).unwrap();
+        assert!(flipped.contains("(tenting back)"), "{flipped}");
+
+        let straight = FLIP_FOOTPRINT
+            .replace("smd roundrect", "smd trapezoid")
+            .replace("(roundrect_rratio 0.25)", "(rect_delta 0.4 0)");
+        let flipped = flip_footprint_block(&straight).unwrap();
+        assert!(flipped.contains("(rect_delta 0.4 0)"), "{flipped}");
+
         let offset_drill = FLIP_FOOTPRINT.replace(
             "(roundrect_rratio 0.25)",
-            "(roundrect_rratio 0.25)\n    (drill oval 0.4 0.8 (offset 0.2 0.1))",
+            "(roundrect_rratio 0.25)\n    (drill oval 0.55 1.6 (offset 0.2 -0.14))",
+        );
+        let flipped = flip_footprint_block(&offset_drill).unwrap();
+        assert!(
+            flipped.contains("(drill oval 0.55 1.6 (offset 0.2 0.14))"),
+            "{flipped}"
         );
 
-        let error = flip_footprint_block(&offset_drill).unwrap_err();
+        let trapezoid = FLIP_FOOTPRINT
+            .replace("smd roundrect", "smd trapezoid")
+            .replace("(roundrect_rratio 0.25)", "(rect_delta 0.6 0.3)");
+        let flipped = flip_footprint_block(&trapezoid).unwrap();
+        assert!(flipped.contains("(rect_delta 0.6 -0.3)"), "{flipped}");
 
-        assert!(error.to_string().contains("offset"), "{error}");
+        let chamfered = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (chamfer_ratio 0.2)\n    (chamfer top_left bottom_right)",
+        );
+        let flipped = flip_footprint_block(&chamfered).unwrap();
+        assert!(
+            flipped.contains("(chamfer top_right bottom_left)"),
+            "{flipped}"
+        );
+        assert!(flipped.contains("(chamfer_ratio 0.2)"));
+        let three = chamfered.replace(
+            "(chamfer top_left bottom_right)",
+            "(chamfer top_left top_right bottom_left)",
+        );
+        let flipped = flip_footprint_block(&three).unwrap();
+        assert!(
+            flipped.contains("(chamfer top_left bottom_left bottom_right)"),
+            "{flipped}"
+        );
+    }
+
+    /// The Tag-Connect TC2030 keepout on a footprint at `(at 80 60 90)`, and
+    /// what pcbnew 10.0.7 saved after flipping it: mirrored about the
+    /// footprint's Y in board coordinates, on the other side.
+    #[test]
+    fn flip_mirrors_a_child_zone_about_the_footprint_as_kicad_does() {
+        let zone = "  (zone\n    (net 0)\n    (net_name \"\")\n    (layer \"F.Cu\")\n    (hatch full 0.508)\n    (keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints not_allowed))\n    (polygon (pts (xy 79.365 58.73) (xy 79.365 61.27) (xy 80.635 61.27) (xy 80.635 58.73)))\n    (filled_polygon (layer \"F.Cu\") (pts (xy 79.4 58.8) (xy 79.4 61.2) (xy 80.6 61.2)))\n  )\n  (model";
+        let front = FLIP_FOOTPRINT
+            .replace("(at 10 20 30)", "(at 80 60 90)")
+            .replace("  (model", zone);
+        let back = flip_footprint_block(&front).unwrap();
+        assert!(back.contains("(at 80 60 -90)"), "{back}");
+        assert!(
+            back.contains("(polygon (pts (xy 79.365 61.27) (xy 79.365 58.73) (xy 80.635 58.73) (xy 80.635 61.27)))"),
+            "{back}"
+        );
+        assert!(
+            back.contains("(filled_polygon (layer \"B.Cu\") (pts (xy 79.4 61.2) (xy 79.4 58.8) (xy 80.6 58.8)))"),
+            "{back}"
+        );
+        assert!(
+            back.contains("    (layer \"B.Cu\")\n    (hatch full 0.508)"),
+            "{back}"
+        );
+        assert_eq!(flip_footprint_block(&back).unwrap(), front);
+    }
+
+    /// KiCad reverses the board's inner copper layers on a flip: pcbnew
+    /// 10.0.7 turns a zone on `F.Cu In1.Cu F.Paste` into `B.Cu In2.Cu
+    /// B.Paste` on a four-layer board and `B.Cu In4.Cu B.Paste` on a
+    /// six-layer one. A zone on every copper layer keeps its clause.
+    #[test]
+    fn a_zone_on_inner_layers_follows_the_boards_stackup() {
+        let inner = |count: usize| {
+            (1..=count)
+                .map(|index| format!("In{index}.Cu"))
+                .collect::<Vec<_>>()
+        };
+        let zone = |layers: &str| {
+            FLIP_FOOTPRINT.replace(
+                "  (model",
+                &format!("  (zone (layers {layers}) (polygon (pts (xy 9 19) (xy 11 19) (xy 11 21))))\n  (model"),
+            )
+        };
+        let partial = zone("\"F.Cu\" \"In1.Cu\" \"F.Paste\"");
+        let four = flip_footprint_block_on(&partial, &inner(2)).unwrap();
+        assert!(
+            four.contains("(layers \"B.Cu\" \"In2.Cu\" \"B.Paste\")"),
+            "{four}"
+        );
+        let six = flip_footprint_block_on(&partial, &inner(4)).unwrap();
+        assert!(
+            six.contains("(layers \"B.Cu\" \"In4.Cu\" \"B.Paste\")"),
+            "{six}"
+        );
+
+        let every = zone("\"F.Cu\" \"B.Cu\" \"In1.Cu\" \"In2.Cu\"");
+        let flipped = flip_footprint_block_on(&every, &inner(2)).unwrap();
+        assert!(
+            flipped.contains("(layers \"F.Cu\" \"B.Cu\" \"In1.Cu\" \"In2.Cu\")"),
+            "{flipped}"
+        );
+        let wildcard = zone("\"*.Cu\"");
+        assert!(flip_footprint_block_on(&wildcard, &inner(2))
+            .unwrap()
+            .contains("(layers \"*.Cu\")"));
+    }
+
+    /// pcbnew 10.0.7 on a four-layer board: a pad on `F.Cu In1.Cu` and a
+    /// line on `In1.Cu` land on `B.Cu In2.Cu` and `In2.Cu`; a filled zone
+    /// whose layer changes is saved as `(fill …)`, no longer `(fill yes …)`,
+    /// with its mirrored fill on the new layer, and one on both outer layers
+    /// keeps `(fill yes …)` and exchanges its two fills.
+    #[test]
+    fn inner_layers_and_zone_fills_follow_kicads_flip() {
+        let inner = vec!["In1.Cu".to_string(), "In2.Cu".to_string()];
+        let source = FLIP_FOOTPRINT
+            .replace(
+                "(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")",
+                "(layers \"F.Cu\" \"F.Mask\" \"In1.Cu\")",
+            )
+            .replace("(layer \"F.SilkS\")\n  )\n  (fp_arc", "(layer \"In1.Cu\")\n  )\n  (fp_arc")
+            .replace(
+                "  (model",
+                "  (zone (net \"GND\") (layer \"In1.Cu\") (fill yes (thermal_gap 0.5)) (polygon (pts (xy 9 19) (xy 11 19) (xy 11 21))) (filled_polygon (layer \"In1.Cu\") (pts (xy 9 19) (xy 11 19) (xy 11 21))))\n  (zone (layers \"F.Cu\" \"B.Cu\") (fill yes (thermal_gap 0.5)) (polygon (pts (xy 9 19) (xy 11 19) (xy 11 21))) (filled_polygon (layer \"F.Cu\") (pts (xy 9 19) (xy 11 19) (xy 10 21))) (filled_polygon (layer \"B.Cu\") (pts (xy 9 19) (xy 11 19) (xy 11 21))))\n  (model",
+            );
+        assert!(source.contains("(layer \"In1.Cu\")\n  )\n  (fp_arc"));
+        let flipped = flip_footprint_block_on(&source, &inner).unwrap();
+        assert!(
+            flipped.contains("(layers \"B.Cu\" \"B.Mask\" \"In2.Cu\")"),
+            "{flipped}"
+        );
+        assert!(
+            flipped.contains("(layer \"In2.Cu\")\n  )\n  (fp_arc"),
+            "{flipped}"
+        );
+        assert!(
+            flipped.contains("(zone (net \"GND\") (layer \"In2.Cu\") (fill (thermal_gap 0.5)) (polygon (pts (xy 9 21) (xy 11 21) (xy 11 19))) (filled_polygon (layer \"In2.Cu\") (pts (xy 9 21) (xy 11 21) (xy 11 19))))"),
+            "{flipped}"
+        );
+        assert!(
+            flipped.contains("(zone (layers \"F.Cu\" \"B.Cu\") (fill yes (thermal_gap 0.5)) (polygon (pts (xy 9 21) (xy 11 21) (xy 11 19))) (filled_polygon (layer \"B.Cu\") (pts (xy 9 21) (xy 11 21) (xy 10 19))) (filled_polygon (layer \"F.Cu\") (pts (xy 9 21) (xy 11 21) (xy 11 19))))"),
+            "{flipped}"
+        );
+    }
+
+    /// A side-changing batch flips, then sets the placement. pcbnew 10.0.7
+    /// leaves a flipped field at the angle the flip gave it when the
+    /// footprint is then set to the rotation it already has, so the set must
+    /// not turn the field to its readable form.
+    #[test]
+    fn setting_a_flipped_footprint_to_the_rotation_it_has_keeps_its_text_angles() {
+        let back = flip_footprint_block(FLIP_FOOTPRINT).unwrap();
+        assert!(back.contains("(at 1 2 140)"), "{back}");
+        let set = update_footprint_placement(
+            &back,
+            FootprintPlacementUpdate::Set {
+                x: 10.0,
+                y: 20.0,
+                rotation: 330.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(set, back);
+    }
+
+    /// What the flip still cannot mirror is refused by name: the pad and its
+    /// clause, or the footprint child.
+    #[test]
+    fn flip_names_the_pad_and_clause_or_the_child_it_cannot_mirror() {
+        for (clause, named) in [
+            (
+                "(zone_layer_connections \"In1.Cu\")",
+                "(zone_layer_connections …)",
+            ),
+            (
+                "(front_post_machining (type counterbore))",
+                "(front_post_machining …)",
+            ),
+            ("(covering (front yes) (back no))", "(covering …)"),
+        ] {
+            let source = FLIP_FOOTPRINT.replace(
+                "(roundrect_rratio 0.25)",
+                &format!("(roundrect_rratio 0.25)\n    {clause}"),
+            );
+            let error = format!("{:#}", flip_footprint_block(&source).unwrap_err());
+            assert!(
+                error.contains("pad '1'") && error.contains(named),
+                "{error}"
+            );
+        }
+        // An empty list, as KiCad writes for most pads, names no layer.
+        let empty = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (zone_layer_connections)",
+        );
+        assert!(flip_footprint_block(&empty).is_ok());
+
+        let padstack = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (padstack (mode front_inner_back))",
+        );
+        let error = format!("{:#}", flip_footprint_block(&padstack).unwrap_err());
+        assert!(
+            error.contains("pad '1'") && error.contains("(padstack …)"),
+            "{error}"
+        );
+
+        let text = FLIP_FOOTPRINT.replace(
+            "roundrect (at 2 3 50) (size 1 2)",
+            "custom (at 2 3 50) (size 1 2)\n    (primitives (gr_text \"A\" (at 0 0)))",
+        );
+        let error = format!("{:#}", flip_footprint_block(&text).unwrap_err());
+        assert!(
+            error.contains("pad '1'") && error.contains("(gr_text …)"),
+            "{error}"
+        );
+
+        for child in ["dimension", "image", "fp_text_box"] {
+            let source = FLIP_FOOTPRINT.replace("  (model", &format!("  ({child})\n  (model"));
+            let error = format!("{:#}", flip_footprint_block(&source).unwrap_err());
+            assert!(error.contains(&format!("'{child}'")), "{error}");
+        }
+
+        let bezier = FLIP_FOOTPRINT.replace(
+            "  (model",
+            "  (zone (layer \"F.Cu\") (polygon (pts (xy 9 19) (bezier 1 2 3 4))))\n  (model",
+        );
+        let error = format!("{:#}", flip_footprint_block(&bezier).unwrap_err());
+        assert!(
+            error.contains("child zone") && error.contains("(bezier …)"),
+            "{error}"
+        );
+    }
+
+    /// An outline arc and a Bezier curve mirror like vertices.
+    #[test]
+    fn flip_mirrors_polygon_arcs_and_curves() {
+        let source = FLIP_FOOTPRINT.replace(
+            "(fp_poly (pts (xy 1 2) (xy 3 4) (xy 5 6))",
+            "(fp_curve (pts (xy 0 1) (xy 1 2) (xy 2 2) (xy 3 1))\n    (stroke (width 0.1) (type solid))\n    (layer \"F.Fab\")\n  )\n  (fp_poly (pts (xy 1 2) (arc (start 3 4) (mid 4 5) (end 5 6)))",
+        );
+        let flipped = flip_footprint_block(&source).unwrap();
+        assert!(
+            flipped.contains("(fp_poly (pts (xy 1 -2) (arc (start 3 -4) (mid 4 -5) (end 5 -6)))"),
+            "{flipped}"
+        );
+        assert!(
+            flipped.contains("(fp_curve (pts (xy 0 -1) (xy 1 -2) (xy 2 -2) (xy 3 -1))\n    (stroke (width 0.1) (type solid))\n    (layer \"B.Fab\")"),
+            "{flipped}"
+        );
+    }
+
+    /// A batch that cannot change sides says so for every footprint in the
+    /// way, so one refusal is not read as the reason for all of them.
+    #[tokio::test]
+    async fn a_side_changing_batch_names_every_footprint_that_blocks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        let dimensioned = FLIP_FOOTPRINT
+            .replace("\"U1\"", "\"J302\"")
+            .replace("  (model", "  (dimension)\n  (model");
+        let stacked = FLIP_FOOTPRINT.replace("\"U1\"", "\"JP611\"").replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (padstack (mode front_inner_back))",
+        );
+        let before = flip_board(&[FLIP_FOOTPRINT, &dimensioned, &stacked], "\n");
+        std::fs::write(&board, &before).unwrap();
+        let placement = |reference: &str| json!({ "reference": reference, "x": 10.0, "y": 20.0, "rotation": 0.0, "layer": "B.Cu" });
+
+        let refused = handle_set_component_placements(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [placement("U1"), placement("J302"), placement("JP611")],
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error, "{:?}", refused.content);
+        let text = result_text(&refused);
+        assert!(text.contains("2 footprints"), "{text}");
+        assert!(
+            text.contains("'J302'") && text.contains("'dimension'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("'JP611'") && text.contains("pad '1'"),
+            "{text}"
+        );
+        assert!(!text.contains("'U1'"), "U1 can be flipped: {text}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     #[test]
@@ -7595,8 +8322,11 @@ mod tests {
     async fn unsupported_flip_geometry_returns_zero_writes() {
         let tmp = tempfile::tempdir().unwrap();
         let board = tmp.path().join("unsupported.kicad_pcb");
-        let custom = FLIP_FOOTPRINT.replace("roundrect (at 2 3 50)", "custom (at 2 3 50)");
-        let before = flip_board(&[&custom], "\n");
+        let stacked = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25)\n    (padstack (mode front_inner_back))",
+        );
+        let before = flip_board(&[&stacked], "\n");
         std::fs::write(&board, &before).unwrap();
 
         let refusal = handle_flip_component(
@@ -7615,7 +8345,10 @@ mod tests {
             "unsupported pad geometry must fail closed"
         );
         let text = result_text(&refusal);
-        assert!(text.contains("custom pads"), "{text}");
+        assert!(
+            text.contains("'U1'") && text.contains("pad '1'") && text.contains("(padstack …)"),
+            "{text}"
+        );
         assert!(text.contains("not modified"), "{text}");
         assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
@@ -10938,7 +11671,7 @@ mod side_batch_tests {
 \t\t(pad \"1\" smd roundrect (at -0.5 0 0) (size 0.6 0.5) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25) (net 1 \"GND\") (uuid \"bbbbbbbb-4444-4444-8444-444444444444\")))
 \t(footprint \"Custom:Odd\" (layer \"F.Cu\") (uuid \"cccccccc-1111-4111-8111-111111111111\") (at 50 20 0)
 \t\t(property \"Reference\" \"U9\" (at 0 -1.2 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))
-\t\t(pad \"1\" smd custom (at 0 0 0) (size 0.5 0.5) (layers \"F.Cu\") (primitives (gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (width 0) (fill yes)))))
+\t\t(pad \"1\" smd custom (at 0 0 0) (size 0.5 0.5) (layers \"F.Cu\") (primitives (gr_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (width 0) (fill yes))) (padstack (mode front_inner_back))))
 )
 ";
 
@@ -11048,7 +11781,11 @@ mod side_batch_tests {
             .await
             .unwrap();
         assert!(refused.is_error);
-        assert!(format!("{:?}", refused.content).contains("custom pads"));
+        let text = format!("{:?}", refused.content);
+        assert!(
+            text.contains("'U9'") && text.contains("(padstack …)"),
+            "{text}"
+        );
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
 
         let bad = json!({ "board": board, "placements": [
