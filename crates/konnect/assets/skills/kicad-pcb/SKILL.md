@@ -349,6 +349,7 @@ rules) is still the check.
 | `route_differential_pair` | Matched-length USB/LVDS/Ethernet pairs      |
 | `add_via`                 | Layer transition                            |
 | `create_netclass`         | Define width/clearance rules for net groups |
+| `route_native_region`     | Autoroute a region of the saved board (`native_routing` toolset). A net with a copper zone gets fanout vias, not tracks; name pours a refill will carve in `carve_zones` / `carve_zone_nets`; read `warnings`, the per-net plane report and `refill` in the result, and refill before DRC |
 
 ### route_pad_to_pad
 

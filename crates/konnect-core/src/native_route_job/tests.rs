@@ -45,6 +45,9 @@ fn spec(root: &Path, out: &str, source: CopperSource) -> NativeJobSpec {
         threads: Some(2),
         optimize: true,
         zones_are_obstacles: true,
+        carve_zones: Vec::new(),
+        carve_zone_nets: Vec::new(),
+        plane_nets_as_tracks: Vec::new(),
         clear_findings: None,
         time_limit_seconds: None,
         allowances: Default::default(),
@@ -572,4 +575,344 @@ fn a_plan_the_strict_lint_will_refuse_is_reported_with_its_tracks_before_it_is_a
         shown["note"].as_str().unwrap().contains(REPORT_FILE),
         "{shown}"
     );
+}
+
+/// The demo board with its GND plane's fill taken out of the saved file.
+fn without_fill(root: &Path) {
+    let text = konnect_route::synthetic::MINIMAL_KICAD10_BOARD;
+    let start = text.find("\t\t(filled_polygon").unwrap();
+    let end = start + text[start..].find("\t\t)\n").unwrap() + "\t\t)\n".len();
+    let unfilled = format!("{}{}", &text[..start], &text[end..]);
+    assert!(!unfilled.contains("filled_polygon"));
+    std::fs::write(root.join("demo.kicad_pcb"), unfilled).unwrap();
+}
+
+/// The demo board with a filled GND pour named `GND wall` right across
+/// every routing layer, between J1.2 (D+) and a new D+ pad R2.1 below it.
+fn with_wall(root: &Path) {
+    let text = konnect_route::synthetic::MINIMAL_KICAD10_BOARD;
+    let end = text.rfind(')').unwrap();
+    let band = "(pts (xy 0.1 28) (xy 49.9 28) (xy 49.9 29) (xy 0.1 29))";
+    let extra = format!(
+        r#"	(footprint "R_0402"
+		(layer "F.Cu")
+		(uuid "00000000-0000-0000-0000-000000000030")
+		(at 30 33)
+		(property "Reference" "R2"
+			(at 0 -1 0)
+			(layer "F.SilkS")
+		)
+		(pad "1" smd roundrect
+			(at 0 0)
+			(size 0.6 0.5)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(roundrect_rratio 0.25)
+			(net "D+")
+			(uuid "00000000-0000-0000-0000-000000000031")
+		)
+	)
+	(zone
+		(net "GND")
+		(layers "F.Cu" "In2.Cu" "B.Cu")
+		(uuid "00000000-0000-0000-0000-000000000032")
+		(name "GND wall")
+		(polygon {band})
+		(filled_polygon (layer "F.Cu") {band})
+		(filled_polygon (layer "In2.Cu") {band})
+		(filled_polygon (layer "B.Cu") {band})
+	)
+"#
+    );
+    let walled = format!("{}{}{}", &text[..end], extra, &text[end..]);
+    std::fs::write(root.join("demo.kicad_pcb"), walled).unwrap();
+}
+
+fn plan_nets(path: &Path) -> BTreeSet<String> {
+    let plan: RoutePlan = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    plan.tracks
+        .iter()
+        .map(|t| t.net.clone())
+        .chain(plan.vias.iter().map(|v| v.net.clone()))
+        .collect()
+}
+
+#[test]
+fn a_plane_net_is_left_to_its_plane_and_its_pads_are_accounted_for() {
+    let f = fixture();
+    let s = spec(&f.root, "plane.json", CopperSource::Native);
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(report.plane_nets.len(), 1, "{:?}", report.plane_nets);
+    let gnd = &report.plane_nets[0];
+    assert_eq!(
+        (gnd.net.as_str(), gnd.fill.as_str(), gnd.handling.as_str()),
+        ("GND", "filled", "left_to_plane")
+    );
+    // J1.1 is a through-hole pad in the plane; R1.2 got the fanout's via.
+    assert_eq!(gnd.pads, 2);
+    assert_eq!(gnd.connected_by_plane.pads, vec!["J1.1".to_string()]);
+    assert_eq!(gnd.connected_by_fanout.pads, vec!["R1.2".to_string()]);
+    assert!(gnd.needs_via_or_track.is_empty());
+    assert_eq!(gnd.connections_left_unrouted, 0);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.refill.is_none(), "no zone was declared crossable");
+    // The report a finished job hands back carries the same account.
+    let dir = prepare(&spec(&f.root, "plane2.json", CopperSource::Native), false).unwrap();
+    run_job_dir(&dir).unwrap();
+    let status = status_of(&f.root.join("plane2.json"));
+    assert_eq!(status["report"]["plane_nets"][0]["net"], "GND", "{status}");
+    assert_eq!(status["report"]["warnings"], json!([]));
+}
+
+#[test]
+fn a_plane_net_with_no_fill_is_warned_about_and_routed_as_tracks_only_when_named() {
+    let f = fixture();
+    without_fill(&f.root);
+    let s = spec(&f.root, "unfilled.json", CopperSource::Native);
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    let gnd = &report.plane_nets[0];
+    assert_eq!(
+        (gnd.net.as_str(), gnd.fill.as_str(), gnd.handling.as_str()),
+        ("GND", "unfilled", "left_to_plane")
+    );
+    assert_eq!(gnd.unfilled_zones.len(), 1);
+    assert_eq!(gnd.unfilled_zones[0].zone.as_deref(), Some("GND plane"));
+    assert_eq!(gnd.unfilled_zones[0].layer, "In1.Cu");
+    assert_eq!(gnd.connections_left_unrouted, 1);
+    // The connection left open is named by its two ends.
+    assert_eq!(gnd.unrouted_connections.len(), 1, "{gnd:?}");
+    let c = &gnd.unrouted_connections[0];
+    assert!(
+        c.from.contains('.') && c.to.contains('.') && c.from != c.to,
+        "{c:?}"
+    );
+    // Nothing of GND was routed: with no other open connection, no plan.
+    let route = report.stages.iter().find(|r| r.stage == "route").unwrap();
+    assert_eq!(route.detail["tasks"], 0, "{:?}", route.detail);
+    assert_eq!(route.detail["left_to_planes"], 1);
+    assert_eq!(route.detail["failed"], json!({}));
+    assert!(!s.output_plan.exists());
+    // The list of open connections holds it, as left to its plane: it is
+    // no failure of the run, and nothing is unexplained.
+    let open = report.unrouted.as_ref().expect("the run reached the check");
+    assert_eq!(open.total, 1, "{open:?}");
+    assert_eq!(open.connections[0].net, "GND");
+    assert_eq!(open.connections[0].reason, "left_to_plane");
+    assert_eq!(
+        open.by_reason,
+        BTreeMap::from([("left_to_plane".to_string(), 1)])
+    );
+    assert!(open.route_failures.is_empty());
+    let listed = unrouted::listing(&serde_json::to_value(open).unwrap(), 50, None);
+    assert!(
+        listed["reasons"]["left_to_plane"]
+            .as_str()
+            .unwrap()
+            .contains("plane_nets"),
+        "{listed}"
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let w = &report.warnings[0];
+    assert!(
+        w.contains("GND")
+            && w.contains("no zone fill")
+            && w.contains("GND plane@In1.Cu")
+            && w.contains("left unrouted")
+            && w.contains("plane_nets_as_tracks"),
+        "{w}"
+    );
+
+    // Asked for, the net is routed as tracks; the missing fill is still said.
+    let mut s = spec(&f.root, "as_tracks.json", CopperSource::Native);
+    s.plane_nets_as_tracks = vec!["GN?".to_string()];
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(report.plane_nets[0].handling, "routed_as_tracks");
+    assert_eq!(report.plane_nets[0].connections_left_unrouted, 0);
+    let route = report.stages.iter().find(|r| r.stage == "route").unwrap();
+    assert_eq!(route.detail["tasks"], 1, "{:?}", route.detail);
+    assert_eq!(route.detail["connections_after"], 0, "{:?}", route.detail);
+    assert_eq!(
+        plan_nets(&s.output_plan),
+        BTreeSet::from(["GND".to_string()])
+    );
+    assert!(
+        report.warnings[0].contains("no zone fill")
+            && report.warnings[0].contains("routed as tracks"),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn a_filled_pour_is_crossed_only_when_declared_and_the_report_asks_for_a_refill() {
+    let f = fixture();
+    with_wall(&f.root);
+    let only_d_plus = |out: &str| {
+        let mut s = spec(&f.root, out, CopperSource::Native);
+        s.nets = Some(vec!["D+".to_string()]);
+        s
+    };
+    // As saved the wall is copper: the connection fails, nothing is planned.
+    let s = only_d_plus("blocked.json");
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert!(report.stopped.is_none(), "{report:?}");
+    let route = report.stages.iter().find(|r| r.stage == "route").unwrap();
+    assert_eq!(route.detail["tasks"], 1, "{:?}", route.detail);
+    assert_eq!(route.detail["routed"], 0, "{:?}", route.detail);
+    assert!(!s.output_plan.exists());
+    assert!(report.refill.is_none());
+    // The failure names the fills in the way and the option that lifts them.
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let w = &report.warnings[0];
+    assert!(
+        w.starts_with("1 connection(s) were not routed")
+            && w.contains("GND wall@F.Cu")
+            && w.contains("GND wall@B.Cu")
+            && !w.contains("In1.Cu")
+            && w.contains("carve_zones"),
+        "{w}"
+    );
+
+    // By name, by net, and with the old switch: each lets the route through.
+    for (out, by) in [("named.json", 0), ("by_net.json", 1), ("all.json", 2)] {
+        let mut s = only_d_plus(out);
+        match by {
+            0 => s.carve_zones = vec!["GND wall".to_string()],
+            1 => s.carve_zone_nets = vec!["GND".to_string()],
+            _ => s.zones_are_obstacles = false,
+        }
+        let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+        assert!(report.stopped.is_none(), "{out}: {report:?}");
+        let route = report.stages.iter().find(|r| r.stage == "route").unwrap();
+        assert_eq!(route.detail["routed"], 1, "{out}: {:?}", route.detail);
+        assert_eq!(report.check.as_ref().unwrap().violations, 0, "{out}");
+        assert_eq!(
+            plan_nets(&s.output_plan),
+            BTreeSet::from(["D+".to_string()])
+        );
+        let refill = report
+            .refill
+            .as_ref()
+            .expect("zones were declared crossable");
+        assert!(refill.required, "{out}: {refill:?}");
+        assert!(!refill.crossed_zones.is_empty(), "{out}: {refill:?}");
+        assert!(refill
+            .crossed_zones
+            .iter()
+            .all(|c| c.zone.net == "GND" && c.tracks + c.vias > 0));
+        let wall = |c: &planes::CrossedZone| c.zone.zone.as_deref() == Some("GND wall");
+        assert!(refill.crossed_zones.iter().any(|c| wall(c) && c.tracks > 0));
+        // By name only the wall is declared. By net or with the switch the
+        // In1 plane is too: no track runs there, but a via through it needs
+        // its antipad from the same refill.
+        assert_eq!(
+            refill.crossable_zones.len(),
+            if by == 0 { 3 } else { 4 },
+            "{out}"
+        );
+        assert!(refill
+            .crossed_zones
+            .iter()
+            .all(|c| wall(c) || (by != 0 && c.zone.layer == "In1.Cu" && c.tracks == 0)));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("Refill required") && w.contains("GND wall@")),
+            "{out}: {:?}",
+            report.warnings
+        );
+    }
+}
+
+#[test]
+fn zone_options_naming_nothing_on_the_board_stop_the_run_as_an_input_error() {
+    let f = fixture();
+    let stopped = |edit: &dyn Fn(&mut NativeJobSpec)| {
+        let mut s = spec(&f.root, "bad_zone.json", CopperSource::Native);
+        edit(&mut s);
+        let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+        assert_eq!(report.stop_kind, Some(StopKind::InputError), "{report:?}");
+        assert!(!s.output_plan.exists());
+        report.stopped.unwrap()
+    };
+    // A rule area is never crossable.
+    let why = stopped(&|s| s.carve_zones = vec!["no_vias".to_string()]);
+    assert!(
+        why.contains("carve_zones") && why.contains("rule area"),
+        "{why}"
+    );
+    let why = stopped(&|s| s.carve_zones = vec!["GND plane".to_string(), "Nope".to_string()]);
+    assert!(
+        why.contains("no copper zone of the board is named 'Nope'"),
+        "{why}"
+    );
+    // SIG is a net, but owns no zone.
+    let why = stopped(&|s| s.carve_zone_nets = vec!["SIG".to_string()]);
+    assert!(
+        why.contains("carve_zone_nets") && why.contains("'GND'"),
+        "{why}"
+    );
+    let why = stopped(&|s| s.plane_nets_as_tracks = vec!["SIG".to_string()]);
+    assert!(
+        why.contains("plane_nets_as_tracks") && why.contains("'SIG'"),
+        "{why}"
+    );
+    // Taking existing copper routes nothing, so there is nothing to name.
+    let mut s = spec(&f.root, "taken.json", CopperSource::BoardUnlocked);
+    s.plane_nets_as_tracks = vec!["GND".to_string()];
+    let report = run_pipeline(&s, None, &mut Quiet).unwrap();
+    assert_eq!(report.stop_kind, Some(StopKind::InputError));
+    assert!(report.stopped.unwrap().contains("native routing"));
+}
+
+#[test]
+fn old_specs_without_the_zone_options_still_read() {
+    let f = fixture();
+    let s = spec(&f.root, "old.json", CopperSource::Native);
+    let mut v = serde_json::to_value(&s).unwrap();
+    // The options are not written when unset, so an old job's spec is the
+    // same bytes and resumes.
+    for key in ["carve_zones", "carve_zone_nets", "plane_nets_as_tracks"] {
+        assert!(v.get(key).is_none(), "{key} in {v}");
+    }
+    v.as_object_mut().unwrap().remove("zones_are_obstacles");
+    let back: NativeJobSpec = serde_json::from_value(v).unwrap();
+    assert_eq!(back, s);
+}
+
+#[test]
+fn a_filled_plane_in_separate_pieces_is_warned_about_even_when_every_pad_is_joined() {
+    use super::planes::{warnings, PlaneNetSummary, UnroutedConnection};
+    let split = PlaneNetSummary {
+        net: "GND".to_string(),
+        fill: "filled".to_string(),
+        handling: "left_to_plane".to_string(),
+        pads: 4,
+        connections_left_unrouted: 1,
+        unrouted_connections: vec![UnroutedConnection {
+            from: "C1.2".to_string(),
+            to: "C2.2".to_string(),
+        }],
+        ..PlaneNetSummary::default()
+    };
+    let w = warnings(std::slice::from_ref(&split), None);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("GND")
+            && w[0].contains("1 connection(s)")
+            && w[0].contains("unrouted_connections")
+            && w[0].contains("plane_nets_as_tracks"),
+        "{}",
+        w[0]
+    );
+    // Whole, the same net is nothing to warn about.
+    let whole = PlaneNetSummary {
+        connections_left_unrouted: 0,
+        unrouted_connections: Vec::new(),
+        ..split
+    };
+    assert!(warnings(&[whole], None).is_empty());
 }

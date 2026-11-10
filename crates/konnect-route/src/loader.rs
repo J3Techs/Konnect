@@ -1090,6 +1090,7 @@ fn load_zones(
                     island: false,
                     zone_name: z.name.clone(),
                     priority: z.priority,
+                    crossable: false,
                 });
             }
             continue;
@@ -1114,6 +1115,7 @@ fn load_zones(
                     island: fill.island,
                     zone_name: z.name.clone(),
                     priority: z.priority,
+                    crossable: false,
                 }),
                 None => report.skip("zone fill"),
             }

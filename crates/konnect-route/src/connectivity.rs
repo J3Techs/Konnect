@@ -394,6 +394,23 @@ pub fn plane_nets(board: &RouteBoard) -> Vec<NetId> {
         .collect()
 }
 
+/// Nets that own a copper zone, filled or not, in net order: the nets a
+/// pour is meant to join. A superset of [`plane_nets`]; a net here that is
+/// not there has no fill in the saved file, so nothing proves what its pour
+/// joins.
+pub fn zone_nets(board: &RouteBoard) -> Vec<NetId> {
+    let mut mask = vec![false; board.nets.len()];
+    for n in board.zones.iter().filter_map(|z| z.net) {
+        if let Some(m) = mask.get_mut(n.index()) {
+            *m = true;
+        }
+    }
+    (0..board.nets.len())
+        .filter(|&i| mask[i])
+        .map(|i| NetId(i as u32))
+        .collect()
+}
+
 fn plane_net_mask(board: &RouteBoard) -> Vec<bool> {
     let mut mask = vec![false; board.nets.len()];
     for z in board.zones.iter().filter(|z| z.filled) {

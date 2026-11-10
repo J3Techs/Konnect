@@ -365,7 +365,8 @@ impl<'a> ExactChecker<'a> {
                 net: v.net,
             });
         }
-        for z in &board.zones {
+        // A pour declared crossable is carved by the refill: never copper.
+        for z in board.zones.iter().filter(|z| !z.crossable) {
             let shape = Shape::Polygon(z.region.clone());
             add(
                 &mut checker,
@@ -1048,6 +1049,32 @@ mod tests {
                 .kind,
             ViolationKind::EdgeClearance
         );
+    }
+
+    #[test]
+    fn a_pour_declared_crossable_is_not_copper_to_the_checker() {
+        let mut board = crate::synthetic::plane_with_pads();
+        // The GND plane on In1 again on F.Cu, where SIG runs.
+        let mut front = board.zones[0].clone();
+        front.id = crate::api::ZoneId(1);
+        front.layer = LayerId(0);
+        board.zones.push(front);
+        let rules = UniformRules::default();
+        let sig = board.net_by_name("SIG").unwrap();
+        let mm = |v: f64| konnect_geom::mm_to_nm(v).unwrap();
+        let through = Segment::new(
+            Point::new(mm(8.0), mm(3.0)),
+            Point::new(mm(15.0), mm(3.0)),
+            mm(0.15),
+        );
+        let hit = |board: &RouteBoard| {
+            ExactChecker::new(board, &rules, CheckerOptions::default())
+                .track_violation(sig, LayerId(0), &through, &[], &|_, _| false)
+                .map(|v| v.kind)
+        };
+        assert_eq!(hit(&board), Some(ViolationKind::Short));
+        board.zones[1].crossable = true;
+        assert_eq!(hit(&board), None);
     }
 
     #[test]

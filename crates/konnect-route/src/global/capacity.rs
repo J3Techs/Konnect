@@ -96,7 +96,11 @@ fn collect(
         }
     }
     if settings.zones_block {
-        for z in board.zones.iter().filter(|z| z.layer == layer) {
+        for z in board
+            .zones
+            .iter()
+            .filter(|z| z.layer == layer && !z.crossable)
+        {
             track.push((Shape::Polygon(z.region.clone()), Kind::Copper));
             via.push((Shape::Polygon(z.region.clone()), Kind::Copper));
         }

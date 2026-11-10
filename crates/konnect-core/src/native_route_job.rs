@@ -43,6 +43,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod unrouted;
 pub use unrouted::{RouteFailure, Unrouted};
+pub mod planes;
+
+pub use planes::{PlaneNetSummary, RefillNotice, ZoneOptionError, ZonePolicy};
 
 /// The hidden subcommand the starter runs.
 pub const RUNNER_SUBCOMMAND: &str = "native-route-runner";
@@ -101,9 +104,24 @@ pub struct NativeJobSpec {
     pub threads: Option<usize>,
     #[serde(default = "yes")]
     pub optimize: bool,
-    /// Treat other nets' zone fills as copper in the optimizer and check.
+    /// Treat other nets' zone fills as copper. `false` declares every
+    /// copper zone crossable (see [`planes`]): routing, the optimizer and
+    /// the interim check all leave the fills to the refill.
     #[serde(default = "yes")]
     pub zones_are_obstacles: bool,
+    /// Copper zones (exact names) a refill will carve around the new
+    /// copper: their fill is no obstacle to other nets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carve_zones: Vec<String>,
+    /// Nets (names or `*` `?` patterns) whose every copper zone is
+    /// crossable in the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carve_zone_nets: Vec<String>,
+    /// Plane nets (names or `*` `?` patterns) to route as tracks like any
+    /// other net. Default: none; a net that owns a copper zone is left to
+    /// its plane and the fanout. Native routing only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plane_nets_as_tracks: Vec<String>,
     /// After S6, take out each piece of routed copper S7 still finds a
     /// defect in ([`konnect_route::pipeline::clear_findings`]), leaving its
     /// connections open. Unset: on for native routing, off for copper taken
@@ -422,6 +440,18 @@ pub struct PipelineReport {
     /// The same for the separate fanout plan, when one was written.
     #[serde(default)]
     pub fanout_plan_lint: Option<PlanLint>,
+    /// A native run's plane nets: what each plane joins, what the fanout
+    /// joined and which pads still need a via or a track.
+    #[serde(default)]
+    pub plane_nets: Vec<PlaneNetSummary>,
+    /// Set when zones were declared crossable: whether the plan needs a
+    /// refill, and which zones its copper cuts.
+    #[serde(default)]
+    pub refill: Option<RefillNotice>,
+    /// What a caller must not miss: plane nets with no fill, plane pads
+    /// left unconnected, a refill the plan depends on.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub telemetry: Telemetry,
 }
 
@@ -521,6 +551,9 @@ pub struct Checkpoint {
     /// reports why a connection is open.
     #[serde(default)]
     pub route_failures: Vec<RouteFailure>,
+    /// The route stage's plane-net account, kept for a resumed run.
+    #[serde(default)]
+    pub plane_nets: Vec<PlaneNetSummary>,
     pub optimize: Option<OptimizeReport>,
     pub check: Option<CheckSummary>,
     pub written_unix: u64,
@@ -652,6 +685,10 @@ struct NativeRoute {
     routed: RoutedCopper,
     /// Open connections the class policy left out, per class.
     excluded: BTreeMap<String, usize>,
+    /// The plane nets of the run.
+    plane_nets: Vec<PlaneNetSummary>,
+    /// Connections the stages could not route.
+    failed: usize,
     /// Counts for the `route` stage record.
     detail: Value,
     /// The tasks behind `detail.failed`, by pad.
@@ -666,6 +703,8 @@ impl NativeRoute {
             fanout: RoutedCopper::default(),
             routed,
             excluded: BTreeMap::new(),
+            plane_nets: Vec::new(),
+            failed: 0,
             detail: json!({}),
             failures: Vec::new(),
             telemetry: Telemetry::default(),
@@ -713,6 +752,7 @@ fn route_native(
         "iterations": r.detail.iterations,
         "connections_after": r.connections_after,
         "excluded_by_policy": excluded,
+        "left_to_planes": r.left_to_planes.len(),
         "fallback_routed": r.telemetry.counters.get("pipeline_fallback_routed").copied().unwrap_or(0),
     });
     // The stage's tasks name items of the board with its fanout appended.
@@ -729,6 +769,8 @@ fn route_native(
         fanout: r.fanout_copper,
         routed: r.routed,
         excluded,
+        plane_nets: planes::summaries(board, &r.plane_nets, &r.left_to_planes),
+        failed: r.detail.failure_details.len(),
         detail,
         telemetry: r.telemetry,
     })
@@ -798,6 +840,15 @@ pub fn run_pipeline(
         }),
     );
     report.net_classes = Some(classes);
+    // The zones the caller declared crossable are marked on the board, so
+    // every later stage leaves their fill to the refill.
+    let zone_policy = match spec.apply_zone_options(&mut board) {
+        Ok(p) => p,
+        Err(e) => {
+            report.stop(StopKind::InputError, e.to_string());
+            return Ok(report);
+        }
+    };
 
     // S1: connectivity.
     let t = Instant::now();
@@ -839,6 +890,7 @@ pub fn run_pipeline(
         frozen: RoutedCopper::default(),
         fanout: RoutedCopper::default(),
         route_failures: Vec::new(),
+        plane_nets: Vec::new(),
         optimize: None,
         check: None,
         written_unix: 0,
@@ -867,7 +919,19 @@ pub fn run_pipeline(
         );
         return Ok(report);
     }
+    if spec.source != CopperSource::Native && !spec.plane_nets_as_tracks.is_empty() {
+        report.stop(
+            StopKind::InputError,
+            "plane_nets_as_tracks applies only to native routing (source native); this job takes existing copper"
+                .to_string(),
+        );
+        return Ok(report);
+    }
     if spec.source == CopperSource::Native {
+        // A net that owns a copper zone is left to its plane and the
+        // fanout unless the caller asks for tracks.
+        settings.plane_tracks =
+            konnect_route::pipeline::PlaneTracks::Only(zone_policy.as_tracks.clone());
         match spec
             .allowances
             .resolve(&board, rules.classes(), &mut settings)
@@ -881,6 +945,8 @@ pub fn run_pipeline(
     }
 
     let t = Instant::now();
+    // Said when connections fail behind fills nobody declared crossable.
+    let mut zone_hint: Option<String> = None;
     let (mut work, frozen, fanout, route_failures) = if let Some(cp) =
         resume.as_ref().filter(|_| done("route"))
     {
@@ -899,6 +965,7 @@ pub fn run_pipeline(
             json!({ "tracks": cp.copper.tracks.len(), "vias": cp.copper.vias.len(),
                     "fanout_tracks": cp.fanout.tracks.len(), "fanout_vias": cp.fanout.vias.len() }),
         );
+        report.plane_nets = cp.plane_nets.clone();
         (
             cp.copper.clone(),
             cp.frozen.clone(),
@@ -939,6 +1006,8 @@ pub fn run_pipeline(
                 }
                 checkpoint.completed.push("route".to_string());
                 report.excluded_by_policy = r.excluded.clone();
+                report.plane_nets = r.plane_nets.clone();
+                zone_hint = planes::obstacle_hint(&board, r.failed);
                 let mut detail = json!({ "tracks": r.routed.tracks.len(), "vias": r.routed.vias.len(),
                                          "fanout_tracks": r.fanout.tracks.len(),
                                          "fanout_vias": r.fanout.vias.len() });
@@ -982,6 +1051,9 @@ pub fn run_pipeline(
     checkpoint.frozen = frozen;
     checkpoint.fanout = fanout.clone();
     checkpoint.route_failures = route_failures.clone();
+    checkpoint.plane_nets = report.plane_nets.clone();
+    report.warnings = planes::warnings(&report.plane_nets, None);
+    report.warnings.extend(zone_hint.clone());
     checkpoint.written_unix = now_unix();
     observer.checkpoint(&checkpoint);
     if let Some((kind, why)) = stop_check(observer) {
@@ -1110,6 +1182,7 @@ pub fn run_pipeline(
                 region,
                 own_from,
                 excluded_classes: &settings.excluded_classes,
+                plane_tracks: &settings.plane_tracks,
                 routed_here: spec.source == CopperSource::Native,
                 failures: &route_failures,
                 cleared: report.cleared.as_ref().map_or(&none, |c| &c.nets),
@@ -1188,13 +1261,19 @@ pub fn run_pipeline(
             report.fanout_plan_lint = Some(PlanLint::of(path, &plan));
         }
     }
+    let all_copper = RoutedCopper {
+        tracks: fanout.tracks.iter().chain(&work.tracks).copied().collect(),
+        vias: fanout.vias.iter().chain(&work.vias).copied().collect(),
+    };
+    // Which crossable pours the copper cut: the plan depends on a refill
+    // there.
+    report.refill = planes::refill_notice(&board, &rules, &zone_policy, &all_copper);
+    report.warnings = planes::warnings(&report.plane_nets, report.refill.as_ref());
+    report.warnings.extend(zone_hint);
     let planned = if separate.is_some() {
         work.clone()
     } else {
-        RoutedCopper {
-            tracks: fanout.tracks.iter().chain(&work.tracks).copied().collect(),
-            vias: fanout.vias.iter().chain(&work.vias).copied().collect(),
-        }
+        all_copper
     };
     if planned.tracks.is_empty() && planned.vias.is_empty() {
         record(
@@ -1490,6 +1569,7 @@ fn report_listing(dir: &Path, status: &JobStatus, listed: usize) -> Value {
             "stopped": r["stopped"], "fanout_plan": r["fanout_plan_path"],
             "net_classes": r["net_classes"], "allowances": r["allowances"],
             "excluded_by_policy": r["excluded_by_policy"], "reference": r["reference"],
+            "plane_nets": r["plane_nets"], "refill": r["refill"], "warnings": r["warnings"],
             "stage_wall_us": r["telemetry"]["stages"], "threads": r["telemetry"]["threads"],
         });
         if r["unrouted"].is_object() {
