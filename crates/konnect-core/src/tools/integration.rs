@@ -17,7 +17,7 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, lcsc_packages, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, invalid_arg, lcsc_packages, require_str, ToolContext, ToolDef};
 use konnect_sexp::{
     command::{commit_command, prepare_command, ItemId, SchematicCommand},
     parse_sexp,
@@ -56,7 +56,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "search_jlcpcb_parts",
-            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive.",
+            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive. Each result names its LCSC part number as lcsc_id (and under the legacy key lcsc); pass it to get_jlcpcb_part or get_datasheet_url.",
             json!({
                 "type": "object",
                 "properties": {
@@ -72,13 +72,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_jlcpcb_part",
-            "Retrieve full details for a single JLCPCB part by its LCSC part number.",
+            "Retrieve full details for a single JLCPCB part by its LCSC part number: the lcsc_id of a search_jlcpcb_parts or suggest_jlcpcb_alternatives result. The part is returned with the same keys as a search result.",
             json!({
                 "type": "object",
                 "properties": {
-                    "lcsc_id": { "type": "string", "description": "LCSC part number (e.g. 'C14663')" }
+                    "lcsc_id": { "type": "string", "description": "LCSC part number (e.g. 'C14663'). Required unless its alias 'lcsc' is given" },
+                    "lcsc": { "type": "string", "description": "Alias of lcsc_id: the legacy key a part result also carries. Giving both with different values is an error." }
                 },
-                "required": ["lcsc_id"]
+                "required": []
             }),
             |args, ctx| async move { handle_get_jlcpcb_part(args, ctx).await }
         ),
@@ -129,7 +130,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "mpn": { "type": "string", "description": "Manufacturer part number (optional)" },
-                    "lcsc_id": { "type": "string", "description": "LCSC part number (optional)" }
+                    "lcsc_id": { "type": "string", "description": "LCSC part number (optional)" },
+                    "lcsc": { "type": "string", "description": "Alias of lcsc_id: the legacy key a part result also carries. Giving both with different values is an error." }
                 },
                 "required": []
             }),
@@ -810,6 +812,24 @@ async fn handle_search_jlcpcb_parts(
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
+/// The LCSC part number a call names: `lcsc_id`, or `lcsc` as part results
+/// also spell it. `None` when neither is given.
+fn lcsc_id_arg(args: &serde_json::Value) -> Result<Option<String>, CallToolResult> {
+    let read = |key: &str| match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_arg(key, "must be a string")),
+    };
+    match (read("lcsc_id")?, read("lcsc")?) {
+        (Some(a), Some(b)) if a != b => Err(invalid_arg(
+            "lcsc",
+            "conflicts with 'lcsc_id'; give one, or the same value in both",
+        )),
+        (Some(id), _) | (None, Some(id)) => Ok(Some(id)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
     // The exact LCSC PDF URL for most parts. Omitted here once made a caller
     // unable to get a datasheet the table already held (#255); an empty cell
@@ -818,8 +838,12 @@ fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         url if url.is_empty() => serde_json::Value::Null,
         url => json!(url),
     };
+    let lcsc_id = row.get::<_, String>(0).unwrap_or_default();
     Ok(json!({
-        "lcsc": row.get::<_, String>(0).unwrap_or_default(),
+        // `lcsc_id` is the name every tool argument uses; `lcsc` is the key
+        // results carried before it and stays for callers that read it.
+        "lcsc_id": lcsc_id,
+        "lcsc": lcsc_id,
         "mpn": row.get::<_, String>(1).unwrap_or_default(),
         "package": row.get::<_, String>(2).unwrap_or_default(),
         "manufacturer": row.get::<_, String>(3).unwrap_or_default(),
@@ -835,15 +859,23 @@ async fn handle_get_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let lcsc_id = match lcsc_id_arg(args) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Ok(invalid_arg(
+                "lcsc_id",
+                "missing; give 'lcsc_id' (or its alias 'lcsc')",
+            ))
+        }
+        Err(refusal) => return Ok(refusal),
+    };
     let db_path = resolve_db_path(args, ctx);
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
         ));
     }
-    let lcsc_id = require_str(args, "lcsc_id")
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?
-        .to_string();
+    let requested = lcsc_id.clone();
 
     let key = cache_key("get_jlcpcb_part", &db_path, &[&lcsc_id]);
     if let Some(mut cached) = ctx.jlcpcb_cache.get(&key) {
@@ -873,8 +905,7 @@ async fn handle_get_jlcpcb_part(
             Ok(CallToolResult::text(serde_json::to_string(&part).unwrap()))
         }
         None => Ok(CallToolResult::error(format!(
-            "Part not found in database: {}",
-            args["lcsc_id"].as_str().unwrap_or("")
+            "Part not found in database: {requested}"
         ))),
     }
 }
@@ -1677,7 +1708,11 @@ async fn handle_get_datasheet_url(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let mpn = args["mpn"].as_str();
-    let lcsc_id = args["lcsc_id"].as_str();
+    let lcsc_id = match lcsc_id_arg(args) {
+        Ok(id) => id,
+        Err(refusal) => return Ok(refusal),
+    };
+    let lcsc_id = lcsc_id.as_deref();
 
     if mpn.is_none() && lcsc_id.is_none() {
         return Ok(CallToolResult::error("Provide either 'mpn' or 'lcsc_id'"));
@@ -3269,6 +3304,132 @@ mod jlcpcb_cache_tests {
         assert_eq!(response_json(&first)["cached"], json!(false));
         assert_eq!(response_json(&second)["cached"], json!(true));
         assert_eq!(response_json(&first)["lcsc"], json!("C14663"));
+    }
+
+    /// Whether the published schema admits the call. `output_path` is the
+    /// handlers' test-only database override, not a published argument.
+    fn part_lookup_validates(mut args: serde_json::Value) -> bool {
+        args.as_object_mut().unwrap().remove("output_path");
+        let def = tools()
+            .into_iter()
+            .find(|tool| tool.name == "get_jlcpcb_part")
+            .unwrap();
+        def.input_validator.is_valid(&args)
+    }
+
+    /// A search result's part number goes straight into the lookup, under
+    /// either key the result carries; the schema used to require `lcsc_id`
+    /// while results offered only `lcsc`.
+    #[tokio::test]
+    async fn a_search_result_key_is_accepted_by_the_part_lookup() {
+        let (_dir, db_path) = seed_test_db();
+        let ctx = test_ctx();
+        let db = db_path.to_str().unwrap();
+        let search =
+            handle_search_jlcpcb_parts(&json!({ "query": "10k", "output_path": db }), &ctx)
+                .await
+                .unwrap();
+        let hit = response_json(&search)["results"][0].clone();
+        assert_eq!(hit["lcsc_id"], json!("C14663"), "{hit}");
+        assert_eq!(hit["lcsc"], hit["lcsc_id"], "{hit}");
+
+        for key in ["lcsc_id", "lcsc"] {
+            let args = json!({ key: hit[key], "output_path": db });
+            assert!(part_lookup_validates(args.clone()), "{args}");
+            let result = handle_get_jlcpcb_part(&args, &ctx).await.unwrap();
+            assert!(!result.is_error, "{key}: {result:?}");
+            let part = response_json(&result);
+            assert_eq!(part["lcsc_id"], json!("C14663"), "{key}: {part}");
+            assert_eq!(part["lcsc"], json!("C14663"), "{key}: {part}");
+            assert_eq!(part["mpn"], json!("RC0402FR-0710KL"), "{key}: {part}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_part_lookup_accepts_both_keys_when_they_agree() {
+        let (_dir, db_path) = seed_test_db();
+        let args = json!({
+            "lcsc_id": "C14663",
+            "lcsc": "C14663",
+            "output_path": db_path.to_str().unwrap()
+        });
+        assert!(part_lookup_validates(args.clone()));
+        let result = handle_get_jlcpcb_part(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(response_json(&result)["lcsc_id"], json!("C14663"));
+    }
+
+    #[tokio::test]
+    async fn the_part_lookup_refuses_two_different_part_numbers() {
+        let (_dir, db_path) = seed_test_db();
+        let args = json!({
+            "lcsc_id": "C14663",
+            "lcsc": "C25804",
+            "output_path": db_path.to_str().unwrap()
+        });
+        let result = handle_get_jlcpcb_part(&args, &test_ctx()).await.unwrap();
+        assert!(result.is_error);
+        let body = response_json(&result);
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "lcsc", "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_part_lookup_refuses_a_missing_or_non_string_part_number() {
+        let (_dir, db_path) = seed_test_db();
+        let db = db_path.to_str().unwrap();
+        for (args, field) in [
+            (json!({ "output_path": db }), "lcsc_id"),
+            (json!({ "lcsc_id": 14663, "output_path": db }), "lcsc_id"),
+            (json!({ "lcsc": 14663, "output_path": db }), "lcsc"),
+        ] {
+            let result = handle_get_jlcpcb_part(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error, "{args}");
+            let body = response_json(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], field, "{body}");
+        }
+        assert!(!part_lookup_validates(json!({ "lcsc_id": 14663 })));
+        assert!(!part_lookup_validates(json!({ "part": "C14663" })));
+    }
+
+    #[tokio::test]
+    async fn the_part_lookup_names_the_part_it_did_not_find() {
+        let (_dir, db_path) = seed_test_db();
+        let args = json!({ "lcsc": "C99999999", "output_path": db_path.to_str().unwrap() });
+        let result = handle_get_jlcpcb_part(&args, &test_ctx()).await.unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(text.contains("C99999999"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_datasheet_url_accepts_the_lcsc_alias_and_refuses_a_conflict() {
+        let (_dir, db_path) = seed_test_db();
+        let db = db_path.to_str().unwrap();
+        let by_alias =
+            handle_get_datasheet_url(&json!({ "lcsc": "C14663", "output_path": db }), &test_ctx())
+                .await
+                .unwrap();
+        let body = response_json(&by_alias);
+        assert_eq!(body["lcsc_id"], json!("C14663"), "{body}");
+        assert_eq!(
+            body["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+
+        let conflict = handle_get_datasheet_url(
+            &json!({ "lcsc_id": "C14663", "lcsc": "C25804", "output_path": db }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(conflict.is_error);
+        let body = response_json(&conflict);
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], "lcsc", "{body}");
     }
 
     #[tokio::test]
