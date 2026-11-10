@@ -224,10 +224,143 @@ http_address = "127.0.0.1:3000"
 ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
 ```
 
-Start `konnect` from a normal terminal and point the client at
-`http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
-the server is up. Keep the address on `127.0.0.1`: the HTTP transport has no
-authentication. KiCad needs no change.
+Start `konnect` with stdin redirected (`konnect.exe < NUL` in `cmd.exe`; on a
+terminal's stdin it runs its first-time setup instead of a server) and point
+the client at `http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health`
+answers `ok` while the server is up. Keep the address on `127.0.0.1`: the HTTP
+transport has no authentication. KiCad needs no change. To keep that server
+running across sessions, see
+[the next section](#the-http-server-stops-when-the-session-that-started-it-ends).
+
+## The HTTP server stops when the session that started it ends
+
+A Konnect started with `transport = "http"` is an ordinary foreground process.
+It has no daemon mode, installs no service and handles no shutdown signal.
+Started as a background task of an AI client's session, or from a terminal
+that is later closed, it ends when that parent ends its children: an agent
+session's time limit, for example, takes the server with it in the middle of a
+job. For a server that must outlive any session, start it from the operating
+system's service manager, as the same user as KiCad and inside that user's
+desktop session (KiCad's IPC endpoint belongs to that user).
+
+What the binary needs, whichever manager starts it:
+
+- **Standard input that is not a terminal.** With a terminal on stdin,
+  `konnect` runs its first-time setup, waits for Enter and never starts a
+  server. A service manager supplies no terminal. From a shell, redirect it:
+  `konnect --config <file> < /dev/null`, or `konnect.exe --config <file> < NUL`
+  in `cmd.exe`.
+- **`--config <path>`.** It is the server's only option besides `--client`.
+  Without it the [search list](KICAD_INTEGRATION.md) starts at `konnect.toml`
+  in the working directory, and a service's working directory is seldom the
+  one intended.
+- **`transport = "http"` in that file**, with `http_address` if the default
+  `127.0.0.1:3000` does not suit. Not `"both"`: that mode also serves stdio
+  and exits when stdin reaches end of file, which under a service manager is
+  at once. Keep the address on `127.0.0.1`; the transport has no
+  authentication.
+- Logs go to stderr, at `log_level` from the file or `RUST_LOG`.
+
+The three examples below use only those options. They follow each service
+manager's documentation and were not installed or run while writing this.
+
+**Linux**, a systemd user unit at `~/.config/systemd/user/konnect.service`,
+then `systemctl --user enable --now konnect`:
+
+```ini
+[Unit]
+Description=Konnect MCP server (HTTP)
+
+[Service]
+ExecStart=%h/.local/bin/konnect --config %h/.config/konnect/config.toml
+Restart=on-failure
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+`KillMode=process` matters for route jobs: systemd's default ends every
+process in the unit's control group when the unit stops, job runners included.
+
+**macOS**, a launch agent at `~/Library/LaunchAgents/local.konnect.plist`,
+then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.konnect.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.konnect</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/konnect</string>
+    <string>--config</string>
+    <string>/Users/you/Library/Application Support/konnect/config.toml</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/konnect.log</string>
+</dict>
+</plist>
+```
+
+**Windows**, a scheduled task that starts at logon, from PowerShell. The
+action goes through `cmd.exe` only to redirect stdin, and the settings remove
+Task Scheduler's default three-day execution limit and its default of not
+running, and stopping, on battery power:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "cmd.exe" `
+  -Argument '/c ""C:\Tools\konnect.exe" --config "C:\Tools\konnect.toml" < NUL 2>> "C:\Tools\konnect.log""'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
+  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "Konnect HTTP" -Action $action -Trigger $trigger -Settings $settings
+```
+
+### Reconnecting a client
+
+The HTTP transport keeps no session: there is no session ID, and every `POST`
+to `http://127.0.0.1:3000/mcp` is answered on its own. After a restart a client
+keeps the same URL and its next request is served. `GET /health` answers `ok`
+once the server is up. What a restart does lose is the process's memory:
+
+- toolsets loaded with `load_toolset` (load them again, or set
+  `eager_toolsets` or `auto_load_toolsets` in the configuration);
+- the client adaptation done at `initialize`, so a client that relies on it
+  must initialize again;
+- the SSE stream on `GET /mcp` that carries notifications, which the client
+  must reopen.
+
+### What happens to work in progress when the server stops
+
+Nothing is finished or rolled back on the way out; the process simply ends.
+
+- **A tool call in flight** ends with the process and the client sees a
+  dropped connection instead of a result. That includes the routers that run
+  inside the server, `route_native_region` and `route_specctra_dsn`.
+  Whatever the call had already written to a file or sent to KiCad stays as
+  it was at that moment, so inspect before repeating it. Konnect ends the
+  Freerouting `java` process of a `route_specctra_dsn` call only when the
+  call itself ends; a server that is killed does not, so that process goes
+  only if the stop takes the server's child processes too. Look for a
+  leftover `java` process before routing again.
+- **A route job** (`start_native_route_job`, `start_specctra_route_job`) is a
+  separate `konnect` runner process and keeps its state on disk, in
+  `<output_plan>.konnect-native-job/` or `<ses_output_path>.konnect-job/`. On Unix the
+  runner has its own process group. On Windows it is started broken away from
+  the server's job object when that job allows it; the start result says so in
+  `left_client_job`, and when that is `false` the runner ends with whatever
+  ends the server. A runner that survives carries on, and
+  `get_native_route_job` / `get_specctra_route_job` on the restarted server
+  report it, because they read only the job directory.
+- **A runner that was killed too** shows as `RUNNER_LOST` once its heartbeat
+  is more than 30 seconds old for a native job, or 120 seconds for a
+  Freerouting job. A native job keeps `checkpoint.json` after each completed
+  stage and continues from it with `start_native_route_job` and
+  `resume: true`. A Freerouting job keeps its last `checkpoint.ses`; it has no
+  resume and is started again.
 
 ## Tools answer from the file while KiCad is open
 

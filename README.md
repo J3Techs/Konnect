@@ -108,7 +108,7 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | PCB editing | KiCad 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
 | Specctra routing | Revision-bound Rust DSN export, local Freerouting MCP routing, and strict one-transaction SES import; an authenticated KiCad 10 native-export bridge is explicit opt-in |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
-| Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
+| Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`; [running it as a long-lived service](docs/TROUBLESHOOTING.md#the-http-server-stops-when-the-session-that-started-it-ends)) |
 
 Explore the request path and safety boundaries in the
 [interactive architecture diagrams](docs/ARCHITECTURE_DIAGRAMS.md). They are
