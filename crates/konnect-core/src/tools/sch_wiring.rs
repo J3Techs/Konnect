@@ -364,7 +364,9 @@ pub fn tools() -> Vec<ToolDef> {
              which are one net across all sheets and instances. label_orientation \
              'along_stub' turns the label along a vertical stub; shape sets a global or \
              hierarchical label's shape, or 'from_pin' takes it from the pin. Junction dots \
-             follow KiCad's rule: one goes where the stub makes three or more exits meet.",
+             follow KiCad's rule: one goes where the stub makes three or more exits meet. \
+             For a net that leaves the sheet or runs to a distant block; neighbouring parts \
+             of one block are joined with wires (connect_pins, add_wire), not matching labels.",
             json!({
                 "type": "object",
                 "properties": {

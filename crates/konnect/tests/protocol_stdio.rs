@@ -811,12 +811,16 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     std::fs::write(tmp.path().join(".konnect/.installed"), "0.2.2").unwrap();
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
+    let (standing, notice) = instructions
+        .split_once("\n\n")
+        .expect("a notice after the standing instructions");
+    assert!(standing.contains("batch_connect_to_net"), "{standing}");
     assert!(
-        instructions.starts_with("Konnect Claude guidance (installed by v0.2.2)"),
-        "{instructions}"
+        notice.starts_with("Konnect Claude guidance (installed by v0.2.2)"),
+        "{notice}"
     );
-    assert!(instructions.contains("`konnect init`"), "{instructions}");
-    assert_eq!(instructions.lines().count(), 1, "Codex was never installed");
+    assert!(notice.contains("`konnect init`"), "{notice}");
+    assert_eq!(notice.lines().count(), 1, "Codex was never installed");
 
     let result = p.call_tool("get_installation_info", json!({}));
     let body = McpProcess::tool_body(&result);
@@ -835,7 +839,9 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
 
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let init = &p.initialized["result"];
-    assert!(init.get("instructions").is_none(), "{init}");
+    let standing = init["instructions"].as_str().unwrap();
+    assert!(!standing.contains("konnect init"), "{standing}");
+    assert_eq!(standing.lines().count(), 1, "{standing}");
     let result = p.call_tool("get_installation_info", json!({}));
     let guidance = &McpProcess::tool_body(&result)["guidance"];
     assert_eq!(guidance["claude"]["state"], "out_of_sync");
