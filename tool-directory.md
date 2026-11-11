@@ -117,8 +117,8 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_wire` | Add a wire segment (H or V) between two points. T-junctions are auto-detected and junction dots inserted. |
-| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. |
+| `add_wire` | Add a wire segment (H or V) between two points. Junction dots follow KiCad's rule: one where the wire makes three or more exits meet, on a span or at wire ends. |
+| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. Junction dots follow KiCad's rule, as `add_wire`. |
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified by KiCad's junction rule (fewer than three exits: a corner, a straight join, a lone wire, a wire end on a pin). |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified by KiCad's junction rule. |
 | `split_wire_at_point` | Split a wire at a given point into two segments. A junction dot goes at the split only where KiCad's junction rule calls for one (another wire ending there, a pin or a sheet pin); `junction_added` says which. |
