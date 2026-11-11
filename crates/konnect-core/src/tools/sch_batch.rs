@@ -54,7 +54,12 @@ pub fn tools() -> Vec<ToolDef> {
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
-             global labels are one net across all sheets and instances.",
+             global labels are one net across all sheets and instances. \
+             For the pins of an IC or connector whose nets leave the block or the sheet. It \
+             is not a way to wire a block: parts with a label on every pin and no wires \
+             between them are a netlist, not a schematic. Join neighbouring parts with \
+             connect_pins or batch_add_wire. A two-pin part given a label on both pins is \
+             reported in drawing_style.label_only_parts.",
             json!({
                 "type": "object",
                 "properties": {
@@ -896,6 +901,16 @@ async fn handle_batch_connect_to_net(
         "added_count": added.len(),
         "errors": Vec::<String>::new()
     });
+    let label_only = label_only_two_pin_parts(&planned, &instances, &lib_syms);
+    if !label_only.is_empty() {
+        body["drawing_style"] = json!({
+            "label_only_parts": label_only,
+            "advice": "Each of these two-pin parts now has a label on both pins and no wire to \
+                       its neighbours. If it sits inside a functional block, remove the labels \
+                       and join it with wires (connect_pins, batch_add_wire); keep a label only \
+                       where the net leaves the block or the sheet."
+        });
+    }
     if !is_legacy_placement {
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(call_label.kind);
@@ -907,6 +922,47 @@ async fn handle_batch_connect_to_net(
             .collect::<Vec<_>>());
     }
     Ok(CallToolResult::json(&body))
+}
+
+/// Two-pin parts this call put a label on both pins of, in call order: the
+/// mark of a sheet being wired by matching names instead of drawn. A part
+/// with more pins is an IC or connector fanning out, which labels suit.
+fn label_only_two_pin_parts(
+    planned: &[PlannedConnection],
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::SexpNode],
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for item in planned {
+        if parts.contains(&item.reference) {
+            continue;
+        }
+        let pins_in_call = planned
+            .iter()
+            .filter(|other| other.reference == item.reference)
+            .map(|other| other.pin_number.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if pins_in_call.len() == 2 && placed_pin_count(instances, lib_syms, &item.reference) == 2 {
+            parts.push(item.reference.clone());
+        }
+    }
+    parts
+}
+
+/// How many pins the placed units of `reference` have between them.
+fn placed_pin_count(
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::SexpNode],
+    reference: &str,
+) -> usize {
+    instances
+        .iter()
+        .filter(|instance| instance.reference == reference)
+        .filter_map(|instance| {
+            let lib_sym = find_lib_symbol(lib_syms, instance)?;
+            Some(konnect_sexp::schematic::extract_lib_pins_for_unit(lib_sym, instance.unit).len())
+        })
+        .sum()
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -5693,5 +5749,128 @@ mod round3_connect_tests {
             konnect_sexp::schematic::extract_junctions(&tree),
             [(89.84, 100.0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod label_only_part_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A two-pin R1 and R2 beside a four-pin U1.
+    fn sheet() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin = |x: f64, y: f64, angle: f64, number: &str| {
+            format!(
+                "        (pin passive line (at {x} {y} {angle}) (length 1.27)\n\
+                 \x20         (name \"~\") (number \"{number}\"))\n"
+            )
+        };
+        let resistor = format!(
+            "{}{}",
+            pin(0.0, 3.81, 270.0, "1"),
+            pin(0.0, -3.81, 90.0, "2")
+        );
+        let quad = format!(
+            "{}{}{}{}",
+            pin(-10.16, 2.54, 0.0, "1"),
+            pin(-10.16, -2.54, 0.0, "2"),
+            pin(10.16, 2.54, 180.0, "3"),
+            pin(10.16, -2.54, 180.0, "4"),
+        );
+        let placed = |lib: &str, reference: &str, x: f64| {
+            format!(
+                "  (symbol\n    (lib_id \"Test:{lib}\")\n    (at {x} 100 0)\n    (unit 1)\n    \
+                 (property \"Reference\" \"{reference}\" (at {x} 90 0))\n    \
+                 (property \"Value\" \"{lib}\" (at {x} 110 0))\n  )\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parts.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  \
+                 (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  \
+                 (lib_symbols\n    (symbol \"Test:R\"\n      (symbol \"R_1_1\"\n{resistor}      )\n    )\n    \
+                 (symbol \"Test:QUAD\"\n      (symbol \"QUAD_1_1\"\n{quad}      )\n    )\n  )\n\
+                 {}{}{})\n",
+                placed("R", "R1", 50.0),
+                placed("R", "R2", 70.0),
+                placed("QUAD", "U1", 120.0),
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn connect(path: &std::path::Path, pins: serde_json::Value) -> serde_json::Value {
+        let result = handle_batch_connect_to_net(
+            &json!({ "schematic": path.to_str().unwrap(), "pins": pins }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_two_pin_part_labelled_on_both_pins_is_reported() {
+        let (_dir, path) = sheet();
+        let body = connect(
+            &path,
+            json!([
+                { "reference": "R1", "pin_number": "1", "net": "VIN" },
+                { "reference": "R1", "pin_number": "2", "net": "MID" },
+                { "reference": "R2", "pin_number": "1", "net": "MID" },
+                { "reference": "U1", "pin_number": "1", "net": "MID" },
+                { "reference": "U1", "pin_number": "2", "net": "SCL" },
+                { "reference": "U1", "pin_number": "3", "net": "SDA" }
+            ]),
+        )
+        .await;
+        assert_eq!(body["added_count"], 6);
+        assert_eq!(body["drawing_style"]["label_only_parts"], json!(["R1"]));
+        assert!(body["drawing_style"]["advice"]
+            .as_str()
+            .unwrap()
+            .contains("connect_pins"));
+    }
+
+    #[tokio::test]
+    async fn fan_out_and_single_ended_labels_carry_no_report() {
+        let (_dir, path) = sheet();
+        let body = connect(
+            &path,
+            json!([
+                { "reference": "R1", "pin_number": "1", "net": "VIN" },
+                { "reference": "U1", "pin_number": "1", "net": "A" },
+                { "reference": "U1", "pin_number": "2", "net": "B" },
+                { "reference": "U1", "pin_number": "3", "net": "C" },
+                { "reference": "U1", "pin_number": "4", "net": "D" }
+            ]),
+        )
+        .await;
+        assert!(body.get("drawing_style").is_none(), "{body}");
     }
 }

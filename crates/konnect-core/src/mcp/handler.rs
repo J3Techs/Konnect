@@ -2433,25 +2433,60 @@ mod client_adaptation_tests {
             .expect("initialize returns a result")
     }
 
-    /// Drift reaches the model through `instructions` (#728); with nothing
-    /// to report, or no probe at all, the field is absent rather than empty.
+    /// Every client gets the standing instructions; drift (#728) follows
+    /// them on its own lines when there is some, and nothing does otherwise.
     #[tokio::test]
-    async fn initialize_carries_a_guidance_notice_only_when_there_is_one() {
+    async fn initialize_carries_standing_instructions_and_any_guidance_notice() {
+        use crate::mcp::server::STANDING_INSTRUCTIONS;
         let bare = lazy_handler().await;
-        assert!(initialize_result(&bare).await.get("instructions").is_none());
+        assert_eq!(
+            initialize_result(&bare).await["instructions"],
+            STANDING_INSTRUCTIONS
+        );
 
         let quiet = lazy_handler().await;
         quiet.set_guidance_probe(Arc::new(FixedProbe(None)));
-        assert!(initialize_result(&quiet)
-            .await
-            .get("instructions")
-            .is_none());
+        assert_eq!(
+            initialize_result(&quiet).await["instructions"],
+            STANDING_INSTRUCTIONS
+        );
 
         let drifted = lazy_handler().await;
         drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run konnect init"))));
         let result = initialize_result(&drifted).await;
-        assert_eq!(result["instructions"], "run konnect init");
+        assert_eq!(
+            result["instructions"],
+            format!("{STANDING_INSTRUCTIONS}\n\nrun konnect init")
+        );
         assert_eq!(result["serverInfo"]["name"], "konnect");
+    }
+
+    /// The standing instructions name the wiring tools and the one they
+    /// warn against, so a renamed tool cannot leave them pointing nowhere.
+    #[tokio::test]
+    async fn standing_instructions_name_registered_tools() {
+        use crate::mcp::server::STANDING_INSTRUCTIONS;
+        let handler = lazy_handler().await;
+        handler.ctx.router.load_all().await;
+        let names: Vec<String> = handler
+            .ctx
+            .router
+            .active_tools()
+            .await
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for tool in [
+            "connect_pins",
+            "add_wire",
+            "batch_add_wire",
+            "add_schematic_connection",
+            "batch_connect_to_net",
+            "render_schematic_png",
+        ] {
+            assert!(STANDING_INSTRUCTIONS.contains(tool), "{tool}");
+            assert!(names.iter().any(|name| name == tool), "{tool}");
+        }
     }
 
     /// Claude Code honours list_changed and must not be swept up by a loose

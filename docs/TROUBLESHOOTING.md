@@ -91,8 +91,8 @@ that runs another Konnect binary, written exactly as `konnect init` writes it.
 The serving process makes the same comparison for both clients once per
 installed guidance version, meaning each install marker. The first start
 for that marker scans, records the resulting state in
-`~/.konnect/.guidance-checked-<client>`, and sets the MCP `initialize`
-`instructions` to a one-line notice when either client is `out_of_sync`. Later
+`~/.konnect/.guidance-checked-<client>`, and adds a one-line notice to the MCP `initialize`
+`instructions`, after the standing drawing instructions, when either client is `out_of_sync`. Later
 starts read the record instead of rescanning and give no notice. Running
 `konnect init` starts a new check. Upgrading the binary alone does not. `get_installation_info` reports the
 result under `guidance`; its `checked` field is `now` for a scan in this

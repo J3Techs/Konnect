@@ -263,6 +263,10 @@ whole sheet (see Draw the circuit, not a netlist). Ideal for:
 - Connecting all GND pins
 - Bus signals across multiple ICs
 
+If the result reports label-only parts, the call put a label on
+both pins of those two-pin parts. Inside a functional block that is the netlist
+style: delete the labels and join the parts with wires.
+
 ### batch_edit_schematic_components
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.

@@ -3,6 +3,29 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `initialize` always carries drawing instructions, and `batch_connect_to_net` reports label-only parts
+
+A sheet built as parts with a net label on every pin and no wires between
+them nets up and passes ERC, but a reader has to match names to learn what
+each part connects to. The rule against it lived only in the bundled
+`kicad-schematic` skill, which a client reads only if `konnect init` wrote it
+where that client looks: a client with another configuration directory, or one
+that reaches the HTTP server directly, never saw it.
+
+- The `initialize` result's `instructions` is now always present. It holds the
+  standing drawing instructions (wires inside a functional block, labels at
+  its boundary, power symbols for rails, inspect the render). The one-line
+  guidance notice, when there is one, follows after a blank line. A client
+  that treated the field's presence as "guidance is out of sync" must look for
+  the notice text instead; `get_installation_info` remains the structured
+  source.
+- `batch_connect_to_net` adds `drawing_style` to its result when the call puts
+  a label on both pins of a two-pin part: `label_only_parts` lists the
+  references in call order, and `advice` says what to do instead. The field is
+  absent otherwise. Nothing is refused and the edit is unchanged.
+- The descriptions of `connect_to_net` and `batch_connect_to_net` say what the
+  tools are for and that neighbouring parts are joined with wires.
+
 ## Unreleased: live placement creates a footprint's rule areas, or refuses
 
 A library footprint can own zones: the keepout under a Tag-Connect header, the
@@ -2060,10 +2083,10 @@ Each client entry carries `checked`: `now` when this process scanned, or
 `earlier` when it reuses the record. An `earlier` entry has `state` and
 `marker` but no `files` or `hooks`.
 
-The `initialize` result gains `instructions`, present only on the first
+The `initialize` result's `instructions` gains a notice on the first
 `initialize` after a scan that found a client `out_of_sync`. It holds one line
 per such client, naming the marker version and the `konnect init` command to
-run. Later starts with the same install marker omit it.
+run. Later starts with the same install marker omit the notice.
 
 `konnect status` prints `[current]`, `[different]`, `[missing]`, or
 `[unreadable]` for each skill file, agent, and hook in place of `[+]`/`[-]`,
