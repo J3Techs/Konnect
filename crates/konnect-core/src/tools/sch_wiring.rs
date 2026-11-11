@@ -49,7 +49,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_wire",
             "Add a wire segment between two points. The wire must be horizontal or vertical. \
-             T-junctions are automatically detected and junction dots inserted.",
+             Junction dots follow KiCad's rule: one goes where the wire makes three or more \
+             exits meet, whether on a span or at wire ends.",
             json!({
                 "type": "object",
                 "properties": {
@@ -63,7 +64,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_add_wire",
-            "Add multiple wire segments in a single file read/write cycle.",
+            "Add multiple wire segments in a single file read/write cycle. Junction dots \
+             follow KiCad's rule: one goes where the wires make three or more exits meet, \
+             whether on a span or at wire ends.",
             json!({
                 "type": "object",
                 "properties": {
@@ -651,6 +654,9 @@ async fn handle_add_wire(
     let (_, tree) = read_schematic(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
+    // A wire end meeting two other exits (wire ends, pins) is no T on any
+    // span, so the passes above miss it; KiCad's rule covers it.
+    add_junctions_for_new_wires(&mut sch, &[((x1, y1), (x2, y2))]);
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -686,6 +692,7 @@ async fn handle_batch_add_wire(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
+    let mut new_wires: Vec<WireSpan> = Vec::new();
 
     // Pin endpoints are fixed for the whole batch (only wires change below).
     let pins = read_schematic(&sch_path)
@@ -715,8 +722,12 @@ async fn handle_batch_add_wire(
         add_missing_junctions(&mut sch, &junctions);
         // Pins this wire passes over mid-segment also need junction dots.
         add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
+        new_wires.push(((x1, y1), (x2, y2)));
         added += 1;
     }
+    // Wire ends that meet two other exits (wire ends, pins) without lying on
+    // any span: judged once, against the whole batch, by KiCad's rule.
+    add_junctions_for_new_wires(&mut sch, &new_wires);
 
     sch.overwrite()?;
     Ok(CallToolResult::json(&json!({ "added_wires": added })))
@@ -3734,6 +3745,41 @@ mod unit_aware_wiring_tests {
         for (x, y) in tees {
             assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
         }
+    }
+
+    /// Three wire ends on one point are a junction with no wire's span
+    /// through it, so T detection never saw it and the dot was left out. A
+    /// corner of two ends still gets none.
+    #[tokio::test]
+    async fn wire_ends_meeting_at_a_point_get_one_junction() {
+        let star = json!([
+            { "x1": 100.33, "y1": 100.33, "x2": 110.49, "y2": 100.33 },
+            { "x1": 110.49, "y1": 100.33, "x2": 120.65, "y2": 100.33 },
+            { "x1": 110.49, "y1": 100.33, "x2": 110.49, "y2": 110.49 },
+            { "x1": 110.49, "y1": 110.49, "x2": 120.65, "y2": 110.49 }
+        ]);
+        let (_d, path) = bare_schematic();
+        let result = handle_batch_add_wire(
+            &json!({ "schematic": path.display().to_string(), "wires": star }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(junctions_at(&path, 110.49, 100.33), 1, "three ends");
+        assert_eq!(junctions_at(&path, 110.49, 110.49), 0, "a corner");
+
+        let (_d, path) = bare_schematic();
+        for w in star.as_array().unwrap() {
+            let mut args = json!({ "schematic": path.display().to_string() });
+            for (k, v) in w.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            let result = handle_add_wire(&args, &test_ctx()).await.unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+        }
+        assert_eq!(junctions_at(&path, 110.49, 100.33), 1, "three ends");
+        assert_eq!(junctions_at(&path, 110.49, 110.49), 0, "a corner");
     }
 
     /// Fixture provenance: built with Konnect tools against the stock `Device:R`,

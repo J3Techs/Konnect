@@ -3,6 +3,20 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `add_wire` and `batch_add_wire` dot the points where wire ends meet
+
+Both tools added a junction dot where a wire end landed on another wire's
+span, or where a wire ran over a pin. Three wire ends meeting on one point,
+or two wire ends on a pin, lie on no span, so they got no dot: a rail drawn as
+separate segments between its taps came out connected but undotted, and
+`list_schematic_junctions` had nothing to judge.
+
+Both now also apply KiCad's rule to the ends of the wires they add, as
+`connect_to_net` and `batch_connect_to_net` already do: a dot goes where
+three or more exits meet and none is there yet. A corner of two ends gets
+none. Arguments and results are unchanged; a sheet drawn after this carries
+dots it did not before.
+
 ## Unreleased: `initialize` always carries drawing instructions, and `batch_connect_to_net` reports label-only parts
 
 A sheet built as parts with a net label on every pin and no wires between
