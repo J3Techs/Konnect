@@ -58,6 +58,22 @@ const LIBRARY_HEADER: [&str; 3] = ["version", "generator", "generator_version"];
 /// drops from footprints (`Footprint`, removed in V9).
 const NOT_COPIED_FIELDS: [&str; 3] = ["Reference", "Value", "Footprint"];
 
+/// The two fields that identify a board instance, with the `fp_text` kind
+/// that spelled each before KiCad 8 and the layer KiCad gives a new one.
+const IDENTITY_FIELDS: [(&str, &str, &str); 2] = [
+    ("Reference", "reference", "F.SilkS"),
+    ("Value", "value", "F.Fab"),
+];
+
+/// The first board format whose footprint fields are `(property …)` clauses
+/// (KiCad 8). Below it a footprint `(property "Reference" …)` is read as a
+/// plain key and value, so only the `fp_text` spelling names the field.
+const FIELDS_AS_PROPERTIES: i64 = 20230620;
+
+/// How far beyond the pads a Reference or Value the library lacks is placed,
+/// in millimetres: a usual courtyard margin and half a line of text.
+const FIELD_CLEARANCE: f64 = 1.25;
+
 /// Board items KiCad writes before its footprints.
 const BOARD_HEADER: [&str; 12] = [
     "version",
@@ -913,9 +929,107 @@ struct Template {
     members: Vec<(usize, usize, String)>,
     eol: &'static str,
     indent: String,
+    /// Whether the board this is embedded into reads `(property …)` clauses
+    /// as footprint fields; see [`FIELDS_AS_PROPERTIES`].
+    fields_as_properties: bool,
+}
+
+/// One direct child of a library footprint that states its Reference or its
+/// Value, in either spelling.
+struct IdentityClause {
+    /// The whole clause.
+    block: (usize, usize),
+    /// Its head and key together: `property "Reference"` or
+    /// `fp_text reference`.
+    spelling: (usize, usize),
+    /// Its text, quotes included.
+    value: (usize, usize),
+    property: bool,
+}
+
+/// Which identity field `node` states, in either spelling.
+fn identity_field(node: &SexpNode) -> Option<&'static str> {
+    let key = node.get(1).and_then(SexpNode::as_str)?;
+    IDENTITY_FIELDS
+        .iter()
+        .find(|(name, kind, _)| match node.head() {
+            Some("property") => key == *name,
+            Some("fp_text") => key == *kind,
+            _ => false,
+        })
+        .map(|(name, _, _)| *name)
 }
 
 impl Template {
+    /// Every direct child stating the identity field `name`, in file order.
+    ///
+    /// KiCad's footprint parser assigns the one Reference (or Value) field
+    /// from each such clause in turn, `(property "Reference" …)` and
+    /// `(fp_text reference …)` alike, so the last one is the field KiCad
+    /// keeps and every earlier one is discarded on load.
+    fn identity_clauses(&self, name: &str) -> Vec<IdentityClause> {
+        let Some((_, kind, _)) = IDENTITY_FIELDS.iter().find(|(field, _, _)| *field == name) else {
+            return Vec::new();
+        };
+        self.children
+            .iter()
+            .filter_map(|(start, end, head)| {
+                let block = &self.source[*start..*end];
+                let spans = tokens(block);
+                let (head_span, key, value) = (*spans.first()?, *spans.get(1)?, *spans.get(2)?);
+                let key_text = unquote(&block[key.0..key.1]);
+                let property = match head.as_str() {
+                    "property" if key_text == name => true,
+                    "fp_text" if key_text == *kind => false,
+                    _ => return None,
+                };
+                Some(IdentityClause {
+                    block: (*start, *end),
+                    spelling: (start + head_span.0, start + key.1),
+                    value: (start + value.0, start + value.1),
+                    property,
+                })
+            })
+            .collect()
+    }
+
+    /// Where a Reference and a Value the library does not carry go: the
+    /// horizontal centre of the pads, and a clear distance above and below
+    /// them. A rotated pad counts by its longer side.
+    fn field_anchors(&self) -> (f64, f64, f64) {
+        let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+        for pad in self.root.find_all("pad") {
+            let (Some(at), Some(size)) = (pad.find("at"), pad.find("size")) else {
+                continue;
+            };
+            let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) else {
+                continue;
+            };
+            let (width, height) = (
+                size.get_f64(1).unwrap_or(0.0),
+                size.get_f64(2).unwrap_or(0.0),
+            );
+            let (half_x, half_y) = if at.get_f64(3).unwrap_or(0.0) == 0.0 {
+                (width / 2.0, height / 2.0)
+            } else {
+                (width.max(height) / 2.0, width.max(height) / 2.0)
+            };
+            min_x = min_x.min(x - half_x);
+            max_x = max_x.max(x + half_x);
+            min_y = min_y.min(y - half_y);
+            max_y = max_y.max(y + half_y);
+        }
+        if min_x > max_x {
+            return (0.0, -FIELD_CLEARANCE, FIELD_CLEARANCE);
+        }
+        (
+            (min_x + max_x) / 2.0,
+            min_y - FIELD_CLEARANCE,
+            max_y + FIELD_CLEARANCE,
+        )
+    }
+
     fn child(&self, head: &str) -> Option<(usize, usize)> {
         self.children
             .iter()
@@ -1114,6 +1228,7 @@ fn template_from_source(
         members,
         eol,
         indent,
+        fields_as_properties: board_version >= FIELDS_AS_PROPERTIES,
         source,
     })
 }
@@ -1420,22 +1535,64 @@ fn draft(
         edits.push(SexpEdit::replace(*start, *end, quote(new)));
     }
 
-    let reference = template
-        .field_value_span("Reference")
-        .ok_or("the footprint has no Reference property or fp_text")?;
-    edits.push(SexpEdit::replace(
-        reference.0,
-        reference.1,
-        quote(&expected.reference),
-    ));
-    let value = template
-        .field_value_span("Value")
-        .ok_or("the footprint has no Value property or fp_text")?;
-    edits.push(SexpEdit::replace(value.0, value.1, quote(&expected.value)));
+    // Reference and Value: the instance carries exactly one clause for each.
+    // The library clause KiCad would keep — the last — takes the instance's
+    // text and, where the board reads fields as properties, that spelling;
+    // every earlier clause is removed, because KiCad would let the last one
+    // win and a library text left in a later clause would replace the
+    // instance's on the next load. A field the library lacks is written new.
+    let (centre_x, above, below) = template.field_anchors();
+    let mut added = String::new();
+    let mut removed = HashSet::new();
+    for (name, _, layer) in IDENTITY_FIELDS {
+        let (text, y) = match name {
+            "Reference" => (&expected.reference, above),
+            _ => (&expected.value, below),
+        };
+        let clauses = template.identity_clauses(name);
+        match clauses.split_last() {
+            Some((kept, shadowed)) => {
+                edits.push(SexpEdit::replace(kept.value.0, kept.value.1, quote(text)));
+                if !kept.property && template.fields_as_properties {
+                    edits.push(SexpEdit::replace(
+                        kept.spelling.0,
+                        kept.spelling.1,
+                        format!("property {}", quote(name)),
+                    ));
+                }
+                for clause in shadowed {
+                    let (start, end) = clause.block;
+                    let (from, to) = find_block_with_leading_whitespace(source, start)
+                        .filter(|(_, to)| *to == end)
+                        .unwrap_or((start, end));
+                    edits.push(SexpEdit::delete(from, to));
+                    removed.insert(end);
+                }
+            }
+            None if template.fields_as_properties => {
+                let uuid = ids.allocate(&format!("field\u{0}{label}\u{0}{name}"));
+                added.push_str(&format!(
+                    "{eol}{indent}(property {} {} (at {} {} 0) (layer {}) (uuid {}) \
+                     (effects (font (size 1 1) (thickness 0.15))))",
+                    quote(name),
+                    quote(text),
+                    mm(centre_x),
+                    mm(y),
+                    quote(layer),
+                    quote(&uuid)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the footprint has no {name} property or fp_text, and the board's format \
+                     predates footprint field properties"
+                ))
+            }
+        }
+    }
 
     // Schematic fields: an existing library property keeps its presentation
     // and takes the schematic's text; an absent one is added hidden on F.Fab.
-    let mut added = String::new();
     for (name, text) in &part.fields {
         if NOT_COPIED_FIELDS.contains(&name.as_str()) || text.is_empty() || text == "~" {
             continue;
@@ -1499,13 +1656,15 @@ fn draft(
         None => {}
     }
 
-    // Insert the new properties after the last library property, so they sit
-    // with the others; with none, after the root identity and position.
+    // Insert the new properties after the last library property that stays,
+    // so they sit with the others; with none, after the root identity and
+    // position.
     let last_property = template
         .children
         .iter()
         .filter(|(_, _, head)| head == "property" || head == "fp_text")
         .map(|(_, end, _)| *end)
+        .filter(|end| !removed.contains(end))
         .max();
     let layer = template
         .child("layer")
@@ -2013,11 +2172,46 @@ fn verify_instance(
         "wrong sheet name or file",
         &mut problems,
     );
-    check(
-        field_value(node, "Value", "value").as_deref() == Some(instance.value.as_str()),
-        "wrong value",
-        &mut problems,
-    );
+    // Exactly one clause states each identity field, with the instance's
+    // text: KiCad keeps the last of several, so a second one is a different
+    // reference or value waiting for the next load.
+    let stated = |name: &str| {
+        node.children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|child| identity_field(child) == Some(name))
+            .collect::<Vec<_>>()
+    };
+    for (name, _, _) in IDENTITY_FIELDS {
+        let want = match name {
+            "Reference" => instance.reference.as_str(),
+            _ => instance.value.as_str(),
+        };
+        let clauses = stated(name);
+        check(
+            clauses.len() == 1,
+            &format!(
+                "{} clauses state the {name}, where KiCad keeps only the last",
+                clauses.len()
+            ),
+            &mut problems,
+        );
+        check(
+            clauses
+                .last()
+                .is_some_and(|clause| clause.get(2).and_then(SexpNode::as_str) == Some(want)),
+            &format!("wrong {}", name.to_lowercase()),
+            &mut problems,
+        );
+        check(
+            !template.fields_as_properties
+                || clauses
+                    .iter()
+                    .all(|clause| clause.head() == Some("property")),
+            &format!("the {name} is not a property"),
+            &mut problems,
+        );
+    }
     let attr = |footprint: &SexpNode| {
         footprint
             .find("attr")
@@ -2107,6 +2301,23 @@ fn verify_instance(
         .iter()
         .map(|(library, new)| (new.clone(), library.clone()))
         .collect::<HashMap<_, _>>();
+    // Of several library clauses for one identity field only the last is
+    // carried, and a field the library lacks is the instance's own.
+    let mut library_clauses = IDENTITY_FIELDS.map(|(name, _, _)| {
+        template
+            .root
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|child| identity_field(child) == Some(name))
+            .count()
+    });
+    let library_lacks = IDENTITY_FIELDS
+        .iter()
+        .zip(library_clauses)
+        .filter(|(_, count)| *count == 0)
+        .map(|((name, _, _), _)| *name)
+        .collect::<Vec<_>>();
     let library_children = template
         .root
         .children()
@@ -2117,7 +2328,14 @@ fn verify_instance(
             Some("version" | "generator" | "generator_version" | "attr" | "at") => false,
             // The root's own identity, replaced by the instance's.
             Some("uuid" | "tstamp") => template.root_id.is_none(),
-            _ => true,
+            _ => match identity_field(child) {
+                Some(name) => {
+                    let left = &mut library_clauses[usize::from(name == "Value")];
+                    *left -= 1;
+                    *left == 0
+                }
+                None => true,
+            },
         })
         .map(|child| {
             restore_library_field(
@@ -2138,6 +2356,9 @@ fn verify_instance(
                 head,
                 "uuid" | "tstamp" | "at" | "path" | "sheetname" | "sheetfile" | "attr"
             ) {
+                return false;
+            }
+            if identity_field(child).is_some_and(|name| library_lacks.contains(&name)) {
                 return false;
             }
             !(head == "property"
@@ -2284,8 +2505,10 @@ fn map_back(node: &SexpNode, inverse: &HashMap<String, String>) -> SexpNode {
     }
 }
 
-/// A Reference, Value or overridden field with the library's text back in
-/// place, so the tree comparison sees only what the instance must not change.
+/// A field without what the instance sets, so the tree comparison sees only
+/// what the instance must not change: an overridden field with the library's
+/// text back in place, and a Reference or Value in one spelling with no text
+/// (`verify_instance` holds their text and spelling to the plan itself).
 fn restore_library_field(
     node: &SexpNode,
     template: &Template,
@@ -2294,14 +2517,19 @@ fn restore_library_field(
     let SexpNode::List(children) = node else {
         return node.clone();
     };
+    if let Some(name) = identity_field(node) {
+        let mut children = children.clone();
+        children[0] = SexpNode::Atom("property".to_string());
+        children[1] = SexpNode::Str(name.to_string());
+        if children.len() > 2 {
+            children[2] = SexpNode::Str(String::new());
+        }
+        return SexpNode::List(children);
+    }
     let key = match (node.head(), node.get(1).and_then(SexpNode::as_str)) {
-        (Some("property"), Some(name))
-            if name == "Reference" || name == "Value" || instance.overridden.contains_key(name) =>
-        {
+        (Some("property"), Some(name)) if instance.overridden.contains_key(name) => {
             name.to_string()
         }
-        (Some("fp_text"), Some("reference")) => "Reference".to_string(),
-        (Some("fp_text"), Some("value")) => "Value".to_string(),
         _ => return node.clone(),
     };
     let Some((start, end)) = template.field_value_span(&key) else {
@@ -3492,6 +3720,22 @@ mod tests {
                 "DNP cleared",
                 planned.replacen("(attr smd dnp)", "(attr smd)", 1),
             ),
+            (
+                "a second clause for the reference, which KiCad would keep",
+                planned.replacen(
+                    "(path \"",
+                    "(fp_text reference \"REF**\" (at 0 0) (layer \"F.SilkS\")) (path \"",
+                    1,
+                ),
+            ),
+            (
+                "a second property for the value, which KiCad would keep",
+                planned.replacen(
+                    "(path \"",
+                    "(property \"Value\" \"Bga4\" (at 0 0) (layer \"F.Fab\")) (path \"",
+                    1,
+                ),
+            ),
         ] {
             assert_ne!(tampered, planned, "{what}: the tamper must change the text");
             assert!(verify(&tampered).is_err(), "{what} must not verify");
@@ -3553,6 +3797,266 @@ mod tests {
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].code, "fabrication_property_rebuild_refused");
         assert_eq!(refused[0].references, ["U1"]);
+    }
+
+    /// A two-pad footprint as `create_footprint` wrote it before it wrote
+    /// field properties: format 20240108, no identities, and Reference and
+    /// Value as `(fp_text …)` after the pads and graphics. `{fields}` is where
+    /// a property added by hand goes.
+    fn authored(name: &str, fields: &str, fp_texts: bool) -> String {
+        let fp_texts = if fp_texts {
+            format!(
+                "\n  (fp_text reference \"REF**\" (at 0.0000 -1.7500 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{name}\" (at 0.0000 1.7500 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))"
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "(footprint \"{name}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"authored part\"){fields}\n  (attr smd)\n  (pad \"1\" smd rect (at -1 0) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")  )\n  (pad \"2\" smd rect (at 1 0) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")  )\n  (fp_rect (start -1.7500 -0.7500) (end 1.7500 0.7500) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\")){fp_texts}\n)"
+        )
+    }
+
+    const INLINE_FIELDS: &str = "\n  (property \"Reference\" \"REF**\" (at 0 -3 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (property \"Value\" \"Inline\" (at 0 3 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))";
+    const MULTI_LINE_FIELDS: &str = "\n  (property \"Reference\" \"REF**\"\n    (at 0 -3 0)\n    (layer \"F.SilkS\")\n    (effects\n      (font\n        (size 1 1)\n        (thickness 0.15)\n      )\n    )\n  )\n  (property \"Value\" \"MultiLine\"\n    (at 0 3 0)\n    (layer \"F.Fab\")\n    (effects\n      (font\n        (size 1 1)\n        (thickness 0.15)\n      )\n    )\n  )";
+
+    /// One part per footprint of the `Parts` library, each with pad 1 on GND.
+    fn authored_netlist(parts: &[(&str, &str, &str)]) -> String {
+        let mut components = String::new();
+        let mut nodes = String::new();
+        for (index, (reference, value, footprint)) in parts.iter().enumerate() {
+            components.push_str(&format!(
+                "    (comp (ref \"{reference}\") (value \"{value}\") (footprint \"{footprint}\")\n      (sheetpath (names \"/\") (tstamps \"/\")) (tstamps \"11111111-1111-4111-8111-0000000001{index:02}\"))\n"
+            ));
+            nodes.push_str(&format!(" (node (ref \"{reference}\") (pin \"1\"))"));
+        }
+        format!(
+            "(export (version \"E\")\n  (design (source \"carrier.kicad_sch\") (date \"d\") (tool \"Eeschema 10.0.4\"))\n  (components\n{components}  )\n  (nets\n    (net (code \"1\") (name \"GND\") (class \"Default\"){nodes})))\n"
+        )
+    }
+
+    /// The clauses of `footprint` that state the field `name`, in file order,
+    /// as `(head, text)`. KiCad assigns the field from each in turn, so the
+    /// last is what it holds after a load and writes back on a save.
+    fn stated(footprint: &SexpNode, name: &str) -> Vec<(String, String)> {
+        footprint
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|child| {
+                let key = child.get(1).and_then(SexpNode::as_str);
+                match child.head() {
+                    Some("property") => key == Some(name),
+                    Some("fp_text") => key == Some(name.to_lowercase().as_str()),
+                    _ => false,
+                }
+            })
+            .map(|child| {
+                (
+                    child.head().unwrap().to_string(),
+                    child.get(2).and_then(SexpNode::as_str).unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn field<'a>(footprint: &'a SexpNode, name: &str) -> &'a SexpNode {
+        footprint
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
+            .unwrap()
+    }
+
+    /// A library footprint may state its Reference and Value in neither
+    /// spelling, in the `fp_text` one `create_footprint` used to write, as
+    /// properties, or — once someone adds the properties to such a file by
+    /// hand — in both. Importing the last kind set the property and left the
+    /// `fp_text` after it holding `REF**`; KiCad keeps the last clause, so the
+    /// part lost its reference and value on the first load and save. Every
+    /// instance now carries exactly one property for each.
+    #[tokio::test]
+    async fn every_imported_instance_states_its_reference_and_value_once_as_properties() {
+        let parts = [
+            ("U10", "bare", "Parts:Bare"),
+            ("U11", "legacy", "Parts:Legacy"),
+            ("U12", "inline", "Parts:Inline"),
+            ("U13", "multi", "Parts:MultiLine"),
+            ("U14", "current", "Parts:Current"),
+            ("U15", "twice", "Parts:Twice"),
+            ("C1", "100n", "Capacitor_SMD:C_0603_1608Metric"),
+        ];
+        let project = Project::new(BOARD, &authored_netlist(&parts));
+        let library = project.dir.join("Parts.pretty");
+        for (name, source) in [
+            ("Bare", authored("Bare", "", false)),
+            ("Legacy", authored("Legacy", "", true)),
+            ("Inline", authored("Inline", INLINE_FIELDS, true)),
+            ("MultiLine", authored("MultiLine", MULTI_LINE_FIELDS, true)),
+            // The same property twice: the later one is the library's field.
+            (
+                "Twice",
+                authored(
+                    "Twice",
+                    &format!(
+                        "{INLINE_FIELDS}{}",
+                        INLINE_FIELDS.replace("(at 0 -3 0)", "(at 0 -4 0)")
+                    ),
+                    false,
+                ),
+            ),
+        ] {
+            std::fs::write(library.join(format!("{name}.kicad_mod")), source).unwrap();
+        }
+        let ctx = project.ctx("");
+        let create = crate::tools::library::tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_footprint")
+            .unwrap();
+        let created = (create.handler)(
+            &json!({
+                "output": library.join("Current.kicad_mod").to_string_lossy(),
+                "name": "Current",
+                "pads": [
+                    {"number":"1","type":"smd","shape":"rect","x":-1.0,"y":0.0,"width":1.0,"height":1.0},
+                    {"number":"2","type":"smd","shape":"rect","x":1.0,"y":0.0,"width":1.0,"height":1.0}
+                ]
+            }),
+            std::sync::Arc::new(project.ctx("")),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{:?}", created.content);
+
+        let plan = project.dry_run(&ctx).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let (is_error, applied) = project.apply(&ctx, &plan["plan_revision"]).await;
+        assert!(!is_error, "{applied:#}");
+        assert_eq!(applied["write"]["persisted_readback"]["verified"], true);
+
+        let written = project.board_text();
+        let root = konnect_sexp::parse_sexp(&written).unwrap();
+        let instances = root
+            .find_all("footprint")
+            .into_iter()
+            .filter(|node| node.find("path").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(instances.len(), parts.len());
+        for (reference, value, footprint_id) in parts {
+            let instance = instances
+                .iter()
+                .find(|node| node.get(1).and_then(SexpNode::as_str) == Some(footprint_id))
+                .unwrap();
+            assert_eq!(
+                stated(instance, "Reference"),
+                [("property".to_string(), reference.to_string())],
+                "{footprint_id}"
+            );
+            assert_eq!(
+                stated(instance, "Value"),
+                [("property".to_string(), value.to_string())],
+                "{footprint_id}"
+            );
+            assert_eq!(
+                pad_nets(instance)[0],
+                ("1".to_string(), Some("GND".to_string())),
+                "{footprint_id}"
+            );
+        }
+
+        let at = |reference: &str, name: &str| {
+            let property = field(footprint(&root, reference), name);
+            let at = property.find("at").unwrap();
+            (
+                at.get_f64(1).unwrap(),
+                at.get_f64(2).unwrap(),
+                property.find_str("layer").unwrap().to_string(),
+                property.find("hide").is_some(),
+            )
+        };
+        // A field the library lacks is written visible, clear of the pads.
+        assert_eq!(
+            at("U10", "Reference"),
+            (0.0, -1.75, "F.SilkS".into(), false)
+        );
+        assert_eq!(at("U10", "Value"), (0.0, 1.75, "F.Fab".into(), false));
+        // An fp_text keeps its presentation and takes the property spelling.
+        assert_eq!(
+            at("U11", "Reference"),
+            (0.0, -1.75, "F.SilkS".into(), false)
+        );
+        assert_eq!(at("U11", "Value"), (0.0, 1.75, "F.Fab".into(), false));
+        // Of two clauses the last is the one KiCad reads from the library, so
+        // its presentation is the one carried.
+        for reference in ["U12", "U13"] {
+            assert_eq!(
+                at(reference, "Reference"),
+                (0.0, -1.75, "F.SilkS".into(), false)
+            );
+            assert_eq!(at(reference, "Value"), (0.0, 1.75, "F.Fab".into(), false));
+        }
+        assert_eq!(at("U15", "Reference"), (0.0, -4.0, "F.SilkS".into(), false));
+        // What create_footprint writes now is carried as it stands.
+        assert_eq!(
+            at("U14", "Reference"),
+            (0.0, -1.75, "F.SilkS".into(), false)
+        );
+        assert_eq!(at("U14", "Value"), (0.0, 1.75, "F.Fab".into(), false));
+        // A stock library footprint is still byte for byte its library text.
+        let c1 = C0603
+            .lines()
+            .skip_while(|line| !line.contains("(property \"Reference\""))
+            .take_while(|line| !line.contains("(property \"KiLib_Generator\""))
+            .map(|line| format!("\t{line}\n"))
+            .collect::<String>()
+            .replace("\"REF**\"", "\"C1\"")
+            .replace("\"C_0603_1608Metric\"", "\"100n\"");
+        assert!(written.contains(&c1), "{c1}");
+    }
+
+    /// A board older than KiCad 8 reads a footprint `(property …)` as a plain
+    /// key and value, so there an `fp_text` field keeps its spelling, and a
+    /// footprint with no field at all is refused rather than given a property
+    /// that board would not read as one.
+    #[tokio::test]
+    async fn a_board_older_than_field_properties_keeps_fp_text_fields() {
+        let board = BOARD.replace("(version 20260206)", "(version 20230101)");
+        let old = |name: &str, fp_texts: bool| {
+            authored(name, "", fp_texts).replace("(version 20240108)", "(version 20230101)")
+        };
+        let project = Project::new(
+            &board,
+            &authored_netlist(&[("U11", "legacy", "Parts:Legacy")]),
+        );
+        let library = project.dir.join("Parts.pretty");
+        std::fs::write(library.join("Legacy.kicad_mod"), old("Legacy", true)).unwrap();
+        let ctx = project.ctx("");
+        let plan = project.dry_run(&ctx).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        let (is_error, applied) = project.apply(&ctx, &plan["plan_revision"]).await;
+        assert!(!is_error, "{applied:#}");
+        let root = konnect_sexp::parse_sexp(&project.board_text()).unwrap();
+        let instance = footprint(&root, "U11");
+        assert_eq!(
+            stated(instance, "Reference"),
+            [("fp_text".to_string(), "U11".to_string())]
+        );
+        assert_eq!(
+            stated(instance, "Value"),
+            [("fp_text".to_string(), "legacy".to_string())]
+        );
+
+        let project = Project::new(&board, &authored_netlist(&[("U10", "bare", "Parts:Bare")]));
+        let library = project.dir.join("Parts.pretty");
+        std::fs::write(library.join("Bare.kicad_mod"), old("Bare", false)).unwrap();
+        let refused = project.dry_run(&project.ctx("")).await;
+        assert_ne!(refused["status"], "ready", "{refused:#}");
+        assert!(
+            refused
+                .to_string()
+                .contains("no Reference property or fp_text"),
+            "{refused:#}"
+        );
+        assert_eq!(project.board_text(), board);
     }
 
     fn saved_design_stub() -> super::super::ExportedDesign {
