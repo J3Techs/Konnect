@@ -3,6 +3,50 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `create_footprint` writes Reference and Value properties, and `closed_initial` imports exactly one of each
+
+`create_footprint` wrote a footprint's Reference and Value as
+`(fp_text reference …)` and `(fp_text value …)`, the spelling KiCad stopped
+writing with version 8, after the pads and graphics. The file therefore held
+no `(property "Reference" …)` or `(property "Value" …)`, and a footprint with
+no pads held neither field in any spelling.
+
+KiCad assigns a footprint's one Reference from every clause that states it,
+`(property "Reference" …)` and `(fp_text reference …)` alike, in file order,
+so the last one is what it keeps. A library file with the properties added by
+hand above the `fp_text` clauses therefore reads in KiCad with the `fp_text`
+text. `update_pcb_from_schematic` with `backend: "closed_initial"` set the
+instance's reference and value in the first clause only: the board it wrote
+read back correctly from the file, and the first time KiCad loaded and saved
+it the part was `REF**` with the library's value, its pads still on their
+nets.
+
+- `create_footprint` now writes `(property "Reference" "REF**" …)` on F.SilkS
+  one millimetre above the courtyard and fab outline, and
+  `(property "Value" "<name>" …)` on F.Fab one millimetre below, after the
+  description, in the layout of KiCad's own libraries. It writes them for a
+  footprint without pads too, around the origin. The name is escaped as a
+  string. `set_footprint_metadata`, `set_footprint_graphics`,
+  `edit_footprint_pad` and `set_footprint_models` leave them as they are.
+- `closed_initial` gives every imported footprint exactly one Reference and
+  one Value. Of several library clauses for one field it carries the last,
+  the one KiCad reads from the library, with the instance's text, and removes
+  the earlier ones. On a board of format 20230620 or later (KiCad 8) an
+  `fp_text` field is written as a property, keeping its position, layer and
+  effects, and a field the library lacks is written new, visible, above
+  (Reference, F.SilkS) or below (Value, F.Fab) the pads. On an older board,
+  which reads a footprint `(property …)` as a plain key and value, an
+  `fp_text` field keeps its spelling and a footprint with neither spelling is
+  refused, as before.
+- The import's readback refuses a footprint that states its Reference or
+  Value more than once.
+
+Arguments and results are unchanged. A footprint file written by an earlier
+`create_footprint` keeps working: it imports with its `fp_text` fields turned
+into properties. Regenerate it, or delete its two `fp_text` clauses after
+adding properties by hand, if the file itself should carry properties; KiCad's
+footprint editor also rewrites it that way on save.
+
 ## Unreleased: `initialize` always carries drawing instructions, and `batch_connect_to_net` reports label-only parts
 
 A sheet built as parts with a net label on every pin and no wires between
