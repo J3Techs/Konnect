@@ -48,12 +48,10 @@ closed-board tool had to ask the user to close it. Two tools in the
   never deleted, because an editor ended that way leaves its lock and possibly
   unsaved work behind. An editor that stays open, for example behind the
   unsaved-changes prompt when `save` is false, is `editor_not_closed`.
-- On macOS the close request is a quit sent to the standalone `pcbnew`
-  application, which cannot be addressed to one process. While another
-  standalone PCB editor is running from the same application the call refuses
-  with `close_request_failed`, before saving, because the editor that answered
-  the quit could be the user's. A PCB editor that is a window of the project
-  manager is a different application and does not cause this.
+- The close request is addressed to the one editor this server started: a
+  window id on Windows and Linux, the process id on macOS (an Apple event sent
+  with `Application(<pid>).quit()`). Another PCB editor the user has open,
+  also a second standalone one from the same application, is not touched.
 - After `closed`, `closed_board_tools_ready` is true and closed-board tools
   accept the board in the same server session. The record that this server
   saw the board live is cleared only here: after this server's own editor was

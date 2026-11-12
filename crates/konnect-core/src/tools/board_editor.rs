@@ -80,10 +80,9 @@ pub(crate) fn close_tool() -> ToolDef {
          an editor this server started is closed: for any other editor the call refuses \
          and the user has to close it. Never forces anything: an editor that stays open \
          (it is showing a prompt, for example about unsaved changes when 'save' is false) \
-         is reported with status 'editor_not_closed' and left alone. On macOS the close \
-         request goes to the PCB editor application, not to one process, so while another \
-         standalone PCB editor is running the call refuses ('close_request_failed') \
-         rather than risk closing that one. If no KiCad holds the board and no lock is \
+         is reported with status 'editor_not_closed' and left alone. The close request is \
+         addressed to that one editor, so another PCB editor the user has open is not \
+         touched. If no KiCad holds the board and no lock is \
          present, the result is status 'not_open' and nothing is done.",
         json!({
             "type": "object",
