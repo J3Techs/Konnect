@@ -43,7 +43,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "open_project",
             "List PCB documents open in the running KiCad UI and optionally check whether \
-             one specific KiCad project or board is open over IPC.",
+             one specific KiCad project or board is open over IPC. Every KiCad process is \
+             asked, not only the one at the configured IPC address: a further KiCad process \
+             (a standalone PCB editor beside the project manager, a second project) answers \
+             at its own endpoint beside the first. 'endpoints' lists each endpoint that \
+             answered with the boards it holds; 'requested_endpoint' is the one holding the \
+             board asked about.",
             json!({
                 "type": "object",
                 "properties": {
@@ -308,71 +313,127 @@ async fn handle_open_project(
         Ok(requested) => requested,
         Err(error) => return Ok(error),
     };
-    let ipc = konnect_ipc::KiCadIpcClient::new(ctx.ipc_address());
-    let ping = ipc.ping_outcome();
-    let connected = ping.is_responsive();
-    let (open_boards, open_boards_error) = if connected {
-        match ipc.get_open_board_paths() {
-            Ok(paths) => (
-                paths
-                    .into_iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>(),
-                None,
-            ),
-            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-        }
-    } else {
-        (Vec::new(), None)
-    };
-    let (requested_path, requested_board, requested_open, requested_check_error) = match requested {
-        Some((project_or_board, board)) if connected => match ipc.find_open_board(&board) {
-            Ok(_) => {
-                ctx.board_session.observe_live(&board);
-                (
-                    Some(project_or_board),
-                    Some(board.display().to_string()),
-                    Some(true),
-                    None,
+    // Every endpoint a KiCad process may serve: a board open in a second
+    // KiCad process is open, whichever address this server was given.
+    let addresses = ctx.ipc_addresses();
+    let candidates = requested
+        .as_ref()
+        .map(|(_, board)| ctx.board_ipc_candidates(board));
+    let requested_for_ipc = requested.as_ref().map(|(_, board)| board.clone());
+    let (endpoints, located) = tokio::task::spawn_blocking(move || {
+        let endpoints = crate::tools::board_endpoint::survey(&addresses);
+        let located = match (candidates, requested_for_ipc) {
+            (Some(candidates), Some(board))
+                if endpoints.iter().any(|endpoint| endpoint.available) =>
+            {
+                Some(
+                    crate::tools::board_endpoint::locate_board(&candidates, &board)
+                        .map(|located| located.address)
+                        .map_err(|missed| format!("{:#}", missed.error)),
                 )
             }
-            Err(error) => (
-                Some(project_or_board),
-                Some(board.display().to_string()),
-                Some(false),
-                Some(format!("{error:#}")),
-            ),
-        },
+            _ => None,
+        };
+        (endpoints, located)
+    })
+    .await?;
+
+    let configured = &endpoints[0];
+    let ping = configured
+        .ping
+        .clone()
+        .expect("the configured endpoint is pinged");
+    let connected = endpoints.iter().any(|endpoint| endpoint.available);
+    let display = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut open_boards: Vec<String> = Vec::new();
+    for board in endpoints
+        .iter()
+        .flat_map(|endpoint| display(&endpoint.open_boards))
+    {
+        if !open_boards.contains(&board) {
+            open_boards.push(board);
+        }
+    }
+    let endpoint_reports: Vec<serde_json::Value> = endpoints
+        .iter()
+        .map(|endpoint| {
+            json!({
+                "ipc_address": endpoint.address,
+                "configured": endpoint.configured,
+                "ipc_available": endpoint.available,
+                "ipc_failure": endpoint.ping.as_ref().map(crate::tools::ipc_failure_evidence),
+                "open_boards": display(&endpoint.open_boards),
+                "open_boards_error": endpoint.open_boards_error,
+            })
+        })
+        .collect();
+
+    let (requested_path, requested_board) = match &requested {
         Some((project_or_board, board)) => (
-            Some(project_or_board),
+            Some(project_or_board.clone()),
             Some(board.display().to_string()),
-            None,
-            None,
         ),
-        None => (None, None, None, None),
+        None => (None, None),
+    };
+    let (requested_open, requested_endpoint, requested_check_error) = match located {
+        Some(Ok(address)) => {
+            if let Some((_, board)) = &requested {
+                ctx.board_session.observe_live(board);
+                ctx.board_endpoints.remember(board, &address);
+            }
+            (Some(true), Some(address), None)
+        }
+        Some(Err(error)) => (Some(false), None, Some(error)),
+        None => (None, None, None),
     };
 
     let message = if !connected {
-        unanswered_message(&ping)
+        unanswered_message(&ping).to_string()
+    } else if let Some(endpoint) = requested_endpoint
+        .as_ref()
+        .filter(|endpoint| **endpoint != configured.address)
+    {
+        format!(
+            "The requested board is open in KiCad, in a KiCad process that answers at \
+             '{endpoint}' rather than at the configured address. Live tools reach it there."
+        )
     } else if requested_open == Some(true) {
-        "The requested board is open in KiCad."
+        "The requested board is open in KiCad.".to_string()
     } else if requested_open == Some(false) {
-        "KiCad IPC is available, but the requested board is not open."
+        "KiCad IPC is available, but the requested board is not open.".to_string()
+    } else if endpoints
+        .iter()
+        .any(|endpoint| !endpoint.configured && endpoint.available)
+    {
+        "KiCad IPC is available at an endpoint beside the configured one; open PCB documents \
+         are listed in open_boards, and under the endpoint that holds each in endpoints."
+            .to_string()
     } else {
-        "KiCad IPC is available; open PCB documents are listed in open_boards."
+        "KiCad IPC is available; open PCB documents are listed in open_boards.".to_string()
     };
 
     Ok(CallToolResult::json(&json!({
         "kicad_ui_running": connected,
         "ipc_available": connected,
-        "ipc_address": ctx.ipc_address(),
-        "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
+        "ipc_address": configured.address,
+        "ipc_failure": if connected {
+            serde_json::Value::Null
+        } else {
+            crate::tools::ipc_failure_evidence(&ping)
+        },
+        "endpoints": endpoint_reports,
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,
-        "open_boards_error": open_boards_error,
+        "open_boards_error": configured.open_boards_error,
         "requested_path": requested_path,
         "requested_board": requested_board,
         "requested_open": requested_open,
+        "requested_endpoint": requested_endpoint,
         "requested_check_error": requested_check_error,
         "message": message
     })))
@@ -1149,6 +1210,126 @@ mod tests {
                 .is_some_and(|message| message.starts_with("KiCad IPC is not reachable")),
             "{response}"
         );
+    }
+
+    /// The configured `api.sock` was left behind by a KiCad that has exited,
+    /// and the board is open in a KiCad process listening beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_project_finds_a_board_open_at_an_endpoint_beside_the_configured_one() {
+        use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board_at;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let address = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        drop(std::os::unix::net::UnixListener::bind(dir.path().join("api.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(dir.path().join("api-7.sock")).unwrap());
+        let editor = spawn_kicad_holding_board_at(address("api-4242.sock"), &board);
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = address("api.sock");
+
+        let listing = response_json(&handle_open_project(&json!({}), &ctx).await.unwrap());
+        assert_eq!(listing["ipc_available"], true, "{listing}");
+        assert_eq!(listing["ipc_failure"], json!(null), "{listing}");
+        assert_eq!(listing["ipc_address"], address("api.sock"), "{listing}");
+        assert_eq!(
+            listing["open_boards"],
+            json!([board.display().to_string()]),
+            "{listing}"
+        );
+        assert_eq!(
+            listing["endpoints"],
+            json!([
+                {
+                    "ipc_address": address("api.sock"),
+                    "configured": true,
+                    "ipc_available": false,
+                    "ipc_failure": listing["endpoints"][0]["ipc_failure"],
+                    "open_boards": [],
+                    "open_boards_error": null,
+                },
+                {
+                    "ipc_address": editor.address(),
+                    "configured": false,
+                    "ipc_available": true,
+                    "ipc_failure": null,
+                    "open_boards": [board.display().to_string()],
+                    "open_boards_error": null,
+                }
+            ]),
+            "a stale sibling is passed over, not reported: {listing}"
+        );
+        assert_eq!(
+            listing["endpoints"][0]["ipc_failure"]["kind"], "no_listener",
+            "{listing}"
+        );
+
+        // Asked by project file: the sibling board is the one looked for.
+        let project = dir.path().join("demo.kicad_pro");
+        let asked = response_json(
+            &handle_open_project(&json!({ "path": project.display().to_string() }), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(asked["requested_open"], true, "{asked}");
+        assert_eq!(asked["requested_endpoint"], editor.address(), "{asked}");
+        assert!(
+            asked["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(editor.address())),
+            "{asked}"
+        );
+        assert!(ctx.board_session.was_observed_live(&board));
+
+        let absent = dir.path().join("absent.kicad_pcb");
+        let asked = response_json(
+            &handle_open_project(&json!({ "path": absent.display().to_string() }), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(asked["requested_open"], false, "{asked}");
+        assert_eq!(asked["requested_endpoint"], json!(null), "{asked}");
+        assert!(
+            asked["requested_check_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("demo.kicad_pcb")),
+            "the answer names what the answering KiCad does hold: {asked}"
+        );
+    }
+
+    /// One endpoint is reported as it always was, with the endpoint list
+    /// beside it.
+    #[tokio::test]
+    async fn open_project_with_one_endpoint_reports_it_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let kicad =
+            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |_| None);
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = kicad.address().to_string();
+
+        let response = response_json(
+            &handle_open_project(&json!({ "path": board.display().to_string() }), &ctx)
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(response["ipc_available"], true, "{response}");
+        assert_eq!(response["ipc_address"], kicad.address(), "{response}");
+        assert_eq!(response["open_board_count"], 1, "{response}");
+        assert_eq!(response["requested_open"], true, "{response}");
+        assert_eq!(
+            response["requested_endpoint"],
+            kicad.address(),
+            "{response}"
+        );
+        assert_eq!(
+            response["message"], "The requested board is open in KiCad.",
+            "{response}"
+        );
+        assert_eq!(response["endpoints"].as_array().map(Vec::len), Some(1));
     }
 
     /// A rep0 endpoint that answers every request with `AS_NOT_READY`, the

@@ -3231,7 +3231,24 @@ pub(crate) mod board_mock {
         documents: Vec<kiapi::common::types::DocumentSpecifier>,
         respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> MockIpcServer {
-        MockIpcServer::spawn("board-documents", move |request| {
+        MockIpcServer::spawn("board-documents", reporting_documents(documents, respond))
+    }
+
+    /// As [`spawn_kicad_holding_board`], listening on an address the caller
+    /// names: a socket in a directory, where a KiCad process beside another
+    /// one listens.
+    pub fn spawn_kicad_holding_board_at(address: String, board: &std::path::Path) -> MockIpcServer {
+        MockIpcServer::spawn_at(
+            address,
+            reporting_documents(vec![board_document(&board.to_string_lossy())], |_| None),
+        )
+    }
+
+    fn reporting_documents(
+        documents: Vec<kiapi::common::types::DocumentSpecifier>,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> impl Fn(kiapi::common::ApiRequest) -> kiapi::common::ApiResponse + Send + 'static {
+        move |request| {
             let command = request.message.expect("a command");
             let body = if command.type_url.ends_with("GetOpenDocuments") {
                 Some(konnect_ipc::builders::pack_any(
@@ -3251,7 +3268,7 @@ pub(crate) mod board_mock {
                 header: None,
                 message: body,
             }
-        })
+        }
     }
 }
 
