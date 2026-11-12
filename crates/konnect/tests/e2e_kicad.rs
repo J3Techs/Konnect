@@ -2,7 +2,9 @@
 //!
 //! Drives the shipped binary over stdio through a full design loop:
 //! create project → place components → wire → ERC → export Gerbers → DRC.
-//! Also checks selected-layer PCB SVG export through the same MCP boundary.
+//! Also checks selected-layer PCB SVG export through the same MCP boundary,
+//! and that a closed-board import's references and values survive KiCad
+//! loading and saving the board.
 //!
 //! Requires kicad-cli and the standard symbol libraries, so it is `#[ignore]`
 //! by default and run explicitly by the e2e-kicad workflow (and locally):
@@ -59,8 +61,12 @@ fn find_kicad_cli() -> Option<String> {
 
 impl Mcp {
     fn spawn(kicad_cli: &str) -> Self {
+        Self::spawn_with_config(json!({"kicad_cli": kicad_cli}))
+    }
+
+    fn spawn_with_config(settings: Value) -> Self {
         let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
-        write!(config, "{}", json!({"kicad_cli": kicad_cli})).unwrap();
+        write!(config, "{settings}").unwrap();
         config.flush().unwrap();
         let (_persist, config_path) = config.keep().unwrap();
 
@@ -610,4 +616,233 @@ fn a_written_default_netclass_still_plots_wires() {
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
+}
+
+/// A two-pad footprint in the layout `create_footprint` wrote before it wrote
+/// field properties: Reference and Value, when `fp_texts`, as `(fp_text …)`
+/// after the pads. `fields` is where a property added by hand goes.
+fn authored_footprint(name: &str, fields: &str, fp_texts: bool) -> String {
+    let fp_texts = if fp_texts {
+        format!(
+            "\n  (fp_text reference \"REF**\" (at 0.0000 -1.7500 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (fp_text value \"{name}\" (at 0.0000 1.7500 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "(footprint \"{name}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"authored part\"){fields}\n  (attr smd)\n  (pad \"1\" smd rect (at -1 0) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")  )\n  (pad \"2\" smd rect (at 1 0) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")  )\n  (fp_rect (start -1.7500 -0.7500) (end 1.7500 0.7500) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\")){fp_texts}\n)"
+    )
+}
+
+/// Each schematic-linked footprint of a saved board as KiCad reads it:
+/// library id, then the Reference and the Value, and how many clauses state
+/// the Reference. KiCad assigns a field from every `(property "Reference" …)`
+/// and `(fp_text reference …)` in turn, so the last clause is the one it
+/// holds.
+fn board_parts(board: &std::path::Path) -> Vec<(String, String, String, usize)> {
+    let content = std::fs::read_to_string(board).unwrap();
+    let tree = konnect_sexp::parse_sexp(&content).expect("the board must parse");
+    let stated = |footprint: &konnect_sexp::SexpNode, name: &str| {
+        footprint
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|child| {
+                let key = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+                match child.head() {
+                    Some("property") => key == Some(name),
+                    Some("fp_text") => key == Some(name.to_lowercase().as_str()),
+                    _ => false,
+                }
+            })
+            .map(|child| {
+                child
+                    .get(2)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut parts = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|footprint| footprint.find("path").is_some())
+        .map(|footprint| {
+            let references = stated(footprint, "Reference");
+            (
+                footprint
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .unwrap()
+                    .to_string(),
+                references.last().cloned().unwrap_or_default(),
+                stated(footprint, "Value")
+                    .last()
+                    .cloned()
+                    .unwrap_or_default(),
+                references.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    parts.sort();
+    parts
+}
+
+/// A closed-board initial import of footprints that state their Reference
+/// and Value in every way a library file can — not at all, as the `fp_text`
+/// clauses `create_footprint` used to write, as properties, as both once the
+/// properties are added by hand, and as KiCad's own library writes them —
+/// keeps every part's reference and value when KiCad loads the board and
+/// saves it again. KiCad keeps the last clause that states a field, so an
+/// import that set the property and left a library `fp_text` after it read
+/// back correctly from the file and came out of KiCad as `REF**`.
+#[test]
+#[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
+fn closed_initial_references_and_values_survive_a_kicad_save() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("fields");
+    let sch = proj.join("fields.kicad_sch");
+    let pcb = proj.join("fields.kicad_pcb");
+    // An address nothing listens on: the import requires the board closed,
+    // and must not ask a KiCad that happens to be running on this machine.
+    let mut p = Mcp::spawn_with_config(json!({
+        "kicad_cli": kicad_cli,
+        "ipc_address": format!("ipc://{}", tmp.path().join("no-kicad-here.sock").display()),
+    }));
+    p.tool(
+        "create_project",
+        json!({"name": "fields", "path": proj.to_string_lossy()}),
+    );
+
+    // ── Library ──────────────────────────────────────────────────────────
+    let library = proj.join("Parts.pretty");
+    std::fs::create_dir_all(&library).unwrap();
+    let inline = "\n  (property \"Reference\" \"REF**\" (at 0 -3 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))\n  (property \"Value\" \"Inline\" (at 0 3 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))";
+    let multi_line = "\n  (property \"Reference\" \"REF**\"\n    (at 0 -3 0)\n    (layer \"F.SilkS\")\n    (effects\n      (font\n        (size 1 1)\n        (thickness 0.15)\n      )\n    )\n  )\n  (property \"Value\" \"MultiLine\"\n    (at 0 3 0)\n    (layer \"F.Fab\")\n    (effects\n      (font\n        (size 1 1)\n        (thickness 0.15)\n      )\n    )\n  )";
+    for (name, source) in [
+        ("Bare", authored_footprint("Bare", "", false)),
+        ("Legacy", authored_footprint("Legacy", "", true)),
+        ("Inline", authored_footprint("Inline", inline, true)),
+        (
+            "MultiLine",
+            authored_footprint("MultiLine", multi_line, true),
+        ),
+        (
+            "C_0603_1608Metric",
+            include_str!("../../konnect-core/tests/fixtures/c_0603_1608metric_kicad10.kicad_mod")
+                .to_string(),
+        ),
+    ] {
+        std::fs::write(library.join(format!("{name}.kicad_mod")), source).unwrap();
+    }
+    p.load("library");
+    p.tool(
+        "create_footprint",
+        json!({
+            "output": library.join("Current.kicad_mod").to_string_lossy(),
+            "name": "Current",
+            "pads": [
+                {"number": "1", "type": "smd", "shape": "rect", "x": -1.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                {"number": "2", "type": "smd", "shape": "rect", "x": 1.0, "y": 0.0, "width": 1.0, "height": 1.0}
+            ]
+        }),
+    );
+    std::fs::write(
+        proj.join("fp-lib-table"),
+        "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/Parts.pretty\") (options \"\") (descr \"\"))\n)\n",
+    )
+    .unwrap();
+
+    // ── Schematic: one resistor per footprint ────────────────────────────
+    let parts = [
+        ("R1", "bare", "Parts:Bare"),
+        ("R2", "legacy", "Parts:Legacy"),
+        ("R3", "inline", "Parts:Inline"),
+        ("R4", "multi", "Parts:MultiLine"),
+        ("R5", "current", "Parts:Current"),
+        ("R6", "stock", "Parts:C_0603_1608Metric"),
+    ];
+    p.load("sch_components");
+    p.load("sch_batch");
+    for (index, (reference, value, footprint)) in parts.iter().enumerate() {
+        p.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": sch.to_string_lossy(), "lib_id": "Device:R",
+                "reference": reference, "value": value, "footprint": footprint,
+                "x": 60.0 + 20.0 * index as f64, "y": 100.0
+            }),
+        );
+    }
+    p.tool(
+        "batch_connect_to_net",
+        json!({
+            "schematic": sch.to_string_lossy(), "net_name": "GND",
+            "pins": parts
+                .iter()
+                .map(|(reference, _, _)| json!({"reference": reference, "pin_number": "1"}))
+                .collect::<Vec<_>>()
+        }),
+    );
+
+    // ── Import into the closed board ─────────────────────────────────────
+    p.load("sch_export");
+    let import = |p: &mut Mcp, extra: Value| {
+        let mut args = json!({
+            "schematic": sch.to_string_lossy(),
+            "board": pcb.to_string_lossy(),
+            "backend": "closed_initial"
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        body(&p.tool("update_pcb_from_schematic", args))
+    };
+    let plan = import(&mut p, json!({}));
+    assert_eq!(plan["status"], "ready", "{plan:#}");
+    let applied = import(
+        &mut p,
+        json!({"dry_run": false, "expected_plan_revision": plan["plan_revision"]}),
+    );
+    assert_eq!(applied["status"], "applied", "{applied:#}");
+
+    let mut expected = parts
+        .iter()
+        .map(|(reference, value, footprint)| {
+            (
+                footprint.to_string(),
+                reference.to_string(),
+                value.to_string(),
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(board_parts(&pcb), expected, "as the import wrote the board");
+
+    // ── KiCad loads the board and saves it ───────────────────────────────
+    let imported = std::fs::read_to_string(&pcb).unwrap();
+    let report = proj.join("drc.rpt");
+    let drc = Command::new(&kicad_cli)
+        .args(["pcb", "drc", "--refill-zones", "--save-board", "--output"])
+        .arg(&report)
+        .arg(&pcb)
+        .output()
+        .expect("failed to run KiCad DRC");
+    assert!(
+        drc.status.success(),
+        "kicad-cli pcb drc failed: {}{}",
+        String::from_utf8_lossy(&drc.stdout),
+        String::from_utf8_lossy(&drc.stderr)
+    );
+    assert_ne!(
+        std::fs::read_to_string(&pcb).unwrap(),
+        imported,
+        "KiCad must have rewritten the board for this to be a round trip"
+    );
+    assert_eq!(board_parts(&pcb), expected, "after KiCad saved the board");
 }

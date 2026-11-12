@@ -620,9 +620,54 @@ fn build_model_sexp(args: &serde_json::Value) -> String {
     )
 }
 
-/// Build the courtyard, silkscreen, fab outline, reference/value text, and the
-/// pin-1 marker (silk dot + fab chamfer) for a footprint from its pad geometry.
-fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeom]) -> String {
+/// The `Reference` and `Value` fields every KiCad footprint carries, in the
+/// layout KiCad's own libraries use: `REF**` on F.SilkS one millimetre above
+/// `top`, and the footprint name on F.Fab one millimetre below `bottom`, both
+/// centred on `centre_x`.
+///
+/// They are `(property …)` clauses, not the `(fp_text reference|value …)`
+/// spelling KiCad stopped writing with version 8. A file that carries a field
+/// in both spellings is read by KiCad with the later clause winning, so a
+/// footprint written here must never hold a second copy.
+fn footprint_fields(name: &str, centre_x: f64, top: f64, bottom: f64) -> String {
+    let field = |field: &str, text: &str, y: f64, layer: &str| {
+        format!(
+            "\n  (property \"{field}\" \"{}\"\n    (at {} {} 0)\n    (layer \"{layer}\")\n    \
+             (effects\n      (font\n        (size 1 1)\n        (thickness 0.15)\n      )\n    )\n  )",
+            escape_library_string(text),
+            fmt_mm(centre_x),
+            fmt_mm(y),
+        )
+    };
+    format!(
+        "{}{}",
+        field("Reference", "REF**", top - 1.0, "F.SilkS"),
+        field("Value", name, bottom + 1.0, "F.Fab")
+    )
+}
+
+/// A millimetre value to four decimals without trailing zeros or a negative
+/// zero, as KiCad writes coordinates.
+fn fmt_mm(value: f64) -> String {
+    let text = format!("{value:.4}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Build the courtyard, silkscreen, fab outline, and the pin-1 marker (silk
+/// dot + fab chamfer) for a footprint from its pad geometry.
+///
+/// Also returns `(centre_x, top, bottom)`: the horizontal centre of the pads
+/// and the vertical extent of the courtyard and fab outline together, which
+/// place the Reference and Value fields clear of the body.
+fn build_footprint_graphics(
+    args: &serde_json::Value,
+    pads: &[PadGeom],
+) -> (String, (f64, f64, f64)) {
     let (pmin_x, pmin_y, pmax_x, pmax_y) = pads_bbox(pads);
 
     let body = match (args["body_width"].as_f64(), args["body_height"].as_f64()) {
@@ -722,18 +767,10 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
         ));
     }
 
-    // Reference (F.SilkS, above) and value (F.Fab, below).
+    // A body larger than the pad envelope reaches past the courtyard, so the
+    // fields clear whichever is further out.
     let cx = (pmin_x + pmax_x) / 2.0;
-    s.push_str(&format!(
-        "\n  (fp_text reference \"REF**\" (at {:.4} {:.4} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))",
-        cx, cmin_y - 1.0
-    ));
-    s.push_str(&format!(
-        "\n  (fp_text value \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))",
-        name, cx, cmax_y + 1.0
-    ));
-
-    s
+    (s, (cx, cmin_y.min(fmin_y), cmax_y.max(fmax_y)))
 }
 
 async fn handle_create_footprint(
@@ -846,12 +883,15 @@ async fn handle_create_footprint(
         });
     }
 
-    // Courtyard, silk, fab, text, and pin-1 marker, derived from pad geometry.
-    let graphics = if pad_geoms.is_empty() {
-        String::new()
+    // Courtyard, silk, fab, and pin-1 marker, derived from pad geometry. A
+    // footprint without pads has no body to draw, and still carries its
+    // Reference and Value fields, around the origin.
+    let (graphics, (centre_x, top, bottom)) = if pad_geoms.is_empty() {
+        (String::new(), (0.0, 0.0, 0.0))
     } else {
-        build_footprint_graphics(args, name, &pad_geoms)
+        build_footprint_graphics(args, &pad_geoms)
     };
+    let fields = footprint_fields(name, centre_x, top, bottom);
     let model_sexp = build_model_sexp(args);
 
     let attr = if pad_geoms.iter().any(|p| p.pad_type == "smd") {
@@ -861,8 +901,8 @@ async fn handle_create_footprint(
     };
 
     let content = format!(
-        "(footprint \"{}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"{}\")\n  (attr {}){}{}{}\n)",
-        name, description, attr, pad_sexp, graphics, model_sexp
+        "(footprint \"{}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"{}\"){}\n  (attr {}){}{}{}\n)",
+        name, description, fields, attr, pad_sexp, graphics, model_sexp
     );
 
     // Ensure parent directory exists
@@ -7092,14 +7132,233 @@ mod tests {
         assert!(c.contains("F.SilkS"));
         assert!(c.contains("(fp_poly"), "missing fab chamfer outline");
         assert!(c.contains("(fp_circle"), "missing pin-1 silk dot");
-        assert!(c.contains("(fp_text reference \"REF**\""));
-        assert!(c.contains("(fp_text value \"TEST_QFN\""));
+        assert!(c.contains("(property \"Reference\" \"REF**\""));
+        assert!(c.contains("(property \"Value\" \"TEST_QFN\""));
         assert!(c.contains("(model \"${KICAD9_3DMODEL_DIR}/Package.3dshapes/TEST_QFN.wrl\""));
         // Round-trips through the S-expression parser.
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated footprint doesn't parse"
         );
+    }
+
+    /// The direct `(property "<name>" …)` children of a footprint.
+    fn footprint_field<'a>(root: &'a SexpNode, name: &str) -> Vec<&'a SexpNode> {
+        root.find_all("property")
+            .into_iter()
+            .filter(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
+            .collect()
+    }
+
+    /// Hold `content` to what every KiCad library footprint carries: one
+    /// Reference `REF**` on F.SilkS and one Value on F.Fab, as properties and
+    /// in no other spelling. Returns the two `(at …)` heights.
+    fn assert_reference_and_value(content: &str, value: &str) -> (f64, f64) {
+        let root = konnect_sexp::parse_sexp(content).unwrap();
+        assert!(
+            root.find_all("fp_text").iter().all(|text| !matches!(
+                text.get(1).and_then(SexpNode::as_str),
+                Some("reference" | "value")
+            )),
+            "KiCad keeps the last of two clauses for one field, so none may be an fp_text:\n{content}"
+        );
+        let mut heights = [0.0; 2];
+        for (index, (name, text, layer)) in
+            [("Reference", "REF**", "F.SilkS"), ("Value", value, "F.Fab")]
+                .into_iter()
+                .enumerate()
+        {
+            let fields = footprint_field(&root, name);
+            assert_eq!(fields.len(), 1, "one {name} property:\n{content}");
+            let field = fields[0];
+            assert_eq!(field.get(2).and_then(SexpNode::as_str), Some(text));
+            assert_eq!(field.find_str("layer"), Some(layer));
+            assert_eq!(field.find("hide"), None, "{name} is visible");
+            let font = field.find("effects").unwrap().find("font").unwrap();
+            assert_eq!(font.find("size").unwrap().get_f64(1), Some(1.0));
+            assert_eq!(font.find("thickness").unwrap().get_f64(1), Some(0.15));
+            let at = field.find("at").unwrap();
+            assert_eq!(at.get_f64(3), Some(0.0));
+            heights[index] = at.get_f64(2).unwrap();
+        }
+        (heights[0], heights[1])
+    }
+
+    /// `create_footprint` wrote its Reference and Value as `(fp_text
+    /// reference|value …)`, a spelling KiCad stopped writing with version 8,
+    /// so the file held no Reference or Value property. Reading it for a
+    /// property found none, and adding the properties by hand left two clauses
+    /// for each field, of which KiCad keeps the last — the library's `REF**`.
+    #[tokio::test]
+    async fn create_footprint_writes_reference_and_value_properties_clear_of_the_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("Module.kicad_mod");
+        let pads = json!([
+            {"number":"1","type":"smd","shape":"rect","x":-8.75,"y":-5.26,"width":1.5,"height":0.9},
+            {"number":"2","type":"smd","shape":"rect","x":-8.75,"y":5.26,"width":1.5,"height":0.9},
+            {"number":"3","type":"smd","shape":"rect","x":8.75,"y":0.0,"width":1.5,"height":0.9}
+        ]);
+        let result = handle_create_footprint(
+            &json!({
+                "output": out.to_string_lossy(),
+                "name": "Module \"A\"",
+                "description": "castellated module",
+                "pads": pads
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let written = std::fs::read_to_string(&out).unwrap();
+        // The name is written as a string literal, quotes escaped.
+        assert!(
+            written.contains(r#"(property "Value" "Module \"A\"""#),
+            "{written}"
+        );
+
+        // Pads span y -5.71..5.71 and the SMD courtyard adds 0.25: the text
+        // sits one millimetre beyond it, centred on the pads.
+        std::fs::remove_file(&out).unwrap();
+        handle_create_footprint(
+            &json!({"output": out.to_string_lossy(), "name": "Module", "pads": pads}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let written = std::fs::read_to_string(&out).unwrap();
+        let (reference_y, value_y) = assert_reference_and_value(&written, "Module");
+        assert!((reference_y + 6.96).abs() < 1e-9, "{reference_y}");
+        assert!((value_y - 6.96).abs() < 1e-9, "{value_y}");
+        // KiCad's layout: the fields follow the description and precede
+        // everything drawn.
+        let order = [
+            "(descr",
+            "(property \"Reference\"",
+            "(property \"Value\"",
+            "(attr",
+            "(pad",
+        ]
+        .map(|clause| {
+            written
+                .find(clause)
+                .unwrap_or_else(|| panic!("{clause}:\n{written}"))
+        });
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{written}");
+
+        // A body taller than the pad envelope pushes the text out with it.
+        handle_create_footprint(
+            &json!({
+                "output": out.to_string_lossy(), "name": "Module", "pads": pads,
+                "body_width": 18.0, "body_height": 25.5
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let (reference_y, value_y) =
+            assert_reference_and_value(&std::fs::read_to_string(&out).unwrap(), "Module");
+        assert!((reference_y + 13.75).abs() < 1e-9, "{reference_y}");
+        assert!((value_y - 13.75).abs() < 1e-9, "{value_y}");
+
+        // No pads, so nothing to draw: the two fields are still there.
+        handle_create_footprint(
+            &json!({"output": out.to_string_lossy(), "name": "Module", "pads": []}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let (reference_y, value_y) =
+            assert_reference_and_value(&std::fs::read_to_string(&out).unwrap(), "Module");
+        assert_eq!((reference_y, value_y), (-1.0, 1.0));
+    }
+
+    /// The other library-authoring tools edit a `create_footprint` file
+    /// without touching its Reference and Value.
+    #[tokio::test]
+    async fn footprint_editing_tools_keep_the_reference_and_value_properties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Module.kicad_mod");
+        handle_create_footprint(
+            &json!({
+                "output": path.to_string_lossy(),
+                "name": "Module",
+                "pads": [
+                    {"number":"1","type":"smd","shape":"rect","x":-2.0,"y":0.0,"width":1.0,"height":1.0},
+                    {"number":"2","type":"smd","shape":"rect","x":2.0,"y":0.0,"width":1.0,"height":1.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let created = std::fs::read_to_string(&path).unwrap();
+        let fields = |content: &str| {
+            let start = content.find("(property \"Reference\"").unwrap();
+            let end = content.find("(attr").unwrap();
+            content[start..end].trim_end().to_string()
+        };
+        let expected = fields(&created);
+        assert_reference_and_value(&created, "Module");
+
+        let ctx = Arc::new(test_ctx());
+        for (tool, args) in [
+            (
+                "set_footprint_metadata",
+                json!({
+                    "footprint_path": path,
+                    "description": "edited",
+                    "tags": ["module"],
+                    "attributes": ["smd", "exclude_from_bom"]
+                }),
+            ),
+            (
+                "set_footprint_graphics",
+                json!({
+                    "footprint_path": path,
+                    "selector": {"layer": "F.SilkS"},
+                    "mode": "replace",
+                    "graphics": [{
+                        "type": "line",
+                        "start": {"x": -3.0, "y": -1.0},
+                        "end": {"x": 3.0, "y": -1.0},
+                        "stroke_width_mm": 0.12
+                    }]
+                }),
+            ),
+            (
+                "set_footprint_graphics",
+                json!({
+                    "footprint_path": path,
+                    "selector": {"layer": "F.Fab"},
+                    "mode": "delete"
+                }),
+            ),
+            (
+                "edit_footprint_pad",
+                json!({"footprint_path": path, "pad_number": "2", "new_number": "3"}),
+            ),
+            (
+                "set_footprint_models",
+                json!({
+                    "footprint_path": path,
+                    "mode": "replace",
+                    "models": [{"path": "${KIPRJMOD}/models/module.step"}]
+                }),
+            ),
+        ] {
+            let before = std::fs::read_to_string(&path).unwrap();
+            let def = tools()
+                .into_iter()
+                .find(|def| def.name == tool)
+                .unwrap_or_else(|| panic!("{tool} is registered"));
+            let result = (def.handler)(&args, ctx.clone()).await.unwrap();
+            assert!(!result.is_error, "{tool}: {:?}", result.content);
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_ne!(after, before, "{tool} changed the file");
+            assert_eq!(fields(&after), expected, "{tool} left the fields alone");
+            assert_reference_and_value(&after, "Module");
+        }
     }
 
     #[test]
