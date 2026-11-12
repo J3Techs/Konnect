@@ -60,6 +60,38 @@ impl BoardSessionMemory {
         self.authorize_file_fallback_with(board, || editor_lock(board))
     }
 
+    /// Forget the live observation for `board` after a close this server
+    /// carried out itself: it started the editor, asked it to close, and saw
+    /// its process exit and KiCad's lock go.
+    ///
+    /// [`Self::authorize_file_fallback`] needs the lock to have been seen at
+    /// observation time, because for an editor it knows nothing about a
+    /// missing lock proves nothing. Here the editor's exit was watched, so
+    /// the lock being absent now is the whole of the evidence. Returns
+    /// whether the saved file is authoritative afterwards; a lock that is
+    /// present or cannot be inspected keeps the observation and returns
+    /// `false`.
+    pub(crate) fn release_after_verified_close(&self, board: &Path) -> bool {
+        self.release_after_verified_close_with(board, || editor_lock(board))
+    }
+
+    fn release_after_verified_close_with(
+        &self,
+        board: &Path,
+        inspect: impl FnOnce() -> EditorLock,
+    ) -> bool {
+        let mut observed = self
+            .observed_live
+            .lock()
+            .expect("board-session memory poisoned");
+        // Inspected under the memory lock, as in `authorize_file_fallback`.
+        if !matches!(inspect(), EditorLock::Absent) {
+            return false;
+        }
+        observed.remove(&board_key(board));
+        true
+    }
+
     fn authorize_file_fallback_with(
         &self,
         board: &Path,
@@ -225,6 +257,51 @@ mod tests {
         memory.observe_live(&board);
 
         assert!(!memory.authorize_file_fallback(&board));
+    }
+
+    #[test]
+    fn a_verified_close_releases_a_board_observed_without_its_lock() {
+        // Observed before KiCad had written its lock: no lock evidence, so
+        // only a close this server watched can restore the file's authority.
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "").unwrap();
+        let memory = BoardSessionMemory::default();
+        memory.observe_live(&board);
+        assert!(!memory.authorize_file_fallback(&board));
+
+        assert!(memory.release_after_verified_close(&board));
+
+        assert!(!memory.was_observed_live(&board));
+        assert!(memory.authorize_file_fallback(&board));
+    }
+
+    #[test]
+    fn a_verified_close_releases_nothing_while_the_lock_remains_or_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_with_lock(dir.path(), "board.kicad_pcb");
+        let other = board_with_lock(dir.path(), "other.kicad_pcb");
+        let memory = BoardSessionMemory::default();
+        memory.observe_live(&board);
+        memory.observe_live(&other);
+
+        assert!(!memory.release_after_verified_close(&board));
+        assert!(memory.was_observed_live(&board));
+
+        let unreadable = super::super::live_board::editor_lock_with(&board, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        });
+        assert!(!memory.release_after_verified_close_with(&board, || unreadable));
+        assert!(memory.was_observed_live(&board));
+
+        // Once the lock is gone the board is released, and only that board.
+        std::fs::remove_file(dir.path().join("~board.kicad_pcb.lck")).unwrap();
+        assert!(memory.release_after_verified_close(&board));
+        assert!(!memory.was_observed_live(&board));
+        assert!(memory.was_observed_live(&other));
     }
 
     #[test]

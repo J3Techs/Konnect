@@ -148,7 +148,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "launch_kicad_ui",
-            "Launch the KiCAD GUI application and optionally open a project file.",
+            "Launch the KiCAD GUI application (the project manager) and optionally open a \
+             project file. This does not open the PCB editor; to get a board open for \
+             live-board tools, call open_board_editor with the .kicad_pcb path instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -169,6 +171,8 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_launch_kicad_ui(args, ctx).await }
         ),
         crate::tools::closed_board_edit::tool(),
+        crate::tools::board_editor::open_tool(),
+        crate::tools::board_editor::close_tool(),
         tool!(
             "copy_routing_pattern",
             "Copy a routing pattern (traces and vias) from one region of the board to another.",

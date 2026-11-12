@@ -1,6 +1,7 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
 pub(crate) mod board_analysis;
+pub(crate) mod board_editor;
 pub(crate) mod board_endpoint;
 #[cfg(test)]
 mod board_extents_tests;
@@ -291,6 +292,9 @@ pub struct ToolContext {
     pub(crate) board_session: board_session::BoardSessionMemory,
     /// The endpoint that last held each board; see [`board_endpoint`].
     pub(crate) board_endpoints: board_endpoint::BoardEndpoints,
+    /// The standalone PCB editors this server started, which are the only
+    /// ones `close_board_editor` closes.
+    pub(crate) started_editors: board_editor::StartedEditors,
     /// Which configuration file configured this process, captured at startup
     /// and reported read-only by `get_installation_info` (#419). Defaults to
     /// `unavailable` so a caller that does not track the load reports absence
@@ -336,6 +340,7 @@ impl ToolContext {
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
             board_endpoints: board_endpoint::BoardEndpoints::default(),
+            started_editors: board_editor::StartedEditors::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_discovery: std::sync::OnceLock::new(),
@@ -357,6 +362,7 @@ impl ToolContext {
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
             board_endpoints: board_endpoint::BoardEndpoints::default(),
+            started_editors: board_editor::StartedEditors::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_discovery: std::sync::OnceLock::new(),

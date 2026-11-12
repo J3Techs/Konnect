@@ -15,7 +15,7 @@
 //! lock: an editor that will not close (it is showing a prompt) stops the
 //! cycle with nothing edited.
 
-mod desktop;
+pub(crate) mod desktop;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -719,10 +719,16 @@ impl Stage for LiveStage {
                 "no standalone PCB editor (pcbnew) was found in the KiCad installation".to_string()
             })?;
         let pid = self.desktop.launch(&binary, &self.board)?;
-        Ok(Launched {
-            pid,
-            binary: binary.display().to_string(),
-        })
+        let binary = binary.display().to_string();
+        // An editor this server started is one `close_board_editor` may close.
+        self.ctx.started_editors.record(
+            &self.board,
+            crate::tools::board_editor::StartedEditor {
+                pid,
+                binary: binary.clone(),
+            },
+        );
+        Ok(Launched { pid, binary })
     }
 
     async fn addressable(&self) -> Result<(), String> {
@@ -764,7 +770,7 @@ fn same_board(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
-fn seconds(args: &Value, key: &str, default: u64) -> Result<u64, CallToolResult> {
+pub(crate) fn seconds(args: &Value, key: &str, default: u64) -> Result<u64, CallToolResult> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(value) => value
@@ -774,7 +780,7 @@ fn seconds(args: &Value, key: &str, default: u64) -> Result<u64, CallToolResult>
     }
 }
 
-fn polls(seconds: u64) -> u32 {
+pub(crate) fn polls(seconds: u64) -> u32 {
     (seconds * 1000 / POLL.as_millis() as u64) as u32
 }
 
