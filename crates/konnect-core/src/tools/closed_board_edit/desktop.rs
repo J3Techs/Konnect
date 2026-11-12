@@ -145,6 +145,41 @@ pub(crate) fn select_pcb_editor(
     }
 }
 
+/// The main window of the standalone PCB editor process `pid`, for a caller
+/// that knows the process because it started it.
+///
+/// Matching the executable as well as the process id keeps a recycled id,
+/// now some other program's, from being asked to close.
+///
+/// It is an error when another process carries the same window handle. That
+/// happens where the platform cannot tell windows apart and the handle is the
+/// application itself (macOS): the close request there goes to the
+/// application, and with two editors running from it there is no saying which
+/// one would answer. The other one may be the user's.
+pub(crate) fn closable_editor_of(
+    windows: &[KiCadWindow],
+    pid: u32,
+) -> Result<&KiCadWindow, String> {
+    let window = windows
+        .iter()
+        .find(|window| window.pid == pid && window.process == "pcbnew" && window.owner.is_none())
+        .ok_or_else(|| {
+            format!("no standalone PCB editor window of process {pid} was found on this desktop")
+        })?;
+    match windows
+        .iter()
+        .find(|other| other.pid != pid && other.id == window.id)
+    {
+        None => Ok(window),
+        Some(other) => Err(format!(
+            "another PCB editor (pid {}) runs from the same application, and on this platform \
+             a close request cannot be addressed to one of them; Konnect will not risk closing \
+             the wrong one",
+            other.pid
+        )),
+    }
+}
+
 /// Titles of the dialogs KiCad is showing on top of `editor`, where the
 /// platform reports ownership. A save prompt is one of these.
 pub(crate) fn blocking_dialogs(windows: &[KiCadWindow], editor: &KiCadWindow) -> Vec<String> {
@@ -690,6 +725,44 @@ mod tests {
         assert!(select_pcb_editor(&two, Path::new(BOARD)).is_err());
         let manager_only = [window("b", 200, "kicad", None)];
         assert!(select_pcb_editor(&manager_only, Path::new(BOARD)).is_err());
+    }
+
+    #[test]
+    fn a_started_editor_is_found_by_its_process_and_nothing_else_is() {
+        let mut prompt = window("9", 100, "pcbnew", Some("Save Changes?"));
+        prompt.owner = Some("7".to_string());
+        let windows = [
+            prompt,
+            window("7", 100, "pcbnew", Some("board \u{2014} PCB Editor")),
+            window("3", 200, "kicad", Some("board \u{2014} PCB Editor")),
+            window("8", 400, "pcbnew", Some("other \u{2014} PCB Editor")),
+        ];
+        assert_eq!(closable_editor_of(&windows, 100).unwrap().id, "7");
+        // The project manager is never a standalone editor, and a process id
+        // with no editor window behind it finds nothing.
+        assert!(closable_editor_of(&windows, 200).is_err());
+        assert!(closable_editor_of(&windows, 300).is_err());
+    }
+
+    /// Where the handle is the application rather than a window, two editors
+    /// from one application cannot be told apart by a close request.
+    #[test]
+    fn an_editor_sharing_its_handle_with_another_process_is_not_closable() {
+        let app =
+            "/Applications/KiCad/KiCad.app/Contents/Applications/pcbnew.app/Contents/MacOS/pcbnew";
+        let ours = window(app, 100, "pcbnew", None);
+        let manager = window(
+            "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad",
+            300,
+            "kicad",
+            None,
+        );
+        let alone = [ours.clone(), manager.clone()];
+        assert_eq!(closable_editor_of(&alone, 100).unwrap().pid, 100);
+
+        let beside_the_users = [ours, manager, window(app, 200, "pcbnew", None)];
+        let error = closable_editor_of(&beside_the_users, 100).unwrap_err();
+        assert!(error.contains("pid 200"), "{error}");
     }
 
     #[test]

@@ -57,10 +57,27 @@ restart Konnect automatically, or edit `.kicad_pcb` directly. If the user confir
 clean close and an authoritative saved file, they may restart Konnect to deliberately
 begin a new closed-board session.
 
+To get a board open for live work, call `open_board_editor` (`verification` toolset)
+with the `.kicad_pcb` path instead of asking the user to open it. If a KiCad that Konnect
+can reach already holds the board it starts nothing and says so; otherwise it starts
+KiCad's standalone PCB editor on the board and waits until the board answers over IPC.
+`launch_kicad_ui` only starts the project manager, which does not open the PCB editor.
+`open_project` lists the boards open in every running KiCad process and the endpoint
+that holds each, so a board open in a second KiCad window is found too.
+
+When the editor is no longer needed, or a closed-board tool has to run and
+`run_closed_board_edit` does not fit, call `close_board_editor`. It saves the board,
+closes the editor and waits for KiCad's lock to go; after that closed-board tools accept
+the board in the same session. It closes only an editor that Konnect started. For any
+other editor it refuses: ask the user to save and close the board themselves, and never
+try to end a KiCad process another way.
+
 If connection fails:
-- Tell the user to open KiCAD and load the project
+- Call `open_board_editor` for the board. If it refuses because KiCad's lock file is
+  present, an editor Konnect cannot reach (or one that crashed) holds the board: relay
+  its `next_action` to the user
 - The board (.kicad_pcb) must be open in the PCB editor
-- KiCAD's IPC API must be enabled (default in KiCAD 8+)
+- KiCAD's IPC API must be enabled in KiCad (Preferences > Plugins > Enable KiCad API)
 
 ---
 
@@ -81,7 +98,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode; run_closed_board_edit)
+load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode; run_closed_board_edit; open_board_editor, close_board_editor)
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.

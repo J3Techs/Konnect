@@ -3,6 +3,86 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `open_board_editor` and `close_board_editor` open and close the PCB editor on a board
+
+`launch_kicad_ui` starts the KiCad project manager, where the PCB editor is
+opened by a click Konnect cannot make, so an agent that needed a live board
+had to ask the user to open it, and one that needed the board closed for a
+closed-board tool had to ask the user to close it. Two tools in the
+`verification` toolset do both.
+
+`open_board_editor { board, timeout_seconds? }`
+
+- If a KiCad that Konnect can reach already holds the board (at any endpoint,
+  see the entry below), nothing is started: `status: "already_open"`, with the
+  `endpoint` that holds it.
+- Otherwise the standalone PCB editor of the configured KiCad installation is
+  started on the board file and the call waits (default 90 s) until an
+  endpoint reports the board open: `status: "opened"`, with `endpoint`, `pid`
+  and `binary`. The editor is the `pcbnew` beside the configured
+  `kicad_binary` (`pcbnew.exe` on Windows; inside the macOS bundle,
+  `Contents/Applications/pcbnew.app/Contents/MacOS/pcbnew`), found the way
+  `run_closed_board_edit` finds it. There is no separate configuration key.
+- It refuses, starting nothing, when KiCad's sibling lock
+  (`~<board>.kicad_pcb.lck`) is present although no reachable KiCad holds the
+  board (`kicad_lock_present`, or `kicad_lock_unreadable`): an editor Konnect
+  cannot reach owns the board, or one crashed. It also refuses while a KiCad
+  answers without settling whether it holds the board
+  (`board_state_unknown`).
+- An editor that is started but does not answer in time is reported as
+  `editor_not_addressable` with its `pid`; a second call waits for that same
+  process instead of starting another.
+
+`close_board_editor { board, save? = true, timeout_seconds? }`
+
+- Only an editor this server process started is closed: by
+  `open_board_editor`, or by `run_closed_board_edit` when it reopened the
+  board. For any other editor, and for a lock with no reachable editor behind
+  it, the call refuses with `editor_not_started_by_konnect` and the user has
+  to close it. A user's own KiCad is never closed.
+- With `save` (default) the board is saved through IPC first; a refused save
+  leaves the editor open (`save_failed`). The editor is then sent the request
+  its close button sends, and the call waits (default 30 s) until the process
+  has exited and KiCad has removed its lock: `status: "closed"`.
+- Nothing is forced. A process is never signalled or killed and a lock is
+  never deleted, because an editor ended that way leaves its lock and possibly
+  unsaved work behind. An editor that stays open, for example behind the
+  unsaved-changes prompt when `save` is false, is `editor_not_closed`.
+- On macOS the close request is a quit sent to the standalone `pcbnew`
+  application, which cannot be addressed to one process. While another
+  standalone PCB editor is running from the same application the call refuses
+  with `close_request_failed`, before saving, because the editor that answered
+  the quit could be the user's. A PCB editor that is a window of the project
+  manager is a different application and does not cause this.
+- After `closed`, `closed_board_tools_ready` is true and closed-board tools
+  accept the board in the same server session. The record that this server
+  saw the board live is cleared only here: after this server's own editor was
+  seen to exit, with the lock gone and no reachable KiCad holding the board.
+  Every other outcome leaves that record, and the `unsafe_file_fallback`
+  refusals it causes, as they were.
+- If nothing holds the board and no lock is present, the result is
+  `status: "not_open"` and nothing is done.
+
+Both results carry `status`, `message`, `board`, `endpoint`, `pid`, `binary`,
+`started_by_konnect`, `next_action` and `elapsed_ms`; `open_board_editor` adds
+`launched`, `close_board_editor` adds `saved` and `closed_board_tools_ready`.
+A refusal is `isError` with `error.kind: "plan_blocked"`, the tool as
+`operation` and the status as the one reason: `board_state_unknown`,
+`kicad_lock_present`, `kicad_lock_unreadable`, `launch_failed`,
+`editor_exited`, `editor_not_addressable`, `editor_not_started_by_konnect`,
+`save_failed`, `close_request_failed`, `editor_not_closed`.
+
+The window handling is `run_closed_board_edit`'s: tested on Windows there;
+the Linux (`wmctrl`, X11 or XWayland) and macOS (`osascript` quit of the
+standalone `pcbnew` application) paths are implemented and untested. The two
+new tools have not been run against KiCad on any platform; their decisions
+are covered by tests that script the editor. On Windows a PCB editor started
+while another KiCad process owns the IPC address is not reachable (see the
+entry below), so `open_board_editor` reports `editor_not_addressable` there.
+
+`launch_kicad_ui`'s description now says that it starts the project manager
+and names `open_board_editor`; its behaviour is unchanged.
+
 ## Unreleased: a board open in a second KiCad process is reached, and `open_project` lists every endpoint
 
 KiCad's API server listens on `<temp dir>/kicad/api.sock`. A KiCad process

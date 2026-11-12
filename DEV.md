@@ -90,6 +90,7 @@ Konnect/
 │   │           ├── board_source.rs   # board_source selector: live-vs-saved board reads + provenance
 │   │           ├── live_board.rs     # what KiCad's answer proves about one board, shared by read and write gates
 │   │           ├── board_endpoint.rs # which KiCad endpoint (api.sock or an api-<pid>.sock beside it) holds a requested board
+│   │           ├── board_editor.rs   # open_board_editor / close_board_editor: start the standalone PCB editor on a board, close the one this server started
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
@@ -380,7 +381,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 284 tools (291 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 286 tools (293 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -465,12 +466,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **24 toolsets, 284 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **24 toolsets, 286 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 291 tools (284 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 293 tools (286 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.
