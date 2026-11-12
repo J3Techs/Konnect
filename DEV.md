@@ -89,6 +89,7 @@ Konnect/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── board_source.rs   # board_source selector: live-vs-saved board reads + provenance
 │   │           ├── live_board.rs     # what KiCad's answer proves about one board, shared by read and write gates
+│   │           ├── board_endpoint.rs # which KiCad endpoint (api.sock or an api-<pid>.sock beside it) holds a requested board
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)

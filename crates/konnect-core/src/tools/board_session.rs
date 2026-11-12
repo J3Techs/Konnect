@@ -86,7 +86,7 @@ impl BoardSessionMemory {
 /// Prefer filesystem identity. If the path cannot be canonicalized, retain a
 /// stable absolute lexical spelling instead of silently dropping the safety
 /// observation.
-fn board_key(board: &Path) -> PathBuf {
+pub(crate) fn board_key(board: &Path) -> PathBuf {
     board.canonicalize().unwrap_or_else(|_| {
         if board.is_absolute() {
             board.to_path_buf()

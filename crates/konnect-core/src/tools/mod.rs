@@ -1,6 +1,7 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
 pub(crate) mod board_analysis;
+pub(crate) mod board_endpoint;
 #[cfg(test)]
 mod board_extents_tests;
 mod board_graphics;
@@ -288,6 +289,8 @@ pub struct ToolContext {
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
+    /// The endpoint that last held each board; see [`board_endpoint`].
+    pub(crate) board_endpoints: board_endpoint::BoardEndpoints,
     /// Which configuration file configured this process, captured at startup
     /// and reported read-only by `get_installation_info` (#419). Defaults to
     /// `unavailable` so a caller that does not track the load reports absence
@@ -332,6 +335,7 @@ impl ToolContext {
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            board_endpoints: board_endpoint::BoardEndpoints::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_discovery: std::sync::OnceLock::new(),
@@ -352,6 +356,7 @@ impl ToolContext {
             observer,
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            board_endpoints: board_endpoint::BoardEndpoints::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
             ipc_discovery: std::sync::OnceLock::new(),
@@ -419,6 +424,58 @@ impl ToolContext {
                 late.last_miss = Some(now);
                 String::new()
             }
+        }
+    }
+
+    /// Every KiCad endpoint to consider, the one [`Self::ipc_address`] names
+    /// first.
+    ///
+    /// A further KiCad process listens beside the first under its own name,
+    /// so a board can be open at an endpoint other than the configured one
+    /// (see `konnect_ipc::sibling_ipc_addresses`). Only an address in KiCad's
+    /// default naming has siblings; a TCP address or a socket path somebody
+    /// chose is returned alone, and so is a blank one. Listing reads the
+    /// socket directory and never connects.
+    pub fn ipc_addresses(&self) -> Vec<String> {
+        let address = self.ipc_address();
+        if address.is_empty() {
+            return vec![address];
+        }
+        konnect_ipc::sibling_ipc_addresses(&address)
+    }
+
+    /// The endpoints to ask about `board`, in the order to ask them.
+    pub(crate) fn board_ipc_candidates(
+        &self,
+        board: &std::path::Path,
+    ) -> board_endpoint::Candidates {
+        self.board_endpoints
+            .candidates_for(board, self.ipc_addresses())
+    }
+
+    /// The address of the endpoint that has `board` open, or the configured
+    /// one when none does. For a caller that dials by address; one that can
+    /// take the located client uses [`with_bound_board_ipc_classified`].
+    pub(crate) async fn ipc_address_for_board(&self, board: &std::path::Path) -> String {
+        let candidates = self.board_ipc_candidates(board);
+        if candidates.addresses.len() < 2 {
+            return self.ipc_address();
+        }
+        let requested = board.to_path_buf();
+        let located = tokio::task::spawn_blocking(move || {
+            board_endpoint::locate_board(&candidates, &requested)
+                .ok()
+                .map(|located| located.address)
+        })
+        .await
+        .ok()
+        .flatten();
+        match located {
+            Some(address) => {
+                self.board_endpoints.remember(board, &address);
+                address
+            }
+            None => self.ipc_address(),
         }
     }
 
@@ -843,30 +900,45 @@ where
         + 'static,
 {
     let requested = board_path.to_path_buf();
-    let observation = requested.clone();
     let memory = ctx.board_session.clone();
-    with_ipc_classified(ctx.ipc_address(), move |client| {
-        let document = match client.find_open_board(&requested) {
-            Ok(document) => document,
+    let endpoints = ctx.board_endpoints.clone();
+    // Every endpoint a KiCad process may serve, not only the configured one:
+    // a board held by any of them is live. One endpoint is asked exactly as
+    // it always was.
+    let candidates = ctx.board_ipc_candidates(board_path);
+    let classify = |address: &str, error: anyhow::Error| {
+        warn_if_ipc_unreachable(address, &error);
+        konnect_ipc::IpcFailure::from_error(error)
+    };
+    match tokio::task::spawn_blocking(move || {
+        let located = match board_endpoint::locate_board(&candidates, &requested) {
+            Ok(located) => located,
             // Classified by the typed status in the chain, never by message
             // text. It has to happen here: `IpcFailure` keeps only the
             // rendered message, so by the time the caller sees one the status
             // is gone — and the two unsupported statuses part company here,
             // because only one of them is evidence about KiCad's editors.
-            Err(error) => match BoardEditorAbsence::from_error(&error) {
-                Some(absence) => {
-                    return Ok(BoardBinding::Unserved {
+            Err(missed) => {
+                return match BoardEditorAbsence::from_error(&missed.error) {
+                    Some(absence) => Ok(BoardBinding::Unserved {
                         absence,
-                        message: format!("{error:#}"),
-                    })
+                        message: format!("{:#}", missed.error),
+                    }),
+                    None => Err(classify(&missed.address, missed.error)),
                 }
-                None => return Err(error),
-            },
+            }
         };
-        memory.observe_live(&observation);
-        f(client, document).map(BoardBinding::Bound)
+        memory.observe_live(&requested);
+        endpoints.remember(&requested, &located.address);
+        f(&located.client, located.document)
+            .map(BoardBinding::Bound)
+            .map_err(|error| classify(&located.address, error))
     })
     .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
+    }
 }
 
 /// Run `f` against KiCad's IPC API, reporting a failure as its message.

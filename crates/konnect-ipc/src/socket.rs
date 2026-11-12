@@ -182,6 +182,96 @@ fn is_adoptable(_path: &Path) -> bool {
     false
 }
 
+/// Every endpoint a KiCad process may be serving beside `address`, with
+/// `address` itself first and unchanged.
+///
+/// KiCad's API server listens on `<temp dir>/kicad/api.sock`, and a process
+/// that finds that file already there listens on `api-<pid>.sock` in the same
+/// directory instead. That covers a second project manager, a standalone PCB
+/// editor started beside one, and every KiCad started after an earlier one
+/// left `api.sock` behind when it exited. A server that only ever dials the
+/// one address it was configured with cannot see a board any of those hold.
+///
+/// Siblings are looked for only where the scheme above applies: an `ipc://`
+/// address (or a bare path, which the client dials as one) whose file name is
+/// `api.sock` or `api-<pid>.sock`. A TCP address, or a socket somebody named
+/// themselves, is returned alone.
+///
+/// Like [`detect_ipc_address`], this reads metadata and never connects, and a
+/// sibling is listed only when it is a socket this user owns. A socket file
+/// with no listener behind it is listed too; dialling it with the NNG client
+/// fails at once as unreachable, which is how a caller tells.
+///
+/// Unix only. On Windows the endpoint is a named pipe, and KiCad decides
+/// whether to use the per-process name by looking for `api.sock` as a file,
+/// which a pipe never is; a second KiCad process there does not get an
+/// endpoint of its own name. Other platforms list the address alone.
+pub fn sibling_ipc_addresses(address: &str) -> Vec<String> {
+    let mut addresses = vec![address.to_string()];
+    let Some(path) = kicad_default_socket_path(address) else {
+        return addresses;
+    };
+    let Some(directory) = path.parent() else {
+        return addresses;
+    };
+    for sibling in sibling_sockets_in(directory, is_adoptable) {
+        if sibling != path {
+            addresses.push(format_address(&sibling));
+        }
+    }
+    addresses
+}
+
+/// The socket path of `address` when it follows KiCad's own naming.
+fn kicad_default_socket_path(address: &str) -> Option<PathBuf> {
+    let path = match address.split_once("://") {
+        Some(("ipc", path)) => path,
+        Some(_) => return None,
+        None => address,
+    };
+    let path = PathBuf::from(path);
+    socket_pid_rank(path.file_name()?.to_str()?)?;
+    Some(path)
+}
+
+/// Where a KiCad socket name sorts among its siblings, or `None` for a name
+/// KiCad does not give its API socket: `api.sock` first, then
+/// `api-<pid>.sock` by process id.
+fn socket_pid_rank(file_name: &str) -> Option<u64> {
+    if file_name == "api.sock" {
+        return Some(0);
+    }
+    let pid = file_name.strip_prefix("api-")?.strip_suffix(".sock")?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u64>().ok().map(|pid| pid.saturating_add(1))
+}
+
+/// KiCad's API sockets in `directory` that pass `is_adoptable`, in a stable
+/// order. A directory that cannot be read holds none.
+#[cfg(unix)]
+fn sibling_sockets_in(directory: &Path, is_adoptable: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut sockets: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let rank = socket_pid_rank(entry.file_name().to_str()?)?;
+            let path = entry.path();
+            is_adoptable(&path).then_some((rank, path))
+        })
+        .collect();
+    sockets.sort();
+    sockets.into_iter().map(|(_, path)| path).collect()
+}
+
+#[cfg(not(unix))]
+fn sibling_sockets_in(_directory: &Path, _is_adoptable: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// Format a socket path the way KiCad prints it, so a detected address and a
 /// pasted one are the same string.
 fn format_address(path: &Path) -> String {
@@ -472,6 +562,177 @@ mod tests {
         let address = detected.unwrap();
         assert!(address.starts_with("ipc://"), "{address}");
         println!("discovered {address}");
+    }
+
+    #[test]
+    fn only_kicads_own_socket_names_are_recognised() {
+        assert_eq!(socket_pid_rank("api.sock"), Some(0));
+        assert_eq!(socket_pid_rank("api-4242.sock"), Some(4243));
+        for name in [
+            "api-.sock",
+            "api-12a.sock",
+            "api-12.sock.bak",
+            "xapi.sock",
+            "api.socket",
+            "custom.sock",
+        ] {
+            assert_eq!(socket_pid_rank(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_address_outside_kicads_naming_has_no_siblings() {
+        for address in [
+            "tcp://127.0.0.1:4242",
+            "inproc://mock",
+            "ipc:///run/user/1000/my-kicad.sock",
+            "",
+        ] {
+            assert_eq!(sibling_ipc_addresses(address), [address], "{address}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_lone_configured_endpoint_is_returned_alone_and_unchanged() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let address = format!("ipc://{}", path.display());
+
+        assert_eq!(sibling_ipc_addresses(&address), [address.as_str()]);
+        // An address whose socket is not there yet is still the one to dial.
+        let absent = format!("ipc://{}", dir.path().join("empty/api.sock").display());
+        assert_eq!(sibling_ipc_addresses(&absent), [absent.as_str()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn per_process_sockets_beside_the_configured_one_are_listed_after_it() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bind = |name: &str| UnixListener::bind(dir.path().join(name)).unwrap();
+        let _first = bind("api.sock");
+        let _late = bind("api-900.sock");
+        let _early = bind("api-77.sock");
+        let _unrelated = bind("other.sock");
+        std::fs::write(dir.path().join("api-55.sock"), b"not a socket").unwrap();
+        let address = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+
+        assert_eq!(
+            sibling_ipc_addresses(&address("api.sock")),
+            [
+                address("api.sock"),
+                address("api-77.sock"),
+                address("api-900.sock")
+            ]
+        );
+        // Configured with a per-process socket: it stays first, and the
+        // default one is a sibling like any other.
+        assert_eq!(
+            sibling_ipc_addresses(&address("api-900.sock")),
+            [
+                address("api-900.sock"),
+                address("api.sock"),
+                address("api-77.sock")
+            ]
+        );
+        // A bare path is dialled as an ipc address and is kept as given.
+        let bare = dir.path().join("api.sock").display().to_string();
+        assert_eq!(
+            sibling_ipc_addresses(&bare),
+            [
+                bare.clone(),
+                address("api-77.sock"),
+                address("api-900.sock")
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_sibling_that_fails_the_ownership_check_is_not_listed() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _ours = UnixListener::bind(dir.path().join("api-1.sock")).unwrap();
+        let _theirs = UnixListener::bind(dir.path().join("api-2.sock")).unwrap();
+
+        let listed = sibling_sockets_in(dir.path(), |path| {
+            is_adoptable_owned_by(path, |path| !path.ends_with("api-2.sock"))
+        });
+
+        assert_eq!(listed, [dir.path().join("api-1.sock")]);
+    }
+
+    /// Listing siblings must not open a stream connection to any of them, for
+    /// the reason `detection_never_connects_to_a_candidate` gives (#498).
+    #[test]
+    #[cfg(unix)]
+    fn listing_siblings_never_connects_to_one() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listeners: Vec<UnixListener> = ["api.sock", "api-31.sock"]
+            .iter()
+            .map(|name| {
+                let listener = UnixListener::bind(dir.path().join(name)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                listener
+            })
+            .collect();
+
+        let address = format!("ipc://{}", dir.path().join("api.sock").display());
+        assert_eq!(sibling_ipc_addresses(&address).len(), 2);
+
+        for listener in &listeners {
+            match listener.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                other => panic!("listing siblings touched an endpoint: {other:?}"),
+            }
+        }
+    }
+
+    /// A socket file whose KiCad has exited is listed, as metadata cannot
+    /// tell it from a live one, and the NNG dial that follows fails at once
+    /// as a request that never arrived.
+    #[test]
+    #[cfg(unix)]
+    fn a_stale_sibling_is_listed_and_fails_its_dial_at_once() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _first = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+        drop(UnixListener::bind(dir.path().join("api-12.sock")).unwrap());
+        let stale = format!("ipc://{}", dir.path().join("api-12.sock").display());
+
+        let address = format!("ipc://{}", dir.path().join("api.sock").display());
+        assert_eq!(
+            sibling_ipc_addresses(&address),
+            [address.clone(), stale.clone()]
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = crate::KiCadIpcClient::new(&stale).ping_outcome();
+        assert!(
+            matches!(
+                outcome,
+                crate::PingOutcome::Unreachable {
+                    reason: crate::UnreachableReason::NoListener,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a socket file with no listener must not be waited on: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

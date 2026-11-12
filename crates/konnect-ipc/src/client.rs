@@ -1664,6 +1664,16 @@ impl KiCadIpcClient {
         &self,
         editor: IpcEditorKind,
     ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        self.get_open_documents_within(editor, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::get_open_documents_for`], waiting at most `recv_timeout`
+    /// for KiCad's reply.
+    fn get_open_documents_within(
+        &self,
+        editor: IpcEditorKind,
+        recv_timeout: std::time::Duration,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
         let document_type = match editor {
             IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
             IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
@@ -1672,7 +1682,11 @@ impl KiCadIpcClient {
             r#type: document_type as i32,
         };
         let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
-            self.send_command(&command, "kiapi.common.commands.GetOpenDocuments")?,
+            self.send_command_within(
+                &command,
+                "kiapi.common.commands.GetOpenDocuments",
+                recv_timeout,
+            )?,
             "GetOpenDocuments",
         )?;
         Ok(response.documents)
@@ -2006,8 +2020,17 @@ impl KiCadIpcClient {
     /// Resolve the filenames of every open PCB document, including relative
     /// document identifiers whose project specifier supplies the directory.
     pub fn get_open_board_paths(&self) -> Result<Vec<PathBuf>> {
+        self.get_open_board_paths_within(COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::get_open_board_paths`], waiting at most `recv_timeout` for
+    /// KiCad's reply.
+    pub fn get_open_board_paths_within(
+        &self,
+        recv_timeout: std::time::Duration,
+    ) -> Result<Vec<PathBuf>> {
         Ok(self
-            .get_open_documents()?
+            .get_open_documents_within(IpcEditorKind::Pcb, recv_timeout)?
             .iter()
             .filter_map(board_document_path)
             .collect())
@@ -2075,7 +2098,19 @@ impl KiCadIpcClient {
         &self,
         requested: &Path,
     ) -> Result<kiapi::common::types::DocumentSpecifier> {
-        let docs = self.get_open_documents()?;
+        self.find_open_board_within(requested, COMMAND_RECV_TIMEOUT)
+    }
+
+    /// As [`Self::find_open_board`], waiting at most `recv_timeout` for
+    /// KiCad's list of open documents. For a caller asking several endpoints
+    /// which of them holds a board, where one that never answers must not
+    /// hold up the rest for the default bound.
+    pub fn find_open_board_within(
+        &self,
+        requested: &Path,
+        recv_timeout: std::time::Duration,
+    ) -> Result<kiapi::common::types::DocumentSpecifier> {
+        let docs = self.get_open_documents_within(IpcEditorKind::Pcb, recv_timeout)?;
         let document = select_requested_board(&docs, requested).map_err(anyhow::Error::new)?;
         self.bind_board(requested.to_path_buf(), document.clone())?;
         Ok(document)

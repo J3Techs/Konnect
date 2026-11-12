@@ -132,6 +132,17 @@ instead. Before that was true, Windows detected nothing and every setup had to
 be configured by hand (#529); if you are on a Konnect older than that fix, set
 `ipc_address` or `KICAD_API_SOCKET` explicitly.
 
+**More than one KiCad process.** Only the first KiCad process gets
+`api.sock`; each further one (a standalone PCB editor beside the project
+manager, a second project, or any KiCad started after an earlier one left
+`api.sock` behind) listens on `api-<pid>.sock` in the same directory. On Linux
+and macOS Konnect asks all of them for a board and uses the one that has it
+open, so no address needs changing; `open_project` lists each endpoint that
+answered under `endpoints` and names the one holding a requested board in
+`requested_endpoint`. This applies only when the address in use follows that
+naming. With a TCP address or a socket path of your own, and on Windows, only
+the one address is asked.
+
 If the address is unresolved, both of the following must be correct — neither
 happens automatically:
 

@@ -34,6 +34,16 @@ wedges KiCad's server for every client (#498), and on Windows opening the pipe
 would also consume a server instance. Liveness stays the job of the bounded
 `Ping` in `client.rs`.
 
+One KiCad process serves one endpoint. The first listens on `api.sock`; a
+process that finds that file there listens on `api-<pid>.sock` beside it. A
+board-targeted call therefore asks every such socket in the configured
+endpoint's directory (`konnect_ipc::sibling_ipc_addresses`, Unix only, same
+metadata-and-ownership rule) and runs against the one that names the board:
+`tools/board_endpoint.rs` does the asking, and
+`with_bound_board_ipc_classified` is the one place every board tool goes
+through it. An address outside KiCad's naming (TCP, a custom socket path) has
+no siblings.
+
 The three board-write gates are:
 
 - `KiCadIpcClient::ensure_board_is_active` in `konnect-ipc/src/client.rs`

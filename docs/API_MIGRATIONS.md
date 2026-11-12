@@ -3,6 +3,64 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a board open in a second KiCad process is reached, and `open_project` lists every endpoint
+
+KiCad's API server listens on `<temp dir>/kicad/api.sock`. A KiCad process
+that finds that file already there listens on `api-<pid>.sock` beside it
+instead: a second project manager, a standalone PCB editor started beside the
+project manager, and, because KiCad can leave `api.sock` behind when it exits,
+every KiCad started after such an exit. Konnect dialled the one address it was
+configured with (or found at startup). A board open in any other KiCad process
+was reported as not open, live-only tools refused it, and the hybrid tools
+fell through to the saved file, where only KiCad's sibling lock stood between
+the edit and that editor's next save.
+
+A board-targeted call now asks every KiCad endpoint in the configured
+endpoint's directory (`api.sock` and each `api-<pid>.sock`) and runs against
+the one whose open documents include the requested board. The live-board
+observation that guards later file fallbacks is recorded the same way,
+whichever endpoint held the board, so a board held by any reachable KiCad
+counts as live and never as closed.
+
+- Looking for endpoints reads the socket directory and never connects, and
+  lists only sockets this user owns. A socket file with no listener behind it
+  fails its NNG dial at once and is passed over without an error.
+- When no endpoint holds the board, the caller acts on the answer that permits
+  least: an endpoint that did not settle the question (busy, timed out)
+  outranks one that listed other boards, which outranks one with no PCB
+  editor, which outranks one that was never reached. The lock check on every
+  file fallback is unchanged.
+- The configured endpoint, and the endpoint that last held the board, are
+  given the usual 30 s to list their documents; any further endpoint is given
+  5 s, so a KiCad that is not answering delays a call by that much at most.
+- With one endpoint nothing changes: it is asked once, as before, and its
+  answer is the one acted on.
+- Only an address in KiCad's own naming has siblings: `ipc://…/api.sock` or
+  `ipc://…/api-<pid>.sock` (or the same as a bare path). A TCP address or a
+  socket path of your own choosing is used alone, as before.
+- Linux and macOS only. On Windows the endpoint is a named pipe, and KiCad
+  decides between the two names by looking for `api.sock` as a file, which a
+  pipe is not; a second KiCad process there gets no endpoint of its own, and
+  the sibling lock remains the only evidence of it.
+
+`open_project` asks every endpoint and adds two fields. `endpoints` lists the
+configured endpoint and each further one that answered, with `ipc_address`,
+`configured`, `ipc_available`, `ipc_failure` (the configured endpoint's Ping
+only), `open_boards` and `open_boards_error`. `requested_endpoint` is the
+address of the endpoint holding the board asked about, or null.
+`ipc_available`, `kicad_ui_running`, `open_boards` and `open_board_count` now
+speak for all endpoints together, so `ipc_available` is true and `ipc_failure`
+null when a further endpoint answered although the configured one did not;
+the configured endpoint's own failure is under `endpoints[0].ipc_failure`.
+`ipc_address` and `open_boards_error` still describe the configured endpoint.
+
+`export_specctra_dsn` dials the endpoint holding its board. Tools that are not
+about one board (`save_project`, `check_kicad_ui`, `launch_kicad_ui`, the
+editor state, selection and cross-probe tools) still use the configured
+endpoint. `run_closed_board_edit` still refuses a PCB editor that is a window
+of the project manager; on Linux and macOS the editor it reopens beside
+another KiCad process is now found at its own endpoint.
+
 ## Unreleased: `create_footprint` writes Reference and Value properties, and `closed_initial` imports exactly one of each
 
 `create_footprint` wrote a footprint's Reference and Value as
